@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.db
 inactive components/key_openai
+venv/
