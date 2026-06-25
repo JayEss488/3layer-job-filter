@@ -1,0 +1,464 @@
+[
+    {
+        "domain": "gradcracker.com",
+        "sectors": [
+            "uk",
+            "graduate",
+            "stem",
+            "engineering",
+            "tech",
+            "internships"
+        ]
+    },
+    {
+        "domain": "jobs.ac.uk",
+        "sectors": [
+            "uk",
+            "academia",
+            "research",
+            "university",
+            "science",
+            "higher-education"
+        ]
+    },
+    {
+        "domain": "findajob.dwp.gov.uk",
+        "sectors": [
+            "uk",
+            "government",
+            "public-sector",
+            "general",
+            "all-sectors"
+        ]
+    },
+    {
+        "domain": "reed.co.uk",
+        "sectors": [
+            "uk",
+            "general",
+            "corporate",
+            "all-sectors",
+            "high-volume"
+        ]
+    },
+    {
+        "domain": "cv-library.co.uk",
+        "sectors": [
+            "uk",
+            "general",
+            "all-sectors",
+            "engineering",
+            "admin"
+        ]
+    },
+    {
+        "domain": "weworkremotely.com",
+        "sectors": [
+            "remote",
+            "tech",
+            "design",
+            "marketing",
+            "global"
+        ]
+    },
+    {
+        "domain": "remoteok.com",
+        "sectors": [
+            "remote",
+            "tech",
+            "software",
+            "copywriting",
+            "design"
+        ]
+    },
+    {
+        "domain": "greenhouse.io",
+        "sectors": [
+            "ats",
+            "tech",
+            "startups",
+            "corporate",
+            "direct-employer"
+        ]
+    },
+    {
+        "domain": "lever.co",
+        "sectors": [
+            "ats",
+            "tech",
+            "startups",
+            "mid-market",
+            "direct-employer"
+        ]
+    },
+    {
+        "domain": "workable.com",
+        "sectors": [
+            "ats",
+            "smb",
+            "general",
+            "corporate",
+            "direct-employer"
+        ]
+    },
+    {
+        "domain": "crypto.jobs",
+        "sectors": [
+            "web3",
+            "crypto",
+            "blockchain",
+            "tech",
+            "finance",
+            "global"
+        ]
+    },
+    {
+        "domain": "climatebase.org",
+        "sectors": [
+            "climate-tech",
+            "sustainability",
+            "green-energy",
+            "global"
+        ]
+    },
+    {
+        "domain": "cwjobs.co.uk",
+        "sectors": [
+            "uk",
+            "tech",
+            "it-support",
+            "infrastructure",
+            "software"
+        ]
+    },
+    {
+        "domain": "totaljobs.com",
+        "sectors": [
+            "uk",
+            "general",
+            "hospitality",
+            "retail",
+            "corporate"
+        ]
+    },
+    {
+        "domain": "guardianjobs.com",
+        "sectors": [
+            "uk",
+            "media",
+            "education",
+            "public-sector",
+            "creative"
+        ]
+    },
+    {
+        "domain": "wellfound.com",
+        "sectors": [
+            "startups",
+            "tech",
+            "venture-capital",
+            "remote",
+            "global"
+        ]
+    },
+    {
+        "domain": "prospects.ac.uk",
+        "sectors": [
+            "uk",
+            "graduate",
+            "scheme",
+            "career-start",
+            "all-sectors"
+        ]
+    },
+    {
+        "domain": "targetjobs.co.uk",
+        "sectors": [
+            "uk",
+            "graduate",
+            "scheme",
+            "corporate",
+            "finance",
+            "legal"
+        ]
+    },
+    {
+        "domain": "milkround.com",
+        "sectors": [
+            "uk",
+            "graduate",
+            "internships",
+            "entry-level",
+            "high-volume"
+        ]
+    },
+    {
+        "domain": "grb.uk.com",
+        "sectors": [
+            "uk",
+            "graduate",
+            "sme",
+            "tech",
+            "sales",
+            "consulting"
+        ]
+    },
+    {
+        "domain": "ecitb.org.uk",
+        "sectors": [
+            "uk",
+            "engineering-construction",
+            "skills-training",
+            "government-funded",
+            "technical-apprenticeships",
+            "energy",
+            "renewables",
+            "oil-gas"
+        ]
+    },
+    {
+        "domain": "energyjobline.com",
+        "sectors": [
+            "uk",
+            "global",
+            "energy",
+            "oil-gas",
+            "renewables",
+            "marine",
+            "engineering",
+            "offshore",
+            "wind-power",
+            "solar-power",
+            "hydrogen"
+        ]
+    },
+    {
+        "domain": "charityjobs.co.uk",
+        "sectors": [
+            "uk",
+            "non-profit",
+            "charity",
+            "fundraising",
+            "social-good"
+        ]
+    },
+    {
+        "domain": "technojobs.co.uk",
+        "sectors": [
+            "uk",
+            "tech",
+            "it",
+            "software",
+            "contractor",
+            "cybersecurity"
+        ]
+    },
+    {
+        "domain": "ijme.org.uk",
+        "sectors": [
+            "uk",
+            "graduate",
+            "stem",
+            "engineering",
+            "manufacturing",
+            "construction",
+            "academia",
+            "research",
+            "professional-engineering"
+        ]
+    },
+    {
+        "domain": "insidehighered.com",
+        "sectors": [
+            "academia",
+            "research",
+            "postdoc",
+            "higher-education",
+            "global"
+        ]
+    },
+    {
+        "domain": "universitypositions.com",
+        "sectors": [
+            "academia",
+            "faculty",
+            "research",
+            "higher-education",
+            "international"
+        ]
+    },
+    {
+        "domain": "chronicle.com",
+        "sectors": [
+            "academia",
+            "higher-education",
+            "teaching",
+            "us",
+            "administration"
+        ]
+    },
+    {
+        "domain": "findapharmaid.com",
+        "sectors": [
+            "pharma",
+            "pharma-jobs",
+            "medical",
+            "uk",
+            "clinical",
+            "research"
+        ]
+    },
+    {
+        "domain": "pharmaceutical-journal.com",
+        "sectors": [
+            "pharma",
+            "uk",
+            "pharmacist",
+            "clinical",
+            "healthcare",
+            "industry"
+        ]
+    },
+    {
+        "domain": "acs.org",
+        "sectors": [
+            "pharma",
+            "research",
+            "chemistry",
+            "scientific",
+            "us"
+        ]
+    },
+    {
+        "domain": "newscientist.com/jobs",
+        "sectors": [
+            "science",
+            "research",
+            "global",
+            "academic",
+            "industry"
+        ]
+    },
+    {
+        "domain": "nature.com/jobs",
+        "sectors": [
+            "science",
+            "research",
+            "academic",
+            "global",
+            "biotech"
+        ]
+    },
+    {
+        "domain": "stemlibrary.com",
+        "sectors": [
+            "stem",
+            "science",
+            "tech",
+            "education",
+            "us"
+        ]
+    },
+    {
+        "domain": "stemglassdoor.com",
+        "sectors": [
+            "stem",
+            "science",
+            "tech",
+            "data",
+            "engineering"
+        ]
+    },
+    {
+        "domain": "biotechnologycareers.org",
+        "sectors": [
+            "biotech",
+            "pharma",
+            "science",
+            "research",
+            "us"
+        ]
+    },
+    {
+        "domain": "jobs.iasp.info",
+        "sectors": [
+            "psychology",
+            "research",
+            "academic",
+            "global"
+        ]
+    },
+    {
+        "domain": "sciencecareers.org",
+        "sectors": [
+            "science",
+            "pharma",
+            "research",
+            "academia",
+            "us"
+        ]
+    },
+    {
+        "domain": "chemistryworld.com/jobs",
+        "sectors": [
+            "pharma",
+            "chemistry",
+            "industry",
+            "uk",
+            "research"
+        ]
+    },
+    {
+        "domain": "physicstoday.org",
+        "sectors": [
+            "physics",
+            "research",
+            "academic",
+            "science",
+            "engineering"
+        ]
+    },
+    {
+        "domain": "careersinstatisticalscience.org",
+        "sectors": [
+            "data-science",
+            "statistics",
+            "pharma",
+            "academic",
+            "research",
+            "analytics"
+        ]
+    },
+    {
+        "domain": "statjobs.com",
+        "sectors": [
+            "statistics",
+            "data-science",
+            "pharma",
+            "academic",
+            "research",
+            "gov"
+        ]
+    },
+    {
+        "domain": "aiche.org",
+        "sectors": [
+            "engineering",
+            "chemical-engineering",
+            "process",
+            "energy",
+            "manufacturing",
+            "pharma"
+        ]
+    },
+    {
+        "domain": "ismproperty.com",
+        "sectors": [
+            "engineering",
+            "construction",
+            "uk",
+            "technical",
+            "maintenance"
+        ]
+    }
+]

@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Job Match Results</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg:        #0d0f14;
+      --surface:   #161a23;
+      --border:    #252b38;
+      --border-hi: #313a4d;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --teal:      #2dd4bf;
+      --teal-dim:  #0f3d38;
+      --amber:     #f59e0b;
+      --amber-dim: #3a2a00;
+      --red:       #f87171;
+      --red-dim:   #3b1010;
+      --green:     #4ade80;
+      --green-dim: #0d2b18;
+      --mono:      'JetBrains Mono', monospace;
+      --sans:      'Inter', sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 28px 48px 24px;
+      display: flex;
+      align-items: baseline;
+      gap: 20px;
+    }
+
+    header h1 {
+      font-size: 13px;
+      font-family: var(--mono);
+      font-weight: 600;
+      color: var(--teal);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    header .meta {
+      font-size: 12px;
+      font-family: var(--mono);
+      color: var(--muted);
+    }
+
+    /* ── Upload zone ── */
+    #upload-zone {
+      margin: 60px auto;
+      max-width: 520px;
+      text-align: center;
+    }
+
+    #upload-zone p {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 24px;
+      line-height: 1.7;
+    }
+
+    .drop-area {
+      border: 1.5px dashed var(--border-hi);
+      border-radius: 12px;
+      padding: 48px 32px;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .drop-area:hover, .drop-area.over {
+      border-color: var(--teal);
+      background: rgba(45, 212, 191, 0.04);
+    }
+
+    .drop-area svg { color: var(--muted); margin-bottom: 14px; }
+
+    .drop-area span {
+      display: block;
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    .drop-area strong {
+      color: var(--teal);
+      font-weight: 500;
+    }
+
+    .paste-btn {
+      margin-top: 20px;
+      display: inline-block;
+      padding: 8px 20px;
+      border: 1px solid var(--border-hi);
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+      cursor: pointer;
+      background: none;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    .paste-btn:hover { color: var(--text); border-color: var(--teal); }
+
+    /* ── Paste modal ── */
+    #paste-modal {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+    }
+    #paste-modal.open { display: flex; }
+
+    .modal-box {
+      background: var(--surface);
+      border: 1px solid var(--border-hi);
+      border-radius: 12px;
+      padding: 32px;
+      width: 580px;
+      max-width: 94vw;
+    }
+    .modal-box h2 {
+      font-size: 14px;
+      font-family: var(--mono);
+      color: var(--teal);
+      margin-bottom: 16px;
+    }
+    .modal-box textarea {
+      width: 100%;
+      height: 240px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 14px;
+      resize: vertical;
+      outline: none;
+    }
+    .modal-box textarea:focus { border-color: var(--teal); }
+    .modal-actions { display: flex; gap: 10px; margin-top: 14px; justify-content: flex-end; }
+    .btn-primary {
+      padding: 8px 22px;
+      background: var(--teal);
+      color: #0d0f14;
+      border: none;
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-ghost {
+      padding: 8px 18px;
+      background: none;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .btn-ghost:hover { color: var(--text); }
+
+    /* ── Results ── */
+    #results { display: none; }
+
+    .results-header {
+      padding: 36px 48px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .results-header h2 {
+      font-size: 13px;
+      font-family: var(--mono);
+      color: var(--muted);
+      font-weight: 400;
+    }
+
+    .results-header .count {
+      font-size: 13px;
+      font-family: var(--mono);
+      background: var(--teal-dim);
+      color: var(--teal);
+      padding: 3px 10px;
+      border-radius: 4px;
+    }
+
+    .reset-btn {
+      margin-left: auto;
+      padding: 6px 16px;
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .reset-btn:hover { border-color: var(--border-hi); color: var(--text); }
+
+    /* ── Cards grid ── */
+    .cards {
+      padding: 8px 48px 80px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 20px;
+    }
+
+    /* ── Job Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 0;
+      position: relative;
+      overflow: hidden;
+      transition: border-color 0.2s, transform 0.15s;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .card:hover { border-color: var(--border-hi); transform: translateY(-2px); }
+
+    /* signal bar at top — width driven by match_reasons count */
+    .card-signal {
+      height: 3px;
+      background: linear-gradient(90deg, var(--teal), #0ea5e9);
+      border-radius: 2px 2px 0 0;
+      width: 100%;
+      transform-origin: left;
+      transition: transform 0.5s ease;
+    }
+
+    .card-body { padding: 22px 22px 16px; flex: 1; }
+
+    /* ── Accept / Reject badge buttons ── */
+    .card-actions {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      display: flex;
+      gap: 6px;
+    }
+
+    .action-btn {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      border: 1.5px solid;
+      background: var(--bg);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s, transform 0.1s;
+    }
+
+    .action-btn:hover { transform: scale(1.15); }
+
+    .action-btn.accept {
+      border-color: var(--green);
+      color: var(--green);
+    }
+    .action-btn.accept:hover { background: var(--green-dim); }
+    .action-btn.accept.active { background: var(--green); color: #0d0f14; }
+
+    .action-btn.reject {
+      border-color: var(--red);
+      color: var(--red);
+    }
+    .action-btn.reject:hover { background: var(--red-dim); }
+    .action-btn.reject.active { background: var(--red); color: #0d0f14; }
+
+    .action-btn svg { width: 13px; height: 13px; stroke-width: 2.5; }
+
+    /* card dismissed state */
+    .card.dismissed {
+      opacity: 0.35;
+      filter: saturate(0);
+    }
+    .card.accepted { border-color: rgba(74, 222, 128, 0.35); }
+    .card.rejected  { border-color: rgba(248, 113, 113, 0.25); }
+
+    /* ── Card content ── */
+    .card-board {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .card-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+      line-height: 1.3;
+      margin-bottom: 4px;
+      padding-right: 74px; /* clear action buttons */
+    }
+
+    .card-company {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+
+    .card-summary {
+      font-size: 13px;
+      color: #94a3b8;
+      line-height: 1.65;
+      margin-bottom: 18px;
+    }
+
+    .signals { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+
+    .signal-item {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .signal-item .icon {
+      flex-shrink: 0;
+      width: 16px;
+      height: 16px;
+      margin-top: 2px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .signal-item.match { color: #86efac; }
+    .signal-item.match .icon { color: var(--green); }
+    .signal-item.concern { color: #fcd34d; }
+    .signal-item.concern .icon { color: var(--amber); }
+
+    /* ── Card footer ── */
+    .card-footer {
+      padding: 14px 22px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .card-link {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--teal);
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: opacity 0.15s;
+    }
+    .card-link:hover { opacity: 0.7; }
+    .card-link svg { width: 10px; height: 10px; }
+
+    .card-score {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .card-score span {
+      color: var(--teal);
+      font-weight: 600;
+    }
+
+    /* ── Error ── */
+    .parse-error {
+      margin: 40px 48px;
+      padding: 20px 24px;
+      background: var(--red-dim);
+      border: 1px solid rgba(248,113,113,0.3);
+      border-radius: 10px;
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--red);
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 680px) {
+      header { padding: 20px 20px 16px; }
+      .cards { padding: 8px 16px 60px; grid-template-columns: 1fr; }
+      .results-header { padding: 24px 20px 12px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Job Match Viewer</h1>
+  <span class="meta">// phase 7 output</span>
+</header>
+
+<!-- Upload zone -->
+<div id="upload-zone">
+  <div class="drop-area" id="drop-area">
+    <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+      <polyline points="17 8 12 3 7 8"/>
+      <line x1="12" y1="3" x2="12" y2="15"/>
+    </svg>
+    <span>Drop a <strong>results.json</strong> file here</span>
+    <span style="margin-top:6px;font-size:12px;">or click to browse</span>
+    <input type="file" id="file-input" accept=".json" style="display:none" />
+  </div>
+  <p style="margin-top:18px;">
+    Paste the JSON array output from <code style="font-family:var(--mono);color:var(--teal);font-size:12px;">save_and_display()</code> — the <code style="font-family:var(--mono);color:var(--teal);font-size:12px;">results</code> list.
+  </p>
+  <button class="paste-btn" id="paste-btn">Paste JSON instead</button>
+</div>
+
+<!-- Paste modal -->
+<div id="paste-modal">
+  <div class="modal-box">
+    <h2>// paste results JSON</h2>
+    <textarea id="paste-area" placeholder='[{"title": "...", "company": "...", ...}]'></textarea>
+    <div class="modal-actions">
+      <button class="btn-ghost" id="modal-cancel">Cancel</button>
+      <button class="btn-primary" id="modal-load">Load Results</button>
+    </div>
+  </div>
+</div>
+
+<!-- Results view -->
+<div id="results">
+  <div class="results-header">
+    <h2>matched roles</h2>
+    <span class="count" id="result-count">0</span>
+    <button class="reset-btn" id="reset-btn">↩ new import</button>
+  </div>
+  <div class="cards" id="cards-grid"></div>
+</div>
+
+<script>
+  const BOARD_LABELS = {
+    reed: 'Reed',
+    adzuna: 'Adzuna',
+    remotive: 'Remotive',
+    jobicy: 'Jobicy',
+    google_jobs: 'Google Jobs',
+    jsearch: 'JSearch',
+  };
+
+  // ── DOM refs ──────────────────────────────────────────────────────────────────
+  const uploadZone   = document.getElementById('upload-zone');
+  const dropArea     = document.getElementById('drop-area');
+  const fileInput    = document.getElementById('file-input');
+  const pasteBtn     = document.getElementById('paste-btn');
+  const pasteModal   = document.getElementById('paste-modal');
+  const modalCancel  = document.getElementById('modal-cancel');
+  const modalLoad    = document.getElementById('modal-load');
+  const pasteArea    = document.getElementById('paste-area');
+  const resultsDiv   = document.getElementById('results');
+  const cardsGrid    = document.getElementById('cards-grid');
+  const resultCount  = document.getElementById('result-count');
+  const resetBtn     = document.getElementById('reset-btn');
+
+  // ── File drop / click ────────────────────────────────────────────────────────
+  dropArea.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) readFile(fileInput.files[0]);
+  });
+
+  dropArea.addEventListener('dragover', e => { e.preventDefault(); dropArea.classList.add('over'); });
+  dropArea.addEventListener('dragleave', () => dropArea.classList.remove('over'));
+  dropArea.addEventListener('drop', e => {
+    e.preventDefault();
+    dropArea.classList.remove('over');
+    const f = e.dataTransfer.files[0];
+    if (f) readFile(f);
+  });
+
+  function readFile(file) {
+    const reader = new FileReader();
+    reader.onload = e => parseAndRender(e.target.result);
+    reader.readAsText(file);
+  }
+
+  // ── Paste modal ───────────────────────────────────────────────────────────────
+  pasteBtn.addEventListener('click', () => pasteModal.classList.add('open'));
+  modalCancel.addEventListener('click', () => pasteModal.classList.remove('open'));
+  modalLoad.addEventListener('click', () => {
+    const txt = pasteArea.value.trim();
+    if (txt) { parseAndRender(txt); pasteModal.classList.remove('open'); }
+  });
+
+  // close modal on backdrop click
+  pasteModal.addEventListener('click', e => {
+    if (e.target === pasteModal) pasteModal.classList.remove('open');
+  });
+
+  // ── Reset ─────────────────────────────────────────────────────────────────────
+  resetBtn.addEventListener('click', () => {
+    resultsDiv.style.display = 'none';
+    uploadZone.style.display = '';
+    cardsGrid.innerHTML = '';
+    pasteArea.value = '';
+    fileInput.value = '';
+  });
+
+  // ── Parse & Render ────────────────────────────────────────────────────────────
+  function parseAndRender(raw) {
+    let jobs;
+    try {
+      // Accept either a bare array or the selections wrapper
+      const parsed = JSON.parse(raw);
+      jobs = Array.isArray(parsed)
+        ? parsed
+        : (parsed.selections || parsed.results || [parsed]);
+    } catch(e) {
+      showError('Could not parse JSON — ' + e.message);
+      return;
+    }
+
+    if (!jobs.length) { showError('No job entries found in the provided JSON.'); return; }
+
+    uploadZone.style.display = 'none';
+    cardsGrid.innerHTML = '';
+    resultCount.textContent = jobs.length;
+
+    jobs.forEach((job, i) => {
+      cardsGrid.appendChild(buildCard(job, i));
+    });
+
+    resultsDiv.style.display = '';
+
+    // Animate signal bars in
+    requestAnimationFrame(() => {
+      document.querySelectorAll('.card-signal').forEach(el => {
+        el.style.transform = `scaleX(${parseFloat(el.dataset.fill)})`;
+      });
+    });
+  }
+
+  // ── Build card ────────────────────────────────────────────────────────────────
+  function buildCard(job, idx) {
+    const card = document.createElement('div');
+    card.className = 'card';
+
+    const matchReasons = job.match_reasons || [];
+    const concerns     = job.concerns || [];
+    const fill         = Math.min(1, 0.2 + (matchReasons.length / 5) * 0.8);
+    const boardLabel   = BOARD_LABELS[job.board] || (job.board || 'Unknown').replace(/_/g,' ');
+    const score        = job.llm_score != null ? job.llm_score : (job.embed_score != null ? (job.embed_score * 10).toFixed(1) : null);
+
+    card.innerHTML = `
+      <div class="card-signal" data-fill="${fill}" style="transform:scaleX(0)"></div>
+
+      <div class="card-actions">
+        <button class="action-btn accept" title="Accept" aria-label="Accept this job" data-idx="${idx}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" xmlns="http://www.w3.org/2000/svg">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+        </button>
+        <button class="action-btn reject" title="Reject" aria-label="Reject this job" data-idx="${idx}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" xmlns="http://www.w3.org/2000/svg">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="card-body">
+        <div class="card-board">${escHtml(boardLabel)}</div>
+        <div class="card-title">${escHtml(job.title || 'Untitled Role')}</div>
+        <div class="card-company">${escHtml(job.company || '')}</div>
+        ${job.summary ? `<div class="card-summary">${escHtml(job.summary)}</div>` : ''}
+        <div class="signals">
+          ${matchReasons.map(r => `
+            <div class="signal-item match">
+              <div class="icon">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+              </div>
+              <span>${escHtml(r)}</span>
+            </div>`).join('')}
+          ${concerns.map(c => `
+            <div class="signal-item concern">
+              <div class="icon">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                  <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+                </svg>
+              </div>
+              <span>${escHtml(c)}</span>
+            </div>`).join('')}
+        </div>
+      </div>
+
+      <div class="card-footer">
+        ${job.url
+          ? `<a class="card-link" href="${escHtml(job.url)}" target="_blank" rel="noopener">
+               View listing
+               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" xmlns="http://www.w3.org/2000/svg">
+                 <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                 <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+               </svg>
+             </a>`
+          : '<span></span>'}
+        ${score != null
+          ? `<span class="card-score">score <span>${score}</span></span>`
+          : ''}
+      </div>
+    `;
+
+    // ── Accept / Reject logic ─────────────────────────────────────────────────
+    const acceptBtn = card.querySelector('.action-btn.accept');
+    const rejectBtn = card.querySelector('.action-btn.reject');
+
+    acceptBtn.addEventListener('click', () => {
+      const active = acceptBtn.classList.toggle('active');
+      rejectBtn.classList.remove('active');
+      card.classList.toggle('accepted', active);
+      card.classList.remove('rejected', 'dismissed');
+    });
+
+    rejectBtn.addEventListener('click', () => {
+      const active = rejectBtn.classList.toggle('active');
+      acceptBtn.classList.remove('active');
+      card.classList.toggle('rejected', active);
+      card.classList.toggle('dismissed', active);
+      card.classList.remove('accepted');
+    });
+
+    return card;
+  }
+
+  // ── Error display ─────────────────────────────────────────────────────────────
+  function showError(msg) {
+    uploadZone.style.display = 'none';
+    cardsGrid.innerHTML = `<div class="parse-error">// error: ${escHtml(msg)}</div>`;
+    resultCount.textContent = '0';
+    resultsDiv.style.display = '';
+  }
+
+  function escHtml(s) {
+    if (typeof s !== 'string') return String(s ?? '');
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ── Dev helper: load sample data in one click ────────────────────────────────
+  // Remove or comment out before shipping if desired
+  const SAMPLE = [
+    {
+      "title": "Senior Software Engineer",
+      "company": "Acme Corp",
+      "board": "adzuna",
+      "url": "https://example.com/job/1",
+      "summary": "A strong alignment with the candidate's backend engineering background. The role focuses on distributed systems at scale, closely matching prior experience with event-driven architectures.",
+      "match_reasons": ["Python & Django expertise directly applicable", "Remote-first culture matches candidate preference", "Series B startup — growth trajectory aligns with seniority target"],
+      "concerns": ["Requires Rust experience (2+ years)", "Must hold active SC clearance"],
+      "llm_score": 9
+    },
+    {
+      "title": "Lead Platform Engineer",
+      "company": "BuildCo Technologies",
+      "board": "reed",
+      "url": "https://example.com/job/2",
+      "summary": "Platform engineering role with a strong DevOps component. Kubernetes and Terraform exposure from previous projects maps well to day-to-day responsibilities.",
+      "match_reasons": ["IaC tooling (Terraform) matches CV", "UK-based hybrid — fits location constraint"],
+      "concerns": ["Team leadership expectation may require management experience not evidenced in CV"],
+      "llm_score": 7
+    },
+    {
+      "title": "ML Infrastructure Engineer",
+      "company": "Neural Systems Ltd",
+      "board": "google_jobs",
+      "url": "https://example.com/job/3",
+      "summary": "Intersection of ML and platform work that directly suits this candidate's profile. The team is building internal tooling for model serving, an area the candidate has demonstrable experience in.",
+      "match_reasons": ["Model serving pipeline work matches past projects", "Python-first stack", "Competitive salary band at senior level"],
+      "concerns": ["CUDA/GPU optimisation may be an unexpected requirement"],
+      "llm_score": 8
+    }
+  ];
+
+// ── Auto-load from pipeline ───────────────────────────────────────────────
+  (function () {
+    const params = new URLSearchParams(window.location.search);
+    const jobId  = params.get('job_id');
+
+    // 1. Arrived from a live run — try sessionStorage first (instant, no fetch)
+    if (jobId) {
+      const cached = sessionStorage.getItem('jobscope_results');
+      if (cached) {
+        sessionStorage.removeItem('jobscope_results');
+        parseAndRender(cached);
+        return;
+      }
+
+      // 2. Fallback: poll /api/results until the job is done
+      //    (handles page refresh or direct URL navigation)
+      showLoading();
+      function poll() {
+        fetch(`/api/results/${jobId}`)
+          .then(r => r.json())
+          .then(data => {
+            if (data.status === 'running') { setTimeout(poll, 1500); return; }
+            if (data.error)               { showError(data.error);   return; }
+            parseAndRender(JSON.stringify(data));
+          })
+          .catch(err => showError('Network error: ' + err.message));
+      }
+      poll();
+      return;
+    }
+
+    // 3. No job_id — load sample data so the UI is demonstrable standalone
+    parseAndRender(JSON.stringify(SAMPLE));
+  })();
+
+  function showLoading() {
+    uploadZone.style.display  = 'none';
+    resultsDiv.style.display  = '';
+    resultCount.textContent   = '…';
+    cardsGrid.innerHTML = `
+      <div style="grid-column:1/-1;padding:60px 0;text-align:center;
+                  font-family:var(--mono);font-size:13px;color:var(--muted)">
+        // pipeline running — waiting for results
+        <span id="ld-dot">.</span>
+      </div>`;
+    // Animate the dot so it's clear something is happening
+    let d = 0;
+    setInterval(() => {
+      const el = document.getElementById('ld-dot');
+      if (el) el.textContent = ['.','..','...'][d++ % 3];
+    }, 500);
+  }
+  
+</script>
+</body>
+</html>
