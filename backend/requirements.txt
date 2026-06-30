@@ -1,0 +1,11 @@
+# Backend API deps (the search engine's heavy deps live in the repo-root
+# requirements.txt: crawl4ai, playwright, numpy, etc.)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+pydantic==2.13.4
+python-multipart==0.0.20
+python-dotenv==1.2.2
+openai==2.44.0
+pdfplumber==0.11.10
+python-docx==1.2.0

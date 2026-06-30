@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: monospace;
+    background: #f0f0f0;
+    padding: 20px;
+    font-size: 13px;
+    color: #222;
+  }
+  .screen {
+    background: #fff;
+    border: 2px solid #333;
+    width: 100%;
+    max-width: 900px;
+    margin: 0 auto;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .nav {
+    background: #ddd;
+    border-bottom: 2px solid #333;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    height: 42px;
+    gap: 8px;
+  }
+  .nav-tab { border: 2px solid #333; background: #eee; padding: 5px 16px; border-radius: 3px 3px 0 0; font-size: 12px; font-weight: bold; border-bottom: none; margin-bottom: -2px; }
+  .nav-tab.active { background: #fff; }
+  .nav-spacer { flex: 1; }
+  .nav-btn { border: 2px solid #333; background: #333; color: #fff; padding: 5px 14px; border-radius: 3px; font-size: 12px; font-family: monospace; }
+
+  .page-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+
+  .training-banner {
+    border: 1.5px solid #333;
+    background: #f5f5f5;
+    border-radius: 3px;
+    padding: 7px 14px;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .training-banner .text { flex: 1; }
+  .training-banner .dismiss { color: #aaa; font-size: 11px; cursor: pointer; }
+
+  .meta-row {
+    font-size: 12px;
+    color: #666;
+  }
+  .meta-row .count { font-weight: bold; color: #333; }
+
+  .card {
+    border: 2px solid #333;
+    border-radius: 4px;
+    overflow: hidden;
+    background: #fff;
+  }
+
+  .card-top {
+    display: flex;
+    align-items: flex-start;
+    padding: 12px 14px 10px;
+    gap: 12px;
+  }
+  .card-rank {
+    font-size: 18px;
+    font-weight: bold;
+    color: #bbb;
+    width: 22px;
+    flex-shrink: 0;
+    padding-top: 2px;
+    text-align: center;
+  }
+  .card-main { flex: 1; display: flex; flex-direction: column; gap: 3px; }
+  .card-title {
+    font-size: 14px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card-title a { font-size: 11px; color: #888; font-weight: normal; text-decoration: underline; }
+  .card-company { font-size: 12px; color: #555; }
+  .card-tags { display: flex; gap: 5px; margin-top: 4px; flex-wrap: wrap; }
+  .tag {
+    border: 1px solid #bbb;
+    border-radius: 2px;
+    padding: 1px 6px;
+    font-size: 10px;
+    color: #666;
+    background: #f5f5f5;
+  }
+
+  .card-analysis {
+    border-top: 1px dashed #ccc;
+    padding: 8px 14px 8px 48px;
+    font-size: 11px;
+    color: #444;
+    line-height: 1.6;
+    background: #fafafa;
+  }
+  .highlight { font-weight: bold; color: #222; }
+  .concern { color: #888; }
+
+  .card-actions {
+    border-top: 1px solid #ddd;
+    padding: 8px 14px 8px 48px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .action-btn {
+    border: 2px solid #333;
+    border-radius: 3px;
+    padding: 5px 18px;
+    font-family: monospace;
+    font-size: 13px;
+    font-weight: bold;
+    cursor: pointer;
+    background: #fff;
+  }
+  .action-btn.ticked { background: #333; color: #fff; }
+  .action-btn.crossed { border-color: #bbb; color: #bbb; }
+
+  /* Crossed cards - pushed to bottom */
+  .crossed-section-label {
+    font-size: 11px;
+    color: #aaa;
+    text-align: center;
+    padding: 4px 0 0;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    border-top: 1px dashed #ccc;
+    margin-top: 2px;
+  }
+  .card.crossed {
+    border-color: #ccc;
+    opacity: 0.55;
+  }
+</style>
+</head>
+<body>
+<div class="screen">
+
+  <div class="nav">
+    <div class="nav-tab active">Search</div>
+    <div class="nav-tab">My Roles</div>
+    <div class="nav-tab">Profile</div>
+    <div class="nav-spacer"></div>
+    <div class="nav-btn">&#9654; Run New Search</div>
+  </div>
+
+  <div class="page-body">
+
+    <div class="training-banner">
+      <div class="text">&#9432; Ticking and crossing roles trains your search - results improve over time.</div>
+      <div class="dismiss">dismiss</div>
+    </div>
+
+    <div class="meta-row">Showing <span class="count">10 results</span> - last searched 2 mins ago</div>
+
+    <!-- Card 1 -->
+    <div class="card">
+      <div class="card-top">
+        <div class="card-rank">1</div>
+        <div class="card-main">
+          <div class="card-title">Senior Software Engineer <a href="#">&#8599; view role</a></div>
+          <div class="card-company">Monzo - London (Hybrid)</div>
+          <div class="card-tags">
+            <div class="tag">React</div>
+            <div class="tag">Python</div>
+            <div class="tag">Senior</div>
+            <div class="tag">FinTech</div>
+            <div class="tag">£80k-£95k</div>
+          </div>
+        </div>
+      </div>
+      <div class="card-analysis">
+        <span class="highlight">Strong match on React and Python</span>, which are core requirements. Seniority and hybrid working align well.
+        <span class="concern">Salary top-end (£95k) slightly above your stated range.</span>
+      </div>
+      <div class="card-actions">
+        <div class="action-btn">&#10003; Save</div>
+        <div class="action-btn">&#10007; Pass</div>
+      </div>
+    </div>
+
+    <!-- Card 2 - ticked -->
+    <div class="card">
+      <div class="card-top">
+        <div class="card-rank">2</div>
+        <div class="card-main">
+          <div class="card-title">Tech Lead - Platform <a href="#">&#8599; view role</a></div>
+          <div class="card-company">Revolut - Remote</div>
+          <div class="card-tags">
+            <div class="tag">Tech Lead</div>
+            <div class="tag">AWS</div>
+            <div class="tag">Remote</div>
+            <div class="tag">FinTech</div>
+            <div class="tag">£85k-£100k</div>
+          </div>
+        </div>
+      </div>
+      <div class="card-analysis">
+        <span class="highlight">Tech Lead title and AWS experience are a direct match.</span> Remote working aligns with your preferences.
+        <span class="concern">Role emphasises people management more than hands-on coding.</span>
+      </div>
+      <div class="card-actions">
+        <div class="action-btn ticked">&#10003; Saved</div>
+        <div class="action-btn">&#10007; Pass</div>
+      </div>
+    </div>
+
+    <!-- Card 3 -->
+    <div class="card">
+      <div class="card-top">
+        <div class="card-rank">3</div>
+        <div class="card-main">
+          <div class="card-title">Staff Engineer <a href="#">&#8599; view role</a></div>
+          <div class="card-company">Wise - London (Hybrid)</div>
+          <div class="card-tags">
+            <div class="tag">Python</div>
+            <div class="tag">AWS</div>
+            <div class="tag">Staff</div>
+            <div class="tag">FinTech</div>
+            <div class="tag">£90k-£110k</div>
+          </div>
+        </div>
+      </div>
+      <div class="card-analysis">
+        <span class="highlight">Python and AWS are core to this role and match your profile strongly.</span>
+        <span class="concern">Staff-level may be a step above your stated seniority.</span>
+      </div>
+      <div class="card-actions">
+        <div class="action-btn">&#10003; Save</div>
+        <div class="action-btn">&#10007; Pass</div>
+      </div>
+    </div>
+
+    <!-- Card 4 -->
+    <div class="card">
+      <div class="card-top">
+        <div class="card-rank">4</div>
+        <div class="card-main">
+          <div class="card-title">Senior Backend Engineer <a href="#">&#8599; view role</a></div>
+          <div class="card-company">Starling Bank - London (Hybrid)</div>
+          <div class="card-tags">
+            <div class="tag">Python</div>
+            <div class="tag">Node.js</div>
+            <div class="tag">Senior</div>
+            <div class="tag">FinTech</div>
+            <div class="tag">£75k-£90k</div>
+          </div>
+        </div>
+      </div>
+      <div class="card-analysis">
+        <span class="highlight">Python and seniority align well. Salary range is a strong fit.</span>
+        <span class="concern">Node.js is listed as a core requirement - not currently in your profile.</span>
+      </div>
+      <div class="card-actions">
+        <div class="action-btn">&#10003; Save</div>
+        <div class="action-btn">&#10007; Pass</div>
+      </div>
+    </div>
+
+    <!-- Crossed section -->
+    <div class="crossed-section-label">passed this session</div>
+
+    <div class="card crossed">
+      <div class="card-top">
+        <div class="card-rank" style="color:#ccc;">5</div>
+        <div class="card-main">
+          <div class="card-title">Frontend Engineer <a href="#">&#8599; view role</a></div>
+          <div class="card-company">ASOS - London (On-site)</div>
+          <div class="card-tags">
+            <div class="tag">React</div>
+            <div class="tag">Mid-level</div>
+            <div class="tag">On-site</div>
+            <div class="tag">£55k-£65k</div>
+          </div>
+        </div>
+      </div>
+      <div class="card-analysis">
+        React matches but seniority (mid-level) and salary are below your profile. On-site conflicts with your location preference.
+      </div>
+      <div class="card-actions">
+        <div class="action-btn">&#10003; Save</div>
+        <div class="action-btn crossed">&#10007; Passed</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

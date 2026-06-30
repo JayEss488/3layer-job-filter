@@ -1,9 +1,0 @@
-on 4th account:
-I've found out that the memory is written into the database- the problem is that it doesn't check for previously saved data on load.
-To fix the second, show a creating questions placeholder before it loads.
-Finish after 4pm.
-
-Also:
-Once a set of 5 cards done, allow to go back (currently forced to do next round).
-
-Test if delete from memory part done.

@@ -1,0 +1,95 @@
+"""CV / free-text parsing into normalised profile_attributes.
+
+Both parse-cv and parse-text funnel into parse_text_to_attributes: extract text,
+ask the model for JSON keyed by attribute type (crucially separating past_role
+from target_role), then insert one row per item as confirmed=false."""
+import io
+
+from sqlalchemy.orm import Session
+
+from ..config import ATTRIBUTE_TYPES
+from ..models import ProfileAttribute
+from .llm import llm_json
+
+_PARSE_SYSTEM = (
+    "You extract a structured job-search profile from a candidate's CV or notes. "
+    "Be faithful to the source: do NOT inflate, exaggerate, or invent claims. "
+    "Crucially, separate what the candidate HAS done (past_role) from what they "
+    "WANT next (target_role) — never conflate them."
+)
+
+
+def _parse_prompt(text: str) -> str:
+    return f"""Extract a job-search profile from the document below.
+Return ONLY a JSON object with these keys (omit a key if nothing applies; never invent):
+{{
+  "past_role":   ["job titles the candidate has actually held"],
+  "skill":       ["concrete skills/tools, max 12"],
+  "experience":  ["short achievement bullets, e.g. 'Led team of 8'"],
+  "seniority":   ["one of: Junior, Mid, Senior, Lead, Director, C-Suite"],
+  "target_role": ["roles the candidate explicitly says they want next, if any"],
+  "location":    ["city/region and/or work types like Remote, Hybrid, On-site"],
+  "salary":      ["a single range like '70000-90000' only if clearly stated"],
+  "custom":      ["any hard constraints stated, e.g. 'visa sponsorship required'"]
+}}
+
+Document:
+{text[:12000]}"""
+
+
+def extract_text_from_upload(filename: str, raw: bytes) -> str:
+    """Pull plain text out of a PDF / DOCX / txt upload."""
+    name = (filename or "").lower()
+    if name.endswith(".pdf"):
+        import pdfplumber
+
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+    if name.endswith(".docx"):
+        import docx
+
+        document = docx.Document(io.BytesIO(raw))
+        return "\n".join(p.text for p in document.paragraphs)
+    # Fallback: treat as plain text.
+    return raw.decode("utf-8", errors="ignore")
+
+
+def parse_text_to_attributes(
+    db: Session, profile_id: int, text: str, source: str
+) -> list[ProfileAttribute]:
+    """Parse text and insert each extracted item as an unconfirmed attribute row."""
+    if not text or not text.strip():
+        return []
+
+    data = llm_json(_parse_prompt(text), system=_PARSE_SYSTEM)
+
+    created: list[ProfileAttribute] = []
+    seen: set[tuple[str, str]] = set()
+    for attr_type in ATTRIBUTE_TYPES:
+        if attr_type not in data:
+            continue
+        values = data[attr_type]
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            value = str(value).strip()
+            if not value:
+                continue
+            key = (attr_type, value.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            attr = ProfileAttribute(
+                profile_id=profile_id,
+                type=attr_type,
+                value=value,
+                source=source,
+                confirmed=False,
+            )
+            db.add(attr)
+            created.append(attr)
+
+    db.flush()  # populate ids for the response
+    return created

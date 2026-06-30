@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: monospace;
+    background: #f0f0f0;
+    padding: 20px;
+    font-size: 13px;
+    color: #222;
+  }
+  .screen {
+    background: #fff;
+    border: 2px solid #333;
+    width: 100%;
+    max-width: 900px;
+    margin: 0 auto;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  /* Top nav */
+  .nav {
+    background: #ddd;
+    border-bottom: 2px solid #333;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    height: 42px;
+    gap: 8px;
+  }
+  .nav-tab { border: 2px solid #333; background: #eee; padding: 5px 16px; border-radius: 3px 3px 0 0; font-size: 12px; font-weight: bold; border-bottom: none; margin-bottom: -2px; }
+  .nav-tab.active { background: #fff; }
+  .nav-spacer { flex: 1; }
+  .nav-btn { border: 2px solid #333; background: #333; color: #fff; padding: 5px 14px; border-radius: 3px; font-size: 12px; font-family: monospace; }
+
+  .page-body { padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+  .page-title { font-size: 15px; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 6px; }
+
+  /* Profile tabs */
+  .profile-tab-bar {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    border-bottom: 2px solid #333;
+    margin-bottom: -14px;
+  }
+  .profile-tab {
+    border: 2px solid #333;
+    border-bottom: none;
+    background: #eee;
+    padding: 4px 16px;
+    font-size: 12px;
+    font-weight: bold;
+    border-radius: 3px 3px 0 0;
+    margin-right: 4px;
+    cursor: pointer;
+  }
+  .profile-tab.active { background: #fff; }
+  .profile-tab.add-tab {
+    font-size: 14px;
+    padding: 4px 12px;
+    color: #666;
+    font-weight: normal;
+    background: #ddd;
+  }
+
+  /* Stats */
+  .stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .stat-box { border: 2px solid #333; border-radius: 3px; padding: 10px; text-align: center; }
+  .stat-num { font-size: 24px; font-weight: bold; }
+  .stat-label { font-size: 10px; color: #666; margin-top: 3px; }
+
+  /* Main section */
+  .section { border: 2px solid #333; border-radius: 3px; overflow: hidden; }
+  .section-header { background: #ddd; border-bottom: 2px solid #333; padding: 6px 10px; font-weight: bold; font-size: 12px; }
+  .section-body { padding: 0; }
+
+  /* Attribute rows */
+  .attr-row {
+    display: flex;
+    align-items: flex-start;
+    border-bottom: 1px solid #ddd;
+    padding: 8px 12px;
+    gap: 0;
+    min-height: 36px;
+  }
+  .attr-row:last-child { border-bottom: none; }
+  .attr-label {
+    width: 110px;
+    flex-shrink: 0;
+    font-size: 12px;
+    color: #555;
+    padding-top: 3px;
+    font-weight: bold;
+  }
+  .attr-values {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    align-items: center;
+    flex: 1;
+  }
+  .chip {
+    border: 1.5px solid #333;
+    border-radius: 3px;
+    padding: 2px 7px;
+    font-size: 11px;
+    background: #f7f7f7;
+    white-space: nowrap;
+  }
+  .chip .x { color: #999; font-size: 10px; margin-left: 3px; }
+  .chip-add {
+    border: 1.5px dashed #999;
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-size: 11px;
+    color: #999;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .inline-edit {
+    border: 1.5px solid #bbb;
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-size: 11px;
+    background: #f7f7f7;
+    color: #333;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .edit-link {
+    font-size: 11px;
+    color: #888;
+    border: 1px solid #ccc;
+    border-radius: 2px;
+    padding: 2px 7px;
+    background: #eee;
+    cursor: pointer;
+    margin-left: 6px;
+    align-self: center;
+    white-space: nowrap;
+  }
+
+  /* Expanded states */
+  .expand-row {
+    background: #f5f5f5;
+    border-top: 1px dashed #bbb;
+    border-bottom: 1px solid #ddd;
+    padding: 8px 12px 10px 122px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .expand-label { font-size: 11px; color: #666; }
+  .text-input-mock {
+    border: 1.5px solid #333;
+    border-radius: 3px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-family: monospace;
+    background: #fff;
+    color: #aaa;
+    width: 280px;
+  }
+  .expand-hint { font-size: 10px; color: #999; font-style: italic; }
+
+  .expand-row-choice {
+    background: #f5f5f5;
+    border-top: 1px dashed #bbb;
+    border-bottom: 1px solid #ddd;
+    padding: 8px 12px 10px 122px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .choice-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .choice-btn {
+    border: 1.5px solid #333;
+    border-radius: 3px;
+    padding: 4px 12px;
+    font-size: 11px;
+    background: #fff;
+    cursor: pointer;
+    font-family: monospace;
+  }
+  .choice-btn.selected { background: #333; color: #fff; }
+  .slider-mock {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .slider-track {
+    width: 280px;
+    height: 10px;
+    border: 1.5px solid #333;
+    border-radius: 5px;
+    background: #eee;
+    position: relative;
+    overflow: visible;
+  }
+  .slider-fill {
+    position: absolute;
+    left: 20%;
+    width: 50%;
+    height: 100%;
+    background: #333;
+    border-radius: 5px;
+  }
+  .slider-thumb {
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    border: 2px solid #333;
+    border-radius: 50%;
+    background: #fff;
+    top: -3px;
+  }
+  .slider-thumb.left { left: calc(20% - 7px); }
+  .slider-thumb.right { left: calc(70% - 7px); }
+  .slider-labels { display: flex; justify-content: space-between; font-size: 10px; color: #888; width: 280px; }
+
+  /* Bottom actions */
+  .bottom-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .action-row { display: flex; gap: 10px; }
+  .btn { border: 2px solid #333; background: #eee; padding: 7px 16px; border-radius: 3px; font-family: monospace; font-size: 12px; font-weight: bold; cursor: pointer; }
+  .btn.primary { background: #333; color: #fff; }
+  .btn.danger { border-color: #999; color: #999; background: #fafafa; }
+
+  .annotation { font-size: 11px; color: #888; font-style: italic; }
+  .divider-label {
+    font-size: 10px;
+    color: #aaa;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 4px 12px;
+    background: #f9f9f9;
+    border-bottom: 1px solid #ddd;
+  }
+</style>
+</head>
+<body>
+<div class="screen">
+
+  <!-- Top nav -->
+  <div class="nav">
+    <div class="nav-tab">Search</div>
+    <div class="nav-tab">My Roles</div>
+    <div class="nav-tab active">Profile</div>
+    <div class="nav-spacer"></div>
+    <div class="nav-btn">&#9654; Run New Search</div>
+  </div>
+
+  <div class="page-body">
+    <div class="page-title">Profile &amp; Dashboard</div>
+
+    <!-- Stats -->
+    <div class="stats-row">
+      <div class="stat-box"><div class="stat-num">24</div><div class="stat-label">Roles searched</div></div>
+      <div class="stat-box"><div class="stat-num">7</div><div class="stat-label">Saved</div></div>
+      <div class="stat-box"><div class="stat-num">3</div><div class="stat-label">Applied</div></div>
+    </div>
+
+    <!-- Profile tabs -->
+    <div class="profile-tab-bar">
+      <div class="profile-tab active">Profile 1</div>
+      <div class="profile-tab">Profile 2</div>
+      <div class="profile-tab add-tab">+ new</div>
+    </div>
+
+    <!-- Profile memory section -->
+    <div class="section">
+      <div class="section-header">What you're looking for</div>
+      <div class="section-body">
+
+        <!-- Roles -->
+        <div class="attr-row">
+          <div class="attr-label">Roles</div>
+          <div class="attr-values">
+            <div class="chip">Software Engineer <span class="x">x</span></div>
+            <div class="chip">Tech Lead <span class="x">x</span></div>
+            <div class="chip-add">+ add</div>
+          </div>
+        </div>
+        <!-- Add roles expanded -->
+        <div class="expand-row">
+          <div class="expand-label">Enter new role(s):</div>
+          <div class="text-input-mock">e.g. Backend Engineer, Head of Engineering</div>
+          <div class="expand-hint">AI will suggest related titles - tap to add</div>
+          <div class="attr-values" style="margin-top:2px;">
+            <div class="chip" style="border-style:dashed; color:#888;">Backend Engineer</div>
+            <div class="chip" style="border-style:dashed; color:#888;">Engineering Manager</div>
+            <div class="chip" style="border-style:dashed; color:#888;">Principal Engineer</div>
+          </div>
+        </div>
+
+        <!-- Skills -->
+        <div class="attr-row">
+          <div class="attr-label">Skills</div>
+          <div class="attr-values">
+            <div class="chip">React <span class="x">x</span></div>
+            <div class="chip">Python <span class="x">x</span></div>
+            <div class="chip">AWS <span class="x">x</span></div>
+            <div class="chip-add">+ add</div>
+          </div>
+        </div>
+
+        <!-- Experience -->
+        <div class="attr-row">
+          <div class="attr-label">Experience</div>
+          <div class="attr-values">
+            <div class="chip">Increased sales by 40% <span class="x">x</span></div>
+            <div class="chip">Led team of 8 <span class="x">x</span></div>
+            <div class="chip-add">+ add</div>
+          </div>
+        </div>
+
+        <div class="divider-label">Preferences</div>
+
+        <!-- Seniority -->
+        <div class="attr-row">
+          <div class="attr-label">Seniority</div>
+          <div class="attr-values">
+            <div class="inline-edit">Senior</div>
+            <div class="edit-link">edit</div>
+          </div>
+        </div>
+        <!-- Seniority edit expanded -->
+        <div class="expand-row-choice">
+          <div class="expand-label">Select level(s):</div>
+          <div class="choice-row">
+            <div class="choice-btn">Junior</div>
+            <div class="choice-btn">Mid</div>
+            <div class="choice-btn selected">Senior</div>
+            <div class="choice-btn">Lead</div>
+            <div class="choice-btn">Director</div>
+            <div class="choice-btn">C-Suite</div>
+          </div>
+        </div>
+
+        <!-- Salary -->
+        <div class="attr-row">
+          <div class="attr-label">Salary</div>
+          <div class="attr-values">
+            <div class="inline-edit">£70k - £90k</div>
+            <div class="edit-link">edit</div>
+          </div>
+        </div>
+        <!-- Salary slider expanded -->
+        <div class="expand-row-choice">
+          <div class="expand-label">Drag to set range:</div>
+          <div class="slider-mock">
+            <div class="slider-track">
+              <div class="slider-fill"></div>
+              <div class="slider-thumb left"></div>
+              <div class="slider-thumb right"></div>
+            </div>
+            <div class="slider-labels"><span>£0</span><span>£70k</span><span>£90k</span><span>£200k+</span></div>
+          </div>
+        </div>
+
+        <!-- Location -->
+        <div class="attr-row">
+          <div class="attr-label">Location</div>
+          <div class="attr-values">
+            <div class="inline-edit">London / Remote</div>
+            <div class="edit-link">edit</div>
+          </div>
+        </div>
+        <!-- Location edit expanded -->
+        <div class="expand-row-choice">
+          <div class="expand-label">City / region:</div>
+          <div class="text-input-mock" style="width:220px;">London</div>
+          <div class="expand-label" style="margin-top:4px;">Work type:</div>
+          <div class="choice-row">
+            <div class="choice-btn">On-site</div>
+            <div class="choice-btn selected">Hybrid</div>
+            <div class="choice-btn selected">Remote</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Bottom row -->
+    <div class="bottom-row">
+      <div class="action-row">
+        <div class="btn primary">&#9654; Run New Search</div>
+        <div class="btn">&#128196; Upload new CV</div>
+      </div>
+      <div class="btn danger">Clear memory</div>
+    </div>
+
+    <div class="annotation">Ticking and crossing roles in Search adjusts your profile weights automatically.</div>
+  </div>
+</div>
+</body>
+</html>

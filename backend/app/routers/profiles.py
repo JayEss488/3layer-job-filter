@@ -1,0 +1,93 @@
+"""Profiles = the dashboard tabs. Lists auto-create a default profile so the app
+is never empty on first load."""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..deps import current_user_id, get_profile_or_404
+from ..models import Profile, Role
+from ..schemas import ProfileCreate, ProfileOut, ProfileUpdate, StatsOut
+
+router = APIRouter(prefix="/profiles", tags=["profiles"])
+
+
+def _ensure_default(db: Session) -> None:
+    exists = db.execute(
+        select(Profile.id).where(Profile.user_id == current_user_id())
+    ).first()
+    if not exists:
+        db.add(Profile(user_id=current_user_id(), name="Profile 1", is_active=True))
+        db.commit()
+
+
+@router.get("", response_model=list[ProfileOut])
+def list_profiles(db: Session = Depends(get_db)):
+    _ensure_default(db)
+    return db.execute(
+        select(Profile)
+        .where(Profile.user_id == current_user_id())
+        .order_by(Profile.id)
+    ).scalars().all()
+
+
+@router.post("", response_model=ProfileOut, status_code=201)
+def create_profile(body: ProfileCreate, db: Session = Depends(get_db)):
+    count = len(
+        db.execute(
+            select(Profile.id).where(Profile.user_id == current_user_id())
+        ).all()
+    )
+    name = (body.name or f"Profile {count + 1}").strip()
+    profile = Profile(user_id=current_user_id(), name=name, is_active=True)
+    db.add(profile)
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+@router.patch("/{profile_id}", response_model=ProfileOut)
+def update_profile(
+    body: ProfileUpdate,
+    profile: Profile = Depends(get_profile_or_404),
+    db: Session = Depends(get_db),
+):
+    if body.name is not None:
+        profile.name = body.name.strip()
+    if body.is_active is not None:
+        profile.is_active = body.is_active
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+@router.delete("/{profile_id}", status_code=204)
+def delete_profile(
+    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
+):
+    remaining = db.execute(
+        select(Profile.id).where(Profile.user_id == current_user_id())
+    ).all()
+    if len(remaining) <= 1:
+        raise HTTPException(status_code=400, detail="Cannot delete your only profile")
+    db.delete(profile)
+    db.commit()
+
+
+@router.get("/{profile_id}/stats", response_model=StatsOut)
+def profile_stats(
+    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
+):
+    def count(*statuses: str) -> int:
+        return (
+            db.query(Role)
+            .filter(Role.profile_id == profile.id, Role.status.in_(statuses))
+            .count()
+        )
+
+    searched = (
+        db.query(Role)
+        .filter(Role.profile_id == profile.id, Role.status != "deleted")
+        .count()
+    )
+    return StatsOut(searched=searched, saved=count("saved"), applied=count("applied"))

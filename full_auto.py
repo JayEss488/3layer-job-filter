@@ -16,7 +16,9 @@ import hashlib
 import json
 import os
 import random
+import re
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional, List, Dict
 import numpy as np
@@ -70,8 +72,8 @@ EMBED_MODEL         = "text-embedding-3-small"
 PROFILE_CACHE_DAYS  = 7
 MAX_CONCURRENT      = 5       # Max general simultaneous crawl requests
 RELEVANCE_THRESHOLD = 0.35    # Balanced threshold preventing snippet penalty
-TOP_CANDIDATES      = 10      # Passed to Phase 5 full scrape
-FINAL_PICKS         = 3       # Returned to final results
+TOP_CANDIDATES      = 25      # Pool size handed to the final evaluator
+FINAL_PICKS         = 10      # Max results returned, quality-gated
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -189,6 +191,16 @@ def fetch_reed(query: str, location: str = "United Kingdom") -> List[Dict]:
         return []
 
 
+# Country-level location strings that Adzuna's `where` geocoder rejects (the cc
+# endpoint already scopes the country, so these must be omitted, not passed).
+_ADZUNA_COUNTRY_LEVEL = {
+    "united kingdom", "great britain", "uk", "u.k.", "gb",
+    "united states", "united states of america", "usa", "us", "u.s.",
+    "canada", "australia", "germany", "france", "india", "italy",
+    "netherlands", "austria", "poland", "singapore", "south africa",
+}
+
+
 def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str = "gb") -> List[Dict]:
     """Routes dynamically to the matching Adzuna global regional server."""
     if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
@@ -197,14 +209,18 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
     # Ensure clean lowercase ISO code string (default to 'gb')
     cc = country_code.strip().lower() if country_code else "gb"
     url = f"https://api.adzuna.com/v1/api/jobs/{cc}/search/1"
-    
+
     params = {
         "app_id": ADZUNA_APP_ID,
         "app_key": ADZUNA_APP_KEY,
         "what": query,
-        "where": location,
         "results_per_page": 50
     }
+    # The cc endpoint already scopes the country. Passing a country *name* as
+    # `where` makes Adzuna's geocoder return nothing (e.g. "United Kingdom" -> 0
+    # results), so only set `where` for a sub-country location (a city/region).
+    if location and location.strip().lower() not in _ADZUNA_COUNTRY_LEVEL:
+        params["where"] = location
     try:
         r = requests.get(url, params=params, timeout=12)
         jobs = []
@@ -242,41 +258,30 @@ def fetch_remotive(query: str) -> List[Dict]:
         return []
 
 
-def fetch_jobicy(query: str) -> List[Dict]:
-    """Queries Jobicy remote listings targeting specific keywords."""
-    url = f"https://jobicy.com/api/v2/remote-jobs?count=50&tag={query}"
-    try:
-        r = requests.get(url, timeout=12)
-        jobs = []
-        for job in r.json().get("jobs", []):
-            jobs.append({
-                "board": "jobicy",
-                "title": job.get("jobTitle", ""),
-                "company": job.get("companyName", ""),
-                "url": job.get("url", ""),
-                "snippet": job.get("jobDescription", "")
-            })
-        return jobs
-    except Exception as e:
-        emit(f"   [!] Jobicy API Error: {e}")
-        return []
-
-
-def fetch_google_jobs(query: str, location: str = "United Kingdom") -> List[Dict]:
-    """Fetches localized search results via Google Jobs API."""
+def fetch_google_jobs(query: str, location: str = "United Kingdom", pages: int = 3) -> List[Dict]:
+    """Fetches localized search results via Google Jobs API, following
+    next_page_token for up to `pages` pages. Broad-tier: only called on
+    non-first runs for the rotated term, to keep SerpAPI credit use bounded."""
     if not SERPAPI_KEY:
         return []
-    
+
     clean_loc = normalize_location(location)
-    params = {"engine": "google_jobs", "q": query, "location": clean_loc, "api_key": SERPAPI_KEY}
-    try:
-        r = requests.get("https://serpapi.com/search", params=params, timeout=12)
-        data = r.json()
+    jobs: List[Dict] = []
+    token = None
+    for _ in range(pages):
+        params = {"engine": "google_jobs", "q": query, "location": clean_loc, "api_key": SERPAPI_KEY}
+        if token:
+            params["next_page_token"] = token
+        try:
+            r = requests.get("https://serpapi.com/search", params=params, timeout=12)
+            data = r.json()
+        except Exception as e:
+            emit(f"   [!] Google Jobs API Error: {e}")
+            break
         if "error" in data:
             emit(f"   [!] SerpAPI Error: {data['error']}")
-            return []
-            
-        jobs = []
+            break
+
         for job in data.get("jobs_results", []):
             apply_options = job.get("apply_options") or []
             url = apply_options[0].get("link") if apply_options else ""
@@ -287,10 +292,11 @@ def fetch_google_jobs(query: str, location: str = "United Kingdom") -> List[Dict
                 "url": url,
                 "snippet": job.get("description", "")
             })
-        return jobs
-    except Exception as e:
-        emit(f"   [!] Google Jobs API Error: {e}")
-        return []
+
+        token = (data.get("serpapi_pagination") or {}).get("next_page_token")
+        if not token:
+            break
+    return jobs
 
 
 def fetch_jsearch(query: str, location: str = "United Kingdom") -> List[Dict]:
@@ -318,22 +324,201 @@ def fetch_jsearch(query: str, location: str = "United Kingdom") -> List[Dict]:
         return []
 
 
-def gather_jobs(profile: Dict) -> List[Dict]:
-    """Orchestrates job harvesting across boards using the profile constraints."""
-    location = profile.get("location", "United Kingdom")
-    adzuna_cc = profile.get("adzuna_country_code", "gb")
-    all_jobs = []
+# ── Source protocol + tiers ──────────────────────────────────────────────────
+# "fast" = cheap, text-complete, safe for the first (latency-sensitive) run.
+# "broad" = slower / credit-heavy; only included in the rotation on later runs.
+from typing import Protocol
 
-    for term in profile.get("search_terms", []):
-        emit(f"[api] Fetching listings for: {term}")
-        
-        all_jobs.extend(fetch_reed(term, location))
-        all_jobs.extend(fetch_adzuna(term, location, adzuna_cc))
-        all_jobs.extend(fetch_google_jobs(term, location))
-        all_jobs.extend(fetch_jsearch(term, location))
-        all_jobs.extend(fetch_remotive(term))
-        all_jobs.extend(fetch_jobicy(term))
-        
+
+class JobSource(Protocol):
+    name: str
+    tier: str
+    def fetch(self, profile: dict, since: Optional[datetime]) -> List[Dict]: ...
+
+
+def _terms(profile: Dict) -> List[str]:
+    """The term(s) this run should query. select_sources_for_run fills
+    search_terms_batch: several terms on the first run (fast tier only), a
+    single rotated term on later runs (keeps broad-tier credit use bounded)."""
+    return [t for t in (profile.get("search_terms_batch") or []) if t]
+
+
+class ReedSource:
+    name, tier = "reed", "fast"
+    def fetch(self, profile, since=None):
+        out: List[Dict] = []
+        for term in _terms(profile):
+            out.extend(fetch_reed(term, profile.get("location", "United Kingdom")))
+        return out
+
+
+class AdzunaSource:
+    name, tier = "adzuna", "fast"
+    def fetch(self, profile, since=None):
+        out: List[Dict] = []
+        for term in _terms(profile):
+            out.extend(fetch_adzuna(term, profile.get("location", "United Kingdom"),
+                                    profile.get("adzuna_country_code", "gb")))
+        return out
+
+
+class GoogleJobsSource:
+    name, tier = "google_jobs", "broad"   # paginated + SerpAPI credits
+    def fetch(self, profile, since=None):
+        out: List[Dict] = []
+        for term in _terms(profile):
+            out.extend(fetch_google_jobs(term, profile.get("location", "United Kingdom")))
+        return out
+
+
+class JSearchSource:
+    name, tier = "jsearch", "broad"
+    def fetch(self, profile, since=None):
+        out: List[Dict] = []
+        for term in _terms(profile):
+            out.extend(fetch_jsearch(term, profile.get("location", "United Kingdom")))
+        return out
+
+
+class RemotiveSource:
+    name, tier = "remotive", "broad"
+    def fetch(self, profile, since=None):
+        out: List[Dict] = []
+        for term in _terms(profile):
+            out.extend(fetch_remotive(term))
+        return out
+
+
+# ── ATS feeds ─────────────────────────────────────────────────────────────────
+# Public, no-auth JSON endpoints returning every open role at a company, with
+# clean fields and updated_at. "fast" tier: free, fast, full description - roles
+# sourced here never need scraping.
+ATS_FEEDS = {
+    "greenhouse": "https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true",
+    "lever":      "https://api.lever.co/v0/postings/{token}?mode=json",
+    "ashby":      "https://api.ashbyhq.com/posting-api/job-board/{token}?includeCompensation=true",
+}
+
+
+def fetch_ats(vendor: str, token: str) -> List[Dict]:
+    tmpl = ATS_FEEDS.get(vendor)
+    if not tmpl:
+        return []
+    try:
+        data = requests.get(tmpl.format(token=token), timeout=12).json()
+    except Exception as e:
+        emit(f"   [!] ATS {vendor}/{token} error: {e}")
+        return []
+
+    rows = data.get("jobs") if vendor == "greenhouse" else \
+           data.get("postings") if vendor == "lever" else \
+           data.get("jobs", data)  # ashby
+    out = []
+    for j in rows or []:
+        if vendor == "greenhouse":
+            out.append({"board": f"gh:{token}", "title": j.get("title", ""),
+                        "company": token, "url": j.get("absolute_url", ""),
+                        "location": (j.get("location") or {}).get("name", ""),
+                        "snippet": (j.get("content", "") or "")[:3000],
+                        "updated_at": j.get("updated_at")})
+        elif vendor == "lever":
+            out.append({"board": f"lever:{token}", "title": j.get("text", ""),
+                        "company": token, "url": j.get("hostedUrl", ""),
+                        "location": (j.get("categories") or {}).get("location", ""),
+                        "snippet": (j.get("descriptionPlain", "") or "")[:3000],
+                        "updated_at": j.get("createdAt")})
+        else:  # ashby
+            out.append({"board": f"ashby:{token}", "title": j.get("title", ""),
+                        "company": token, "url": j.get("jobUrl", ""),
+                        "location": j.get("location", ""),
+                        "snippet": (j.get("descriptionPlain", "") or "")[:3000],
+                        "updated_at": j.get("publishedAt")})
+    return out
+
+
+# ── Rotation + tiered first run ──────────────────────────────────────────────
+
+def _load_cursor(profile: Dict) -> int:
+    conn = get_db()
+    row = conn.execute("SELECT value FROM profile_cache WHERE key='rotation_cursor'").fetchone()
+    conn.close()
+    return int(row["value"]) if row else 0
+
+
+def _save_cursor(profile: Dict, cursor: int) -> None:
+    conn = get_db()
+    conn.execute("INSERT OR REPLACE INTO profile_cache(key, value) VALUES(?,?)",
+                 ("rotation_cursor", str(cursor)))
+    conn.commit()
+    conn.close()
+
+
+TERMS_PER_RUN = 4   # size of the rotating term window queried each run
+
+
+def select_sources_for_run(profile: Dict) -> List[JobSource]:
+    terms = profile.get("search_terms") or []
+    # Query-relevant + free: these search by the actual terms, so they run EVERY
+    # run. They are what makes niche / non-tech profiles work (the ATS feeds are
+    # company-centric and only help when a seeded company is in the user's field).
+    always = [AdzunaSource(), ReedSource()]
+    # Credit-heavy / overlapping: one per run on rotation keeps SerpAPI/RapidAPI
+    # spend bounded while still adding breadth.
+    rotation = [GoogleJobsSource(), JSearchSource(), RemotiveSource()]
+
+    cur = _load_cursor(profile)
+    # First run stays fast + free (no SerpAPI/JSearch latency) but spans several
+    # terms so one narrow term can't zero it out.
+    if profile.get("first_run"):
+        profile["search_terms_batch"] = terms[:TERMS_PER_RUN]
+        return always
+
+    # Later runs: slide a window over the term list so successive runs explore
+    # different terms, and add one rotating broad source.
+    start = (cur * TERMS_PER_RUN) % max(1, len(terms))
+    profile["search_terms_batch"] = terms[start:start + TERMS_PER_RUN] or terms[:TERMS_PER_RUN]
+    picked = always + [rotation[cur % len(rotation)]]
+    _save_cursor(profile, cur + 1)
+    return picked
+
+
+def select_ats_batch_for_run(profile: Dict) -> List[tuple]:
+    """Return (company, vendor, token) rows. Smaller, capped batch on first run
+    (still fast because ATS calls are parallel); rotate batches afterward."""
+    tokens = load_company_ats()
+    if not tokens:
+        return []
+    if profile.get("first_run"):
+        return tokens[:40]
+    cur = _load_cursor(profile)
+    size = 40
+    start = (cur * size) % max(1, len(tokens))
+    return tokens[start:start + size]
+
+
+# ── Parallel discovery ───────────────────────────────────────────────────────
+
+def gather_jobs(profile: Dict) -> List[Dict]:
+    """Orchestrates job harvesting: rotated source tier(s) + a batch of ATS
+    feeds, all fetched concurrently. Tiered + cheap on the first run."""
+    tasks: List[tuple] = [("src", s) for s in select_sources_for_run(profile)]
+    tasks += [("ats", (vendor, token)) for (_company, vendor, token) in select_ats_batch_for_run(profile)]
+
+    def run_task(t):
+        kind, payload = t
+        if kind == "src":
+            return payload.fetch(profile, since=profile.get("since"))
+        vendor, token = payload
+        return fetch_ats(vendor, token)
+
+    all_jobs: List[Dict] = []
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for fut in as_completed([ex.submit(run_task, t) for t in tasks]):
+            try:
+                all_jobs.extend(fut.result() or [])
+            except Exception as e:
+                emit(f"   [!] discovery task failed: {e}")
+
     if DEBUG_SAVE_RAW:
         with open(os.path.join(BASE_DIR, "raw_api_jobs.json"), "w") as f:
             json.dump(all_jobs, f, indent=2)
@@ -369,9 +554,82 @@ def init_db():
             ai_summary TEXT
         )
     """)
+    # Bootstrapped ATS tokens (company -> vendor + board token), used by the
+    # ATS discovery layer. Populated by harvest_ats_tokens(), not on every run.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_ats (
+            company TEXT,
+            vendor TEXT,
+            token TEXT,
+            UNIQUE(vendor, token)
+        )
+    """)
     conn.commit()
     conn.close()
     emit("[db] Tables ready and schema initialized.")
+
+
+# ── ATS token store ──────────────────────────────────────────────────────────
+
+def load_company_ats() -> List[tuple]:
+    """Returns a list of (company, vendor, token) rows from the bootstrapped
+    ATS token store."""
+    init_db()
+    conn = get_db()
+    rows = conn.execute("SELECT company, vendor, token FROM company_ats").fetchall()
+    conn.close()
+    return [(r["company"], r["vendor"], r["token"]) for r in rows]
+
+
+def save_company_ats(rows: List[tuple]) -> None:
+    """Upserts (company, vendor, token) rows into the ATS token store."""
+    init_db()
+    conn = get_db()
+    for company, vendor, token in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO company_ats(company, vendor, token) VALUES(?,?,?)",
+            (company, vendor, token)
+        )
+    conn.commit()
+    conn.close()
+
+
+def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
+    """Maintenance job (not run on every search): uses SerpAPI to find company
+    ATS board tokens via site: search, then upserts them into company_ats.
+    Run this occasionally, e.g. once when onboarding a new sector."""
+    if not SERPAPI_KEY:
+        emit("   [!] SERPAPI_KEY not set; cannot harvest ATS tokens.")
+        return []
+
+    site_patterns = {
+        "greenhouse": "site:boards.greenhouse.io",
+        "lever":      "site:jobs.lever.co",
+        "ashby":      "site:jobs.ashbyhq.com",
+    }
+    token_re = re.compile(r"(?:greenhouse\.io|lever\.co|ashbyhq\.com)/([A-Za-z0-9_-]+)")
+
+    found: List[tuple] = []
+    for vendor, site in site_patterns.items():
+        for keyword in sector_keywords:
+            params = {"engine": "google", "q": f"{site} {keyword}", "api_key": SERPAPI_KEY}
+            try:
+                r = requests.get("https://serpapi.com/search", params=params, timeout=12)
+                data = r.json()
+            except Exception as e:
+                emit(f"   [!] ATS harvest error ({vendor}/{keyword}): {e}")
+                continue
+            for result in data.get("organic_results", []):
+                link = result.get("link", "")
+                m = token_re.search(link)
+                if m:
+                    token = m.group(1)
+                    found.append((token, vendor, token))
+
+    deduped = list({(c, v, t) for c, v, t in found})
+    save_company_ats(deduped)
+    emit(f"[ats] Harvested {len(deduped)} ATS tokens across {len(site_patterns)} vendors.")
+    return deduped
 
 
 def get_profile_status() -> dict:
@@ -675,7 +933,9 @@ def final_evaluation(jobs: list[dict], profile: dict) -> list[dict]:
 Candidate Background Profile:
 {cv_text}
 
-Analyze the {len(jobs)} complete extracted documents below. Choose the {FINAL_PICKS} strongest overall alignments.
+Analyze the {len(jobs)} complete extracted documents below. Return every role that is a genuinely
+strong fit for this candidate, up to {FINAL_PICKS}, ordered best first. Return fewer than {FINAL_PICKS}
+if fewer genuinely qualify - do not pad the list with weak matches.
 Output ONLY valid structural JSON object (no markdown formatting code):
 {{"selections": [
   {{

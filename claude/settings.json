@@ -1,0 +1,48 @@
+{
+    "permissions": {
+      "defaultMode": "acceptEdits",
+      "allow": [
+        "Read",
+        "Glob",
+        "Grep",
+        "Edit",
+        "MultiEdit",
+        "Write(src/**)",
+        "Write(templates/**)",
+        "Write(static/**)",
+        "Write(tests/**)",
+        "Bash(python *)",
+        "Bash(pip *)",
+        "Bash(flask *)",
+        "Bash(pytest *)",
+        "Bash(git status)",
+        "Bash(git diff *)",
+        "Bash(git add *)",
+        "Bash(git commit *)",
+        "Bash(git log *)",
+        "Bash(ls *)",
+        "Bash(cat *)",
+        "Bash(echo *)",
+        "WebFetch",
+        "WebSearch"
+      ],
+      "ask": [
+        "Bash(git push *)",
+        "Bash(git merge *)",
+        "Bash(curl *)",
+        "Bash(wget *)",
+        "Write(.env*)"
+      ],
+      "deny": [
+        "Bash(rm -rf *)",
+        "Bash(sudo *)",
+        "Bash(chmod *)",
+        "Bash(chown *)",
+        "Bash(mv /* *)",
+        "Bash(cp /* *)",
+        "Bash(kill *)",
+        "Bash(shutdown *)",
+        "Bash(reboot *)"
+      ]
+    }
+  }

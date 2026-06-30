@@ -1,0 +1,8 @@
+# Terminal 1 — backend
+cd backend
+../venv/Scripts/python -m uvicorn app.main:app --reload --port 8000
+
+# Terminal 2 — frontend
+cd frontend
+npm run dev          
+# http://localhost:3000
