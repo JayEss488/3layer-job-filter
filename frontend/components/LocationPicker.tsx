@@ -9,13 +9,32 @@ import type { Attribute } from "@/lib/types";
 const WORK_TYPES = ["On-site", "Hybrid", "Remote"];
 const WORK_SET = new Set(WORK_TYPES.map((w) => w.toLowerCase()));
 
+const COUNTRY_CHOICES: { code: string; label: string }[] = [
+  { code: "global", label: "Global (no filter)" },
+  { code: "gb", label: "United Kingdom" },
+  { code: "us", label: "United States" },
+  { code: "ca", label: "Canada" },
+  { code: "au", label: "Australia" },
+  { code: "de", label: "Germany" },
+  { code: "fr", label: "France" },
+  { code: "in", label: "India" },
+  { code: "it", label: "Italy" },
+  { code: "nl", label: "Netherlands" },
+  { code: "at", label: "Austria" },
+  { code: "pl", label: "Poland" },
+  { code: "sg", label: "Singapore" },
+  { code: "za", label: "South Africa" },
+];
+
 /** City/region free text + work-type multi-choice. Each stored as a location attr. */
 export function LocationPicker({
   profileId,
   attributes,
+  countryAttributes,
 }: {
   profileId: number;
   attributes: Attribute[];
+  countryAttributes: Attribute[];
 }) {
   const { add, remove, invalidate } = useAttributeMutations(profileId);
 
@@ -25,6 +44,25 @@ export function LocationPicker({
       .filter((a) => WORK_SET.has(a.value.toLowerCase()))
       .map((a) => [a.value.toLowerCase(), a])
   );
+
+  const selectedCountries = new Map(
+    countryAttributes.map((a) => [a.value.toLowerCase(), a])
+  );
+
+  function toggleCountry(code: string) {
+    if (code === "global") {
+      // Selecting Global clears every other selection.
+      countryAttributes.forEach((a) => remove.mutate(a.id));
+      if (!selectedCountries.has("global")) add.mutate({ type: "country", value: "global" });
+      return;
+    }
+    const globalAttr = selectedCountries.get("global");
+    if (globalAttr) remove.mutate(globalAttr.id); // picking a real country clears Global
+
+    const existing = selectedCountries.get(code);
+    if (existing) remove.mutate(existing.id);
+    else add.mutate({ type: "country", value: code });
+  }
 
   const [city, setCity] = useState(cityAttr?.value ?? "");
   useEffect(() => setCity(cityAttr?.value ?? ""), [cityAttr?.value]);
@@ -51,7 +89,7 @@ export function LocationPicker({
   return (
     <div className="location-row">
       <input
-        className="inline-input"
+        className="input"
         style={{ width: 160 }}
         placeholder="City or region…"
         value={city}
@@ -63,10 +101,21 @@ export function LocationPicker({
         {WORK_TYPES.map((w) => (
           <button
             key={w}
-            className={`choice-btn${workTypes.has(w.toLowerCase()) ? " selected" : ""}`}
+            className={`toggle ${workTypes.has(w.toLowerCase()) ? "on" : "off"}`}
             onClick={() => toggleWork(w)}
           >
             {w}
+          </button>
+        ))}
+      </div>
+      <div className="choice-row" style={{ marginTop: 8, flexWrap: "wrap" }}>
+        {COUNTRY_CHOICES.map((c) => (
+          <button
+            key={c.code}
+            className={`country${selectedCountries.has(c.code) ? " on" : ""}`}
+            onClick={() => toggleCountry(c.code)}
+          >
+            {c.label}
           </button>
         ))}
       </div>

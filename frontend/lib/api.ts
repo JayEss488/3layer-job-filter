@@ -2,11 +2,15 @@ import type {
   Attribute,
   AttributesResponse,
   AttributeType,
+  Blocklist,
   Confidence,
   Profile,
   Role,
+  ScrapeSetting,
   SearchStart,
   SearchStatus,
+  SourceInfo,
+  SourceStat,
   Stats,
 } from "./types";
 
@@ -108,4 +112,31 @@ export const api = {
     }),
   deleteRole: (roleId: number) =>
     req<void>(`/roles/${roleId}`, { method: "DELETE" }),
+
+  // settings
+  sources: () => req<SourceInfo[]>("/settings/sources"),
+  sourceStats: () => req<SourceStat[]>("/settings/source-stats"),
+  setSources: (disabled: string[]) =>
+    req<SourceInfo[]>("/settings/sources", {
+      method: "PUT",
+      body: JSON.stringify({ disabled }),
+    }),
+  scrapeSetting: () => req<ScrapeSetting>("/settings/scrape"),
+  setScrapeSetting: (enabled: boolean) =>
+    req<ScrapeSetting>("/settings/scrape", {
+      method: "PUT",
+      body: JSON.stringify({ enabled }),
+    }),
+  blocklist: () => req<Blocklist>("/settings/blocklist"),
+  setBlocklist: (domains: string[]) =>
+    req<Blocklist>("/settings/blocklist", {
+      method: "PUT",
+      body: JSON.stringify({ domains }),
+    }),
+
+  // ATS harvesting
+  harvestAts: (id: number, force = false) =>
+    req<{ status: string }>(`/profiles/${id}/harvest-ats?force=${force}`, {
+      method: "POST",
+    }),
 };

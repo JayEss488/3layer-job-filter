@@ -27,7 +27,7 @@ export function SeniorityPicker({
       {LEVELS.map((level) => (
         <button
           key={level}
-          className={`choice-btn${byValue.has(level.toLowerCase()) ? " selected" : ""}`}
+          className={`toggle ${byValue.has(level.toLowerCase()) ? "on" : "off"}`}
           onClick={() => toggle(level)}
         >
           {level}

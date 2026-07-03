@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -22,6 +23,13 @@ from sqlalchemy.orm import Session
 from ..database import SessionLocal
 from ..models import Role, SearchRun, JobSeen
 from .snapshot import build_snapshot
+from .moderation import filter_blocked, get_blocked_domains
+from .sources import (
+    counts_from_breakdown,
+    get_disabled,
+    get_full_scrape_enabled,
+    save_last_run_counts,
+)
 
 # ── Adaptive funnel tuning ───────────────────────────────────────────────────
 TARGET_POOL       = 25     # candidates fed to the expensive evaluator
@@ -272,17 +280,65 @@ def _adaptive_pool(scored: list[dict]) -> tuple[list[dict], bool]:
     return broadened[:TARGET_POOL], True             # sparse: broaden + flag
 
 
-async def _run_engine_pipeline(engine, eng_profile, weighted_text, db, profile_id):
+def _filter_by_country(engine, jobs: list[dict], country_codes: list[str]) -> list[dict]:
+    """Hard-drop jobs whose location isn't the selected country. A job is only
+    kept if it positively matches an allowed country. The snippet is only
+    consulted when location is genuinely blank -- a known-but-unrecognised
+    location (e.g. "Riga, Latvia" when our token list doesn't cover Latvia)
+    must NOT fall back to scanning the description, since a global company's
+    boilerplate ("headquartered in London...") will false-positive-match the
+    HQ's country for a role based somewhere else entirely. country_codes == []
+    means "Global" -- no filtering. Anything we can't positively confirm is
+    dropped: that's the point of a hard filter, not a reason to wave it through."""
+    if not country_codes:
+        return jobs
+    allowed = set(country_codes)
+    kept = []
+    for j in jobs:
+        location = j.get("location", "") or ""
+        cc = engine.country_of(location) if location.strip() else engine.country_of(j.get("snippet", "") or "")
+        if cc in allowed:
+            kept.append(j)
+    return kept
+
+
+def _progress(db: Session, run: SearchRun, message: str) -> None:
+    run.message = message
+    db.commit()
+
+
+async def _run_engine_pipeline(engine, eng_profile, weighted_text, db, profile_id, run: SearchRun):
     emit = engine.emit  # prints to the backend's own console (see run_search_task)
+    timings: dict[str, float] = {}
+    t0 = time.monotonic()
+
+    def _lap(phase: str, since: float) -> float:
+        timings[phase] = round(time.monotonic() - since, 2)
+        return time.monotonic()
+
     profile_embedding = engine.get_embeddings_batch([weighted_text])[0]
 
     # DISCOVERY (cheap, tiered on first run) -> store. gather_jobs reads the flag.
     eng_profile["first_run"] = _is_first_run(db, profile_id)
+    eng_profile["disabled_sources"] = get_disabled(db)  # per-source toggle (workstream D)
     emit(f"[pipeline] discovery start (first_run={eng_profile['first_run']}, "
+         f"disabled={sorted(eng_profile['disabled_sources'])}, "
          f"terms={eng_profile.get('search_terms', [])[:5]})")
+    _progress(db, run, "Searching job boards…")
     raw_jobs = engine.gather_jobs(eng_profile)
-    emit(f"[pipeline] discovery returned {len(raw_jobs)} raw listings "
-         f"by board: {_board_breakdown(raw_jobs)}")
+    t0 = _lap("discovery", t0)
+    raw_jobs, n_blocked = filter_blocked(raw_jobs, get_blocked_domains(db))
+    if n_blocked:
+        emit(f"[pipeline] spam-domain blocklist dropped {n_blocked} listing(s)")
+    breakdown = _board_breakdown(raw_jobs)
+    emit(f"[pipeline] discovery returned {len(raw_jobs)} raw listings by board: {breakdown}")
+    save_last_run_counts(db, counts_from_breakdown(breakdown))  # for the settings screen
+
+    country_codes = eng_profile.get("country_codes") or []
+    if country_codes:
+        before = len(raw_jobs)
+        raw_jobs = _filter_by_country(engine, raw_jobs, country_codes)
+        emit(f"[pipeline] country filter {country_codes}: {before} -> {len(raw_jobs)} listings")
 
     inserted, refreshed, requeued = _upsert_discovered(db, profile_id, raw_jobs)
     store_counts = _store_counts(db, profile_id)
@@ -301,13 +357,27 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, db, profile_i
         emit(f"[pipeline] scoring whole 'new' store: {len(rows)} rows")
     if not rows:
         emit("[pipeline] STOP: nothing to evaluate (store empty and no backlog) -> 0 results")
-        return [], False, None
+        return [], False, None, timings
 
     # FILTER: embed (cached) + cosine-score the whole set, take an adaptive pool.
+    _progress(db, run, f"Found {len(rows)} jobs, scoring…")
     n_embedded = _ensure_embeddings(engine, db, rows)
     if n_embedded:
         emit(f"[pipeline] embedded {n_embedded} new rows (cached for future runs)")
+    t0 = _lap("embed", t0)
     scored = _score_rows(engine, rows, profile_embedding)
+    t0 = _lap("score", t0)
+
+    # Re-apply the country filter to the *candidate* set, not just this run's fresh
+    # discovery. rows come from the persistent store (_new_rows + backlog), which
+    # can hold listings discovered on an earlier run or under different country
+    # settings; those bypass the raw_jobs filter above, so an out-of-country role
+    # (e.g. "Remote - US" for a GB profile) would otherwise leak into results.
+    if country_codes:
+        before = len(scored)
+        scored = _filter_by_country(engine, scored, country_codes)
+        emit(f"[pipeline] country filter on candidates {country_codes}: "
+             f"{before} -> {len(scored)} rows")
     top_score = scored[0]["embed_score"] if scored else 0.0
     above_primary = sum(1 for j in scored if j["embed_score"] >= RELEVANCE_PRIMARY)
     emit(f"[pipeline] scored {len(scored)} candidates | top_score={top_score:.3f} | "
@@ -317,28 +387,48 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, db, profile_i
     emit(f"[pipeline] adaptive pool size={len(pool)} (harsh/broadened={harsh})")
     if not pool:
         emit(f"[pipeline] STOP: no candidates above RELEVANCE_FLOOR({RELEVANCE_FLOOR}) -> 0 results")
-        return [], harsh, None
+        return [], harsh, None, timings
 
-    # EVALUATE on snippet-as-full_text. No browser scrape on the critical path.
-    emit(f"[pipeline] sending {len(pool)} candidates to final_evaluation (LLM, cap={engine.FINAL_PICKS})")
-    final = engine.final_evaluation(pool, eng_profile)   # up to FINAL_PICKS
+    # EVALUATE. When full-page scraping is enabled (default), rank the pool down
+    # to TOP_CANDIDATES and read each job's real page first, so the final LLM
+    # judges fit against the actual posting text (seniority/experience
+    # requirements included) instead of a short API snippet.
+    to_evaluate = pool
+    if get_full_scrape_enabled(db):
+        _progress(db, run, "Ranking best matches…")
+        ranked = engine.rank_candidates(pool, eng_profile)
+        t0 = _lap("rank", t0)
+        _progress(db, run, "Reading full job pages…")
+        browser_config = engine.BrowserConfig(
+            headless=True, verbose=False, viewport_width=1280, viewport_height=800,
+            user_agent_mode="random",
+        )
+        async with engine.AsyncWebCrawler(config=browser_config) as crawler:
+            to_evaluate = await engine.scrape_full_details(ranked, crawler)
+        t0 = _lap("scrape", t0)
+    else:
+        emit("[pipeline] full-page scraping disabled in settings; evaluating on snippets")
+
+    _progress(db, run, "Final AI review…")
+    emit(f"[pipeline] sending {len(to_evaluate)} candidates to final_evaluation "
+         f"(LLM, cap={engine.FINAL_PICKS})")
+    final = engine.final_evaluation(to_evaluate, eng_profile)   # up to FINAL_PICKS
+    t0 = _lap("final_eval", t0)
+    _progress(db, run, "Writing up top picks…")
     emit(f"[pipeline] final_evaluation returned {len(final)} picks"
          + ("" if final else " -- LLM judged none as a genuinely strong fit"))
 
     processed_ids = [j["_identity"] for j in pool]
     shown_ids = [f.get("_identity") for f in final if f.get("_identity")]
-    return final, harsh, (processed_ids, shown_ids)
+    return final, harsh, (processed_ids, shown_ids), timings
 
 
 def _prune_previous_roles(db: Session, profile_id: int) -> None:
-    """Second-search semantics (notes section 7 extra detail): crossed -> deleted,
-    leftover 'new' -> ignored. saved/applied are left untouched."""
-    db.query(Role).filter(Role.profile_id == profile_id, Role.status == "crossed").update(
-        {Role.status: "deleted"}, synchronize_session=False
-    )
-    db.query(Role).filter(Role.profile_id == profile_id, Role.status == "new").update(
-        {Role.status: "ignored"}, synchronize_session=False
-    )
+    """Second-search semantics: crossed and leftover unactioned 'new' (inbox)
+    roles both age out to deleted. saved/applied are left untouched."""
+    db.query(Role).filter(
+        Role.profile_id == profile_id, Role.status.in_(["crossed", "new"])
+    ).update({Role.status: "deleted"}, synchronize_session=False)
     db.commit()
 
 
@@ -360,9 +450,9 @@ def run_search_task(profile_id: int, run_id: int) -> None:
 
         _prune_previous_roles(db, profile_id)
 
-        final, harsh, marks = asyncio.run(
+        final, harsh, marks, timings = asyncio.run(
             _run_engine_pipeline(
-                engine, snap["engine_profile"], snap["weighted_text"], db, profile_id
+                engine, snap["engine_profile"], snap["weighted_text"], db, profile_id, run
             )
         )
 
@@ -376,6 +466,7 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 url=entry.get("url"),
                 tags=_derive_tags(entry, snap["skills"], snap["seniority_label"]),
                 salary_text=_salary_text(entry),
+                source=entry.get("board"),
                 fit_rank=rank,
                 ai_analysis=_compose_analysis(entry),
                 status="new",
@@ -389,13 +480,15 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         run.result_count = len(final)
         run.status = "done"
         run.finished_at = datetime.utcnow()
+        run.phase_timings = json.dumps(timings)
         if harsh:
             run.warning = (
                 "Your filters look strict — few roles matched. Showing the "
                 "best available anyway; loosen salary/location for more."
             )
-        if not final:
-            run.message = "No new roles found. Try widening your profile or location."
+        run.message = (
+            "No new roles found. Try widening your profile or location." if not final else None
+        )
         db.commit()
         print(f"[pipeline] ── search run {run_id} done: {len(final)} results "
               f"(harsh={harsh}) ──\n")

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Talent Profile — Dashboard (design 1a)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* ============================================================
+     DESIGN TOKENS — direction "1a" (clean & light, warm neutral)
+     Reuse these on every page for a consistent system.
+     ============================================================ */
+  :root{
+    /* surfaces */
+    --paper:#faf8f3;          /* app background            */
+    --surface:#ffffff;        /* cards / panels            */
+    --surface-2:#fdfcf9;      /* top nav, subtle fills     */
+    --surface-3:#fdfbf6;      /* inputs, experience rows   */
+    /* ink */
+    --ink:#26221c;            /* primary text              */
+    --ink-2:#5f584c;          /* secondary text / chips    */
+    --muted:#8a8172;          /* labels, captions          */
+    --faint:#a89e8c;          /* placeholders, hints       */
+    --disabled:#c3bcae;       /* zero / inactive numbers   */
+    /* lines */
+    --line:#ece6d9;           /* card & control borders    */
+    --line-2:#f4efe4;         /* internal row dividers     */
+    --line-input:#e3ddd0;     /* chip / input borders      */
+    --line-dash:#d6cfbe;      /* ghost "add" borders       */
+    /* accent (terracotta) — the ONLY accent hue */
+    --accent:#bf5c3a;
+    --accent-hover:#a94d2f;
+    --accent-tint:#f7f2e9;    /* selected-chip fill        */
+    --accent-tint-bd:#e6ddc9;
+    --accent-ghost-bd:#e3b79f;/* "suggest" ghost border    */
+    /* radii */
+    --r-card:16px; --r-panel:13px; --r-stat:12px; --r-ctrl:8px; --r-pill:999px;
+    /* shadow */
+    --shadow-card:0 6px 22px -8px rgba(40,28,14,.14);
+    /* type */
+    --font:'Geist',system-ui,-apple-system,sans-serif;
+    --mono:'Geist Mono',ui-monospace,monospace;
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:#e9e5dc;font-family:var(--font);color:var(--ink);
+       display:flex;justify-content:center;padding:40px 20px}
+
+  /* ---- shell ---- */
+  .app{width:820px;background:var(--paper);border:1px solid #e7e1d4;
+       border-radius:var(--r-card);overflow:hidden;box-shadow:var(--shadow-card)}
+
+  /* ---- top nav ---- */
+  .nav{display:flex;align-items:center;justify-content:space-between;
+       padding:14px 20px;border-bottom:1px solid var(--line);background:var(--surface-2)}
+  .nav-left{display:flex;align-items:center;gap:22px}
+  .logo{width:22px;height:22px;border-radius:7px;background:var(--accent);
+        display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px}
+  .tabs{display:flex;gap:20px;font-size:13px}
+  .tabs span{color:var(--muted);cursor:pointer}
+  .tabs .active{color:var(--ink);font-weight:600;border-bottom:2px solid var(--accent);
+                padding-bottom:14px;margin-bottom:-15px}
+
+  /* ---- buttons ---- */
+  .btn{display:inline-flex;align-items:center;gap:7px;border-radius:9px;
+       font:600 12.5px var(--font);cursor:pointer;border:none;padding:9px 15px}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-primary:hover{background:var(--accent-hover)}
+  .btn-secondary{background:var(--surface);color:#3d382f;border:1px solid var(--line-input);font-weight:500}
+  .btn-ghost{background:none;color:var(--muted);border:1px solid #e7e1d4;font-weight:500;padding:10px 16px}
+  .btn-lg{padding:10px 16px}
+  .glyph{font-size:9px}
+
+  .body{padding:22px 24px}
+
+  /* ---- header ---- */
+  .head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:16px}
+  .head h2{margin:0;font-size:19px;font-weight:600;letter-spacing:-.02em}
+  .head .sub{font-size:12px;color:var(--faint)}
+
+  /* ---- stat cards ---- */
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}
+  .stat{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-stat);padding:16px 18px}
+  .stat .n{font-size:30px;font-weight:700;letter-spacing:-.03em;line-height:1}
+  .stat .n.zero{color:var(--disabled)}
+  .stat .l{font-size:12px;color:var(--muted);margin-top:6px}
+
+  /* ---- profile tabs ---- */
+  .ptabs{display:flex;gap:7px;margin-bottom:14px}
+  .ptab{display:inline-flex;align-items:center;gap:8px;border-radius:var(--r-ctrl);
+        padding:7px 12px;font-size:12.5px}
+  .ptab.on{background:var(--ink);color:#f6f2ea;font-weight:500}
+  .ptab.off{background:var(--surface);border:1px solid var(--line-input);color:var(--ink-2)}
+  .ptab .x{opacity:.5}
+  .ptab.new{border:1px dashed var(--line-dash);color:var(--muted);gap:6px}
+
+  /* ---- panel ---- */
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-panel);overflow:hidden}
+  .panel-h{padding:12px 18px;border-bottom:1px solid #f0ebdf;font-size:12px;font-weight:600;letter-spacing:.02em;color:#4a443a}
+  .panel-b{padding:4px 18px 16px}
+
+  .row{display:flex;gap:16px;padding:12px 0;border-bottom:1px solid var(--line-2)}
+  .row:last-child{border-bottom:none}
+  .row.pref{padding:11px 0;border-bottom:none;border-top:1px solid var(--line-2)}
+  .row .label{width:96px;flex:none;font-size:12.5px;color:var(--muted);padding-top:5px}
+  .row .field{flex:1;display:flex;flex-wrap:wrap;gap:7px}
+  .row .field.col{flex-direction:column;align-items:flex-start}
+  .subhead{font-size:10.5px;font-weight:600;letter-spacing:.09em;color:var(--faint);padding:14px 0 4px}
+
+  /* ---- chips ---- */
+  .chip{display:inline-flex;align-items:center;gap:7px;border-radius:var(--r-pill);
+        padding:6px 11px;font-size:12.5px;background:var(--surface);border:1px solid var(--line-input)}
+  .chip .x{opacity:.4}
+  .chip.tinted{background:var(--accent-tint);border-color:var(--accent-tint-bd)}
+  .chip.solid{background:#f4f0e7;border-color:var(--accent-tint-bd)}
+  .chip.exp{border-radius:9px;padding:7px 12px;background:var(--surface-3);border-color:#ebe4d6;color:#3d382f;gap:9px}
+  .ghost{display:inline-flex;align-items:center;gap:5px;border:1px dashed var(--line-dash);
+         border-radius:var(--r-pill);padding:6px 11px;font-size:12.5px;color:var(--muted)}
+  .ghost.exp{border-radius:9px;padding:7px 12px}
+  .ghost.suggest{border-color:var(--accent-ghost-bd);color:var(--accent)}
+
+  /* ---- toggle pills (seniority / work mode) ---- */
+  .toggle{border-radius:var(--r-ctrl);padding:7px 14px;font-size:12.5px}
+  .toggle.on{background:var(--accent);color:#fff;font-weight:500}
+  .toggle.off{background:var(--surface);border:1px solid var(--line-input);color:var(--ink-2)}
+
+  /* ---- slider ---- */
+  .slider{flex:1;max-width:420px}
+  .track{position:relative;height:20px;display:flex;align-items:center}
+  .track .rail{position:absolute;left:0;right:0;height:4px;border-radius:4px;background:#e7e0d1}
+  .track .fill{position:absolute;left:0;width:44%;height:4px;border-radius:4px;background:var(--accent)}
+  .track .knob{position:absolute;left:44%;width:16px;height:16px;border-radius:50%;background:#fff;
+               border:2.5px solid var(--accent);transform:translateX(-50%);box-shadow:0 1px 4px rgba(60,40,20,.25)}
+  .scale{display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted);margin-top:4px}
+
+  /* ---- input ---- */
+  .input{background:var(--surface-3);border:1px solid var(--line-input);border-radius:var(--r-ctrl);
+         padding:7px 11px;font-size:12.5px;color:var(--faint);flex:1;max-width:220px}
+  .country{background:var(--surface);border:1px solid var(--line-input);color:var(--ink-2);
+           border-radius:7px;padding:6px 11px;font-size:12px}
+
+  /* ---- footer ---- */
+  .foot{display:flex;align-items:center;justify-content:space-between;margin-top:16px}
+  .foot-l{display:flex;gap:9px}
+  .note{font-size:11.5px;font-style:italic;color:var(--faint);margin-top:12px}
+</style>
+</head>
+<body>
+  <div class="app">
+
+    <!-- TOP NAV -->
+    <div class="nav">
+      <div class="nav-left">
+        <div class="logo">m</div>
+        <div class="tabs">
+          <span>Search</span>
+          <span>My Roles</span>
+          <span class="active">Profile</span>
+          <span>Settings</span>
+        </div>
+      </div>
+      <button class="btn btn-primary"><span class="glyph">▶</span> Run New Search</button>
+    </div>
+
+    <div class="body">
+      <!-- HEADER -->
+      <div class="head">
+        <h2>Profile &amp; Dashboard</h2>
+        <span class="sub">Updated 2 hours ago</span>
+      </div>
+
+      <!-- STATS -->
+      <div class="stats">
+        <div class="stat"><div class="n">9</div><div class="l">Roles searched</div></div>
+        <div class="stat"><div class="n">1</div><div class="l">Saved</div></div>
+        <div class="stat"><div class="n zero">0</div><div class="l">Applied</div></div>
+      </div>
+
+      <!-- PROFILE TABS -->
+      <div class="ptabs">
+        <span class="ptab on">priya <span class="x">✕</span></span>
+        <span class="ptab off">Profile 2 <span class="x">✕</span></span>
+        <span class="ptab new">＋ new</span>
+      </div>
+
+      <!-- PANEL -->
+      <div class="panel">
+        <div class="panel-h">What you're looking for</div>
+        <div class="panel-b">
+
+          <!-- Target roles -->
+          <div class="row">
+            <div class="label">Target roles</div>
+            <div class="field">
+              <span class="chip tinted">Remote appointment setter / SDR <span class="x">✕</span></span>
+              <span class="ghost">＋ add</span>
+              <span class="ghost suggest">✦ suggest</span>
+            </div>
+          </div>
+
+          <!-- Past roles -->
+          <div class="row">
+            <div class="label">Past roles</div>
+            <div class="field">
+              <span class="chip solid">Founder / Operator <span class="x">✕</span></span>
+              <span class="chip solid">Property Consultant <span class="x">✕</span></span>
+              <span class="chip solid">Social Media Manager (Freelance) <span class="x">✕</span></span>
+              <span class="chip solid">Business Development <span class="x">✕</span></span>
+              <span class="ghost">＋ add</span>
+            </div>
+          </div>
+
+          <!-- Skills -->
+          <div class="row">
+            <div class="label">Skills</div>
+            <div class="field">
+              <span class="chip">Cold calling <span class="x">✕</span></span>
+              <span class="chip">Lead generation <span class="x">✕</span></span>
+              <span class="chip">Closing sales <span class="x">✕</span></span>
+              <span class="chip">Client relationship management <span class="x">✕</span></span>
+              <span class="chip">Recruiting &amp; onboarding staff <span class="x">✕</span></span>
+              <span class="chip">Scheduling &amp; day-to-day operations <span class="x">✕</span></span>
+              <span class="chip">Outbound messaging (email/SMS) <span class="x">✕</span></span>
+              <span class="chip">High-ticket sales <span class="x">✕</span></span>
+              <span class="chip">Negotiation <span class="x">✕</span></span>
+              <span class="chip">Objection handling <span class="x">✕</span></span>
+              <span class="chip">CRM &amp; pipeline management <span class="x">✕</span></span>
+              <span class="chip">Social media marketing <span class="x">✕</span></span>
+              <span class="ghost">＋ add</span>
+              <span class="ghost suggest">✦ suggest</span>
+            </div>
+          </div>
+
+          <!-- Experience -->
+          <div class="row">
+            <div class="label">Experience</div>
+            <div class="field col">
+              <span class="chip exp">Performed high-volume cold calling and outbound lead generation <span class="x">✕</span></span>
+              <span class="chip exp">Managed client relationships from enquiry to completion <span class="x">✕</span></span>
+              <span class="chip exp">Closed high-value property sales in a competitive market <span class="x">✕</span></span>
+              <span class="chip exp">Used automated email and SMS outreach tools to support sales <span class="x">✕</span></span>
+              <span class="chip exp">Managed social media content and marketing campaigns for local businesses <span class="x">✕</span></span>
+              <span class="chip exp">Assisted businesses with increasing online visibility, engagement, and customer enquiries <span class="x">✕</span></span>
+              <span class="chip exp">Created marketing content and supported lead generation initiatives <span class="x">✕</span></span>
+              <span class="ghost exp">＋ add</span>
+            </div>
+          </div>
+
+          <!-- PREFERENCES -->
+          <div class="subhead">PREFERENCES</div>
+
+          <!-- Seniority -->
+          <div class="row pref">
+            <div class="label">Seniority</div>
+            <div class="field">
+              <span class="toggle on">Junior</span>
+              <span class="toggle on">Mid</span>
+              <span class="toggle on">Senior</span>
+              <span class="toggle off">Lead</span>
+              <span class="toggle off">Director</span>
+              <span class="toggle off">C-Suite</span>
+            </div>
+          </div>
+
+          <!-- Salary -->
+          <div class="row pref">
+            <div class="label">Salary</div>
+            <div class="slider">
+              <div class="track">
+                <div class="rail"></div>
+                <div class="fill"></div>
+                <div class="knob"></div>
+              </div>
+              <div class="scale"><span>£70k</span><span>£98k</span></div>
+            </div>
+          </div>
+
+          <!-- Location -->
+          <div class="row pref">
+            <div class="label">Location</div>
+            <div class="field" style="flex-direction:column;align-items:stretch;gap:9px">
+              <div style="display:flex;gap:8px">
+                <span class="input">City or region…</span>
+                <span class="toggle off">On-site</span>
+                <span class="toggle off">Hybrid</span>
+                <span class="toggle on">Remote</span>
+              </div>
+              <div style="display:flex;flex-wrap:wrap;gap:6px">
+                <span class="country">Global (no filter)</span>
+                <span class="country">United Kingdom</span>
+                <span class="country">United States</span>
+                <span class="country">Canada</span>
+                <span class="country">Australia</span>
+                <span class="country">Germany</span>
+                <span class="country">France</span>
+                <span class="country">India</span>
+                <span class="country">Italy</span>
+                <span class="country">Netherlands</span>
+                <span class="country">Austria</span>
+                <span class="country">Poland</span>
+                <span class="country">Singapore</span>
+                <span class="country">South Africa</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Anything else -->
+          <div class="row pref">
+            <div class="label">Anything else</div>
+            <div class="field"><span class="ghost">＋ add</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FOOTER -->
+      <div class="foot">
+        <div class="foot-l">
+          <button class="btn btn-primary btn-lg"><span class="glyph">▶</span> Run New Search</button>
+          <button class="btn btn-secondary btn-lg">↑ Upload new CV</button>
+        </div>
+        <button class="btn btn-ghost">Clear memory</button>
+      </div>
+      <div class="note">Ticking and crossing roles in Search adjusts your profile weights automatically.</div>
+    </div>
+  </div>
+</body>
+</html>

@@ -47,6 +47,7 @@ ATTRIBUTE_TYPES = [
     "target_role",
     "salary",
     "location",
+    "country",
     "custom",
 ]
 
@@ -59,8 +60,28 @@ ATTRIBUTE_DIRECTION = {
     "target_role": "target",
     "salary": "constraint",
     "location": "constraint",
+    "country": "constraint",
     "custom": "constraint",
 }
+
+# Selectable countries for the hard location filter (code -> Adzuna cc / label).
+# "global" is a sentinel meaning "no country filter".
+COUNTRY_CHOICES = [
+    ("global", "Global (no filter)"),
+    ("gb", "United Kingdom"),
+    ("us", "United States"),
+    ("ca", "Canada"),
+    ("au", "Australia"),
+    ("de", "Germany"),
+    ("fr", "France"),
+    ("in", "India"),
+    ("it", "Italy"),
+    ("nl", "Netherlands"),
+    ("at", "Austria"),
+    ("pl", "Poland"),
+    ("sg", "Singapore"),
+    ("za", "South Africa"),
+]
 
 # ── Feedback weight system (see implementation notes section 3) ──────────────
 DELTAS = {"tick": 0.10, "cross": -0.15, "ignore": -0.02}

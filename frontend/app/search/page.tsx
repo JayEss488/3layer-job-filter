@@ -1,6 +1,7 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 
 import { Nav } from "@/components/Nav";
 import { RoleCard } from "@/components/RoleCard";
@@ -34,8 +35,19 @@ export default function SearchPage() {
   const tick = useMutation({ mutationFn: api.tick, onSuccess: invalidate });
   const cross = useMutation({ mutationFn: api.cross, onSuccess: invalidate });
 
+  // useSearchStatus stops polling once the run finishes, but the already-mounted
+  // roles query has no idea new rows landed — without this, the list stays stale
+  // until the user navigates away and back (which forces a remount + refetch).
+  const prevStatus = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (prevStatus.current === "running" && status?.status !== "running") {
+      invalidate();
+    }
+    prevStatus.current = status?.status;
+  }, [status?.status]);
+
   if (!activeId) {
-    return <div className="screen"><Nav /><div className="center-pad">Loading…</div></div>;
+    return <div className="app"><Nav /><div className="center-pad">Loading…</div></div>;
   }
 
   const running = status?.status === "running";
@@ -43,15 +55,15 @@ export default function SearchPage() {
   const crossed = (roles ?? []).filter((r) => r.status === "crossed");
 
   return (
-    <div className="screen">
+    <div className="app">
       <Nav />
       <div className="page-body">
         <TrainingBanner />
 
         {running && (
           <div className="warning-banner">
-            <span className="spinner">◴</span> Building your matches… this can take a couple
-            of minutes (fetching, ranking, and reading full role pages).
+            <span className="spinner">◴</span> {status?.message || "Building your matches…"} This
+            can take a couple of minutes (fetching, ranking, and reading full role pages).
           </div>
         )}
         {status?.status === "error" && (
@@ -86,13 +98,13 @@ export default function SearchPage() {
               actions={
                 <>
                   <button
-                    className={`action-btn${saved ? " ticked" : ""}`}
+                    className={`btn ${saved ? "btn-primary" : "btn-secondary"}`}
                     onClick={() => tick.mutate(role.id)}
                     disabled={saved}
                   >
                     {saved ? "✓ Saved" : "✓ Save"}
                   </button>
-                  <button className="action-btn" onClick={() => cross.mutate(role.id)}>
+                  <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
                     ✗ Pass
                   </button>
                 </>
@@ -114,10 +126,10 @@ export default function SearchPage() {
                 variant="crossed"
                 actions={
                   <>
-                    <button className="action-btn" onClick={() => tick.mutate(role.id)}>
+                    <button className="btn btn-secondary" onClick={() => tick.mutate(role.id)}>
                       ✓ Save
                     </button>
-                    <button className="action-btn crossed" disabled>
+                    <button className="btn btn-ghost" disabled>
                       ✗ Passed
                     </button>
                   </>

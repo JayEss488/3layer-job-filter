@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-const KEY = "jobmatch.trainingBannerDismissed";
+const KEY = "omniboard.trainingBannerDismissed";
 
 export function TrainingBanner() {
   const [hidden, setHidden] = useState(true);

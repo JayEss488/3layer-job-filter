@@ -25,7 +25,7 @@ export default function OnboardingPage() {
   const [status, setStatus] = useState("");
 
   if (!activeId) {
-    return <div className="screen narrow"><div className="center-pad">Loading…</div></div>;
+    return <div className="app narrow"><div className="center-pad">Loading…</div></div>;
   }
 
   const g = attrs?.by_type;
@@ -80,15 +80,15 @@ export default function OnboardingPage() {
   }
 
   return (
-    <div className="screen narrow">
+    <div className="app narrow">
       <div className="screen-header">
-        <div className="logo">JobMatch</div>
+        <div className="logo">Omni Board</div>
         <div className="step-indicator">Build your profile</div>
       </div>
 
       <div className="page-body">
         <div>
-          <div className="page-title" style={{ border: "none", paddingBottom: 0 }}>
+          <div className="page-title" style={{ paddingBottom: 0 }}>
             Let&apos;s build your profile
           </div>
           <div className="page-sub">
@@ -108,7 +108,7 @@ export default function OnboardingPage() {
               </div>
               <div className="upload-btn-row">
                 <button
-                  className="btn primary"
+                  className="btn btn-primary"
                   onClick={() => fileRef.current?.click()}
                   disabled={busy}
                 >
@@ -135,7 +135,7 @@ export default function OnboardingPage() {
               onChange={(e) => setText(e.target.value)}
             />
             <div className="upload-btn-row">
-              <button className="btn" onClick={parseText} disabled={busy || !text.trim()}>
+              <button className="btn btn-secondary" onClick={parseText} disabled={busy || !text.trim()}>
                 {busy ? "Parsing…" : "Parse text"}
               </button>
               {status && <span className="muted-text" style={{ alignSelf: "center" }}>{status}</span>}
@@ -148,16 +148,16 @@ export default function OnboardingPage() {
           <div className="step-heading">Step 2 — Review and complete your profile</div>
           <div className="profile-box">
             <div className="profile-header">Your profile</div>
-            <div>
+            <div className="panel-b">
               <div className="profile-section-label">
                 Your background — what you have done
               </div>
               <AttributeRow label="Past roles" profileId={activeId} type="past_role" attributes={g?.past_role ?? []} />
               <AttributeRow label="Skills" profileId={activeId} type="skill" attributes={g?.skill ?? []} enableSuggest />
               <AttributeRow label="Experience" profileId={activeId} type="experience" attributes={g?.experience ?? []} />
-              <div className="attr-row">
-                <div className="attr-label">Seniority</div>
-                <div className="attr-values">
+              <div className="row pref">
+                <div className="label">Seniority</div>
+                <div className="field">
                   <SeniorityPicker profileId={activeId} attributes={g?.seniority ?? []} />
                 </div>
               </div>
@@ -173,16 +173,20 @@ export default function OnboardingPage() {
                 enableSuggest
                 placeholder="e.g. Engineering Manager, Principal Engineer"
               />
-              <div className="attr-row">
-                <div className="attr-label">Salary range</div>
-                <div className="attr-values">
+              <div className="row pref">
+                <div className="label">Salary range</div>
+                <div className="field">
                   <SalarySlider profileId={activeId} attribute={g?.salary?.[0]} />
                 </div>
               </div>
-              <div className="attr-row">
-                <div className="attr-label">Location</div>
-                <div className="attr-values">
-                  <LocationPicker profileId={activeId} attributes={g?.location ?? []} />
+              <div className="row pref">
+                <div className="label">Location</div>
+                <div className="field">
+                  <LocationPicker
+                    profileId={activeId}
+                    attributes={g?.location ?? []}
+                    countryAttributes={g?.country ?? []}
+                  />
                 </div>
               </div>
               <AttributeRow
@@ -202,7 +206,7 @@ export default function OnboardingPage() {
           <div className="launch-box">
             <ConfidenceBar confidence={confidence} />
             <button
-              className="btn primary"
+              className="btn btn-primary"
               style={{ padding: "10px 24px", fontSize: 13 }}
               onClick={runFirstSearch}
               disabled={busy}

@@ -6,6 +6,7 @@ export type AttributeType =
   | "target_role"
   | "salary"
   | "location"
+  | "country"
   | "custom";
 
 export interface Profile {
@@ -14,6 +15,31 @@ export interface Profile {
   is_active: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface SourceInfo {
+  key: string;
+  label: string;
+  kind: "api" | "ats";
+  enabled: boolean;
+  last_count: number;
+}
+
+export interface ScrapeSetting {
+  enabled: boolean;
+}
+
+export interface SourceStat {
+  key: string;
+  label: string;
+  discovered: number;
+  top25: number;
+  shown: number;
+  selected: number;
+}
+
+export interface Blocklist {
+  domains: string[];
 }
 
 export interface Attribute {
@@ -63,6 +89,7 @@ export interface Role {
   url?: string | null;
   tags?: string[] | null;
   salary_text?: string | null;
+  source?: string | null;
   fit_rank?: number | null;
   ai_analysis?: string | null;
   status: RoleStatus;

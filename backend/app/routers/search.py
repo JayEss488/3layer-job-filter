@@ -85,10 +85,12 @@ def list_roles(
     profile: Profile = Depends(get_profile_or_404),
     db: Session = Depends(get_db),
 ):
-    q = db.query(Role).filter(Role.profile_id == profile.id, Role.status != "deleted")
+    q = db.query(Role).filter(Role.profile_id == profile.id)
     if status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
         q = q.filter(Role.status.in_(statuses))
+    else:
+        q = q.filter(Role.status != "deleted")
     return q.order_by(Role.fit_rank.is_(None), Role.fit_rank, Role.id).all()
 
 

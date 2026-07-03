@@ -10,6 +10,11 @@ from openai import OpenAI
 
 # Match the model family the engine uses for cheap calls.
 CHEAP_MODEL = os.getenv("CHEAP_MODEL", "gpt-5.4-nano-2026-03-17")
+# Reserved for low-frequency, high-value calls (CV parsing, target-role
+# suggestions) where reasoning quality matters more than per-call cost.
+# Matches full_auto.py's EXP_MODEL; kept as a plain string here so this module
+# stays independent of full_auto/crawl4ai (see module docstring).
+STRONG_MODEL = os.getenv("STRONG_MODEL", "gpt-5.4")
 
 
 @lru_cache(maxsize=1)

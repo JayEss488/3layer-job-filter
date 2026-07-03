@@ -165,19 +165,66 @@ def normalize_location(location_str: str) -> str:
     return location_str.strip()
 
 
+# Token sets used to positively identify which of the supported countries a
+# free-text job location string belongs to. Keyed by the 2-letter Adzuna code
+# used throughout the engine/snapshot. Kept intentionally small/high-signal:
+# false negatives (returning None) are safe, false positives are not.
+_COUNTRY_TOKENS = {
+    "gb": {"united kingdom", "uk", "u.k.", "great britain", "england", "scotland",
+           "wales", "northern ireland", "london", "manchester", "birmingham",
+           "leeds", "glasgow", "edinburgh", "bristol", "liverpool"},
+    "us": {"united states", "usa", "u.s.", "u.s.a.", "america", "new york",
+           "san francisco", "los angeles", "chicago", "seattle", "austin",
+           "boston", "texas", "california"},
+    "ca": {"canada", "toronto", "vancouver", "montreal", "ottawa", "calgary"},
+    "au": {"australia", "sydney", "melbourne", "brisbane", "perth"},
+    "de": {"germany", "deutschland", "berlin", "munich", "munchen", "hamburg", "frankfurt"},
+    "fr": {"france", "paris", "lyon", "marseille"},
+    "in": {"india", "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "pune"},
+    "it": {"italy", "italia", "rome", "milan", "turin"},
+    "nl": {"netherlands", "holland", "amsterdam", "rotterdam", "the hague"},
+    "at": {"austria", "vienna"},
+    "pl": {"poland", "warsaw", "krakow", "wroclaw"},
+    "sg": {"singapore"},
+    "za": {"south africa", "johannesburg", "cape town", "pretoria"},
+}
+
+
+def country_of(job_location: str) -> str | None:
+    """Best-effort country code for a free-text job location, or None if it
+    can't be confidently determined (ambiguous/blank/unrecognised)."""
+    loc = (job_location or "").strip().lower()
+    if not loc:
+        return None
+    for code, tokens in _COUNTRY_TOKENS.items():
+        if any(tok in loc for tok in tokens):
+            return code
+    return None
+
+
 # ── Flexible API Fetchers ──────────────────────────────────────────────────────
 
-def fetch_reed(query: str, location: str = "United Kingdom") -> List[Dict]:
-    """Reed is primarily UK-focused. Skips execution if profile is elsewhere."""
-    if normalize_location(location) != "United Kingdom" or not REED_API_KEY:
+def fetch_reed(query: str, location: str = "United Kingdom", country_code: str = "gb", pages: int = 3) -> List[Dict]:
+    """Reed is UK-only. Skips execution if the profile's resolved country isn't GB
+    (location is just the locationName Reed's API scopes the search to -- it's
+    never going to equal "United Kingdom" for a real city/postcode profile, so
+    gating on country_code instead of a location-string match)."""
+    if (country_code or "gb").strip().lower() != "gb" or not REED_API_KEY:
         return []
-    
+
     url = "https://www.reed.co.uk/api/1.0/search"
-    params = {"keywords": query, "locationName": location, "resultsToTake": 50}
-    try:
-        r = requests.get(url, params=params, auth=HTTPBasicAuth(REED_API_KEY, ""), timeout=12)
-        jobs = []
-        for job in r.json().get("results", []):
+    page_size = 100  # Reed's max resultsToTake
+    jobs: List[Dict] = []
+    for page in range(pages):
+        params = {"keywords": query, "locationName": location,
+                  "resultsToTake": page_size, "resultsToSkip": page * page_size}
+        try:
+            r = requests.get(url, params=params, auth=HTTPBasicAuth(REED_API_KEY, ""), timeout=12)
+            results = r.json().get("results", [])
+        except Exception as e:
+            emit(f"   [!] Reed API Error: {e}")
+            break
+        for job in results:
             jobs.append({
                 "board": "reed",
                 "title": job.get("jobTitle", ""),
@@ -185,10 +232,9 @@ def fetch_reed(query: str, location: str = "United Kingdom") -> List[Dict]:
                 "url": job.get("jobUrl", ""),
                 "snippet": job.get("jobDescription", "")
             })
-        return jobs
-    except Exception as e:
-        emit(f"   [!] Reed API Error: {e}")
-        return []
+        if len(results) < page_size:  # last page reached
+            break
+    return jobs
 
 
 # Country-level location strings that Adzuna's `where` geocoder rejects (the cc
@@ -201,30 +247,40 @@ _ADZUNA_COUNTRY_LEVEL = {
 }
 
 
-def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str = "gb") -> List[Dict]:
-    """Routes dynamically to the matching Adzuna global regional server."""
+def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str = "gb", pages: int = 3) -> List[Dict]:
+    """Routes dynamically to the matching Adzuna global regional server. The page
+    number is the last path segment (/search/{page}), so pagination just walks it."""
     if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
         return []
-    
+
     # Ensure clean lowercase ISO code string (default to 'gb')
     cc = country_code.strip().lower() if country_code else "gb"
-    url = f"https://api.adzuna.com/v1/api/jobs/{cc}/search/1"
 
-    params = {
+    base_params = {
         "app_id": ADZUNA_APP_ID,
         "app_key": ADZUNA_APP_KEY,
         "what": query,
-        "results_per_page": 50
+        "results_per_page": 50,
     }
     # The cc endpoint already scopes the country. Passing a country *name* as
     # `where` makes Adzuna's geocoder return nothing (e.g. "United Kingdom" -> 0
     # results), so only set `where` for a sub-country location (a city/region).
+    # Adzuna's geocoder also chokes on a trailing postcode fragment (e.g.
+    # "Bristol, BS6") -- pass just the city/region component.
     if location and location.strip().lower() not in _ADZUNA_COUNTRY_LEVEL:
-        params["where"] = location
-    try:
-        r = requests.get(url, params=params, timeout=12)
-        jobs = []
-        for job in r.json().get("results", []):
+        base_params["where"] = location.split(",")[0].strip()
+
+    jobs: List[Dict] = []
+    for page in range(1, pages + 1):
+        url = f"https://api.adzuna.com/v1/api/jobs/{cc}/search/{page}"
+        try:
+            r = requests.get(url, params=base_params, timeout=12)
+            body = r.json()
+            results = body.get("results", [])
+        except Exception as e:
+            emit(f"   [!] Adzuna ({cc}) API Error: {e}")
+            break
+        for job in results:
             jobs.append({
                 "board": "adzuna",
                 "title": job.get("title", ""),
@@ -232,10 +288,12 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
                 "url": job.get("redirect_url", ""),
                 "snippet": job.get("description", "")
             })
-        return jobs
-    except Exception as e:
-        emit(f"   [!] Adzuna ({cc}) API Error: {e}")
-        return []
+        if page == 1 and not results:
+            emit(f"   [!] Adzuna ({cc}) returned 0 results for '{query}' "
+                 f"(where={base_params.get('where', '<none>')}): {body.get('exception') or body.get('error') or 'no error field'}")
+        if len(results) < 50:  # last page reached
+            break
+    return jobs
 
 
 def fetch_remotive(query: str) -> List[Dict]:
@@ -347,8 +405,9 @@ class ReedSource:
     name, tier = "reed", "fast"
     def fetch(self, profile, since=None):
         out: List[Dict] = []
+        country_code = profile.get("adzuna_country_code", "gb")
         for term in _terms(profile):
-            out.extend(fetch_reed(term, profile.get("location", "United Kingdom")))
+            out.extend(fetch_reed(term, profile.get("location", "United Kingdom"), country_code))
         return out
 
 
@@ -397,21 +456,63 @@ ATS_FEEDS = {
     "greenhouse": "https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true",
     "lever":      "https://api.lever.co/v0/postings/{token}?mode=json",
     "ashby":      "https://api.ashbyhq.com/posting-api/job-board/{token}?includeCompensation=true",
+    # Same public, no-auth pattern, but these platforms skew toward the startups,
+    # scale-ups and remote-first / EU orgs that hire for non-eng roles.
+    "workable":   "https://apply.workable.com/api/v1/widget/accounts/{token}?details=true",
+    "recruitee":  "https://{token}.recruitee.com/api/offers/",
+    # Personio is the odd one out: it publishes an XML positions feed (not JSON)
+    # and exposes no per-job URL, so it's parsed separately (see _fetch_personio).
+    "personio":   "https://{token}.jobs.personio.com/xml",
 }
+
+
+def _fetch_personio(url: str, token: str) -> List[Dict]:
+    """Personio exposes an XML positions feed rather than JSON, and gives no
+    per-job URL, so the apply URL is constructed from the position id."""
+    import xml.etree.ElementTree as ET
+    try:
+        r = requests.get(url, timeout=12)
+        root = ET.fromstring(r.content)
+    except Exception as e:
+        emit(f"   [!] ATS personio/{token} error: {e}")
+        return []
+
+    base = url.rsplit("/xml", 1)[0]  # https://{token}.jobs.personio.com
+    out = []
+    for pos in root.findall(".//position"):
+        job_id = pos.findtext("id") or ""
+        # description is a list of <jobDescription><name/><value/></jobDescription>
+        desc = " ".join(
+            jd.findtext("value") or "" for jd in pos.findall("./jobDescriptions/jobDescription")
+        )
+        out.append({"board": f"personio:{token}", "title": pos.findtext("name") or "",
+                    "company": token,
+                    "url": f"{base}/job/{job_id}" if job_id else base,
+                    "location": pos.findtext("office") or "",
+                    "snippet": (desc or "")[:3000],
+                    "updated_at": pos.findtext("createdAt") or pos.findtext("createDate")})
+    return out
 
 
 def fetch_ats(vendor: str, token: str) -> List[Dict]:
     tmpl = ATS_FEEDS.get(vendor)
     if not tmpl:
         return []
+    url = tmpl.format(token=token)
+
+    if vendor == "personio":
+        return _fetch_personio(url, token)
+
     try:
-        data = requests.get(tmpl.format(token=token), timeout=12).json()
+        data = requests.get(url, timeout=12).json()
     except Exception as e:
         emit(f"   [!] ATS {vendor}/{token} error: {e}")
         return []
 
     rows = data.get("jobs") if vendor == "greenhouse" else \
            data.get("postings") if vendor == "lever" else \
+           data.get("offers") if vendor == "recruitee" else \
+           data.get("jobs") if vendor == "workable" else \
            data.get("jobs", data)  # ashby
     out = []
     for j in rows or []:
@@ -427,6 +528,23 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
                         "location": (j.get("categories") or {}).get("location", ""),
                         "snippet": (j.get("descriptionPlain", "") or "")[:3000],
                         "updated_at": j.get("createdAt")})
+        elif vendor == "workable":
+            loc = j.get("location") or {}
+            out.append({"board": f"workable:{token}", "title": j.get("title", ""),
+                        "company": token,
+                        "url": j.get("url") or j.get("application_url", ""),
+                        "location": loc.get("location_str") or ", ".join(
+                            x for x in [loc.get("city"), loc.get("country")] if x),
+                        "snippet": (j.get("description", "") or "")[:3000],
+                        "updated_at": j.get("published_on") or j.get("created_at")})
+        elif vendor == "recruitee":
+            out.append({"board": f"recruitee:{token}", "title": j.get("title", ""),
+                        "company": token,
+                        "url": j.get("careers_url") or j.get("careers_apply_url", ""),
+                        "location": j.get("location") or ", ".join(
+                            x for x in [j.get("city"), j.get("country")] if x),
+                        "snippet": (j.get("description", "") or "")[:3000],
+                        "updated_at": j.get("published_at")})
         else:  # ashby
             out.append({"board": f"ashby:{token}", "title": j.get("title", ""),
                         "company": token, "url": j.get("jobUrl", ""),
@@ -458,17 +576,23 @@ TERMS_PER_RUN = 4   # size of the rotating term window queried each run
 
 def select_sources_for_run(profile: Dict) -> List[JobSource]:
     terms = profile.get("search_terms") or []
-    # Query-relevant + free: these search by the actual terms, so they run EVERY
-    # run. They are what makes niche / non-tech profiles work (the ATS feeds are
+    # Query-relevant: these search by the actual terms, so they run EVERY run.
+    # They are what makes niche / non-tech profiles work (the ATS feeds are
     # company-centric and only help when a seeded company is in the user's field).
-    always = [AdzunaSource(), ReedSource()]
-    # Credit-heavy / overlapping: one per run on rotation keeps SerpAPI/RapidAPI
-    # spend bounded while still adding breadth.
-    rotation = [GoogleJobsSource(), JSearchSource(), RemotiveSource()]
+    # Google Jobs is promoted here because its indexer reads the JobPosting markup
+    # that Workday / SmartRecruiters / custom career pages publish -- i.e. it's how
+    # we reach the "unreachable" tier we can't integrate directly. Costs SerpAPI
+    # credits, but the per-source toggle lets the user disable it if spend matters.
+    always = [AdzunaSource(), ReedSource(), GoogleJobsSource()]
+    # Remaining credit-heavy / overlapping sources: one per run on rotation keeps
+    # RapidAPI spend bounded while still adding breadth.
+    rotation = [JSearchSource(), RemotiveSource()]
 
     cur = _load_cursor(profile)
-    # First run stays fast + free (no SerpAPI/JSearch latency) but spans several
-    # terms so one narrow term can't zero it out.
+    # First run uses the always-on sources (Adzuna, Reed, Google Jobs) across
+    # several terms so one narrow term can't zero it out. Google Jobs adds some
+    # SerpAPI latency/credits here, but it's the first run's best shot at the
+    # Workday/SmartRecruiters/custom-site tier we can't integrate directly.
     if profile.get("first_run"):
         profile["search_terms_batch"] = terms[:TERMS_PER_RUN]
         return always
@@ -482,18 +606,56 @@ def select_sources_for_run(profile: Dict) -> List[JobSource]:
     return picked
 
 
+# Word-level match makes the batch profile-aware: harvested rows carry the phrase
+# that found them, so a profile whose terms/sectors share a word gets those
+# companies first. Drop role-shape words that don't carry sector signal.
+_ATS_MATCH_STOP = {"the", "and", "for", "with", "junior", "senior", "lead", "mid",
+                   "level", "manager", "assistant", "coordinator", "officer",
+                   "associate", "intern", "graduate", "specialist", "role", "jobs"}
+
+
+def _profile_match_words(profile: Dict) -> set:
+    parts = list(profile.get("search_terms") or []) + list(profile.get("sectors") or [])
+    words = set()
+    for p in parts:
+        for w in re.findall(r"[a-z0-9]+", str(p).lower()):
+            if len(w) > 2 and w not in _ATS_MATCH_STOP:
+                words.add(w)
+    return words
+
+
+def _ats_keyword_matches(keyword, words: set) -> bool:
+    if not keyword or keyword == "curated" or not words:
+        return False
+    kw = {w for w in re.findall(r"[a-z0-9]+", str(keyword).lower()) if len(w) > 2}
+    return bool(kw & words)
+
+
 def select_ats_batch_for_run(profile: Dict) -> List[tuple]:
-    """Return (company, vendor, token) rows. Smaller, capped batch on first run
-    (still fast because ATS calls are parallel); rotate batches afterward."""
-    tokens = load_company_ats()
-    if not tokens:
+    """Return (company, vendor, token) rows, profile-aware. company_ats is a
+    single store shared by all profiles, so favour companies whose harvest
+    keyword matches this profile's sector, then fill the batch from the rest by
+    rotation (so the shared, multi-sector store doesn't dilute any one profile)."""
+    rows = load_company_ats()  # (company, vendor, token, keyword)
+    if not rows:
         return []
-    if profile.get("first_run"):
-        return tokens[:40]
-    cur = _load_cursor(profile)
     size = 40
-    start = (cur * size) % max(1, len(tokens))
-    return tokens[start:start + size]
+    words = _profile_match_words(profile)
+    preferred = [r for r in rows if _ats_keyword_matches(r[3], words)]
+    others = [r for r in rows if not _ats_keyword_matches(r[3], words)]
+
+    cur = _load_cursor(profile)
+
+    def _rotate(lst: List[tuple]) -> List[tuple]:
+        # Wrap-around slice so large sets still cycle across runs (first run: cur=0).
+        if not lst:
+            return []
+        start = (cur * size) % len(lst)
+        return (lst[start:] + lst[:start])[:size]
+
+    # Preferred first (up to the cap), then fill with rotated others.
+    ordered = _rotate(preferred) + _rotate(others)
+    return [(c, v, t) for (c, v, t, _kw) in ordered[:size]]
 
 
 # ── Parallel discovery ───────────────────────────────────────────────────────
@@ -501,13 +663,22 @@ def select_ats_batch_for_run(profile: Dict) -> List[tuple]:
 def gather_jobs(profile: Dict) -> List[Dict]:
     """Orchestrates job harvesting: rotated source tier(s) + a batch of ATS
     feeds, all fetched concurrently. Tiered + cheap on the first run."""
-    tasks: List[tuple] = [("src", s) for s in select_sources_for_run(profile)]
-    tasks += [("ats", (vendor, token)) for (_company, vendor, token) in select_ats_batch_for_run(profile)]
+    # Per-source visibility toggle: the backend passes the set of disabled source
+    # keys (API source names like "adzuna"/"google_jobs" and ATS vendor names like
+    # "greenhouse"/"lever"). Anything in it is skipped for this run.
+    disabled = set(profile.get("disabled_sources") or [])
+    tasks: List[tuple] = [("src", s) for s in select_sources_for_run(profile)
+                          if s.name not in disabled]
+    tasks += [("ats", (vendor, token))
+              for (_company, vendor, token) in select_ats_batch_for_run(profile)
+              if vendor not in disabled]
 
     def run_task(t):
         kind, payload = t
         if kind == "src":
-            return payload.fetch(profile, since=profile.get("since"))
+            result = payload.fetch(profile, since=profile.get("since")) or []
+            emit(f"   [source] {payload.name}: {len(result)} jobs")
+            return result
         vendor, token = payload
         return fetch_ats(vendor, token)
 
@@ -554,16 +725,6 @@ def init_db():
             ai_summary TEXT
         )
     """)
-    # Bootstrapped ATS tokens (company -> vendor + board token), used by the
-    # ATS discovery layer. Populated by harvest_ats_tokens(), not on every run.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS company_ats (
-            company TEXT,
-            vendor TEXT,
-            token TEXT,
-            UNIQUE(vendor, token)
-        )
-    """)
     conn.commit()
     conn.close()
     emit("[db] Tables ready and schema initialized.")
@@ -571,24 +732,64 @@ def init_db():
 
 # ── ATS token store ──────────────────────────────────────────────────────────
 
+# The ATS company store is UNIFIED with the backend's DB, so a harvest triggered
+# from the API (on profile create/edit) lands in the same table discovery reads.
+# Resolve the backend sqlite file from DATABASE_URL when it's sqlite, else fall
+# back to backend/jobmatch.db. (Raw sqlite3 keeps full_auto standalone -- it must
+# still work when run from seed_ats.py without importing the backend package.
+# A non-sqlite DATABASE_URL, e.g. Postgres, isn't supported by this bridge.)
+def _ats_db_path() -> str:
+    url = os.getenv("DATABASE_URL", "")
+    if url.startswith("sqlite:///"):
+        return url[len("sqlite:///"):]
+    return os.path.join(BASE_DIR, "backend", "jobmatch.db")
+
+
+def _ats_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(_ats_db_path())
+    conn.row_factory = sqlite3.Row
+    # Schema matches the backend CompanyATS ORM model so both agree on the table
+    # whichever process creates it first.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_ats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company TEXT NOT NULL,
+            vendor TEXT NOT NULL,
+            token TEXT NOT NULL,
+            keyword TEXT,
+            created_at DATETIME,
+            UNIQUE(vendor, token)
+        )
+    """)
+    # Additive migration for stores created before the profile-aware batch tag:
+    # `keyword` records which harvest phrase found the company ("curated" for the
+    # hand-seeded set) so select_ats_batch_for_run can favour a profile's sector.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(company_ats)")}
+    if "keyword" not in cols:
+        conn.execute("ALTER TABLE company_ats ADD COLUMN keyword TEXT")
+    return conn
+
+
 def load_company_ats() -> List[tuple]:
-    """Returns a list of (company, vendor, token) rows from the bootstrapped
-    ATS token store."""
-    init_db()
-    conn = get_db()
-    rows = conn.execute("SELECT company, vendor, token FROM company_ats").fetchall()
+    """Returns a list of (company, vendor, token, keyword) rows from the
+    bootstrapped ATS token store (shared with the backend DB)."""
+    conn = _ats_db()
+    rows = conn.execute("SELECT company, vendor, token, keyword FROM company_ats").fetchall()
     conn.close()
-    return [(r["company"], r["vendor"], r["token"]) for r in rows]
+    return [(r["company"], r["vendor"], r["token"], r["keyword"]) for r in rows]
 
 
-def save_company_ats(rows: List[tuple]) -> None:
-    """Upserts (company, vendor, token) rows into the ATS token store."""
-    init_db()
-    conn = get_db()
-    for company, vendor, token in rows:
+def save_company_ats(rows: List[tuple], default_keyword: str = "curated") -> None:
+    """Upserts rows into the ATS token store. Each row is (company, vendor, token)
+    or (company, vendor, token, keyword); a missing keyword defaults to
+    `default_keyword` (the hand-seeded set is tagged "curated")."""
+    conn = _ats_db()
+    for row in rows:
+        company, vendor, token = row[0], row[1], row[2]
+        keyword = row[3] if len(row) > 3 and row[3] else default_keyword
         conn.execute(
-            "INSERT OR IGNORE INTO company_ats(company, vendor, token) VALUES(?,?,?)",
-            (company, vendor, token)
+            "INSERT OR IGNORE INTO company_ats(company, vendor, token, keyword) VALUES(?,?,?,?)",
+            (company, vendor, token, keyword)
         )
     conn.commit()
     conn.close()
@@ -606,11 +807,24 @@ def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
         "greenhouse": "site:boards.greenhouse.io",
         "lever":      "site:jobs.lever.co",
         "ashby":      "site:jobs.ashbyhq.com",
+        "workable":   "site:apply.workable.com",
+        "recruitee":  "site:recruitee.com",
+        "personio":   "site:jobs.personio.com",
     }
-    token_re = re.compile(r"(?:greenhouse\.io|lever\.co|ashbyhq\.com)/([A-Za-z0-9_-]+)")
+    # Path-segment vendors carry the token after the domain; subdomain vendors
+    # (recruitee, personio) carry it before the domain -- hence per-vendor regex.
+    token_res = {
+        "greenhouse": re.compile(r"greenhouse\.io/([A-Za-z0-9_-]+)"),
+        "lever":      re.compile(r"lever\.co/([A-Za-z0-9_-]+)"),
+        "ashby":      re.compile(r"ashbyhq\.com/([A-Za-z0-9_-]+)"),
+        "workable":   re.compile(r"apply\.workable\.com/([A-Za-z0-9_-]+)"),
+        "recruitee":  re.compile(r"https?://([A-Za-z0-9_-]+)\.recruitee\.com"),
+        "personio":   re.compile(r"https?://([A-Za-z0-9_-]+)\.jobs\.personio\."),
+    }
 
     found: List[tuple] = []
     for vendor, site in site_patterns.items():
+        token_re = token_res[vendor]
         for keyword in sector_keywords:
             params = {"engine": "google", "q": f"{site} {keyword}", "api_key": SERPAPI_KEY}
             try:
@@ -624,9 +838,11 @@ def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
                 m = token_re.search(link)
                 if m:
                     token = m.group(1)
-                    found.append((token, vendor, token))
+                    # Tag the row with the phrase that found it so the batch
+                    # selector can favour it for profiles in this sector.
+                    found.append((token, vendor, token, keyword))
 
-    deduped = list({(c, v, t) for c, v, t in found})
+    deduped = list({(c, v, t, kw) for c, v, t, kw in found})
     save_company_ats(deduped)
     emit(f"[ats] Harvested {len(deduped)} ATS tokens across {len(site_patterns)} vendors.")
     return deduped
@@ -933,9 +1149,18 @@ def final_evaluation(jobs: list[dict], profile: dict) -> list[dict]:
 Candidate Background Profile:
 {cv_text}
 
-Analyze the {len(jobs)} complete extracted documents below. Return every role that is a genuinely
-strong fit for this candidate, up to {FINAL_PICKS}, ordered best first. Return fewer than {FINAL_PICKS}
-if fewer genuinely qualify - do not pad the list with weak matches.
+Analyze the {len(jobs)} complete extracted documents below. For each job, first check whether it
+states an explicit experience/seniority requirement (years of experience, "senior"/"lead"/"principal"
+in the title, or prior experience in a specific sector/domain). Compare that requirement against the
+candidate's actual seniority and background above:
+- If the job clearly requires meaningfully more experience or specific sector experience the candidate
+  does not have, treat that as a disqualifying concern, not a minor caveat - exclude the role unless
+  the candidate's transferable experience genuinely closes the gap.
+- If the requirement is soft, negotiable, or not stated, judge fit on skills/interests as normal -
+  don't invent a seniority objection that isn't in the text.
+
+Return every role that is a genuinely strong fit for this candidate, up to {FINAL_PICKS}, ordered best
+first. Return fewer than {FINAL_PICKS} if fewer genuinely qualify - do not pad the list with weak matches.
 Output ONLY valid structural JSON object (no markdown formatting code):
 {{"selections": [
   {{
@@ -943,9 +1168,9 @@ Output ONLY valid structural JSON object (no markdown formatting code):
     "title": "...",
     "company": "...",
     "url": "...",
-    "summary": "2-3 clear descriptive evaluation sentences mapping role profile directly to candidate vector.",
-    "match_reasons": ["concrete alignment factor 1", "concrete alignment factor 2"],
-    "concerns": ["notable technical skill caps or structural prerequisites"]
+    "summary": "1 concise sentence on why this role fits the candidate.",
+    "match_reasons": ["concrete alignment factor 1", "concrete alignment factor 2 (max 2)"],
+    "concerns": ["the single most notable skill gap or prerequisite, if any"]
   }}
 ]}}
 

@@ -15,8 +15,8 @@ export function Chip({ label, onRemove }: { label: string; onRemove?: () => void
 
 export function SuggestChip({ label, onAdd }: { label: string; onAdd: () => void }) {
   return (
-    <span className="chip-suggest" onClick={onAdd} role="button">
-      + {label}
+    <span className="ghost suggest" onClick={onAdd} role="button">
+      ✦ {label}
     </span>
   );
 }

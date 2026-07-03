@@ -33,6 +33,7 @@ class Profile(Base):
     user_id = Column(Integer, nullable=False, default=CURRENT_USER_ID, index=True)
     name = Column(Text, nullable=False)
     is_active = Column(Boolean, default=True)
+    cv_text = Column(Text)  # raw uploaded/pasted document text, for target-role regeneration
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 
@@ -80,6 +81,7 @@ class Role(Base):
     url = Column(Text)
     tags = Column(JSON)  # ["React","Python","Senior"] - display only
     salary_text = Column(Text)
+    source = Column(Text)  # board this role was discovered on (see JobSeen.source)
     fit_rank = Column(Integer)  # 1..N within a search batch
     ai_analysis = Column(Text)  # the expensive-AI justification
     status = Column(Text, nullable=False, default="new")
@@ -143,8 +145,9 @@ class CompanyATS(Base):
 
     id = Column(Integer, primary_key=True)
     company = Column(Text, nullable=False)
-    vendor = Column(Text, nullable=False)  # greenhouse|lever|ashby
+    vendor = Column(Text, nullable=False)  # greenhouse|lever|ashby|workable|recruitee|personio
     token = Column(Text, nullable=False)
+    keyword = Column(Text)  # harvest phrase that found it ("curated" for the seed)
     created_at = Column(DateTime, default=_now)
 
     __table_args__ = (
@@ -165,3 +168,22 @@ class SearchRun(Base):
     result_count = Column(Integer, default=0)
     started_at = Column(DateTime, default=_now)
     finished_at = Column(DateTime)
+    phase_timings = Column(Text)  # JSON-encoded {phase_name: seconds}, for perf analysis
+
+
+class Setting(Base):
+    """Generic key/value store for app settings that don't warrant their own
+    table: per-source enable/disable toggles, last-run per-source counts, and the
+    harvest keyword-hash marker. profile_id NULL means a global (per-user) setting."""
+
+    __tablename__ = "settings"
+
+    id = Column(Integer, primary_key=True)
+    profile_id = Column(Integer, nullable=True, index=True)  # NULL = global
+    key = Column(Text, nullable=False)
+    value = Column(Text)  # free-form; JSON-encoded where structured
+    updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        UniqueConstraint("profile_id", "key", name="uq_settings_profile_key"),
+    )

@@ -23,26 +23,65 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import full_auto as engine
 
-# Curated candidates: well-known companies with public job boards. Generous on
-# purpose - live validation below filters out any that are wrong or have moved.
+# Curated candidates: companies with public ATS boards, chosen to cover the
+# actual target sectors (marketing/comms, ops/analyst, media/publishing,
+# nonprofits, remote-first UK/EU, scale-ups) rather than only FAANG-adjacent
+# engineering shops -- those over-index the pool with irrelevant roles. Generous
+# on purpose: live validation below drops any token that's wrong or has moved,
+# so the store never accumulates dead boards. The SerpAPI harvest (--harvest,
+# fed profile-derived keywords) is what grows this beyond the curated seed.
 CANDIDATES = {
     "greenhouse": [
-        "stripe", "databricks", "robinhood", "coinbase", "dropbox", "instacart",
-        "brex", "plaid", "figma", "retool", "discord", "cloudflare", "doordash",
-        "lyft", "pinterest", "reddit", "asana", "benchling", "samsara", "affirm",
-        "chime", "gusto", "lattice", "mongodb", "hashicorp", "elastic",
-        "confluent", "snowflake", "datadog", "gitlab", "airtable", "twilio",
-        "sofi", "wise", "monzo", "deliveroo", "gocardless", "starlingbank",
-        "improbable", "wayve", "octoenergy", "revolut", "palantir",
+        # engineering / product tech (kept so software/data profiles stay covered)
+        "databricks", "figma", "cloudflare", "datadog", "mongodb", "snowflake",
+        "confluent", "discord", "reddit", "pinterest", "dropbox", "samsara",
+        "benchling", "coinbase", "plaid", "robinhood", "stripe", "hashicorp",
+        "elastic", "gitlab", "airtable", "twilio",
+        # media / publishing / comms (marketing, editorial, outreach, analyst roles)
+        "voxmedia", "buzzfeed", "npr", "theguardian", "guardiannewsandmedia",
+        "condenast", "theathletic", "vice", "dotdashmeredith", "gannett",
+        # nonprofits / mission-driven (ops, comms, programme, data roles)
+        "wikimedia", "codeforamerica", "khanacademy", "girlswhocode", "mozilla",
+        "wikimediafoundation", "chanzuckerberg", "propublica", "malala",
+        # remote-first / distributed orgs (broad non-eng hiring)
+        "remotecom", "oysterhr", "close", "hopin", "gohenry", "hotjar",
+        "typeform", "personio",
+        # UK/EU scale-ups & ops-heavy consumer businesses (marketing, ops, analyst)
+        "deliveroo", "gousto", "depop", "trainline", "octoenergy", "starlingbank",
+        "gocardless", "monzo", "wise", "tide", "sumup", "cazoo", "onfido",
+        "moneybox", "freetrade", "cleo", "zego", "bulb", "farfetch", "vinted",
+        # broad hirers (large marketing/ops/data orgs alongside eng)
+        "gusto", "lattice", "asana",
     ],
     "lever": [
-        "netflix", "spotify", "match", "yelp", "leadgenius", "lever", "ramp",
-        "plaid", "nubank", "kraken", "blockchain", "voiceflow",
+        # media / consumer / marketplaces with heavy ops & marketing hiring
+        "netflix", "spotify", "yelp", "match", "nubank",
+        # engineering / fintech (kept for software/data profiles)
+        "ramp", "plaid", "kraken",
+        # agencies / marketing / creative / remote-first
+        "buffer", "canva", "brandwatch", "huel", "brew", "shopify",
+        # nonprofits / social impact
+        "leadgenius", "kiva", "watershed",
     ],
     "ashby": [
-        "openai", "ramp", "linear", "vanta", "posthog", "replicate", "modal",
-        "cohere", "mistral", "deel", "runway", "elevenlabs", "perplexity",
-        "huggingface", "together", "anysphere", "notion", "scaleai", "clay",
+        # AI / engineering labs (kept so technical profiles stay covered)
+        "openai", "cohere", "mistral", "perplexity", "huggingface", "together",
+        "anysphere", "scaleai", "replicate", "modal", "runway", "elevenlabs",
+        # remote-first scale-ups that hire broadly across ops/marketing/comms
+        "deel", "notion", "linear", "vanta", "posthog", "clay", "ramp",
+        "remote", "gumroad", "loom", "webflow", "mercury", "zapier",
+    ],
+    # Newer vendors (see ATS_FEEDS): a small confident seed only -- the SerpAPI
+    # harvest is the real driver of coverage here, since these skew to many
+    # smaller EU/remote-first orgs whose tokens aren't well-known.
+    "workable": [
+        "hotjar", "typeform", "remote",
+    ],
+    "recruitee": [
+        "recruitee",
+    ],
+    "personio": [
+        "personio",
     ],
 }
 

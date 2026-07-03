@@ -38,6 +38,10 @@ def _migrate_columns():
     insp = inspect(engine)
     additions = {
         "jobs_seen": [("embedding", "TEXT")],
+        "company_ats": [("keyword", "TEXT")],
+        "search_runs": [("phase_timings", "TEXT")],
+        "roles": [("source", "TEXT")],
+        "profiles": [("cv_text", "TEXT")],
     }
     for table, cols in additions.items():
         if not insp.has_table(table):

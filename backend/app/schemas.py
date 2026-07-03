@@ -83,6 +83,7 @@ class RoleOut(ORMModel):
     url: Optional[str] = None
     tags: Optional[Any] = None
     salary_text: Optional[str] = None
+    source: Optional[str] = None
     fit_rank: Optional[int] = None
     ai_analysis: Optional[str] = None
     status: str

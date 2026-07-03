@@ -14,7 +14,7 @@ interface ProfileCtx {
 }
 
 const Ctx = createContext<ProfileCtx | null>(null);
-const STORAGE_KEY = "jobmatch.activeProfileId";
+const STORAGE_KEY = "omniboard.activeProfileId";
 
 export function ProfileProvider({ children }: { children: React.ReactNode }) {
   const { data: profiles = [], isLoading } = useQuery({

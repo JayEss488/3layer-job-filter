@@ -39,11 +39,11 @@ export function ProfileTabs() {
   }
 
   return (
-    <div className="profile-tab-bar">
+    <div className="ptabs">
       {profiles.map((p) => (
         <div
           key={p.id}
-          className={`profile-tab${p.id === activeId ? " active" : ""}`}
+          className={`ptab ${p.id === activeId ? "on" : "off"}`}
           onClick={() => setActiveId(p.id)}
           onDoubleClick={() => {
             setRenamingId(p.id);
@@ -53,7 +53,7 @@ export function ProfileTabs() {
           {renamingId === p.id ? (
             <input
               autoFocus
-              className="profile-tab-rename"
+              className="ptab-rename"
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onBlur={() => rename(p.id)}
@@ -65,7 +65,7 @@ export function ProfileTabs() {
               {p.name}
               {profiles.length > 1 && (
                 <span
-                  className="tab-x"
+                  className="x"
                   onClick={(e) => {
                     e.stopPropagation();
                     remove(p.id);
@@ -78,8 +78,8 @@ export function ProfileTabs() {
           )}
         </div>
       ))}
-      <div className="profile-tab add-tab" onClick={createProfile}>
-        + new
+      <div className="ptab new" onClick={createProfile}>
+        ＋ new
       </div>
     </div>
   );

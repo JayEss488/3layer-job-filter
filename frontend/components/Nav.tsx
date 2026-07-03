@@ -12,6 +12,7 @@ const TABS = [
   { href: "/search", label: "Search" },
   { href: "/my-roles", label: "My Roles" },
   { href: "/dashboard", label: "Profile" },
+  { href: "/settings", label: "Settings" },
 ];
 
 export function Nav() {
@@ -37,17 +38,21 @@ export function Nav() {
 
   return (
     <div className="nav">
-      {TABS.map((t) => (
-        <Link
-          key={t.href}
-          href={t.href}
-          className={`nav-tab${pathname.startsWith(t.href) ? " active" : ""}`}
-        >
-          {t.label}
-        </Link>
-      ))}
-      <div className="nav-spacer" />
-      <button className="nav-btn" onClick={runSearch} disabled={running || !activeId}>
+      <div className="nav-left">
+        <div className="logo">O</div>
+        <div className="tabs">
+          {TABS.map((t) => (
+            <Link
+              key={t.href}
+              href={t.href}
+              className={`tab${pathname.startsWith(t.href) ? " active" : ""}`}
+            >
+              {t.label}
+            </Link>
+          ))}
+        </div>
+      </div>
+      <button className="btn btn-primary" onClick={runSearch} disabled={running || !activeId}>
         {running ? "Starting…" : "▶ Run New Search"}
       </button>
     </div>

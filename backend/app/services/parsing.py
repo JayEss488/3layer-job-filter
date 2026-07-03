@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..config import ATTRIBUTE_TYPES
 from ..models import ProfileAttribute
-from .llm import llm_json
+from .llm import STRONG_MODEL, llm_json
 
 _PARSE_SYSTEM = (
     "You extract a structured job-search profile from a candidate's CV or notes. "
@@ -23,11 +23,11 @@ def _parse_prompt(text: str) -> str:
     return f"""Extract a job-search profile from the document below.
 Return ONLY a JSON object with these keys (omit a key if nothing applies; never invent):
 {{
-  "past_role":   ["job titles the candidate has actually held"],
+  "past_role":   ["job title only the candidate has actually held, e.g. 'Sales Associate' -- never append the employer name (not 'Sales Associate - Acme Corp')"],
   "skill":       ["concrete skills/tools, max 12"],
   "experience":  ["short achievement bullets, e.g. 'Led team of 8'"],
   "seniority":   ["one of: Junior, Mid, Senior, Lead, Director, C-Suite"],
-  "target_role": ["roles the candidate explicitly says they want next, if any"],
+  "target_role": ["4-6 job titles this candidate should realistically target next. If the document explicitly states an ambition, include it, but do not stop there: weigh the FULL picture -- leadership/project experience, applied use of tools (not just a listed skill), academic background, languages, communications/organisational work -- as heavily as a formal skills-inventory section. Do not default to generic titles that only match keywords in a skills list if the candidate's strongest, most differentiated evidence points elsewhere (e.g. a small self-taught coding project is weaker evidence than a led, evidenced project with real outcomes)."],
   "location":    ["city/region and/or work types like Remote, Hybrid, On-site"],
   "salary":      ["a single range like '70000-90000' only if clearly stated"],
   "custom":      ["any hard constraints stated, e.g. 'visa sponsorship required'"]
@@ -61,7 +61,7 @@ def parse_text_to_attributes(
     if not text or not text.strip():
         return []
 
-    data = llm_json(_parse_prompt(text), system=_PARSE_SYSTEM)
+    data = llm_json(_parse_prompt(text), system=_PARSE_SYSTEM, model=STRONG_MODEL)
 
     created: list[ProfileAttribute] = []
     seen: set[tuple[str, str]] = set()

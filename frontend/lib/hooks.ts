@@ -71,6 +71,10 @@ export function useAttributeMutations(profileId: number) {
     mutationFn: (id: number) => api.deleteAttribute(id),
     onSuccess: invalidate,
   });
+  const clearAll = useMutation({
+    mutationFn: (ids: number[]) => Promise.all(ids.map((id) => api.deleteAttribute(id))),
+    onSuccess: invalidate,
+  });
 
-  return { add, update, remove, invalidate };
+  return { add, update, remove, clearAll, invalidate };
 }

@@ -25,7 +25,7 @@ export function AttributeRow({
   enableSuggest = false,
   placeholder,
 }: Props) {
-  const { add, remove } = useAttributeMutations(profileId);
+  const { add, remove, clearAll } = useAttributeMutations(profileId);
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [suggestions, setSuggestions] = useState<string[]>([]);
@@ -58,10 +58,10 @@ export function AttributeRow({
   }
 
   return (
-    <div className="attr-row">
-      <div className="attr-label">{label}</div>
-      <div className="attr-values" style={{ flexDirection: "column", alignItems: "stretch" }}>
-        <div className="attr-values">
+    <div className="row">
+      <div className="label">{label}</div>
+      <div className="field col">
+        <div className="field">
           {attributes.map((a) => (
             <Chip key={a.id} label={a.value} onRemove={() => remove.mutate(a.id)} />
           ))}
@@ -69,7 +69,7 @@ export function AttributeRow({
           {adding ? (
             <input
               autoFocus
-              className="inline-input"
+              className="input"
               value={draft}
               placeholder={placeholder || `Add ${label.toLowerCase()}…`}
               onChange={(e) => setDraft(e.target.value)}
@@ -86,14 +86,33 @@ export function AttributeRow({
               }}
             />
           ) : (
-            <button className="chip-add" onClick={() => setAdding(true)}>
-              + add
+            <button className="ghost" onClick={() => setAdding(true)}>
+              ＋ add
             </button>
           )}
 
           {enableSuggest && (
-            <button className="chip-add" onClick={fetchSuggestions} disabled={loadingSuggest}>
-              {loadingSuggest ? "…" : "✨ suggest"}
+            <button
+              className="ghost suggest"
+              onClick={fetchSuggestions}
+              disabled={loadingSuggest}
+              style={loadingSuggest ? { opacity: 0.5 } : undefined}
+            >
+              ✦ suggest
+            </button>
+          )}
+
+          {type === "target_role" && attributes.length > 0 && (
+            <button
+              className="ghost"
+              onClick={() => {
+                if (window.confirm(`Clear all ${attributes.length} target roles?`)) {
+                  clearAll.mutate(attributes.map((a) => a.id));
+                }
+              }}
+              disabled={clearAll.isPending}
+            >
+              ✕ clear all
             </button>
           )}
         </div>
@@ -101,7 +120,7 @@ export function AttributeRow({
         {suggestions.length > 0 && (
           <div style={{ marginTop: 6 }}>
             <div className="suggest-label">AI suggestions — tap to add</div>
-            <div className="attr-values" style={{ marginTop: 3 }}>
+            <div className="field" style={{ marginTop: 3 }}>
               {suggestions.map((s) => (
                 <SuggestChip key={s} label={s} onAdd={() => commit(s)} />
               ))}

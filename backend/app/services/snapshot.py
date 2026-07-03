@@ -74,7 +74,16 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
             search_terms.append(t)
     search_terms = search_terms[:14] or ["jobs"]
 
-    region = _infer_region(skills, target_roles + past_roles, location)
+    # Country: explicit user selection (multi-choice) takes priority over the
+    # LLM-inferred guess. "global" (or no selection) means no hard filter.
+    selected_countries = [c.lower() for c in _values(g.get("country", []))]
+    country_codes = [c for c in selected_countries if c != "global"]
+
+    if country_codes:
+        region = {"sectors": _infer_region(skills, target_roles + past_roles, location)["sectors"],
+                   "adzuna_country_code": country_codes[0]}
+    else:
+        region = _infer_region(skills, target_roles + past_roles, location)
     seniority = ", ".join(seniorities) if seniorities else "mid-level"
 
     engine_profile = {
@@ -83,15 +92,21 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         "key_skills": skills[:10],
         "location": location,
         "adzuna_country_code": region["adzuna_country_code"],
+        "country_codes": country_codes,  # [] means no hard filter (Global)
         "search_terms": search_terms,
     }
 
     # Weighted emphasis text drives the embedding pre-filter: repeat each value
     # roughly in proportion to its learned weight so feedback actually shifts results.
+    # target_role gets a baseline lead over skill/past_role so a first-ever search
+    # (before any feedback has nudged weights) still embeds toward what the
+    # candidate WANTS, not just what they've done/used.
+    _BASE_EMPHASIS = {"target_role": 3, "skill": 1, "past_role": 1}
     emphasis: list[str] = []
-    for group in (g.get("target_role", []), g.get("skill", []), g.get("past_role", [])):
-        for a in group:
-            emphasis.extend([a.value] * max(1, round(a.weight)))
+    for group_name in ("target_role", "skill", "past_role"):
+        base = _BASE_EMPHASIS[group_name]
+        for a in g.get(group_name, []):
+            emphasis.extend([a.value] * base * max(1, round(a.weight)))
     emphasis.extend(region["sectors"])
     emphasis.append(seniority)
     weighted_text = " ".join(emphasis) or " ".join(search_terms)

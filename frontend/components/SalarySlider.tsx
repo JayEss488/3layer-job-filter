@@ -16,10 +16,10 @@ function fmt(n: number) {
 }
 
 function parse(value?: string): [number, number] {
-  if (!value) return [70000, 90000];
+  if (!value) return [MIN, MAX];
   const nums = value.replace(/[^0-9-]/g, "").split("-").map(Number);
   if (nums.length === 2 && !nums.some(isNaN)) return [nums[0], nums[1]];
-  return [70000, 90000];
+  return [MIN, MAX];
 }
 
 /** Range slider persisted as one salary attribute "min-max". */
@@ -44,10 +44,14 @@ export function SalarySlider({
     invalidate();
   }
 
+  const loPct = ((lo - MIN) / (MAX - MIN)) * 100;
+  const hiPct = ((hi - MIN) / (MAX - MIN)) * 100;
+
   return (
-    <div className="slider-mock">
-      <div className="range-wrap">
-        <div className="range-track" />
+    <div className="slider">
+      <div className="track">
+        <div className="rail" />
+        <div className="fill" style={{ left: `${loPct}%`, width: `${hiPct - loPct}%` }} />
         <input
           type="range"
           min={MIN}
@@ -69,7 +73,7 @@ export function SalarySlider({
           onTouchEnd={() => persist([lo, hi])}
         />
       </div>
-      <div className="slider-labels" style={{ width: 300 }}>
+      <div className="scale">
         <span>{fmt(lo)}</span>
         <span>{fmt(hi)}</span>
       </div>

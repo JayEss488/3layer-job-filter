@@ -1,5 +1,5 @@
 {
-  "name": "jobmatch-frontend",
+  "name": "omni-board-frontend",
   "version": "1.0.0",
   "private": true,
   "scripts": {
@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.62.7",
+    "geist": "^1.7.2",
     "next": "^14.2.35",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
