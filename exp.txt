@@ -1,6 +1,5 @@
 Seniority: Junior
-Skills: Python, JavaScript, HTML/CSS, SQL, Google Apps Script, Beautiful Soup, OpenAI API, Pandas, scikit-learn, Supabase, Excel (advanced), GIMP
+Skills: JavaScript, HTML/CSS, Google Apps Script, Beautiful Soup, OpenAI API, scikit-learn, Excel (advanced), GIMP, Pandas, Supabase, Python, SQL
 Experience: Operated a high-footfall amusement ride during peak season; managed ride safety and guest experience; Ran sports and cultural activities for international summer camp students; Served as sole welfare oversight overnight and handled minor incident management; Worked independently abroad on a J1 visa, including cooking, go-kart/golf buggy operations, and site maintenance; Voluntary weekly online tutoring for a GCSE Physics student; adapted explanations to the student’s level and pace; Built a visual novel with analytics (Supabase + Python) and iterated based on CTR improvements; Built automation tooling for cold outreach and job-alert filtering using Python, Gmail/Sheets APIs, and OpenAI API; Built ML model for X-ray bone density analysis using feature extraction and scikit-learn; Built websites from scratch (HTML/CSS) and hosted via GitHub Pages
 Target roles: Programme/Project Coordinator (charity, climate, EA-aligned orgs), Policy Advisor / Research Officer (public sector, science-adjacent), AI/Automation-Adjacent Analyst or Coordinator roles (non-engineering), Communications/Marketing Officer (charity or environmental sector), Junior Data/Insights role — but titled toward business/policy analytics
-Location: Southend-on-Sea, Essex (On-site, Hybrid)
-Constraints: Remote roles: immediately (no notice); In-person roles: time to relocate (stated notice = 0 for remote)
+Location: UK (On-site, Hybrid)

@@ -48,6 +48,7 @@ ATTRIBUTE_TYPES = [
     "salary",
     "location",
     "country",
+    "location_scope",
     "custom",
 ]
 
@@ -61,8 +62,21 @@ ATTRIBUTE_DIRECTION = {
     "salary": "constraint",
     "location": "constraint",
     "country": "constraint",
+    "location_scope": "constraint",
     "custom": "constraint",
 }
+
+# How far the candidate's stated location/country should be trusted as a hard
+# filter. Single-value (like seniority), independent of work-type (remote/
+# hybrid/on-site) and independent of the country multi-select: "local" narrows
+# to the stated city on top of the country filter, "national" is today's
+# default country-fail-closed behaviour, "international" drops the country
+# filter entirely regardless of any country chips picked.
+LOCATION_SCOPE_CHOICES = [
+    ("national", "National"),
+    ("local", "Local"),
+    ("international", "International"),
+]
 
 # Selectable countries for the hard location filter (code -> Adzuna cc / label).
 # "global" is a sentinel meaning "no country filter".

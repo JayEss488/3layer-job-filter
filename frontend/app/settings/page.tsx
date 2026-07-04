@@ -111,6 +111,7 @@ export default function SettingsPage() {
   }
 
   const pct = (n: number) => (total > 0 ? Math.round((n / total) * 100) : 0);
+  const funnelPct = (n: number, base: number) => (base > 0 ? Math.round((n / base) * 100) : 0);
 
   return (
     <div className="app">
@@ -244,33 +245,38 @@ export default function SettingsPage() {
           <div className="panel-h">Source performance</div>
           <div className="panel-b">
             <div className="annotation">
-              All-time counts per source: how many jobs it's discovered, how many made
-              the top-25 shortlist pool, how many made the final AI-picked shortlist, and
-              how many you actually saved or applied to. Useful for deciding which APIs
-              are worth keeping.
+              All-time funnel per source: how many jobs it's discovered, how many
+              survived the sector/seniority gates and made the shortlist, how many
+              made the final AI-picked selection, and how many you actually saved or
+              applied to. Useful for deciding which APIs are worth keeping.
             </div>
-            <table style={{ width: "100%", marginTop: 12, borderCollapse: "collapse", fontSize: 12.5 }}>
-              <thead>
-                <tr style={{ textAlign: "right" }}>
-                  <th style={{ textAlign: "left", paddingBottom: 6 }}>Source</th>
-                  <th style={{ paddingBottom: 6 }}>Discovered</th>
-                  <th style={{ paddingBottom: 6 }}>Top 25</th>
-                  <th style={{ paddingBottom: 6 }}>Shown</th>
-                  <th style={{ paddingBottom: 6 }}>Selected</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(sourceStats ?? []).map((s) => (
-                  <tr key={s.key} style={{ textAlign: "right", borderTop: "1px solid var(--line-2)" }}>
-                    <td style={{ textAlign: "left", padding: "6px 0" }}>{s.label}</td>
-                    <td>{s.discovered}</td>
-                    <td>{s.top25}</td>
-                    <td>{s.shown}</td>
-                    <td>{s.selected}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <div className="funnel-row funnel-header" style={{ marginTop: 12 }}>
+              <div className="funnel-label" />
+              <div className="funnel-track" />
+              <div className="funnel-counts">
+                <span>Disc</span>
+                <span>Gated</span>
+                <span>Shown</span>
+                <span>Sel</span>
+              </div>
+            </div>
+            {(sourceStats ?? []).map((s) => (
+              <div key={s.key} className="funnel-row">
+                <div className="funnel-label">{s.label}</div>
+                <div className="funnel-track">
+                  <div className="funnel-seg discovered" style={{ width: "100%" }} />
+                  <div className="funnel-seg gated" style={{ width: `${funnelPct(s.gated, s.discovered)}%` }} />
+                  <div className="funnel-seg shown" style={{ width: `${funnelPct(s.shown, s.discovered)}%` }} />
+                  <div className="funnel-seg selected" style={{ width: `${funnelPct(s.selected, s.discovered)}%` }} />
+                </div>
+                <div className="funnel-counts">
+                  <span>{s.discovered}</span>
+                  <span>{s.gated}</span>
+                  <span>{s.shown}</span>
+                  <span>{s.selected}</span>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
 

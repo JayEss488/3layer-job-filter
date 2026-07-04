@@ -23,15 +23,17 @@ def _parse_prompt(text: str) -> str:
     return f"""Extract a job-search profile from the document below.
 Return ONLY a JSON object with these keys (omit a key if nothing applies; never invent):
 {{
-  "past_role":   ["job title only the candidate has actually held, e.g. 'Sales Associate' -- never append the employer name (not 'Sales Associate - Acme Corp')"],
-  "skill":       ["concrete skills/tools, max 12"],
-  "experience":  ["short achievement bullets, e.g. 'Led team of 8'"],
+  "past_role":   [{{"value": "job title only the candidate has actually held, e.g. 'Sales Associate' -- never append the employer name (not 'Sales Associate - Acme Corp')", "proficiency": "duration/commitment level, ONLY if the source states or clearly implies it, e.g. '3 years' vs 'one-off, one week volunteer stint' -- omit this key entirely if not stated, never invent a duration"}}],
+  "skill":       [{{"value": "a concrete skill/tool, max 12 total", "proficiency": "depth signal, ONLY if the source states or clearly implies it, e.g. '5+ years, daily use' or 'used once in a course project' -- omit this key entirely if not stated, never invent a duration or expertise level"}}],
+  "experience":  ["short achievement bullets, e.g. 'Led team of 8'; include a duration/frequency qualifier only if the source text states it"],
   "seniority":   ["one of: Junior, Mid, Senior, Lead, Director, C-Suite"],
   "target_role": ["4-6 job titles this candidate should realistically target next. If the document explicitly states an ambition, include it, but do not stop there: weigh the FULL picture -- leadership/project experience, applied use of tools (not just a listed skill), academic background, languages, communications/organisational work -- as heavily as a formal skills-inventory section. Do not default to generic titles that only match keywords in a skills list if the candidate's strongest, most differentiated evidence points elsewhere (e.g. a small self-taught coding project is weaker evidence than a led, evidenced project with real outcomes)."],
   "location":    ["city/region and/or work types like Remote, Hybrid, On-site"],
   "salary":      ["a single range like '70000-90000' only if clearly stated"],
   "custom":      ["any hard constraints stated, e.g. 'visa sponsorship required'"]
 }}
+
+Note: "past_role" and "skill" items are objects with "value" and an optional "proficiency" -- every other key is a plain list of strings.
 
 Document:
 {text[:12000]}"""
@@ -73,8 +75,15 @@ def parse_text_to_attributes(
             values = [values]
         if not isinstance(values, list):
             continue
-        for value in values:
-            value = str(value).strip()
+        for item in values:
+            proficiency = None
+            if isinstance(item, dict):
+                value = str(item.get("value", "")).strip()
+                proficiency = item.get("proficiency")
+                if proficiency is not None:
+                    proficiency = str(proficiency).strip() or None
+            else:
+                value = str(item).strip()
             if not value:
                 continue
             key = (attr_type, value.lower())
@@ -87,6 +96,7 @@ def parse_text_to_attributes(
                 value=value,
                 source=source,
                 confirmed=False,
+                proficiency=proficiency,
             )
             db.add(attr)
             created.append(attr)

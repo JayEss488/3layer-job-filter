@@ -50,7 +50,7 @@ export const api = {
   attributes: (id: number) => req<AttributesResponse>(`/profiles/${id}/attributes`),
   addAttribute: (
     id: number,
-    body: { type: AttributeType; value: string; source?: string; confirmed?: boolean }
+    body: { type: AttributeType; value: string; source?: string; confirmed?: boolean; proficiency?: string }
   ) =>
     req<Attribute>(`/profiles/${id}/attributes`, {
       method: "POST",
@@ -58,7 +58,7 @@ export const api = {
     }),
   updateAttribute: (
     attrId: number,
-    body: { value?: string; confirmed?: boolean; weight?: number }
+    body: { value?: string; confirmed?: boolean; weight?: number; proficiency?: string }
   ) =>
     req<Attribute>(`/attributes/${attrId}`, {
       method: "PATCH",

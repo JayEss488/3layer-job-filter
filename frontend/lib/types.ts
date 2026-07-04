@@ -7,6 +7,7 @@ export type AttributeType =
   | "salary"
   | "location"
   | "country"
+  | "location_scope"
   | "custom";
 
 export interface Profile {
@@ -33,7 +34,7 @@ export interface SourceStat {
   key: string;
   label: string;
   discovered: number;
-  top25: number;
+  gated: number;
   shown: number;
   selected: number;
 }
@@ -50,6 +51,7 @@ export interface Attribute {
   weight: number;
   source: string;
   confirmed: boolean;
+  proficiency?: string | null;
 }
 
 export interface AttributesResponse {

@@ -302,6 +302,67 @@ def _filter_by_country(engine, jobs: list[dict], country_codes: list[str]) -> li
     return kept
 
 
+def _filter_by_local_place(jobs: list[dict], place: str) -> list[dict]:
+    """Hard-drop jobs whose location doesn't mention the candidate's city/place.
+    Only active when the profile's location_scope is "local" -- a much tighter
+    filter than the country check, so it's applied on top of it, not instead of
+    it. Unlike _filter_by_country, a blank location is dropped rather than
+    falling back to the snippet/description: a substring match against free
+    text is far more prone to false positives than the country token match, so
+    it needs the stronger signal (an actual location field) to keep a job."""
+    if not place:
+        return jobs
+    needle = place.strip().lower()
+    if not needle:
+        return jobs
+    return [j for j in jobs if needle in (j.get("location", "") or "").lower()]
+
+
+def _filter_by_salary(jobs: list[dict], salary_floor: int) -> list[dict]:
+    """Hard-drop jobs whose stated maximum salary is clearly below the candidate's
+    floor. Same posture as the country filter but softer: salary data is sparser
+    and unknown salary always passes through (never hard-dropped on missing data).
+    Only the *max* is compared, and only when it's a positive number, so a role
+    listing a range whose top end is under the floor is dropped while an
+    unpriced role survives. Note: magnitudes are compared as-is across
+    currencies (GBP/USD/EUR/AUD are close enough for a floor check); this is a
+    coarse guard, not a precise salary match. floor <= 0 disables it entirely."""
+    if not salary_floor or salary_floor <= 0:
+        return jobs
+    kept = []
+    for j in jobs:
+        smax = j.get("salary_max")
+        try:
+            smax = float(smax) if smax is not None else None
+        except (ValueError, TypeError):
+            smax = None
+        if smax is not None and smax > 0 and smax < salary_floor:
+            continue
+        kept.append(j)
+    return kept
+
+
+def _log_score_distribution(emit, scored: list[dict]) -> None:
+    """Calibration aid (Stage 3): log the embed_score distribution of the WHOLE
+    scored set, not just survivors, so RELEVANCE_PRIMARY/FLOOR can eventually be
+    set from real data instead of the current fixed guess. Cheap, log-only."""
+    if not scored:
+        return
+    scores = sorted((j.get("embed_score", 0.0) for j in scored), reverse=True)
+    n = len(scores)
+    def _pct(p: float) -> float:
+        return round(scores[min(n - 1, int(p * n))], 3)
+    buckets = {"0.4+": 0, "0.35-0.4": 0, "0.3-0.35": 0, "0.2-0.3": 0, "<0.2": 0}
+    for s in scores:
+        if s >= 0.40:   buckets["0.4+"] += 1
+        elif s >= 0.35: buckets["0.35-0.4"] += 1
+        elif s >= 0.30: buckets["0.3-0.35"] += 1
+        elif s >= 0.20: buckets["0.2-0.3"] += 1
+        else:           buckets["<0.2"] += 1
+    emit(f"[calibration] score dist n={n} | max={scores[0]:.3f} p25={_pct(0.25)} "
+         f"median={_pct(0.5)} p75={_pct(0.75)} min={scores[-1]:.3f} | buckets={buckets}")
+
+
 def _progress(db: Session, run: SearchRun, message: str) -> None:
     run.message = message
     db.commit()
@@ -339,6 +400,22 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, db, profile_i
         before = len(raw_jobs)
         raw_jobs = _filter_by_country(engine, raw_jobs, country_codes)
         emit(f"[pipeline] country filter {country_codes}: {before} -> {len(raw_jobs)} listings")
+
+    local_place = eng_profile.get("local_place") or ""
+    if eng_profile.get("location_scope") == "local" and local_place:
+        before = len(raw_jobs)
+        raw_jobs = _filter_by_local_place(raw_jobs, local_place)
+        emit(f"[pipeline] local-place filter ({local_place!r}): {before} -> {len(raw_jobs)} listings")
+
+    # Salary hard-filter on fresh discovery only (salary isn't persisted on the
+    # JobSeen store, so it can't be re-applied to backlog candidates -- but a
+    # clearly-underpaid fresh listing is dropped here before it ever enters the
+    # store). Unknown salary passes through.
+    salary_floor = int(eng_profile.get("salary_floor") or 0)
+    if salary_floor > 0:
+        before = len(raw_jobs)
+        raw_jobs = _filter_by_salary(raw_jobs, salary_floor)
+        emit(f"[pipeline] salary filter (floor={salary_floor}): {before} -> {len(raw_jobs)} listings")
 
     inserted, refreshed, requeued = _upsert_discovered(db, profile_id, raw_jobs)
     store_counts = _store_counts(db, profile_id)
@@ -378,10 +455,16 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, db, profile_i
         scored = _filter_by_country(engine, scored, country_codes)
         emit(f"[pipeline] country filter on candidates {country_codes}: "
              f"{before} -> {len(scored)} rows")
+    if eng_profile.get("location_scope") == "local" and local_place:
+        before = len(scored)
+        scored = _filter_by_local_place(scored, local_place)
+        emit(f"[pipeline] local-place filter on candidates ({local_place!r}): "
+             f"{before} -> {len(scored)} rows")
     top_score = scored[0]["embed_score"] if scored else 0.0
     above_primary = sum(1 for j in scored if j["embed_score"] >= RELEVANCE_PRIMARY)
     emit(f"[pipeline] scored {len(scored)} candidates | top_score={top_score:.3f} | "
          f">= RELEVANCE_PRIMARY({RELEVANCE_PRIMARY})={above_primary}")
+    _log_score_distribution(emit, scored)
 
     pool, harsh = _adaptive_pool(scored)
     emit(f"[pipeline] adaptive pool size={len(pool)} (harsh/broadened={harsh})")
@@ -389,22 +472,36 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, db, profile_i
         emit(f"[pipeline] STOP: no candidates above RELEVANCE_FLOOR({RELEVANCE_FLOOR}) -> 0 results")
         return [], harsh, None, timings
 
-    # EVALUATE. When full-page scraping is enabled (default), rank the pool down
-    # to TOP_CANDIDATES and read each job's real page first, so the final LLM
-    # judges fit against the actual posting text (seniority/experience
-    # requirements included) instead of a short API snippet.
-    to_evaluate = pool
+    # GATE: two independent binary passes (cheap model, temperature 0, cached),
+    # then a deterministic top-N by embed_score. This replaces the old single
+    # "rank the best 25 of 60" LLM pass, which was a noisy ranking task on a pool
+    # that was already target-sized. Discarded roles stay in the store (marked
+    # enriched below) and can resurface via backlog, but won't be re-judged
+    # while the profile signature is unchanged (gate cache).
+    _progress(db, run, "Screening by sector…")
+    survivors = engine.sector_gate(pool, eng_profile)
+    _progress(db, run, "Screening by seniority…")
+    survivors = engine.seniority_gate(survivors, eng_profile)
+    t0 = _lap("gate", t0)
+    selected = engine.select_top_n(survivors, engine.TOP_CANDIDATES)
+    emit(f"[pipeline] gates: pool={len(pool)} -> survivors={len(survivors)} "
+         f"-> selected top-{len(selected)} (deterministic by embed_score)")
+    if not selected:
+        emit("[pipeline] STOP: no candidates survived the sector/seniority gates -> 0 results")
+        return [], harsh, ([j["_identity"] for j in pool], []), timings
+
+    # EVALUATE. When full-page scraping is enabled (default), read each selected
+    # job's real page first, so the final LLM judges fit against the actual
+    # posting text (seniority/experience/location) instead of a short snippet.
+    to_evaluate = selected
     if get_full_scrape_enabled(db):
-        _progress(db, run, "Ranking best matches…")
-        ranked = engine.rank_candidates(pool, eng_profile)
-        t0 = _lap("rank", t0)
         _progress(db, run, "Reading full job pages…")
         browser_config = engine.BrowserConfig(
             headless=True, verbose=False, viewport_width=1280, viewport_height=800,
             user_agent_mode="random",
         )
         async with engine.AsyncWebCrawler(config=browser_config) as crawler:
-            to_evaluate = await engine.scrape_full_details(ranked, crawler)
+            to_evaluate = await engine.scrape_full_details(selected, crawler)
         t0 = _lap("scrape", t0)
     else:
         emit("[pipeline] full-page scraping disabled in settings; evaluating on snippets")
@@ -441,6 +538,7 @@ def run_search_task(profile_id: int, run_id: int) -> None:
     print(f"\n[pipeline] ── search run {run_id} for profile {profile_id} starting ──")
     try:
         import full_auto as engine  # lazy: pulls in crawl4ai only now
+        engine.init_db()  # ensures gate_cache/jobs/profile_cache tables exist
 
         snap = build_snapshot(db, profile_id)
 
@@ -448,13 +546,16 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         with open(engine.CV_PATH, "w", encoding="utf-8") as f:
             f.write(snap["cv_text"])
 
-        _prune_previous_roles(db, profile_id)
-
         final, harsh, marks, timings = asyncio.run(
             _run_engine_pipeline(
                 engine, snap["engine_profile"], snap["weighted_text"], db, profile_id, run
             )
         )
+
+        # Prune only after the pipeline has succeeded, so a failed run leaves the
+        # previous "new"/"crossed" roles intact instead of wiping them with nothing
+        # to replace them.
+        _prune_previous_roles(db, profile_id)
 
         for rank, entry in enumerate(final, start=1):
             db.add(Role(

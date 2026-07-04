@@ -230,6 +230,9 @@ def fetch_reed(query: str, location: str = "United Kingdom", country_code: str =
                 "title": job.get("jobTitle", ""),
                 "company": job.get("employerName", ""),
                 "url": job.get("jobUrl", ""),
+                "location": job.get("locationName", ""),
+                "salary_min": job.get("minimumSalary"),
+                "salary_max": job.get("maximumSalary"),
                 "snippet": job.get("jobDescription", "")
             })
         if len(results) < page_size:  # last page reached
@@ -286,6 +289,9 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
                 "title": job.get("title", ""),
                 "company": job.get("company", {}).get("display_name", ""),
                 "url": job.get("redirect_url", ""),
+                "location": (job.get("location") or {}).get("display_name", ""),
+                "salary_min": job.get("salary_min"),
+                "salary_max": job.get("salary_max"),
                 "snippet": job.get("description", "")
             })
         if page == 1 and not results:
@@ -308,6 +314,9 @@ def fetch_remotive(query: str) -> List[Dict]:
                 "title": job.get("title", ""),
                 "company": job.get("company_name", ""),
                 "url": job.get("url", ""),
+                # Remotive is remote-first; candidate_required_location is a
+                # geographic eligibility string (e.g. "USA Only", "Worldwide").
+                "location": job.get("candidate_required_location") or "Remote",
                 "snippet": job.get("description", "")
             })
         return jobs
@@ -348,6 +357,7 @@ def fetch_google_jobs(query: str, location: str = "United Kingdom", pages: int =
                 "title": job.get("title", ""),
                 "company": job.get("company_name", ""),
                 "url": url,
+                "location": job.get("location", ""),
                 "snippet": job.get("description", "")
             })
 
@@ -369,11 +379,16 @@ def fetch_jsearch(query: str, location: str = "United Kingdom") -> List[Dict]:
         r = requests.get("https://jsearch.p.rapidapi.com/search", headers=headers, params=params, timeout=12)
         jobs = []
         for job in r.json().get("data", []):
+            loc = ", ".join(x for x in [job.get("job_city"), job.get("job_state"),
+                                        job.get("job_country")] if x)
             jobs.append({
                 "board": "jsearch",
                 "title": job.get("job_title", ""),
                 "company": job.get("employer_name", ""),
                 "url": job.get("job_apply_link", ""),
+                "location": "Remote" if job.get("job_is_remote") else loc,
+                "salary_min": job.get("job_min_salary"),
+                "salary_max": job.get("job_max_salary"),
                 "snippet": job.get("job_description", "")
             })
         return jobs
@@ -725,6 +740,17 @@ def init_db():
             ai_summary TEXT
         )
     """)
+    # Cheap-model gate decisions, keyed by (gate, profile signature, job id) so an
+    # unchanged backlog job isn't re-judged every run. Cleared implicitly when the
+    # profile signature changes (skills/sectors/seniority edited).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gate_cache (
+            cache_key TEXT PRIMARY KEY,
+            keep INTEGER,
+            reason TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
     emit("[db] Tables ready and schema initialized.")
@@ -935,13 +961,14 @@ def clean_json(raw: str) -> str:
     return raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
 
-def llm(prompt: str, system: str = "", model: str = CHEAP_MODEL, require_json: bool = False) -> str:
+def llm(prompt: str, system: str = "", model: str = CHEAP_MODEL,
+        require_json: bool = False, temperature: float = 0.2) -> str:
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
-    
-    args = {"model": model, "messages": msgs, "temperature": 0.2}
+
+    args = {"model": model, "messages": msgs, "temperature": temperature}
     if require_json:
         args["response_format"] = {"type": "json_object"}
         
@@ -1034,49 +1061,197 @@ def api_candidates(jobs, profile_embedding):
     return candidates
 
 
-# ── Phase 4: Candidate Ranking ──────────────────────────────────────────────────
+# ── Phase 4: Two binary gates + deterministic selection ─────────────────────────
+# Replaces the old single "rank the best 25 of 60" LLM pass. Ranking/selecting
+# from a long unordered list is exactly where a cheap model shows position bias
+# and run-to-run inconsistency; and the backend already narrows to <=25 before
+# this stage, so that pass wasn't doing real narrowing anyway. Instead:
+#   Pass 1 sector/domain gate   -> independent keep/discard per listing
+#   Pass 2 gap/seniority gate   -> independent keep/discard per listing
+#   deterministic top-N by embed_score (no LLM call)
+# Both gates are temperature 0 and cached by (gate, profile signature, job id).
+
+MAX_MUST_HAVE_GAPS = 3   # discard when a role states more hard gaps than this
+_GATE_BATCH = 20         # listings per LLM call
+
+
+def _profile_signature(profile: dict) -> str:
+    """Stable hash of the profile facets a gate decision depends on. When any of
+    these change the cache naturally misses and the job is re-judged."""
+    basis = json.dumps({
+        "sectors": sorted(s.lower() for s in (profile.get("sectors") or [])),
+        "seniority": (profile.get("seniority") or "").lower(),
+        "key_skills": sorted(s.lower() for s in (profile.get("key_skills") or [])),
+        "search_terms": sorted(s.lower() for s in (profile.get("search_terms") or [])),
+    }, sort_keys=True)
+    return hashlib.sha1(basis.encode()).hexdigest()[:12]
+
+
+def _gate_job_id(job: dict) -> str:
+    """Stable per-job key. Prefer the backend's cross-source identity when present."""
+    return job.get("_identity") or make_job_id(job.get("board", ""), job.get("url", ""))
+
+
+def _gate_cache_key(gate: str, sig: str, job_id: str) -> str:
+    return hashlib.sha1(f"{gate}|{sig}|{job_id}".encode()).hexdigest()
+
+
+def _gate_cache_lookup(keys: list[str]) -> dict[str, tuple[bool, str]]:
+    if not keys:
+        return {}
+    conn = get_db()
+    out: dict[str, tuple[bool, str]] = {}
+    # SQLite caps variables per statement; chunk to stay well under it.
+    for i in range(0, len(keys), 400):
+        chunk = keys[i:i + 400]
+        placeholders = ",".join("?" * len(chunk))
+        for r in conn.execute(
+            f"SELECT cache_key, keep, reason FROM gate_cache WHERE cache_key IN ({placeholders})",
+            chunk,
+        ).fetchall():
+            out[r["cache_key"]] = (bool(r["keep"]), r["reason"] or "")
+    conn.close()
+    return out
+
+
+def _gate_cache_store(entries: list[tuple[str, bool, str]]) -> None:
+    if not entries:
+        return
+    conn = get_db()
+    conn.executemany(
+        "INSERT OR REPLACE INTO gate_cache(cache_key, keep, reason) VALUES(?,?,?)",
+        [(k, 1 if keep else 0, reason) for (k, keep, reason) in entries],
+    )
+    conn.commit()
+    conn.close()
+
+
+def _run_gate(gate: str, candidates: list[dict], profile: dict,
+              build_prompt, system: str) -> list[dict]:
+    """Generic per-listing binary gate. Returns the KEPT candidates (order
+    preserved). Cached, temperature 0, batched. Fails OPEN: on any parse/LLM
+    error the batch is kept, since a gate should never silently lose good roles."""
+    if not candidates:
+        return []
+    sig = _profile_signature(profile)
+    keys = [_gate_cache_key(gate, sig, _gate_job_id(c)) for c in candidates]
+    cached = _gate_cache_lookup(keys)
+
+    kept: list[dict] = []
+    to_judge: list[tuple[int, dict]] = []   # (original index, job) needing an LLM call
+    for c, key in zip(candidates, keys):
+        if key in cached:
+            keep, _reason = cached[key]
+            if keep:
+                kept.append(c)
+        else:
+            to_judge.append((c, key))
+
+    n_cached = len(candidates) - len(to_judge)
+    new_entries: list[tuple[str, bool, str]] = []
+    for start in range(0, len(to_judge), _GATE_BATCH):
+        batch = to_judge[start:start + _GATE_BATCH]
+        listing_block = "\n".join(
+            f"{i+1}. {c['title']} @ {c.get('company','')} | "
+            f"{(c.get('location') or 'location unknown')} | {(c.get('snippet') or '')[:150]}"
+            for i, (c, _k) in enumerate(batch)
+        )
+        prompt = build_prompt(profile, listing_block)
+        decisions: dict[int, tuple[bool, str]] = {}
+        try:
+            raw = llm(prompt, system=system, require_json=True, temperature=0)
+            for d in json.loads(clean_json(raw)).get("decisions", []):
+                n = d.get("n")
+                if isinstance(n, int):
+                    decisions[n] = (bool(d.get("keep", True)), str(d.get("reason", "")))
+        except Exception as e:
+            emit(f"[gate:{gate}] batch parse failed ({e}); keeping batch (fail-open).")
+            decisions = {i + 1: (True, "gate_error") for i in range(len(batch))}
+
+        for i, (c, key) in enumerate(batch):
+            keep, reason = decisions.get(i + 1, (True, "missing_decision"))
+            new_entries.append((key, keep, reason))
+            if keep:
+                kept.append(c)
+
+    _gate_cache_store(new_entries)
+    dropped = len(candidates) - len(kept)
+    emit(f"[gate:{gate}] {len(candidates)} in -> {len(kept)} kept "
+         f"({dropped} dropped; {n_cached} from cache)")
+    return kept
+
+
+def _sector_prompt(profile: dict, listing_block: str) -> str:
+    return f"""You are screening job listings for ONE candidate. Judge ONLY sector/domain fit.
+
+Candidate target sectors/domains: {', '.join(profile.get('sectors') or []) or 'n/a'}
+Candidate target roles: {', '.join(profile.get('search_terms') or []) or 'n/a'}
+
+For EACH listing decide keep or discard:
+- keep=true  if the role is in one of these sectors/domains, or clearly adjacent.
+- keep=false if it is in an unrelated field.
+When genuinely unsure, keep=true (later stages judge finer fit).
+
+Output ONLY JSON: {{"decisions":[{{"n":1,"keep":true}},{{"n":2,"keep":false}}]}}
+Include one object per listing, numbered exactly as shown.
+
+Listings:
+{listing_block}"""
+
+
+def _seniority_prompt(profile: dict, listing_block: str) -> str:
+    return f"""You are screening job listings for ONE candidate on SENIORITY and HARD REQUIREMENTS only.
+
+Candidate seniority: {profile.get('seniority', 'mid-level')}
+Candidate core skills: {', '.join(profile.get('key_skills') or []) or 'n/a'}
+(Skill exposure durations, if stated, indicate depth - treat undated/brief mentions as weaker
+signal than multi-year stated experience.)
+
+For EACH listing set keep=false (discard) if EITHER:
+- the title/description clearly implies a seniority level well ABOVE or well BELOW
+  the candidate (e.g. Director/VP/Head/Principal for a mid-level candidate, or
+  Intern/Graduate/Entry for a senior candidate), OR
+- it states more than {MAX_MUST_HAVE_GAPS} hard must-have requirements the candidate
+  clearly lacks.
+Otherwise keep=true. When unsure, keep=true.
+
+Give a short reason code: "ok" | "seniority_high" | "seniority_low" | "too_many_gaps".
+Output ONLY JSON: {{"decisions":[{{"n":1,"keep":true,"reason":"ok"}}]}}
+Include one object per listing, numbered exactly as shown.
+
+Listings:
+{listing_block}"""
+
+
+def sector_gate(candidates: list[dict], profile: dict) -> list[dict]:
+    """Pass 1: binary sector/domain gate (cheap model, temperature 0)."""
+    return _run_gate("sector", candidates, profile, _sector_prompt,
+                     system="You screen job listings for sector fit. Be inclusive when unsure.")
+
+
+def seniority_gate(candidates: list[dict], profile: dict) -> list[dict]:
+    """Pass 2: binary gap/seniority gate (cheap model, temperature 0)."""
+    return _run_gate("seniority", candidates, profile, _seniority_prompt,
+                     system="You screen job listings for seniority and hard-requirement fit.")
+
+
+def select_top_n(candidates: list[dict], n: int = TOP_CANDIDATES) -> list[dict]:
+    """Stage 5: deterministic top-N by embed_score. No LLM call -- a stable sort
+    on a score we already computed, not a subjective 'pick your best 25' task."""
+    return sorted(candidates, key=lambda x: x.get("embed_score", 0), reverse=True)[:n]
+
 
 def rank_candidates(candidates: list[dict], profile: dict) -> list[dict]:
+    """Standalone-path convenience: run both gates then take the deterministic
+    top-N. The backend (engine.py) calls the stages individually for per-stage
+    logging; this keeps `python full_auto.py` working end-to-end."""
     if not candidates:
         emit("[phase 4] No candidates found passing basic structural vector checks.")
         return []
-
-    pool = sorted(candidates, key=lambda x: x.get("embed_score", 0), reverse=True)[:60]
-    emit(f"[phase 4] Ranking top {len(pool)} raw candidates via semantic matrix...")
-
-    listing_block = "\n".join(
-        f"{i+1}. {c['title']} @ {c['company']} | {c['snippet'][:120]}"
-        for i, c in enumerate(pool)
-    )
-
-    prompt = f"""You are an executive talent recruiter. Assess these open roles for a candidate profile matching:
-Core Qualifications: {', '.join(profile['key_skills'])}
-Target Industries: {', '.join(profile['sectors'])}
-Target Experience Bracket: {profile['seniority']}
-
-Select the {TOP_CANDIDATES} absolute best matches. Output ONLY a structured JSON object containing a 'rankings' array:
-{{"rankings": [{{"listing_number": 1, "score": 9, "reason": "Match summary..."}}]}}
-
-Listings Base:
-{listing_block}"""
-
-    try:
-        raw = llm(prompt, require_json=True)
-        ranked_list = json.loads(clean_json(raw)).get("rankings", [])
-    except Exception as e:
-        emit(f"[phase 4] Ranking structural processing failed ({e}). Reverting to default matrix order.")
-        return pool[:TOP_CANDIDATES]
-
-    top = []
-    for entry in ranked_list[:TOP_CANDIDATES]:
-        idx = entry.get("listing_number", 1) - 1
-        if 0 <= idx < len(pool):
-            job = pool[idx].copy()
-            job["llm_score"]  = entry.get("score", 0)
-            job["llm_reason"] = entry.get("reason", "")
-            top.append(job)
-
-    emit(f"[phase 4] Top {len(top)} high-yield listings selected for extraction hydration.")
+    emit(f"[phase 4] Gating {len(candidates)} candidates (sector -> seniority)...")
+    survivors = seniority_gate(sector_gate(candidates, profile), profile)
+    top = select_top_n(survivors, TOP_CANDIDATES)
+    emit(f"[phase 4] {len(top)} listings selected for extraction hydration.")
     return top
 
 
@@ -1140,7 +1315,8 @@ def final_evaluation(jobs: list[dict], profile: dict) -> list[dict]:
     cv_text = open(CV_PATH, encoding="utf-8").read()[:3000]
 
     jobs_block = "\n\n---\n\n".join(
-        f"JOB {i+1}: {j['title']} at {j['company']}\nURL: {j['url']}\n\n{j.get('full_text','')[:2000]}"
+        f"JOB {i+1}: {j['title']} at {j['company']}\n"
+        f"Location: {j.get('location') or 'not stated'}\nURL: {j['url']}\n\n{j.get('full_text','')[:2000]}"
         for i, j in enumerate(jobs)
     )
 
@@ -1149,15 +1325,36 @@ def final_evaluation(jobs: list[dict], profile: dict) -> list[dict]:
 Candidate Background Profile:
 {cv_text}
 
-Analyze the {len(jobs)} complete extracted documents below. For each job, first check whether it
-states an explicit experience/seniority requirement (years of experience, "senior"/"lead"/"principal"
-in the title, or prior experience in a specific sector/domain). Compare that requirement against the
-candidate's actual seniority and background above:
-- If the job clearly requires meaningfully more experience or specific sector experience the candidate
-  does not have, treat that as a disqualifying concern, not a minor caveat - exclude the role unless
-  the candidate's transferable experience genuinely closes the gap.
-- If the requirement is soft, negotiable, or not stated, judge fit on skills/interests as normal -
-  don't invent a seniority objection that isn't in the text.
+Analyze the {len(jobs)} complete extracted documents below. Apply these disqualification rules FIRST,
+before judging general fit:
+
+1. SENIORITY/EXPERIENCE: Check whether the job states an explicit experience/seniority requirement
+   (years of experience, "senior"/"lead"/"principal" in the title, or prior experience in a specific
+   sector/domain). If the job clearly requires meaningfully more experience or specific sector
+   experience the candidate does not have, treat that as disqualifying, not a minor caveat - exclude
+   the role unless the candidate's transferable experience genuinely closes the gap. If the requirement
+   is soft, negotiable, or not stated, judge fit on skills/interests as normal - don't invent a
+   seniority objection that isn't in the text.
+
+2. LOCATION/VISA/RELOCATION: If the role's location (or an explicit on-site/relocation/visa/work-
+   authorization requirement in the text) clearly puts it outside where the candidate can realistically
+   work, exclude it. If location is remote, unstated, or plainly compatible with the candidate's
+   location above, do not raise a location objection.
+
+3. EVIDENCE STRENGTH: The candidate's background profile may show a proficiency/duration qualifier in
+   parentheses next to a skill or past role, e.g. "Python (expert, 5+ years)" or "Camp Counsellor
+   (one-off, one week)". Multi-year or expert-level stated experience is strong evidence; brief,
+   one-time, or duration-unstated exposure is weak evidence - weigh each accordingly. When the
+   candidate's only support for a specific hard requirement (a named tool, a specific process like
+   invoice/expense handling or diary/calendar management, a certification) is a generic or unrelated
+   soft-skill/reliability anecdote (e.g. safety-critical responsibility, leadership of an unrelated
+   activity), that is NOT evidence the requirement is met unless the connection to the requirement is
+   direct and explicitly stated - do not present it as satisfying the requirement in "match_reasons".
+   Put any such gap in "concerns" instead.
+
+Then, for the roles that survive, weigh the CUMULATIVE nice-to-have gaps: several compounding smaller
+gaps (e.g. no fintech background AND no dbt AND no BI tooling) can together make a role a weak fit even
+when no single gap is disqualifying. Report each such gap separately in "concerns".
 
 Return every role that is a genuinely strong fit for this candidate, up to {FINAL_PICKS}, ordered best
 first. Return fewer than {FINAL_PICKS} if fewer genuinely qualify - do not pad the list with weak matches.
@@ -1170,7 +1367,7 @@ Output ONLY valid structural JSON object (no markdown formatting code):
     "url": "...",
     "summary": "1 concise sentence on why this role fits the candidate.",
     "match_reasons": ["concrete alignment factor 1", "concrete alignment factor 2 (max 2)"],
-    "concerns": ["the single most notable skill gap or prerequisite, if any"]
+    "concerns": ["each notable skill gap or prerequisite the candidate lacks, one per item; [] if none"]
   }}
 ]}}
 

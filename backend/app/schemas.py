@@ -34,12 +34,14 @@ class AttributeCreate(BaseModel):
     source: str = "user_added"
     confirmed: bool = True
     weight: Optional[float] = None
+    proficiency: Optional[str] = None
 
 
 class AttributeUpdate(BaseModel):
     value: Optional[str] = None
     confirmed: Optional[bool] = None
     weight: Optional[float] = None
+    proficiency: Optional[str] = None
 
 
 class AttributeOut(ORMModel):
@@ -50,6 +52,7 @@ class AttributeOut(ORMModel):
     weight: float
     source: str
     confirmed: bool
+    proficiency: Optional[str] = None
 
 
 # ── Onboarding / parsing ────────────────────────────────────────────────────

@@ -124,9 +124,10 @@ def set_full_scrape_enabled(db: Session, enabled: bool) -> bool:
 
 def source_funnel(db: Session) -> list[dict]:
     """All-time, per-source funnel: how many jobs each source has discovered,
-    how many made the top-25 shortlist pool, how many made the final AI-picked
-    shortlist, and how many the user actually saved/applied to. Lets you see
-    which sources are worth keeping before an API gets cut."""
+    how many survived the sector/seniority gates and the deterministic
+    embed-score shortlist, how many made the final AI-picked shortlist, and
+    how many the user actually saved/applied to. Lets you see which sources
+    are worth keeping before an API gets cut."""
     discovered: dict[str, int] = {}
     for source, count in db.execute(
         select(JobSeen.source, func.count(JobSeen.id)).group_by(JobSeen.source)
@@ -135,7 +136,7 @@ def source_funnel(db: Session) -> list[dict]:
         if key:
             discovered[key] = discovered.get(key, 0) + count
 
-    top25: dict[str, int] = {}
+    gated: dict[str, int] = {}
     for source, count in db.execute(
         select(JobSeen.source, func.count(JobSeen.id))
         .where(JobSeen.state.in_(["enriched", "shown"]))
@@ -143,7 +144,7 @@ def source_funnel(db: Session) -> list[dict]:
     ).all():
         key = canonical_key(source)
         if key:
-            top25[key] = top25.get(key, 0) + count
+            gated[key] = gated.get(key, 0) + count
 
     shown: dict[str, int] = {}
     for source, count in db.execute(
@@ -170,7 +171,7 @@ def source_funnel(db: Session) -> list[dict]:
             "key": s["key"],
             "label": s["label"],
             "discovered": discovered.get(s["key"], 0),
-            "top25": top25.get(s["key"], 0),
+            "gated": gated.get(s["key"], 0),
             "shown": shown.get(s["key"], 0),
             "selected": selected.get(s["key"], 0),
         }

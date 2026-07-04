@@ -147,6 +147,7 @@ export default function DashboardPage() {
                   profileId={activeId}
                   attributes={g?.location ?? []}
                   countryAttributes={g?.country ?? []}
+                  scopeAttributes={g?.location_scope ?? []}
                 />
               </div>
             </div>

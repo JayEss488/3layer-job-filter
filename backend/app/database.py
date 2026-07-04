@@ -42,6 +42,7 @@ def _migrate_columns():
         "search_runs": [("phase_timings", "TEXT")],
         "roles": [("source", "TEXT")],
         "profiles": [("cv_text", "TEXT")],
+        "profile_attributes": [("proficiency", "TEXT")],
     }
     for table, cols in additions.items():
         if not insp.has_table(table):

@@ -7,6 +7,8 @@ import { useAttributeMutations } from "@/lib/hooks";
 import type { Attribute, AttributeType } from "@/lib/types";
 import { Chip, SuggestChip } from "./Chip";
 
+const PROFICIENCY_CHOICES = ["Expert", "Proficient", "Familiar", "One-time"];
+
 interface Props {
   label: string;
   profileId: number;
@@ -25,13 +27,14 @@ export function AttributeRow({
   enableSuggest = false,
   placeholder,
 }: Props) {
-  const { add, remove, clearAll } = useAttributeMutations(profileId);
+  const { add, remove, update, clearAll } = useAttributeMutations(profileId);
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [loadingSuggest, setLoadingSuggest] = useState(false);
 
   const existing = new Set(attributes.map((a) => a.value.toLowerCase()));
+  const showProficiency = type === "skill" || type === "past_role";
 
   function commit(value: string) {
     const v = value.trim();
@@ -63,7 +66,23 @@ export function AttributeRow({
       <div className="field col">
         <div className="field">
           {attributes.map((a) => (
-            <Chip key={a.id} label={a.value} onRemove={() => remove.mutate(a.id)} />
+            <span key={a.id} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <Chip label={a.value} onRemove={() => remove.mutate(a.id)} />
+              {showProficiency && (
+                <select
+                  className="input"
+                  style={{ fontSize: 11, padding: "3px 5px" }}
+                  value={a.proficiency ?? ""}
+                  onChange={(e) => update.mutate({ id: a.id, proficiency: e.target.value })}
+                  title="How deep is this experience?"
+                >
+                  <option value="">— proficiency —</option>
+                  {PROFICIENCY_CHOICES.map((p) => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              )}
+            </span>
           ))}
 
           {adding ? (

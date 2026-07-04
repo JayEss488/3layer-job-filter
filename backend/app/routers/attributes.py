@@ -61,6 +61,7 @@ def add_attribute(
         source=body.source,
         confirmed=body.confirmed,
         weight=body.weight if body.weight is not None else DEFAULT_WEIGHT,
+        proficiency=body.proficiency,
     )
     db.add(attr)
     db.commit()
@@ -77,6 +78,8 @@ def update_attribute(attr_id: int, body: AttributeUpdate, db: Session = Depends(
         attr.confirmed = body.confirmed
     if body.weight is not None:
         attr.weight = body.weight
+    if body.proficiency is not None:
+        attr.proficiency = body.proficiency or None  # "" clears it back to unset
     db.commit()
     db.refresh(attr)
     return attr

@@ -186,6 +186,7 @@ export default function OnboardingPage() {
                     profileId={activeId}
                     attributes={g?.location ?? []}
                     countryAttributes={g?.country ?? []}
+                    scopeAttributes={g?.location_scope ?? []}
                   />
                 </div>
               </div>

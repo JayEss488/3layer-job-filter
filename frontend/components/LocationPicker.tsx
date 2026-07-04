@@ -9,6 +9,12 @@ import type { Attribute } from "@/lib/types";
 const WORK_TYPES = ["On-site", "Hybrid", "Remote"];
 const WORK_SET = new Set(WORK_TYPES.map((w) => w.toLowerCase()));
 
+const SCOPE_CHOICES: { value: string; label: string }[] = [
+  { value: "national", label: "National" },
+  { value: "local", label: "Local" },
+  { value: "international", label: "International" },
+];
+
 const COUNTRY_CHOICES: { code: string; label: string }[] = [
   { code: "global", label: "Global (no filter)" },
   { code: "gb", label: "United Kingdom" },
@@ -31,10 +37,12 @@ export function LocationPicker({
   profileId,
   attributes,
   countryAttributes,
+  scopeAttributes,
 }: {
   profileId: number;
   attributes: Attribute[];
   countryAttributes: Attribute[];
+  scopeAttributes: Attribute[];
 }) {
   const { add, remove, invalidate } = useAttributeMutations(profileId);
 
@@ -48,6 +56,18 @@ export function LocationPicker({
   const selectedCountries = new Map(
     countryAttributes.map((a) => [a.value.toLowerCase(), a])
   );
+
+  // Single-value, like seniority: at most one location_scope row.
+  const scope = scopeAttributes[0]?.value.toLowerCase() || "national";
+  function setScope(value: string) {
+    if (scope === value) return;
+    scopeAttributes.forEach((a) => remove.mutate(a.id));
+    add.mutate({ type: "location_scope", value });
+  }
+  // Scope becomes the sole authority on whether a country filter applies at
+  // all once it's "local" or "international" -- showing country chips there
+  // would let them silently contradict the scope setting.
+  const showCountryChips = scope === "national";
 
   function toggleCountry(code: string) {
     if (code === "global") {
@@ -108,17 +128,30 @@ export function LocationPicker({
           </button>
         ))}
       </div>
-      <div className="choice-row" style={{ marginTop: 8, flexWrap: "wrap" }}>
-        {COUNTRY_CHOICES.map((c) => (
+      <div className="choice-row" style={{ marginTop: 8 }}>
+        {SCOPE_CHOICES.map((s) => (
           <button
-            key={c.code}
-            className={`country${selectedCountries.has(c.code) ? " on" : ""}`}
-            onClick={() => toggleCountry(c.code)}
+            key={s.value}
+            className={`toggle ${scope === s.value ? "on" : "off"}`}
+            onClick={() => setScope(s.value)}
           >
-            {c.label}
+            {s.label}
           </button>
         ))}
       </div>
+      {showCountryChips && (
+        <div className="choice-row" style={{ marginTop: 8, flexWrap: "wrap" }}>
+          {COUNTRY_CHOICES.map((c) => (
+            <button
+              key={c.code}
+              className={`country${selectedCountries.has(c.code) ? " on" : ""}`}
+              onClick={() => toggleCountry(c.code)}
+            >
+              {c.label}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

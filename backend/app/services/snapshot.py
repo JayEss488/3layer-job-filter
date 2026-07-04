@@ -3,6 +3,7 @@
 This is half of the clean boundary around the search engine: the rest of the app
 deals in attribute rows; the engine receives the dict shape full_auto.py expects,
 with attribute weights translated into ranking emphasis."""
+import re
 from collections import defaultdict
 
 from sqlalchemy import select
@@ -12,6 +13,16 @@ from ..models import ProfileAttribute
 from .llm import llm_json
 
 _WORK_TYPES = {"remote", "hybrid", "on-site", "onsite"}
+
+
+def _parse_salary_floor(values: list[str]) -> int:
+    """Lower bound of a stated salary range (e.g. '70000-90000' -> 70000).
+    Returns 0 when no range is stated or the floor is 0 (slider default)."""
+    for v in values:
+        nums = re.findall(r"\d+", (v or "").replace(",", ""))
+        if nums:
+            return int(nums[0])
+    return 0
 
 
 def _grouped(db: Session, profile_id: int) -> dict[str, list[ProfileAttribute]]:
@@ -29,6 +40,34 @@ def _grouped(db: Session, profile_id: int) -> dict[str, list[ProfileAttribute]]:
 
 def _values(group: list[ProfileAttribute]) -> list[str]:
     return [a.value for a in group]
+
+
+def _labeled(group: list[ProfileAttribute]) -> list[str]:
+    """Values annotated with their stated proficiency, e.g. 'Python (expert, 5+ years)'."""
+    return [f"{a.value} ({a.proficiency})" if a.proficiency else a.value for a in group]
+
+
+# Depth signal for skill/past_role emphasis: how many extra times a value is
+# repeated in the embedding text on top of the existing feedback-weight
+# multiplier. Substring-matched against the free-text proficiency field so it
+# still works with values the user typed by hand, not just a fixed enum.
+_PROFICIENCY_MULT = {
+    "expert": 2.0,
+    "proficient": 1.5,
+    "familiar": 1.0,
+    "one-time": 0.5,
+    "one-off": 0.5,
+}
+
+
+def _proficiency_multiplier(proficiency: str | None) -> float:
+    if not proficiency:
+        return 1.0
+    text = proficiency.lower()
+    for key, mult in _PROFICIENCY_MULT.items():
+        if key in text:
+            return mult
+    return 1.0
 
 
 def _infer_region(skills: list[str], roles: list[str], location: str) -> dict:
@@ -74,17 +113,44 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
             search_terms.append(t)
     search_terms = search_terms[:14] or ["jobs"]
 
+    # Location scope: how far the candidate's stated location/country should be
+    # trusted as a hard filter. Single-value, like seniority. No row yet ->
+    # "national" (today's existing default), UNLESS the profile already has the
+    # old "global" country chip set with no scope row, in which case treat that
+    # as an explicit "international" opt-out -- this is a code-level fallback
+    # for pre-existing profiles, not a migration/backfill.
+    scope_values = [v.lower() for v in _values(g.get("location_scope", []))]
+    scope = scope_values[0] if scope_values else ""
+
     # Country: explicit user selection (multi-choice) takes priority over the
-    # LLM-inferred guess. "global" (or no selection) means no hard filter.
+    # LLM-inferred guess. Selecting "global" is an explicit opt-out of the hard
+    # filter. But NO country row at all must NOT silently mean "Global" -- that
+    # was root cause B (the filter sat inert by default, letting out-of-scope
+    # roles through). Fail closed: default the filter to the location-derived
+    # country unless the user explicitly chose "global" (or scope="international").
     selected_countries = [c.lower() for c in _values(g.get("country", []))]
+    explicit_global = "global" in selected_countries
     country_codes = [c for c in selected_countries if c != "global"]
 
-    if country_codes:
+    if not scope:
+        scope = "international" if explicit_global else "national"
+
+    if scope == "international":
+        region = _infer_region(skills, target_roles + past_roles, location)
+        country_codes = []
+    elif country_codes:
         region = {"sectors": _infer_region(skills, target_roles + past_roles, location)["sectors"],
                    "adzuna_country_code": country_codes[0]}
     else:
         region = _infer_region(skills, target_roles + past_roles, location)
+        # No explicit country chip and scope isn't "international" ->
+        # default the hard filter to the country we inferred from their location.
+        country_codes = [region["adzuna_country_code"]]
     seniority = ", ".join(seniorities) if seniorities else "mid-level"
+
+    # Salary floor for the hard prefilter: the lower bound of the stated range.
+    # 0 (the slider's default min) means "no floor" -> the filter is a no-op.
+    salary_floor = _parse_salary_floor(_values(g.get("salary", [])))
 
     engine_profile = {
         "sectors": region["sectors"],
@@ -93,6 +159,9 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         "location": location,
         "adzuna_country_code": region["adzuna_country_code"],
         "country_codes": country_codes,  # [] means no hard filter (Global)
+        "location_scope": scope,          # local | national | international
+        "local_place": loc_place if scope == "local" else "",
+        "salary_floor": salary_floor,     # 0 means no salary floor
         "search_terms": search_terms,
     }
 
@@ -106,7 +175,9 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     for group_name in ("target_role", "skill", "past_role"):
         base = _BASE_EMPHASIS[group_name]
         for a in g.get(group_name, []):
-            emphasis.extend([a.value] * base * max(1, round(a.weight)))
+            mult = _proficiency_multiplier(a.proficiency) if group_name != "target_role" else 1.0
+            count = max(1, round(base * max(1, round(a.weight)) * mult))
+            emphasis.extend([a.value] * count)
     emphasis.extend(region["sectors"])
     emphasis.append(seniority)
     weighted_text = " ".join(emphasis) or " ".join(search_terms)
@@ -114,11 +185,11 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     # Synthetic CV text for the expensive-AI final evaluation (engine reads a file).
     cv_lines = []
     if past_roles:
-        cv_lines.append("Past roles: " + ", ".join(past_roles))
+        cv_lines.append("Past roles: " + ", ".join(_labeled(g.get("past_role", []))))
     if seniorities:
         cv_lines.append("Seniority: " + ", ".join(seniorities))
     if skills:
-        cv_lines.append("Skills: " + ", ".join(skills))
+        cv_lines.append("Skills: " + ", ".join(_labeled(g.get("skill", []))))
     if experience:
         cv_lines.append("Experience: " + "; ".join(experience))
     if target_roles:

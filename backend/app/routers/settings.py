@@ -42,7 +42,7 @@ class SourceStatOut(BaseModel):
     key: str
     label: str
     discovered: int  # all-time jobs discovered from this source
-    top25: int        # made the shortlist pool
+    gated: int         # survived the sector/seniority gates + embed-score cut
     shown: int         # made the final AI-picked shortlist
     selected: int      # user saved or applied
 

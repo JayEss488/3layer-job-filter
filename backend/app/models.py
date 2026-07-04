@@ -59,6 +59,10 @@ class ProfileAttribute(Base):
     weight = Column(Float, nullable=False, default=DEFAULT_WEIGHT)
     source = Column(Text, nullable=False)  # cv_parsed|text_parsed|user_added|engine_inferred
     confirmed = Column(Boolean, default=False)
+    # Depth/duration signal for skill|past_role, e.g. "expert, 5+ years" or
+    # "one-off, one week". Free text, set by CV parsing or edited by the user;
+    # only meaningful for skill/past_role rows, null everywhere else.
+    proficiency = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 

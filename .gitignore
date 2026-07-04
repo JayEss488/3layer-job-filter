@@ -4,3 +4,4 @@ __pycache__/
 *.db
 inactive components/key_openai
 venv/
+raw_api_jobs.json

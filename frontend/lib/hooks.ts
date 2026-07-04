@@ -58,13 +58,13 @@ export function useAttributeMutations(profileId: number) {
   };
 
   const add = useMutation({
-    mutationFn: (v: { type: AttributeType; value: string; source?: string }) =>
+    mutationFn: (v: { type: AttributeType; value: string; source?: string; proficiency?: string }) =>
       api.addAttribute(profileId, { confirmed: true, ...v }),
     onSuccess: invalidate,
   });
   const update = useMutation({
-    mutationFn: (v: { id: number; value?: string; confirmed?: boolean }) =>
-      api.updateAttribute(v.id, { value: v.value, confirmed: v.confirmed }),
+    mutationFn: (v: { id: number; value?: string; confirmed?: boolean; proficiency?: string }) =>
+      api.updateAttribute(v.id, { value: v.value, confirmed: v.confirmed, proficiency: v.proficiency }),
     onSuccess: invalidate,
   });
   const remove = useMutation({
