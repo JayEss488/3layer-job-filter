@@ -121,27 +121,48 @@ idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
    on each, instead of being averaged into a fit-for-neither blend.
 2. **`backend/app/services/engine.py::_run_engine_pipeline`** orchestrates, per run:
    discovery (`full_auto.gather_jobs` — Reed/Adzuna/Google-Jobs-via-serper.dev/JSearch/
-   Remotive + the ATS vendor batch) → blocklist/training/country filters → dedupe-upsert
-   into `jobs_seen` → embed & cosine-score every candidate against **every** cluster
-   embedding, assigning each job to its single best-scoring cluster → free heuristic
-   prescreen (`_heuristic_prescreen`: title-regex drops obvious seniority mismatches —
-   Director/VP for a junior, Intern for a senior — before any LLM spends a token) →
-   adaptive strict/broadened pool per cluster → **one merged sector+seniority screen per
-   cluster** (`full_auto.screen_gate`, a cached cheap-model call that *annotates* rather
-   than drops): the backend then hard-drops only off-sector jobs, **demotes rather than
+   Remotive + the ATS vendor batch; search terms sent to the board APIs are the
+   profile's `target_role`s only — `past_role`s used to be appended too, which pulled in
+   results matching what the candidate has *done* rather than what they want next) →
+   blocklist/training/country filters → dedupe-upsert into `jobs_seen` → embed &
+   cosine-score every candidate against **every** cluster embedding, assigning each job
+   to its single best-scoring cluster → free heuristic prescreen (`_heuristic_prescreen`:
+   title-regex drops obvious seniority mismatches — Director/VP for a junior, Intern for
+   a senior — before any LLM spends a token) → adaptive strict/broadened pool per cluster
+   (`TARGET_POOL` = 90) → **one merged sector+seniority screen per cluster**
+   (`full_auto.screen_gate`, a cached cheap-model call that *annotates* rather than
+   drops): the backend then hard-drops only off-sector jobs, **demotes rather than
    drops** seniority failures, auto-admits the top `AUTO_PASS_TOP` by embed_score, and
    **guarantees a per-cluster floor** so the cheap gate can never starve a cluster to
-   zero (the full-text final AI stays the real seniority judge) → fair-allocate to a
-   capped pool → optional Phase 5 full-page scrape (skipped for ATS-sourced jobs, for any
-   snippet already long enough to judge, and for anything with a persisted `full_text`
-   from a prior run — see `engine.py::_needs_full_scrape`) → **Phase 6 final LLM
-   evaluation runs once per cluster**, each a **single** expensive call
-   (`full_auto.final_evaluation_split`) returning both a strict `strong` list and a
-   lenient disqualifier-only `backup` list (no more second "relaxed pass" call); jobs
-   already judged under the current profile are served from their stored verdict and
-   never re-sent → deterministic top-N fallback only if nothing is strong and there's no
-   backup → fair-allocate the combined per-cluster picks to a final cap → persisted as
-   `Role` rows.
+   zero (the full-text final AI stays the real seniority judge) → fair-allocate to
+   `TARGET_POOL` → **cheap numeric rank stage** (`full_auto.rank_gate`, also run once
+   *per cluster* with that cluster's own roles — a profile-wide call was diluting a
+   minority cluster's fit scores with the candidate's other target-role cluster's
+   context, a real bug fixed once already): a 0–100 fit estimate per job; the bottom
+   `RANK_AUTOREJECT_FRACTION` (20%) is dropped **per cluster, before** fair-allocating to
+   `JUDGE_POOL` (40), so a cluster that happens to score lower can't lose more than its
+   own share before fair-allocate ever runs → optional Phase 5 full-page scrape (skipped
+   for ATS-sourced jobs, for any snippet already long enough to judge —
+   `SNIPPET_SUFFICIENT_CHARS`, deliberately above Adzuna's exact-500-char API truncation
+   so Adzuna snippets don't wave through as "sufficient" by coincidence — and for
+   anything with a persisted `full_text` from a prior run — see
+   `engine.py::_needs_full_scrape`) → **Phase 6 final LLM evaluation runs once per
+   cluster**, each a **single** expensive call (`full_auto.final_evaluation_split`)
+   returning a strict `strong` list, a lenient disqualifier-only `backup` list, and an
+   optional `disqualified` list (a short AI-authored reason for any job hard-excluded by
+   a DISQUALIFIERS rule, persisted into that job's `eval_analysis` instead of the blank
+   field a plain reject used to get — added because 100% of historical reject verdicts
+   had zero captured reasoning, which made a past investigation into thin results unable
+   to see why anything was excluded); jobs already judged under the current profile are
+   served from their stored verdict and never re-sent, and a job with a stored `reject`
+   verdict under the current signature is never resurfaced — including by the
+   fallback below, which used to pull from the full unfiltered candidate list and could
+   re-show exactly these rejects as an "inconclusive, showing anyway" placeholder → a
+   deterministic top-N fallback fires **only when the expensive call itself failed**
+   (exception/malformed response) — never when it succeeded and genuinely rejected
+   everyone, which now correctly contributes zero picks for that cluster rather than
+   padding a wrong-function role into the results → fair-allocate the combined
+   per-cluster picks to a final cap (`FINAL_PICKS` = 12) → persisted as `Role` rows.
    Historical note: this stage used to run two separate gates (sector per-cluster,
    seniority once globally) and a strict-then-relaxed two-call final eval. The global
    seniority gate over-pruned and starved clusters, which is why fallbacks fired as the
@@ -164,10 +185,31 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   call spends.
 - The domain blocklist (Settings → Blocked domains, `moderation.py`) is consulted both
   at discovery time (drops listings before they enter the store) and inside Phase 5
-  scraping (skips retrying a known-bad domain instead of paying 2×~28s per attempt).
+  scraping (skips retrying a known-bad domain instead of paying retries/timeouts on it).
 - `AUTO_PASS_TOP` (default 2, `engine.py`) — per cluster, the highest-embed_score
   candidates skip the gate's seniority veto and go straight to the expensive AI.
 - `MIN_RESULTS` (default 3) — the per-cluster keep-floor the merged screen backfills to.
+- `JUDGE_POOL` (default 40) / `RANK_AUTOREJECT_FRACTION` (default 0.20, `engine.py`) —
+  the cheap rank stage's cap and per-cluster autoreject fraction, see pipeline step 2.
+- Google-organic discovery (`full_auto.fetch_google_jobs`/`_looks_like_category_page`)
+  drops board-owned category/search-listing pages (e.g. a charityjob.co.uk "N jobs in
+  X" results page) that aren't an individual posting — these used to enter the store
+  and consume pool/scrape/eval slots as if they were real listings.
+- Phase 5 scraping: every source shares one concurrency lane (`MAX_CONCURRENT`, no more
+  Adzuna-specific single-lane serialization — live testing showed it wasn't preventing
+  any actual blocking, just adding minutes of pure sleep), a redirect-tracking stub
+  (e.g. Adzuna's `/jobs/land/ad/...` click-through pages, which resolve 200 OK but are
+  just a "you're being redirected" page) is detected and treated as a failed scrape
+  rather than persisted as real content, and the whole phase has a 60s total wall-clock
+  budget — whatever hasn't finished by then falls back to its snippet.
+- `emit()` (`full_auto.py`) catches `UnicodeEncodeError` and re-encodes ASCII-safe —
+  a log line containing an emoji used to crash whatever phase was running on a
+  console whose stdout isn't UTF-8-capable (confirmed reproducible on this repo's own
+  venv under some Windows launch paths).
+- `fetch_jsearch` (`full_auto.py`) retries once with a longer timeout on a read
+  timeout — the JSearch RapidAPI endpoint (`/search-v2`, since RapidAPI retired the
+  older `/search`) runs slow enough that a single fixed 12s timeout was dropping the
+  source's results on ordinary slow responses, not just outages.
 - Cross-run reuse (persisted `full_text` + `eval_*` on `JobSeen`, above) means the
   cheapest run is a *repeat* run: unchanged jobs are re-embedded/re-scraped/re-judged by
   nothing. Editing a profile attribute changes the gate/eval signatures and re-opens
@@ -178,8 +220,30 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
 Tick/cross/ignore on a `Role` (`services/feedback.py`) nudges the `weight` of whichever
 `ProfileAttribute`s that role matched, by `config.DELTAS`, clamped to
 `[WEIGHT_MIN, WEIGHT_MAX]`. This is the entire "learning" mechanism — there is no model
-retraining; higher-weighted attributes just get repeated more in the embedding text
-(`snapshot._weighted_text`) so they pull future search results harder.
+retraining. Weight has two effects:
+- **Embedding pre-filter** (`snapshot._weighted_text`): each value is repeated
+  `max(0, round(base_emphasis * weight * proficiency_mult))` times — sustained ticks
+  amplify a value's pull on the semantic pre-filter, and sustained crosses can now
+  genuinely suppress it out of the embedding text entirely (count reaches 0),
+  symmetric in both directions. This used to be `max(1, round(base * max(1,
+  round(weight)) * mult))` — the *inner* `max(1, round(weight))` alone already floored
+  the effective weight at 1 for anything below ~1.5, and the *outer* `max(1, ...)`
+  floored the final count too, so a value crossed all the way down to `WEIGHT_MIN`
+  (0.1) still counted the same as a never-touched 1.0 default — crossing could stop
+  future amplification but never actually suppress anything. Fixed once already —
+  watch for this if touching the formula again; dropping only one of the two `max(1,
+  ...)` calls does not fix it.
+- **Cheap gate/rank prompts** (`full_auto._screen_prompt`/`_rank_prompt`, via
+  `snapshot.build_snapshot`'s `target_role_weight_tiers`/`skill_weight_tiers`): a
+  non-neutral-weight target role or skill is annotated with a coarse priority label
+  (e.g. "strongly preferred by candidate" / "candidate has shown disinterest --
+  deprioritize") so the cheap screen/rank models get some signal from the candidate's
+  own feedback too — this is what lets weight have some influence on which roles reach
+  the expensive final judge (and a small nudge on the cheap rank score), not only on
+  which jobs float toward the top of the embedding pre-filter. The **expensive final
+  judge still sees a flat, unweighted attribute list** (each value once, just possibly
+  reordered since attributes are sorted by weight within their group) — weighting
+  doesn't argue a value more strongly to it, only shapes which candidates arrive there.
 
 ### Background execution & routers
 

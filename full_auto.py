@@ -1670,19 +1670,34 @@ def seniority_gate(candidates: list[dict], profile: dict) -> list[dict]:
 _SENIORITY_BAD_CODES = ("seniority_high", "seniority_low", "too_many_gaps")
 
 
+def _annotate_with_weight_tiers(values: list[str], tiers: dict[str, str] | None) -> str:
+    """Comma-joined list, appending each value's feedback-weight priority tier
+    (from tick/cross history on past results, see snapshot.py's _weight_tier)
+    when it's non-neutral -- so the cheap gate/rank models get some signal from
+    the candidate's own feedback, not just a flat attribute list. Values with no
+    tier (neutral weight) are rendered plain."""
+    if not values:
+        return "n/a"
+    tiers = tiers or {}
+    return ", ".join(f"{v} ({tiers[v]})" if v in tiers else v for v in values)
+
+
 def _screen_prompt(profile: dict, listing_block: str) -> str:
     return f"""You are screening job listings for ONE candidate. For EACH listing judge TWO things independently.
 
 SECTOR/DOMAIN FIT
 Candidate target sectors/domains: {', '.join(profile.get('sectors') or []) or 'n/a'}
-Candidate target roles: {', '.join(profile.get('search_terms') or []) or 'n/a'}
+Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms') or [], profile.get('target_role_weight_tiers'))}
 - sector_ok=true if the role is in one of these sectors/domains, or clearly adjacent.
 - sector_ok=false only if it is in an unrelated field. When unsure, sector_ok=true.
 
 SENIORITY / HARD REQUIREMENTS
 Candidate seniority: {profile.get('seniority', 'mid-level')}
-Candidate core skills: {', '.join(profile.get('key_skills') or []) or 'n/a'}
-(Stated multi-year durations are stronger evidence than brief/undated mentions.)
+Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'))}
+(Stated multi-year durations are stronger evidence than brief/undated mentions. A target role or skill
+tagged "strongly preferred"/"preferred" reflects the candidate's own past tick feedback -- weigh sector fit
+a little more favorably toward it. One tagged "deprioritize"/"lower priority" reflects past cross feedback
+-- don't let it alone satisfy a hard requirement or sector match.)
 - seniority_ok=false if the listing clearly implies a seniority level well ABOVE or well
   BELOW the candidate (e.g. Director/VP/Head/Principal for a mid-level candidate, or
   Intern/Graduate/Entry for a senior candidate), OR if it states more than
@@ -1781,14 +1796,17 @@ def _rank_prompt(profile: dict, listing_block: str) -> str:
     )
     return f"""You are estimating how well each job listing fits ONE candidate, as a rough numeric score.
 
-Candidate target roles: {', '.join(profile.get('search_terms') or []) or 'n/a'}
+Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms') or [], profile.get('target_role_weight_tiers'))}
 Candidate target sectors/domains: {', '.join(profile.get('sectors') or []) or 'n/a'}
 Candidate seniority: {profile.get('seniority', 'mid-level')}
-Candidate core skills: {', '.join(profile.get('key_skills') or []) or 'n/a'}
+Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'))}
 {multi_note}
 For EACH listing, give a fit_score from 0 (clearly wrong fit) to 100 (excellent fit) for how well the
 role, seniority, and sector align with the candidate. Judge relatively across the whole batch -- spread
-scores out rather than clustering everything near one number.
+scores out rather than clustering everything near one number. A target role or skill tagged "strongly
+preferred"/"preferred" reflects the candidate's own past tick feedback -- nudge the score up a little for
+a strong match on it. One tagged "deprioritize"/"lower priority" reflects past cross feedback -- nudge the
+score down a little if the listing leans heavily on it.
 
 Output ONLY JSON: {{"scores":[{{"n":1,"fit_score":72}},{{"n":2,"fit_score":40}}]}}
 Include one object per listing, numbered exactly as shown.

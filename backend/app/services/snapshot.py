@@ -48,6 +48,33 @@ def _labeled(group: list[ProfileAttribute]) -> list[str]:
     return [f"{a.value} ({a.proficiency})" if a.proficiency else a.value for a in group]
 
 
+def _weight_tier(weight: float) -> str | None:
+    """Coarse priority label derived from feedback weight (tick/cross history),
+    for prompts sent to the cheap gate/rank models -- these only ever see a flat
+    attribute list today, so a heavily-ticked or heavily-crossed value carries no
+    more signal there than a never-touched one; the embedding pre-filter is the
+    only thing weight currently influences. None means neutral -- don't annotate."""
+    if weight >= 1.3:
+        return "strongly preferred by candidate"
+    if weight >= 1.15:
+        return "preferred by candidate"
+    if weight <= 0.6:
+        return "candidate has shown disinterest -- deprioritize"
+    if weight <= 0.85:
+        return "lower priority for candidate"
+    return None
+
+
+def _weight_tiers(group: list[ProfileAttribute]) -> dict[str, str]:
+    """value -> tier, omitting neutral-weight values entirely."""
+    out: dict[str, str] = {}
+    for a in group:
+        tier = _weight_tier(a.weight)
+        if tier:
+            out[a.value] = tier
+    return out
+
+
 # Depth signal for skill emphasis (Expert/Proficient/Familiar/One-time) and the
 # past_role employment-type flag (Informal = student club/volunteer/unpaid, not
 # a paid job) -- how many extra times a value is repeated in the embedding text
@@ -174,8 +201,18 @@ def _weighted_text(
 ) -> str:
     """Weighted emphasis text driving the embedding pre-filter: repeat each
     value roughly in proportion to its learned weight so feedback actually
-    shifts results. When role_filter is given, only target_roles in that set
-    are included -- this is what lets each role cluster get its own scoped
+    shifts results both up (sustained ticks) and down (sustained crosses).
+    Previously this used `max(1, round(base * max(1, round(a.weight)) * mult))`
+    -- the INNER max(1, round(weight)) alone already floored the effective
+    weight at 1 for anything below ~1.5, and the OUTER max(1, ...) floored the
+    final count too, so a value crossed all the way down to WEIGHT_MIN (0.1)
+    still rounded to the same repeat count as a never-touched 1.0 default --
+    crossing could stop future amplification but never actually suppress
+    anything. Using the raw weight directly (no inner floor) and allowing the
+    final count to reach 0 (no outer floor) lets sustained crosses genuinely
+    drop a value out of the embedding text, symmetric with how sustained ticks
+    push it up. When role_filter is given, only target_roles in that set are
+    included -- this is what lets each role cluster get its own scoped
     embedding text instead of one blend of every target role the candidate has."""
     emphasis: list[str] = []
     for group_name in ("target_role", "skill", "past_role", "experience", "qualification", "sector_target"):
@@ -184,7 +221,7 @@ def _weighted_text(
             if group_name == "target_role" and role_filter is not None and a.value.strip() not in role_filter:
                 continue
             mult = _proficiency_multiplier(a.proficiency) if group_name != "target_role" else 1.0
-            count = max(1, round(base * max(1, round(a.weight)) * mult))
+            count = max(0, round(base * a.weight * mult))
             emphasis.extend([a.value] * count)
     emphasis.extend(sectors)
     emphasis.append(seniority)
@@ -296,6 +333,13 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         "salary_floor": salary_floor,     # 0 means no salary floor
         "search_terms": search_terms,
         "role_clusters": role_clusters,   # list[{"roles": [...], "weighted_text": "..."}]
+        # value -> priority label, used by the cheap gate/rank prompts (full_auto.py's
+        # _screen_prompt/_rank_prompt) to annotate target roles/skills the candidate
+        # has ticked or crossed on past results -- so that feedback also has some
+        # influence on which roles reach the expensive judge, not just the embedding
+        # pre-filter. Omits neutral-weight values entirely (see _weight_tier).
+        "target_role_weight_tiers": _weight_tiers(g.get("target_role", [])),
+        "skill_weight_tiers": _weight_tiers(g.get("skill", [])),
     }
 
     weighted_text = _weighted_text(g, region["sectors"], seniority, search_terms)
