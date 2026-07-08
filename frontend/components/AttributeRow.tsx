@@ -34,7 +34,9 @@ export function AttributeRow({
   const [loadingSuggest, setLoadingSuggest] = useState(false);
 
   const existing = new Set(attributes.map((a) => a.value.toLowerCase()));
-  const showProficiency = type === "skill" || type === "past_role";
+  const showProficiency = type === "skill";
+  const showInformalToggle = type === "past_role";
+  const isLongText = type === "experience";
 
   function commit(value: string) {
     const v = value.trim();
@@ -66,8 +68,15 @@ export function AttributeRow({
       <div className="field col">
         <div className="field">
           {attributes.map((a) => (
-            <span key={a.id} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-              <Chip label={a.value} onRemove={() => remove.mutate(a.id)} />
+            <span
+              key={a.id}
+              style={
+                isLongText
+                  ? { display: "block", width: "100%" }
+                  : { display: "inline-flex", alignItems: "center", gap: 4 }
+              }
+            >
+              <Chip label={a.value} onRemove={() => remove.mutate(a.id)} variant={isLongText ? "exp" : undefined} />
               {showProficiency && (
                 <select
                   className="input"
@@ -81,6 +90,25 @@ export function AttributeRow({
                     <option key={p} value={p}>{p}</option>
                   ))}
                 </select>
+              )}
+              {showInformalToggle && (
+                a.proficiency === "Informal" ? (
+                  <button
+                    className="tag-informal"
+                    onClick={() => update.mutate({ id: a.id, proficiency: "" })}
+                    title="Student club, society, or volunteer role — not paid employment. Click to unmark."
+                  >
+                    Informal ✕
+                  </button>
+                ) : (
+                  <button
+                    className="ghost tiny"
+                    onClick={() => update.mutate({ id: a.id, proficiency: "Informal" })}
+                    title="Mark as informal (student club, society, or volunteer — not paid employment)"
+                  >
+                    + informal
+                  </button>
+                )
               )}
             </span>
           ))}

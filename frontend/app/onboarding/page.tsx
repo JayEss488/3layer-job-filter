@@ -112,7 +112,13 @@ export default function OnboardingPage() {
                   onClick={() => fileRef.current?.click()}
                   disabled={busy}
                 >
-                  Choose file
+                  {busy ? (
+                    <>
+                      <span className="spinner">◴</span> Working…
+                    </>
+                  ) : (
+                    "Choose file"
+                  )}
                 </button>
                 <input
                   ref={fileRef}
@@ -123,6 +129,11 @@ export default function OnboardingPage() {
                 />
               </div>
             </div>
+            {(busy || status) && (
+              <div className="upload-status">
+                {busy && <span className="spinner">◴</span>} {busy ? status || "Working…" : status}
+              </div>
+            )}
             <div className="honesty-note">
               <strong>Works best if filled in honestly</strong> — AI tends to overestimate
               CV claims.
@@ -138,7 +149,6 @@ export default function OnboardingPage() {
               <button className="btn btn-secondary" onClick={parseText} disabled={busy || !text.trim()}>
                 {busy ? "Parsing…" : "Parse text"}
               </button>
-              {status && <span className="muted-text" style={{ alignSelf: "center" }}>{status}</span>}
             </div>
           </div>
         </div>
@@ -155,6 +165,13 @@ export default function OnboardingPage() {
               <AttributeRow label="Past roles" profileId={activeId} type="past_role" attributes={g?.past_role ?? []} />
               <AttributeRow label="Skills" profileId={activeId} type="skill" attributes={g?.skill ?? []} enableSuggest />
               <AttributeRow label="Experience" profileId={activeId} type="experience" attributes={g?.experience ?? []} />
+              <AttributeRow
+                label="Qualifications"
+                profileId={activeId}
+                type="qualification"
+                attributes={g?.qualification ?? []}
+                placeholder="e.g. First Class Honours BSc Physics, Durham"
+              />
               <div className="row pref">
                 <div className="label">Seniority</div>
                 <div className="field">
@@ -172,6 +189,13 @@ export default function OnboardingPage() {
                 attributes={g?.target_role ?? []}
                 enableSuggest
                 placeholder="e.g. Engineering Manager, Principal Engineer"
+              />
+              <AttributeRow
+                label="Sector / mission interests"
+                profileId={activeId}
+                type="sector_target"
+                attributes={g?.sector_target ?? []}
+                placeholder="e.g. Clean energy / net-zero policy"
               />
               <div className="row pref">
                 <div className="label">Salary range</div>

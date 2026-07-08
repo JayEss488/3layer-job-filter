@@ -37,7 +37,14 @@ def _migrate_columns():
 
     insp = inspect(engine)
     additions = {
-        "jobs_seen": [("embedding", "TEXT")],
+        "jobs_seen": [
+            ("embedding", "TEXT"),
+            ("full_text", "TEXT"),
+            ("eval_verdict", "TEXT"),
+            ("eval_analysis", "TEXT"),
+            ("eval_signature", "TEXT"),
+            ("evaluated_at", "DATETIME"),
+        ],
         "company_ats": [("keyword", "TEXT")],
         "search_runs": [("phase_timings", "TEXT")],
         "roles": [("source", "TEXT")],

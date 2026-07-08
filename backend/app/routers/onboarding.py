@@ -23,7 +23,9 @@ def _background_context(db: Session, profile_id: int) -> str:
     attrs = db.execute(
         select(ProfileAttribute).where(
             ProfileAttribute.profile_id == profile_id,
-            ProfileAttribute.type.in_(["past_role", "skill", "experience", "seniority"]),
+            ProfileAttribute.type.in_(
+                ["past_role", "skill", "experience", "qualification", "seniority", "sector_target"]
+            ),
         )
     ).scalars().all()
     by_type: dict[str, list[str]] = {}
@@ -32,12 +34,16 @@ def _background_context(db: Session, profile_id: int) -> str:
     parts = []
     if by_type.get("past_role"):
         parts.append("Past roles: " + ", ".join(by_type["past_role"]))
+    if by_type.get("qualification"):
+        parts.append("Qualifications: " + "; ".join(by_type["qualification"]))
     if by_type.get("skill"):
         parts.append("Skills: " + ", ".join(by_type["skill"]))
     if by_type.get("experience"):
         parts.append("Experience: " + "; ".join(by_type["experience"]))
     if by_type.get("seniority"):
         parts.append("Seniority: " + ", ".join(by_type["seniority"]))
+    if by_type.get("sector_target"):
+        parts.append("Sector interests: " + "; ".join(by_type["sector_target"]))
     return "\n".join(parts)
 
 
@@ -47,7 +53,7 @@ def _target_role_context(db: Session, profile_id: int) -> str:
     signal that the original document still has."""
     profile = db.get(Profile, profile_id)
     if profile and profile.cv_text:
-        return profile.cv_text[:8000]
+        return profile.cv_text[:20000]
     return _background_context(db, profile_id)
 
 
@@ -56,7 +62,11 @@ _TARGET_ROLE_GUIDANCE = (
     "use of tools, academic background, languages, communications/organisational "
     "work -- as heavily as any skills list. Do not default to generic titles that "
     "only match a skills-inventory section if stronger, more differentiated, "
-    "better-evidenced titles fit their actual background."
+    "better-evidenced titles fit their actual background. If the candidate has "
+    "stated explicit sector, industry, or cause-targeting language (cover-letter "
+    "angles, named industries/organisations they're drawn to), also propose titles "
+    "reflecting those sectors specifically -- don't let a generic skills-first "
+    "framing crowd those out."
 )
 
 
@@ -89,7 +99,7 @@ async def parse_cv(
     text = extract_text_from_upload(file.filename or "", raw)
     if not text.strip():
         raise HTTPException(status_code=422, detail="Could not read any text from that file")
-    profile.cv_text = text[:20000]
+    profile.cv_text = text[:40000]
     created = parse_text_to_attributes(db, profile.id, text, source="cv_parsed")
     created += _preload_target_roles(db, profile.id, created)
     db.commit()
@@ -106,7 +116,7 @@ def parse_text(
     profile: Profile = Depends(get_profile_or_404),
     db: Session = Depends(get_db),
 ):
-    profile.cv_text = body.text[:20000]
+    profile.cv_text = body.text[:40000]
     created = parse_text_to_attributes(db, profile.id, body.text, source="text_parsed")
     created += _preload_target_roles(db, profile.id, created)
     db.commit()

@@ -34,17 +34,30 @@ FRONTEND_ORIGINS = os.getenv(
 # Cost guard: max live searches per profile per calendar day.
 MAX_SEARCHES_PER_DAY = int(os.getenv("MAX_SEARCHES_PER_DAY", "5"))
 
+# Cost/time guard: skip re-querying the ~40-company ATS rotation batch (the
+# single largest chunk of a run's discovery calls) when the last fetch for
+# this profile is still within this many hours. The always-fresh term-based
+# API sources (Reed/Adzuna/Google Jobs/etc.) are unaffected.
+DISCOVERY_ATS_CACHE_TTL_HOURS = float(os.getenv("DISCOVERY_ATS_CACHE_TTL_HOURS", "4"))
+
 # Below this many semantic-filter survivors we warn the filters may be too harsh.
 HARSH_FILTER_THRESHOLD = 5
 
 # ── Controlled vocabulary of attribute types ────────────────────────────────
-# Keep this small. New categories should reuse a type, not add columns.
+# Keep this small. New categories should generally reuse a type, not add
+# columns. "qualification" and "sector_target" are deliberate exceptions:
+# formal credentials (degree class, certifications) and explicit sector/
+# mission-targeting language (cover-letter angles) are structurally distinct
+# from skill/experience bullets and job titles, and previously had no field
+# to land in at all -- see the profile-builder fidelity fix.
 ATTRIBUTE_TYPES = [
     "past_role",
     "skill",
     "experience",
+    "qualification",
     "seniority",
     "target_role",
+    "sector_target",
     "salary",
     "location",
     "country",
@@ -57,8 +70,10 @@ ATTRIBUTE_DIRECTION = {
     "past_role": "background",
     "skill": "background",
     "experience": "background",
+    "qualification": "background",
     "seniority": "background",
     "target_role": "target",
+    "sector_target": "target",
     "salary": "constraint",
     "location": "constraint",
     "country": "constraint",

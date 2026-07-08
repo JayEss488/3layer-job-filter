@@ -86,7 +86,7 @@ export default function SearchPage() {
           </div>
         )}
 
-        {active.map((role: Role) => {
+        {!running && active.map((role: Role) => {
           const saved = role.status === "saved";
           return (
             <RoleCard
@@ -113,7 +113,7 @@ export default function SearchPage() {
           );
         })}
 
-        {crossed.length > 0 && (
+        {!running && crossed.length > 0 && (
           <>
             <div className="crossed-section-label">passed this session</div>
             {crossed.map((role) => (

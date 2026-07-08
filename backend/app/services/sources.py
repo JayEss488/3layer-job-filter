@@ -9,6 +9,7 @@ discovery is Greenhouse" directly instead of it hiding in the debug JSON.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -34,6 +35,7 @@ SOURCES: list[dict] = [
 
 _PREFIX_TO_KEY = {s["board_prefix"]: s["key"] for s in SOURCES}
 _VALID_KEYS = {s["key"] for s in SOURCES}
+ATS_KEYS = {s["key"] for s in SOURCES if s["kind"] == "ats"}
 
 
 def canonical_key(board: str | None) -> str | None:
@@ -194,3 +196,35 @@ def sources_overview(db: Session) -> list[dict]:
         }
         for s in SOURCES
     ]
+
+
+_ATS_FETCH_MARKER_KEY = "last_ats_fetch_at"
+
+
+def get_ats_batch_stale(db: Session, profile_id: int, ttl_hours: float) -> bool:
+    """Whether this profile's ~40-company ATS rotation batch is due for a fresh
+    fetch. True when never fetched or older than ttl_hours -- lets a run skip
+    re-querying every ATS company's board when a very recent run already did,
+    without touching the always-fresh term-based API sources (Reed/Adzuna/etc)."""
+    row = db.execute(
+        select(Setting).where(Setting.profile_id == profile_id, Setting.key == _ATS_FETCH_MARKER_KEY)
+    ).scalar_one_or_none()
+    if not row or not row.value:
+        return True
+    try:
+        last = datetime.fromisoformat(row.value)
+    except (ValueError, TypeError):
+        return True
+    return datetime.utcnow() - last > timedelta(hours=ttl_hours)
+
+
+def mark_ats_batch_fetched(db: Session, profile_id: int) -> None:
+    row = db.execute(
+        select(Setting).where(Setting.profile_id == profile_id, Setting.key == _ATS_FETCH_MARKER_KEY)
+    ).scalar_one_or_none()
+    value = datetime.utcnow().isoformat()
+    if row is not None:
+        row.value = value
+    else:
+        db.add(Setting(profile_id=profile_id, key=_ATS_FETCH_MARKER_KEY, value=value))
+    db.commit()

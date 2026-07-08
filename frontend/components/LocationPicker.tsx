@@ -10,8 +10,8 @@ const WORK_TYPES = ["On-site", "Hybrid", "Remote"];
 const WORK_SET = new Set(WORK_TYPES.map((w) => w.toLowerCase()));
 
 const SCOPE_CHOICES: { value: string; label: string }[] = [
-  { value: "national", label: "National" },
   { value: "local", label: "Local" },
+  { value: "national", label: "National" },
   { value: "international", label: "International" },
 ];
 
@@ -31,6 +31,43 @@ const COUNTRY_CHOICES: { code: string; label: string }[] = [
   { code: "sg", label: "Singapore" },
   { code: "za", label: "South Africa" },
 ];
+
+// Mirrors full_auto.py _COUNTRY_TOKENS (high-signal tokens only) so the picker
+// can auto-detect the country from a typed city/region and highlight it — which
+// matches the backend's fail-closed default (no explicit country chip -> filter
+// by the country inferred from the location).
+const COUNTRY_TOKENS: Record<string, string[]> = {
+  gb: ["united kingdom", "uk", "u.k.", "great britain", "england", "scotland", "wales",
+       "northern ireland", "london", "manchester", "birmingham", "leeds", "glasgow",
+       "edinburgh", "bristol", "liverpool", "sheffield", "newcastle", "nottingham",
+       "leicester", "coventry", "cardiff", "belfast", "cambridge", "oxford", "reading",
+       "brighton", "aberdeen", "dundee", "southampton", "portsmouth", "essex", "kent",
+       "surrey", "sussex", "hampshire", "yorkshire", "lancashire", "cheshire", "devon",
+       "cornwall", "southend"],
+  us: ["united states", "usa", "u.s.", "america", "new york", "san francisco",
+       "los angeles", "chicago", "seattle", "austin", "boston", "texas", "california",
+       "florida", "washington", "denver", "atlanta", "dallas", "houston", "philadelphia"],
+  ca: ["canada", "toronto", "vancouver", "montreal", "ottawa", "calgary"],
+  au: ["australia", "sydney", "melbourne", "brisbane", "perth"],
+  de: ["germany", "deutschland", "berlin", "munich", "hamburg", "frankfurt"],
+  fr: ["france", "paris", "lyon", "marseille"],
+  in: ["india", "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "pune"],
+  it: ["italy", "italia", "rome", "milan", "turin"],
+  nl: ["netherlands", "holland", "amsterdam", "rotterdam", "the hague"],
+  at: ["austria", "vienna"],
+  pl: ["poland", "warsaw", "krakow", "wroclaw"],
+  sg: ["singapore"],
+  za: ["south africa", "johannesburg", "cape town", "pretoria"],
+};
+
+function detectCountry(text: string): string | null {
+  const loc = (text || "").trim().toLowerCase();
+  if (!loc) return null;
+  for (const [code, tokens] of Object.entries(COUNTRY_TOKENS)) {
+    if (tokens.some((t) => loc.includes(t))) return code;
+  }
+  return null;
+}
 
 /** City/region free text + work-type multi-choice. Each stored as a location attr. */
 export function LocationPicker({
@@ -87,6 +124,12 @@ export function LocationPicker({
   const [city, setCity] = useState(cityAttr?.value ?? "");
   useEffect(() => setCity(cityAttr?.value ?? ""), [cityAttr?.value]);
 
+  // Country auto-detected from the typed city/region. When the user hasn't
+  // explicitly picked a country, this is the one the backend will filter by
+  // (fail-closed default), so highlight it to make that visible.
+  const detected = detectCountry(city);
+  const noneSelected = selectedCountries.size === 0;
+
   async function persistCity() {
     const v = city.trim();
     if (cityAttr && v && v !== cityAttr.value) {
@@ -108,27 +151,29 @@ export function LocationPicker({
 
   return (
     <div className="location-row">
-      <input
-        className="input"
-        style={{ width: 160 }}
-        placeholder="City or region…"
-        value={city}
-        onChange={(e) => setCity(e.target.value)}
-        onBlur={persistCity}
-        onKeyDown={(e) => e.key === "Enter" && persistCity()}
-      />
-      <div className="choice-row">
-        {WORK_TYPES.map((w) => (
-          <button
-            key={w}
-            className={`toggle ${workTypes.has(w.toLowerCase()) ? "on" : "off"}`}
-            onClick={() => toggleWork(w)}
-          >
-            {w}
-          </button>
-        ))}
+      <div className="location-line">
+        <input
+          className="input"
+          style={{ width: 160 }}
+          placeholder="City or region…"
+          value={city}
+          onChange={(e) => setCity(e.target.value)}
+          onBlur={persistCity}
+          onKeyDown={(e) => e.key === "Enter" && persistCity()}
+        />
+        <div className="choice-row">
+          {WORK_TYPES.map((w) => (
+            <button
+              key={w}
+              className={`toggle ${workTypes.has(w.toLowerCase()) ? "on" : "off"}`}
+              onClick={() => toggleWork(w)}
+            >
+              {w}
+            </button>
+          ))}
+        </div>
       </div>
-      <div className="choice-row" style={{ marginTop: 8 }}>
+      <div className="choice-row">
         {SCOPE_CHOICES.map((s) => (
           <button
             key={s.value}
@@ -140,16 +185,25 @@ export function LocationPicker({
         ))}
       </div>
       {showCountryChips && (
-        <div className="choice-row" style={{ marginTop: 8, flexWrap: "wrap" }}>
+        <div className="choice-row" style={{ flexWrap: "wrap" }}>
           {COUNTRY_CHOICES.map((c) => (
             <button
               key={c.code}
-              className={`country${selectedCountries.has(c.code) ? " on" : ""}`}
+              className={`country${selectedCountries.has(c.code) ? " on" : ""}${
+                noneSelected && c.code === detected ? " detected" : ""
+              }`}
               onClick={() => toggleCountry(c.code)}
             >
               {c.label}
             </button>
           ))}
+        </div>
+      )}
+      {showCountryChips && noneSelected && detected && (
+        <div className="hint-detected">
+          Detected{" "}
+          <strong>{COUNTRY_CHOICES.find((c) => c.code === detected)?.label}</strong>{" "}
+          from your location — used automatically unless you pick a country.
         </div>
       )}
     </div>

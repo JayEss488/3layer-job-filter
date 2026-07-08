@@ -5,6 +5,7 @@ deals in attribute rows; the engine receives the dict shape full_auto.py expects
 with attribute weights translated into ranking emphasis."""
 import re
 from collections import defaultdict
+from functools import lru_cache
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -47,16 +48,17 @@ def _labeled(group: list[ProfileAttribute]) -> list[str]:
     return [f"{a.value} ({a.proficiency})" if a.proficiency else a.value for a in group]
 
 
-# Depth signal for skill/past_role emphasis: how many extra times a value is
-# repeated in the embedding text on top of the existing feedback-weight
-# multiplier. Substring-matched against the free-text proficiency field so it
-# still works with values the user typed by hand, not just a fixed enum.
+# Depth signal for skill emphasis (Expert/Proficient/Familiar/One-time) and the
+# past_role employment-type flag (Informal = student club/volunteer/unpaid, not
+# a paid job) -- how many extra times a value is repeated in the embedding text
+# on top of the existing feedback-weight multiplier. Substring-matched so it
+# still works with values the user typed by hand, not just the parser's output.
 _PROFICIENCY_MULT = {
     "expert": 2.0,
     "proficient": 1.5,
     "familiar": 1.0,
     "one-time": 0.5,
-    "one-off": 0.5,
+    "informal": 0.5,
 }
 
 
@@ -86,6 +88,118 @@ Location: {location or 'United Kingdom'}"""
     return {"sectors": sectors or ["general"], "adzuna_country_code": str(cc).lower()[:2]}
 
 
+@lru_cache(maxsize=256)
+def _cluster_target_roles_cached(roles_key: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    """LLM grouping of a role set into clusters, cached for this process's
+    lifetime per unique (sorted, deduped) role set -- most profiles never
+    change their target roles between searches, so this avoids re-paying the
+    call every run. Falls open to a single cluster on anything malformed."""
+    roles = list(roles_key)
+    data = llm_json(
+        f"""Group these job title strings into 1-3 clusters by underlying job
+function / career path. STRONGLY prefer returning ONE cluster. Only split
+into more when the titles are in genuinely unrelated professional fields
+(e.g. "marketing coordinator" vs "nursing assistant") -- NOT for different
+specializations, seniority levels, or sub-disciplines within the same
+broader field. For example, "CAD Engineering Intern", "Electrical
+Engineering Intern", and "Manufacturing Engineering Intern" are all
+engineering and belong in ONE cluster, not three. When in doubt, merge
+rather than split. Every title must appear in exactly one cluster.
+Output ONLY JSON: {{"clusters": [["title a", "title b"], ["title c"]]}}
+Titles: {', '.join(roles)}"""
+    )
+    clusters = data.get("clusters")
+    if not isinstance(clusters, list) or not clusters:
+        return (tuple(roles),)
+    seen: set[str] = set()
+    out: list[tuple[str, ...]] = []
+    for c in clusters:
+        if not isinstance(c, list):
+            continue
+        members = tuple(r for r in c if isinstance(r, str) and r in roles and r not in seen)
+        seen.update(members)
+        if members:
+            out.append(members)
+    missing = [r for r in roles if r not in seen]
+    if missing:
+        out.append(tuple(missing))
+    if not out:
+        return (tuple(roles),)
+    # The prompt asks for 1-3 clusters, but nothing enforces that on the model's
+    # output -- merge any excess into the last cluster rather than let an
+    # unbounded cluster count reach the pipeline's per-cluster fan-out. Kept low
+    # deliberately: discovery volume is fixed per run (not scaled by cluster
+    # count), so more clusters just thins each one's candidate pool.
+    MAX_CLUSTERS = 3
+    if len(out) > MAX_CLUSTERS:
+        overflow = tuple(r for cluster in out[MAX_CLUSTERS:] for r in cluster)
+        out = out[:MAX_CLUSTERS - 1] + (out[MAX_CLUSTERS - 1] + overflow,)
+    return tuple(out)
+
+
+def cluster_target_roles(target_roles: list[str]) -> list[list[str]]:
+    """Group a profile's target roles into 1-3 clusters of similar job
+    function. Downstream (engine.py) scores, gates, and evaluates each
+    cluster independently, so a job matching ANY ONE of a candidate's
+    distinct role interests can surface on its own merits, instead of being
+    judged against a single blended average of all of them (which silently
+    penalises candidates targeting more than one field). Fails open to one
+    cluster -- today's behavior -- on 0-1 roles or any LLM/parsing issue."""
+    roles = [r.strip() for r in target_roles if r and r.strip()]
+    if len(roles) <= 1:
+        return [roles] if roles else []
+    try:
+        clusters = _cluster_target_roles_cached(tuple(sorted(set(roles))))
+    except Exception:
+        return [roles]
+    return [list(c) for c in clusters if c]
+
+
+# target_role gets a baseline lead over skill/past_role so a first-ever search
+# (before any feedback has nudged weights) still embeds toward what the
+# candidate WANTS, not just what they've done/used. qualification and
+# sector_target sit above plain skill/past_role/experience -- they're often
+# stronger differentiators (a hard-filter-clearing credential, an explicit
+# mission/sector preference) than a generic skill or job title -- but below
+# target_role's literal job-title signal.
+_BASE_EMPHASIS = {
+    "target_role": 3, "skill": 1, "past_role": 1,
+    "experience": 1, "qualification": 2, "sector_target": 2,
+}
+
+
+def _weighted_text(
+    g: dict[str, list[ProfileAttribute]], sectors: list[str], seniority: str,
+    search_terms: list[str], role_filter: set[str] | None = None,
+) -> str:
+    """Weighted emphasis text driving the embedding pre-filter: repeat each
+    value roughly in proportion to its learned weight so feedback actually
+    shifts results. When role_filter is given, only target_roles in that set
+    are included -- this is what lets each role cluster get its own scoped
+    embedding text instead of one blend of every target role the candidate has."""
+    emphasis: list[str] = []
+    for group_name in ("target_role", "skill", "past_role", "experience", "qualification", "sector_target"):
+        base = _BASE_EMPHASIS[group_name]
+        for a in g.get(group_name, []):
+            if group_name == "target_role" and role_filter is not None and a.value.strip() not in role_filter:
+                continue
+            mult = _proficiency_multiplier(a.proficiency) if group_name != "target_role" else 1.0
+            count = max(1, round(base * max(1, round(a.weight)) * mult))
+            emphasis.extend([a.value] * count)
+    emphasis.extend(sectors)
+    emphasis.append(seniority)
+    return " ".join(emphasis) or " ".join(search_terms)
+
+
+def cv_text_for_cluster(cv_text_base: str, cluster_roles: list[str]) -> str:
+    """Scope the synthetic CV's target-roles line to one role cluster, so a
+    per-cluster final-evaluation call judges fit against ONE coherent role
+    identity instead of every field the candidate has ever listed."""
+    if not cluster_roles:
+        return cv_text_base
+    return f"{cv_text_base}\nTarget roles: {', '.join(cluster_roles)}"
+
+
 def build_snapshot(db: Session, profile_id: int) -> dict:
     """Return everything the engine run needs, derived from the profile's memory."""
     g = _grouped(db, profile_id)
@@ -94,7 +208,9 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     past_roles = _values(g.get("past_role", []))
     skills = _values(g.get("skill", []))
     experience = _values(g.get("experience", []))
+    qualifications = _values(g.get("qualification", []))
     seniorities = _values(g.get("seniority", []))
+    sector_targets = _values(g.get("sector_target", []))
     customs = _values(g.get("custom", []))
 
     # Location: separate the place from the work-type tokens.
@@ -106,9 +222,13 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
             loc_place = v
     location = loc_place or "United Kingdom"
 
-    # Search terms: target roles lead (what they WANT), past roles follow.
+    # Search terms sent to Reed/Adzuna/Google/JSearch: target roles only (what
+    # they WANT). past_roles used to be appended here too, but that pulls in
+    # discovery results matching what the candidate has DONE rather than what
+    # they're looking for next -- past_role still feeds the embedding/CV text
+    # (_weighted_text/cv_text_base), just not the literal board search query.
     search_terms = []
-    for t in target_roles + past_roles:
+    for t in target_roles:
         if t not in search_terms:
             search_terms.append(t)
     search_terms = search_terms[:14] or ["jobs"]
@@ -152,6 +272,18 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     # 0 (the slider's default min) means "no floor" -> the filter is a no-op.
     salary_floor = _parse_salary_floor(_values(g.get("salary", [])))
 
+    # Role clusters: usually one, but a candidate targeting genuinely different
+    # fields (e.g. "marketing" and "research") gets several. The engine scores,
+    # gates, and evaluates each cluster independently. Each cluster carries its
+    # own weighted_text (scoped to just that cluster's roles) so its embedding
+    # isn't diluted by the candidate's other, unrelated target roles.
+    role_groups = cluster_target_roles(target_roles)
+    role_clusters = [
+        {"roles": grp, "weighted_text": _weighted_text(g, region["sectors"], seniority,
+                                                        search_terms, role_filter=set(grp))}
+        for grp in role_groups
+    ]
+
     engine_profile = {
         "sectors": region["sectors"],
         "seniority": seniority,
@@ -163,47 +295,45 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         "local_place": loc_place if scope == "local" else "",
         "salary_floor": salary_floor,     # 0 means no salary floor
         "search_terms": search_terms,
+        "role_clusters": role_clusters,   # list[{"roles": [...], "weighted_text": "..."}]
     }
 
-    # Weighted emphasis text drives the embedding pre-filter: repeat each value
-    # roughly in proportion to its learned weight so feedback actually shifts results.
-    # target_role gets a baseline lead over skill/past_role so a first-ever search
-    # (before any feedback has nudged weights) still embeds toward what the
-    # candidate WANTS, not just what they've done/used.
-    _BASE_EMPHASIS = {"target_role": 3, "skill": 1, "past_role": 1}
-    emphasis: list[str] = []
-    for group_name in ("target_role", "skill", "past_role"):
-        base = _BASE_EMPHASIS[group_name]
-        for a in g.get(group_name, []):
-            mult = _proficiency_multiplier(a.proficiency) if group_name != "target_role" else 1.0
-            count = max(1, round(base * max(1, round(a.weight)) * mult))
-            emphasis.extend([a.value] * count)
-    emphasis.extend(region["sectors"])
-    emphasis.append(seniority)
-    weighted_text = " ".join(emphasis) or " ".join(search_terms)
+    weighted_text = _weighted_text(g, region["sectors"], seniority, search_terms)
 
     # Synthetic CV text for the expensive-AI final evaluation (engine reads a file).
+    # cv_text_base omits the "Target roles" line -- see cv_text_for_cluster,
+    # which appends it scoped to one role cluster at a time, instead of always
+    # listing every target role the candidate has (which invites the judge to
+    # weigh fit against all of them at once).
     cv_lines = []
     if past_roles:
         cv_lines.append("Past roles: " + ", ".join(_labeled(g.get("past_role", []))))
+    if qualifications:
+        cv_lines.append("Qualifications: " + "; ".join(qualifications))
     if seniorities:
         cv_lines.append("Seniority: " + ", ".join(seniorities))
     if skills:
         cv_lines.append("Skills: " + ", ".join(_labeled(g.get("skill", []))))
     if experience:
-        cv_lines.append("Experience: " + "; ".join(experience))
-    if target_roles:
-        cv_lines.append("Target roles: " + ", ".join(target_roles))
+        cv_lines.append("Experience: " + "; ".join(_labeled(g.get("experience", []))))
+    if sector_targets:
+        cv_lines.append("Sector interests: " + "; ".join(sector_targets))
     if location or work_types:
         cv_lines.append(f"Location: {location} ({', '.join(work_types) or 'any'})")
     if customs:
         cv_lines.append("Constraints: " + "; ".join(customs))
-    cv_text = "\n".join(cv_lines) or "General candidate."
+    cv_text_base = "\n".join(cv_lines) or "General candidate."
+    cv_text = (
+        "\n".join([*cv_lines, f"Target roles: {', '.join(target_roles)}"])
+        if target_roles else cv_text_base
+    )
 
     return {
         "engine_profile": engine_profile,
         "weighted_text": weighted_text,
         "cv_text": cv_text,
+        "cv_text_base": cv_text_base,
+        "role_clusters": role_clusters,
         "skills": skills,
         "seniority_label": seniorities[0] if seniorities else None,
     }

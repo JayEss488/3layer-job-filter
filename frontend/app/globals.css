@@ -144,7 +144,18 @@ a { color: inherit; }
 .chip .x { opacity: .4; cursor: pointer; }
 .chip.tinted { background: var(--accent-tint); border-color: var(--accent-tint-bd); }
 .chip.solid { background: #f4f0e7; border-color: var(--accent-tint-bd); }
-.chip.exp { border-radius: 9px; padding: 7px 12px; background: var(--surface-3); border-color: #ebe4d6; color: #3d382f; gap: 9px; white-space: normal; }
+.chip.exp {
+  border-radius: 9px; padding: 7px 12px; background: var(--surface-3); border-color: #ebe4d6;
+  color: #3d382f; gap: 9px; white-space: normal; display: flex; align-items: flex-start;
+  width: 100%; max-width: 640px; box-sizing: border-box;
+}
+.chip.exp .x { margin-top: 2px; }
+.tag-informal {
+  display: inline-flex; align-items: center; border-radius: var(--r-pill); border: 1px solid var(--accent-tint-bd);
+  background: var(--accent-tint); color: #6b4028; font-size: 10.5px; padding: 3px 8px; cursor: pointer;
+  white-space: nowrap;
+}
+.ghost.tiny { font-size: 10.5px; padding: 3px 8px; }
 .ghost {
   display: inline-flex; align-items: center; gap: 5px; border: 1px dashed var(--line-dash);
   border-radius: var(--r-pill); padding: 6px 11px; font-size: 12.5px; color: var(--muted); cursor: pointer; background: none;
@@ -185,7 +196,11 @@ a { color: inherit; }
 .input::placeholder { color: var(--faint); }
 .country { background: var(--surface); border: 1px solid var(--line-input); color: var(--ink-2); border-radius: 7px; padding: 6px 11px; font-size: 12px; cursor: pointer; }
 .country.on { background: var(--accent); color: #fff; border-color: var(--accent); }
-.location-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.country.detected { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: var(--accent-tint); }
+.hint-detected { font-size: 11.5px; color: var(--muted); }
+.hint-detected strong { color: var(--ink-2); font-weight: 600; }
+.location-row { display: flex; flex-direction: column; gap: 8px; }
+.location-line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
 /* ── Source-performance funnel ───────────────────────────────────────────── */
 .funnel-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line-2); }
@@ -262,6 +277,7 @@ a { color: inherit; }
 .upload-btn-row { display: flex; gap: 8px; align-items: center; }
 .honesty-note { border: 1px solid var(--line); border-radius: var(--r-ctrl); background: var(--surface-3); padding: 8px 12px; font-size: 11.5px; color: var(--ink-2); line-height: 1.5; }
 .honesty-note strong { color: var(--ink); }
+.upload-status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); }
 .or-divider { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--faint); }
 .or-divider::before, .or-divider::after { content: ''; flex: 1; border-top: 1px dashed var(--line-2); }
 .textarea-input { border: 1px solid var(--line-input); border-radius: var(--r-ctrl); padding: 9px 11px; font-size: 12px; font-family: inherit; background: var(--surface-3); color: var(--ink); width: 100%; min-height: 90px; line-height: 1.6; }

@@ -123,6 +123,20 @@ export default function DashboardPage() {
               type="experience"
               attributes={g?.experience ?? []}
             />
+            <AttributeRow
+              label="Qualifications"
+              profileId={activeId}
+              type="qualification"
+              attributes={g?.qualification ?? []}
+              placeholder="e.g. First Class Honours BSc Physics, Durham"
+            />
+            <AttributeRow
+              label="Sector / mission interests"
+              profileId={activeId}
+              type="sector_target"
+              attributes={g?.sector_target ?? []}
+              placeholder="e.g. Clean energy / net-zero policy"
+            />
 
             <div className="subhead">PREFERENCES</div>
 

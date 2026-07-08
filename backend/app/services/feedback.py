@@ -11,7 +11,10 @@ from ..config import DELTAS, WEIGHT_MAX, WEIGHT_MIN
 from ..models import FeedbackLog, ProfileAttribute, Role
 
 # Types whose values are short keywords worth string-matching against a role.
-_MATCHABLE_TYPES = {"past_role", "skill", "target_role", "seniority"}
+# qualification is deliberately excluded -- its values are long descriptive
+# phrases (e.g. "First Class Honours BSc Physics, Durham University"), a poor
+# fit for this substring match.
+_MATCHABLE_TYPES = {"past_role", "skill", "target_role", "seniority", "sector_target"}
 
 
 def _clamp(w: float) -> float:

@@ -1,8 +1,16 @@
 "use client";
 
-export function Chip({ label, onRemove }: { label: string; onRemove?: () => void }) {
+export function Chip({
+  label,
+  onRemove,
+  variant,
+}: {
+  label: string;
+  onRemove?: () => void;
+  variant?: "exp";
+}) {
   return (
-    <span className="chip">
+    <span className={variant ? `chip ${variant}` : "chip"}>
       {label}
       {onRemove && (
         <span className="x" onClick={onRemove} role="button" aria-label={`remove ${label}`}>

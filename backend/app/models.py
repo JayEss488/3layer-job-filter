@@ -133,6 +133,14 @@ class JobSeen(Base):
     embedding = Column(Text)           # JSON-encoded vector, cached once per job
     state = Column(Text, nullable=False, default="new")       # new|enriched|shown
     source_updated_at = Column(DateTime)                      # ATS updated_at when present
+    # Cross-run reuse of the two most expensive artifacts, so a job that resurfaces
+    # (backlog top-up, re-queue) skips re-scraping and re-judging. Cleared when a
+    # source-updated row is re-queued so a changed posting is re-scraped/re-judged.
+    full_text = Column(Text)           # scraped page text, persisted so no re-scrape
+    eval_verdict = Column(Text)        # strong|backup|reject (final-AI decision)
+    eval_analysis = Column(Text)       # JSON: summary/match_reasons/concerns
+    eval_signature = Column(Text)      # profile signature at eval time (validity key)
+    evaluated_at = Column(DateTime)
     first_seen = Column(DateTime, default=_now)
     last_seen = Column(DateTime, default=_now, onupdate=_now)
 
