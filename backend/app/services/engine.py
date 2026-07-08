@@ -344,13 +344,19 @@ def _persist_scrape(db: Session, profile_id: int, jobs: list[dict]) -> None:
 
 
 def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
-                      strong: list[dict], backup: list[dict], eval_sig: str) -> None:
+                      strong: list[dict], backup: list[dict], disqualified: list[dict],
+                      eval_sig: str) -> None:
     """Store the final-AI verdict per freshly-judged job so an unchanged profile never
-    re-pays the expensive model for it. Jobs the AI omitted are recorded as 'reject'."""
+    re-pays the expensive model for it. Jobs the AI omitted are recorded as 'reject';
+    ones it flagged as hard-disqualified carry the AI's own reason in eval_analysis
+    (see the "disqualified" list in the final-eval schema) instead of the blank
+    analysis a plain reject used to get -- jobs simply not chosen among the best
+    options (passed disqualifiers but weren't picked) still record no reasoning."""
     if not judged:
         return
     strong_ids = {s.get("_identity") for s in strong if s.get("_identity")}
     backup_by = {b.get("_identity"): b for b in backup if b.get("_identity")}
+    disqualified_by = {d.get("_identity"): d.get("reason", "") for d in disqualified if d.get("_identity")}
     now = datetime.utcnow()
     verdicts: dict[str, tuple[str, str]] = {}
     for j in judged:
@@ -361,6 +367,8 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             verdict, src = "strong", next(s for s in strong if s.get("_identity") == ident)
         elif ident in backup_by:
             verdict, src = "backup", backup_by[ident]
+        elif ident in disqualified_by:
+            verdict, src = "reject", {"concerns": [disqualified_by[ident]]} if disqualified_by[ident] else {}
         else:
             verdict, src = "reject", j
         analysis = json.dumps({
@@ -873,31 +881,44 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         return [], True, ([j["_identity"] for j in pool], []), timings, \
             _compose_fallback_warning(role_clusters, fallback_notes)
 
-    # RANK: one more cheap-model call over the gate survivors, estimating a
-    # numeric 0-100 fit score per job instead of a boolean pass/fail, so the
-    # expensive full-text judge only ever sees a curated top slice (JUDGE_POOL)
-    # instead of every gate survivor (up to TARGET_POOL). The bottom
-    # RANK_AUTOREJECT_FRACTION is dropped outright; this is a per-run funnel
-    # decision, not a permanent verdict -- unlike an expensive-AI reject, a
-    # cheap-rank exclusion doesn't get persisted, so a job scored out here is
-    # still free to resurface (and be re-ranked) on a future run.
+    # RANK: one more cheap-model call per cluster over that cluster's own gate
+    # survivors, estimating a numeric 0-100 fit score per job instead of a
+    # boolean pass/fail, so the expensive full-text judge only ever sees a
+    # curated top slice (JUDGE_POOL) instead of every gate survivor (up to
+    # TARGET_POOL). Scoped per cluster (own cluster_profile, mirroring the gate
+    # loop above) rather than once across the whole cross-cluster pool -- a
+    # profile-wide call was scoring a minority cluster's jobs against a
+    # candidate description dominated by the OTHER cluster's target roles,
+    # which measurably tanked its scores. The bottom RANK_AUTOREJECT_FRACTION is
+    # dropped PER CLUSTER (not off the merged pool) so a cluster that happens to
+    # score lower can't lose more than its own share before fair-allocate ever
+    # gets a chance to protect it. This is a per-run funnel decision, not a
+    # permanent verdict -- unlike an expensive-AI reject, a cheap-rank exclusion
+    # doesn't get persisted, so a job scored out here is still free to
+    # resurface (and be re-ranked) on a future run.
     _progress(db, run, "Ranking candidates…")
-    ranked = engine.rank_gate(selected, eng_profile)
-    ranked_sorted = sorted(ranked, key=lambda j: j.get("_rank_score", 50.0), reverse=True)
-    keep_n = max(1, int(len(ranked_sorted) * (1 - RANK_AUTOREJECT_FRACTION)))
-    survivors_after_rank = ranked_sorted[:keep_n]
-    n_autorejected = len(ranked_sorted) - len(survivors_after_rank)
+    selected_for_rank: dict[int, list[dict]] = defaultdict(list)
+    for j in selected:
+        selected_for_rank[j.get("_cluster", 0)].append(j)
 
-    rank_by_cluster: dict[int, list[dict]] = defaultdict(list)
-    for j in survivors_after_rank:
-        rank_by_cluster[j.get("_cluster", 0)].append(j)
-    for items in rank_by_cluster.values():
-        items.sort(key=lambda j: j.get("_rank_score", 50.0), reverse=True)
+    rank_by_cluster: dict[int, list[dict]] = {}
+    n_scored = n_autorejected = 0
+    for idx, cluster_items in selected_for_rank.items():
+        cluster_profile = dict(eng_profile)
+        cluster_profile["search_terms"] = role_clusters[idx].get("roles") or eng_profile.get("search_terms")
+        cluster_profile["_multi_cluster"] = len(role_clusters) > 1
+        ranked = engine.rank_gate(cluster_items, cluster_profile)
+        ranked_sorted = sorted(ranked, key=lambda j: j.get("_rank_score", 50.0), reverse=True)
+        keep_n = max(1, int(len(ranked_sorted) * (1 - RANK_AUTOREJECT_FRACTION)))
+        rank_by_cluster[idx] = ranked_sorted[:keep_n]
+        n_scored += len(ranked_sorted)
+        n_autorejected += len(ranked_sorted) - keep_n
+
     selected = _fair_allocate(rank_by_cluster, JUDGE_POOL)
     t0 = _lap("rank", t0)
-    emit(f"[pipeline] cheap rank: {len(ranked_sorted)} scored -> {n_autorejected} auto-dropped "
-         f"(bottom {RANK_AUTOREJECT_FRACTION:.0%}, kept for a future run) -> top-{len(selected)} "
-         f"sent to full evaluation")
+    emit(f"[pipeline] cheap rank: {n_scored} scored across {len(rank_by_cluster)} cluster(s) -> "
+         f"{n_autorejected} auto-dropped (bottom {RANK_AUTOREJECT_FRACTION:.0%} per cluster, kept "
+         f"for a future run) -> top-{len(selected)} sent to full evaluation")
 
     # EVALUATE. When full-page scraping is enabled (default), read each selected
     # job's real page first, so the final LLM judges fit against the actual
@@ -983,17 +1004,17 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}): {len(fresh)} to judge, "
              f"{len(jobs) - len(fresh)} reused from prior verdict (LLM cap={engine.FINAL_PICKS})")
 
-        strong, backup, call_failed = [], [], False
+        strong, backup, disqualified, call_failed = [], [], [], False
         if fresh:
-            strong, backup = engine.final_evaluation_split(fresh, eng_profile, cv_text=cv_text)
+            strong, backup, disqualified = engine.final_evaluation_split(fresh, eng_profile, cv_text=cv_text)
             if strong is None:
                 # The call itself failed (exception/malformed response) -- nothing
                 # was actually judged. Don't persist any verdict, and don't treat
                 # this the same as a genuine unanimous rejection below.
                 call_failed = True
-                strong, backup = [], []
+                strong, backup, disqualified = [], [], []
             else:
-                _persist_verdicts(db, profile_id, fresh, strong, backup, eval_sig)
+                _persist_verdicts(db, profile_id, fresh, strong, backup, disqualified, eval_sig)
 
         picks = [dict(p, strong_fit=True) for p in strong] + cached_strong
         if not picks:

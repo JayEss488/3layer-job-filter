@@ -514,6 +514,39 @@ def _skip_organic_host(host: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in _ORGANIC_SKIP_DOMAINS)
 
 
+# Category/search-listing pages on boards we DO want individual postings from
+# (charityjob, itjobswatch, jobs.ac.uk, etc.) -- _skip_organic_host only blocks
+# whole aggregator domains, so a niche board's own "N jobs matching X" page
+# still gets through that check and was observed landing in the discovery store
+# as if it were a posting (e.g. "charityjob.co.uk/research-assistant-jobs-in-
+# london", "itjobswatch.co.uk/find/Conversational-AI-jobs-in-England").
+_CATEGORY_URL_RE = re.compile(
+    r"/(?:find|search|categor(?:y|ies))/|-jobs-in-[a-z0-9-]+(?:/|$)|/jobs-in-[a-z0-9-]+(?:/|$)",
+    re.I,
+)
+_CATEGORY_TITLE_RE = re.compile(r"^\s*\d[\d,]*\+?\s+.{0,60}\bjobs\b", re.I)  # "53 ... Jobs in England"
+# A bare ".../something-jobs" or ".../jobs" path suffix is another common
+# category-page shape, but risks colliding with a real posting's URL on an
+# unusual ATS/career page -- only applied to hosts actually known to do this,
+# not globally.
+_CATEGORY_HOST_HINTS = ("charityjob.co.uk", "itjobswatch.co.uk", "jobs.ac.uk")
+_CATEGORY_URL_SUFFIX_RE = re.compile(r"-jobs/?$|/jobs/?$", re.I)
+
+
+def _looks_like_category_page(title: str, url: str, host: str) -> bool:
+    if _CATEGORY_TITLE_RE.search(title or ""):
+        return True
+    try:
+        path = urlsplit(url).path.lower()
+    except ValueError:
+        return False
+    if _CATEGORY_URL_RE.search(path):
+        return True
+    if any(host == d or host.endswith("." + d) for d in _CATEGORY_HOST_HINTS):
+        return bool(_CATEGORY_URL_SUFFIX_RE.search(path))
+    return False
+
+
 def _fetch_google_jobs_serpapi(query: str, clean_loc: str, pages: int) -> List[Dict]:
     """SerpAPI's *structured* Google-Jobs engine (jobs_results). Used only when
     serpapi is the selected provider or the only key present."""
@@ -571,6 +604,7 @@ def fetch_google_jobs(query: str, location: str = "United Kingdom", pages: int =
     results = _google_organic(f"{query} jobs {clean_loc}", gl=gl, location=clean_loc,
                               num=pages * 10 if pages else 10)
     jobs: List[Dict] = []
+    n_category = 0
     for res in results:
         link = res.get("link", "")
         if not link:
@@ -581,14 +615,21 @@ def fetch_google_jobs(query: str, location: str = "United Kingdom", pages: int =
             host = ""
         if _skip_organic_host(host):
             continue
+        raw_title = res.get("title", "")
+        if _looks_like_category_page(raw_title, link, host):
+            n_category += 1
+            continue
         # Organic titles are often "Role - Company | Board" -- keep the role
         # part; company is unknown here (the final scrape hydrates the page).
-        title = re.split(r"\s[-–|]\s", res.get("title", ""), 1)[0].strip()
+        title = re.split(r"\s[-–|]\s", raw_title, 1)[0].strip()
         jobs.append({
-            "board": "google_jobs", "title": title or res.get("title", ""),
+            "board": "google_jobs", "title": title or raw_title,
             "company": "", "url": link, "location": clean_loc,
             "snippet": res.get("snippet", ""),
         })
+    if n_category:
+        emit(f"   [google_jobs] dropped {n_category} board category/search-listing page(s) "
+             f"(not individual postings)")
     return jobs
 
 
@@ -1732,13 +1773,19 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
 
 
 def _rank_prompt(profile: dict, listing_block: str) -> str:
+    multi_note = (
+        "\nNote: the candidate has more than one distinct role interest; judge fit ONLY against the "
+        "target roles listed above for THIS batch, not any other goals they may have listed elsewhere -- "
+        "don't penalize a listing for not matching an unrelated interest of theirs.\n"
+        if profile.get("_multi_cluster") else ""
+    )
     return f"""You are estimating how well each job listing fits ONE candidate, as a rough numeric score.
 
 Candidate target roles: {', '.join(profile.get('search_terms') or []) or 'n/a'}
 Candidate target sectors/domains: {', '.join(profile.get('sectors') or []) or 'n/a'}
 Candidate seniority: {profile.get('seniority', 'mid-level')}
 Candidate core skills: {', '.join(profile.get('key_skills') or []) or 'n/a'}
-
+{multi_note}
 For EACH listing, give a fit_score from 0 (clearly wrong fit) to 100 (excellent fit) for how well the
 role, seniority, and sector align with the candidate. Judge relatively across the whole batch -- spread
 scores out rather than clustering everything near one number.
@@ -2006,7 +2053,8 @@ _FINAL_EVAL_STRONG_RULES = """4. EVIDENCE STRENGTH: The candidate's background p
    AND no dbt AND no BI tooling) can together make a role a weak fit even when no single gap is
    disqualifying. Report each such gap separately in "concerns"."""
 
-_FINAL_EVAL_SCHEMA = """Output ONLY a valid JSON object (no markdown), with two lists using this item shape:
+_FINAL_EVAL_SCHEMA = """Output ONLY a valid JSON object (no markdown), with two required lists and one
+optional list, using this item shape for "strong"/"backup":
 {"strong": [
   {
     "job_number": 1, "title": "...", "company": "...", "url": "...",
@@ -2015,7 +2063,14 @@ _FINAL_EVAL_SCHEMA = """Output ONLY a valid JSON object (no markdown), with two 
     "concerns": ["each notable skill gap or prerequisite the candidate lacks, one per item; [] if none"]
   }
 ],
- "backup": [ {same item shape} ]}"""
+ "backup": [ {same item shape} ],
+ "disqualified": [
+   {"job_number": 3, "reason": "one short phrase naming which DISQUALIFIER applied and why"}
+ ]}
+Include a "disqualified" entry for every job you excluded from BOTH lists above because it failed one of
+the DISQUALIFIERS rules -- this is the only place that reasoning needs recording, so it stays auditable.
+Do NOT add an entry for a job that simply wasn't picked among the best-fitting options (one that passed
+the disqualifiers but wasn't chosen for "strong"/"backup") -- leave those out of all three lists."""
 
 # Static system prefix -- identical across every cluster/call, so it's a stable
 # (prompt-cache-friendly) prefix instead of being rebuilt into each user prompt. It
@@ -2051,13 +2106,18 @@ def _final_eval_job_block(i: int, j: dict) -> str:
             f"{j.get('full_text','')[:2000]}")
 
 
-def _run_final_eval(jobs: list[dict], cv_text: str | None) -> tuple[list[dict], list[dict]]:
-    """One expensive-model call returning (strong, backup) lists of merged job dicts.
-    Replaces the old strict-then-relaxed two-call pattern: the single prompt asks for
-    both a strict "strong" list and a lenient disqualifier-only "backup" list, so a
-    round with no strong fits no longer costs a second full-payload call."""
+def _run_final_eval(jobs: list[dict], cv_text: str | None
+                    ) -> tuple[list[dict], list[dict], list[dict]]:
+    """One expensive-model call returning (strong, backup, disqualified) lists of merged
+    job dicts. Replaces the old strict-then-relaxed two-call pattern: the single prompt
+    asks for both a strict "strong" list and a lenient disqualifier-only "backup" list,
+    so a round with no strong fits no longer costs a second full-payload call.
+    "disqualified" carries a short AI-authored reason for any job hard-excluded by a
+    DISQUALIFIERS rule -- without it, a reject verdict is persisted with zero reasoning,
+    which made a past investigation into thin results unable to see why anything was
+    excluded."""
     if not jobs:
-        return [], []
+        return [], [], []
     emit(f"[phase 6] Final matching processing matrix active ({EXP_MODEL})...")
     if cv_text is None:
         cv_text = open(CV_PATH, encoding="utf-8").read()
@@ -2069,7 +2129,8 @@ def _run_final_eval(jobs: list[dict], cv_text: str | None) -> tuple[list[dict], 
 
 Judge the {len(jobs)} complete job postings below. Return up to {FINAL_PICKS} genuinely strong fits in
 "strong" (best first), and up to 3 least-bad disqualifier-only survivors in "backup" (best first; empty
-if "strong" already covers it or nothing qualifies).
+if "strong" already covers it or nothing qualifies). For any job you hard-exclude from both lists via a
+DISQUALIFIERS rule, add it to "disqualified" with a short reason.
 
 Jobs Payload:
 {jobs_block}"""
@@ -2079,12 +2140,12 @@ Jobs Payload:
         data = json.loads(clean_json(raw))
     except Exception as e:
         emit(f"[phase 6] Final generation evaluation failed: {e}")
-        # None,None (not [],[]) -- a failed call must be distinguishable from a
+        # None,None,None (not [],[],[]) -- a failed call must be distinguishable from a
         # real judgment that rejected everyone. The caller (engine.py) treats
         # the two very differently: a genuine rejection must never resurface,
         # while a failed call falls back to an unverified top-N so a transient
         # API error doesn't get silently recorded as a permanent rejection.
-        return None, None
+        return None, None, None
 
     def _merge(entries, cap):
         out = []
@@ -2096,15 +2157,19 @@ Jobs Payload:
                 out.append(merged)
         return out
 
-    return _merge(data.get("strong"), FINAL_PICKS), _merge(data.get("backup"), min(3, len(jobs)))
+    return (_merge(data.get("strong"), FINAL_PICKS),
+            _merge(data.get("backup"), min(3, len(jobs))),
+            _merge(data.get("disqualified"), len(jobs)))
 
 
 def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None = None
-                           ) -> tuple[list[dict] | None, list[dict] | None]:
-    """Backend entry point: (strong, backup) from ONE expensive call. The backend uses
-    `strong` when non-empty, else `backup` (tagged as a non-strong fallback). Returns
-    (None, None) if the call itself failed -- see _run_final_eval's except branch --
-    so the caller can tell that apart from a real judgment that rejected everyone."""
+                           ) -> tuple[list[dict] | None, list[dict] | None, list[dict] | None]:
+    """Backend entry point: (strong, backup, disqualified) from ONE expensive call. The
+    backend uses `strong` when non-empty, else `backup` (tagged as a non-strong
+    fallback); `disqualified` carries a short AI-authored reason for hard-excluded jobs,
+    persisted into their reject verdict instead of leaving it blank. Returns
+    (None, None, None) if the call itself failed -- see _run_final_eval's except branch
+    -- so the caller can tell that apart from a real judgment that rejected everyone."""
     return _run_final_eval(jobs, cv_text)
 
 
@@ -2112,7 +2177,7 @@ def final_evaluation(jobs: list[dict], profile: dict, cv_text: str | None = None
     """Judge `jobs`; return the best flat list -- strong fits, or the least-bad backups
     when nothing is strong. Standalone/CLI callers use this; `cv_text`, when given,
     overrides reading CV_PATH (the backend passes a role-cluster-scoped bio)."""
-    strong, backup = _run_final_eval(jobs, cv_text)
+    strong, backup, _disqualified = _run_final_eval(jobs, cv_text)
     return (strong or backup) or []
 
 
