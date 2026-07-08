@@ -600,11 +600,29 @@ def fetch_jsearch(query: str, location: str = "United Kingdom") -> List[Dict]:
     clean_loc = normalize_location(location)
     headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
     params = {"query": f"{query} in {clean_loc}", "page": 1, "num_pages": 1}
+
+    # RapidAPI retired /search in favour of /search-v2 (jobs now nested under
+    # data.jobs instead of data directly) -- same field names. /search-v2 runs
+    # noticeably slower than the old endpoint, so a single fixed 12s timeout
+    # was dropping this source's results outright on ordinary slow responses,
+    # not just real outages. Retry once with a longer timeout before giving up.
+    data = None
+    for attempt, timeout in enumerate((15, 25), start=1):
+        try:
+            r = requests.get("https://jsearch.p.rapidapi.com/search-v2", headers=headers,
+                              params=params, timeout=timeout)
+            data = r.json()
+            break
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                emit(f"   [!] JSearch API Error: timed out after {attempt} attempts")
+                return []
+            emit(f"   [!] JSearch API timeout (attempt {attempt}/2), retrying with a longer timeout...")
+        except Exception as e:
+            emit(f"   [!] JSearch API Error: {e}")
+            return []
+
     try:
-        # RapidAPI retired /search in favour of /search-v2 (jobs now nested
-        # under data.jobs instead of data directly) -- same field names.
-        r = requests.get("https://jsearch.p.rapidapi.com/search-v2", headers=headers, params=params, timeout=12)
-        data = r.json()
         if data.get("status") != "OK":
             emit(f"   [!] JSearch API Error: {data.get('message') or data}")
             return []
