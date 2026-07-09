@@ -44,6 +44,40 @@ Document:
 {text[:40000]}"""
 
 
+_SUMMARY_SYSTEM = (
+    "You compress a candidate's CV/notes into a short, dense paragraph of extra "
+    "background context for another AI to read alongside a normalised skills/role "
+    "list. Preserve specific, differentiating details that list would lose -- named "
+    "projects, concrete outcomes, scope of leadership, domain-specific nuance, tools "
+    "used in context. Do not restate a generic skills inventory or job-title list; "
+    "that is supplied separately. Be faithful to the source -- never invent or embellish."
+)
+
+
+def summarize_cv_text(text: str) -> str:
+    """Compress the raw CV/notes into a short paragraph of extra context for the
+    final job-match judge (see snapshot.py::cv_text_base), kept separate from the
+    structured attribute rows so the editable-fields model doesn't change -- this
+    just gives the judge back some of the nuance that parsing into typed rows
+    necessarily drops. Returns "" on empty input or an LLM failure (snapshot.py
+    then falls back to the attribute-only text, same as before this existed)."""
+    if not text or not text.strip():
+        return ""
+    data = llm_json(
+        f"""Compress the document below into ONE paragraph (max 100 words) of dense
+background context -- concrete projects, achievements, leadership scope, domain
+nuance -- that a plain skills/role list would lose. No preamble, no bullet points.
+
+Document:
+{text[:40000]}
+
+Return ONLY JSON: {{"summary": "..."}}""",
+        system=_SUMMARY_SYSTEM,
+        model=STRONG_MODEL,
+    )
+    return str(data.get("summary", "")).strip()[:1200]
+
+
 def extract_text_from_upload(filename: str, raw: bytes) -> str:
     """Pull plain text out of a PDF / DOCX / txt upload."""
     name = (filename or "").lower()

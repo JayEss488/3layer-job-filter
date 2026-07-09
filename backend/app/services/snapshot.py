@@ -10,7 +10,7 @@ from functools import lru_cache
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import ProfileAttribute
+from ..models import Profile, ProfileAttribute
 from .llm import llm_json
 
 _WORK_TYPES = {"remote", "hybrid", "on-site", "onsite"}
@@ -182,17 +182,18 @@ def cluster_target_roles(target_roles: list[str]) -> list[list[str]]:
     return [list(c) for c in clusters if c]
 
 
-# target_role gets a baseline lead over skill/past_role so a first-ever search
-# (before any feedback has nudged weights) still embeds toward what the
-# candidate WANTS, not just what they've done/used. qualification and
-# sector_target sit above plain skill/past_role/experience -- they're often
-# stronger differentiators (a hard-filter-clearing credential, an explicit
-# mission/sector preference) than a generic skill or job title -- but below
-# target_role's literal job-title signal.
-_BASE_EMPHASIS = {
-    "target_role": 3, "skill": 1, "past_role": 1,
-    "experience": 1, "qualification": 2, "sector_target": 2,
-}
+# Embedding pre-filter is cosine similarity, which rewards a tight, topical
+# query -- so it's deliberately narrower than the full profile. target_role is
+# the direct signal for "what job"; sector_target adds domain/mission context.
+# skill/past_role/qualification/experience used to be blended in too, but a
+# generic skill list matches broadly across unrelated postings, and free-text
+# experience bullets (unbounded in count, sometimes full sentences) diluted
+# the query further the richer a candidate's history was -- exactly backwards,
+# since a well-documented candidate should score BETTER, not worse. All of
+# that detail still reaches the final AI judge in full (cv_text_base) and
+# still shapes the cheap gate/rank prompts (skill_weight_tiers) -- only the
+# cosine pre-filter stops using it.
+_BASE_EMPHASIS = {"target_role": 3, "sector_target": 2}
 
 
 def _weighted_text(
@@ -215,7 +216,7 @@ def _weighted_text(
     included -- this is what lets each role cluster get its own scoped
     embedding text instead of one blend of every target role the candidate has."""
     emphasis: list[str] = []
-    for group_name in ("target_role", "skill", "past_role", "experience", "qualification", "sector_target"):
+    for group_name in ("target_role", "sector_target"):
         base = _BASE_EMPHASIS[group_name]
         for a in g.get(group_name, []):
             if group_name == "target_role" and role_filter is not None and a.value.strip() not in role_filter:
@@ -366,6 +367,16 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append(f"Location: {location} ({', '.join(work_types) or 'any'})")
     if customs:
         cv_lines.append("Constraints: " + "; ".join(customs))
+    # Extra unstructured context from the original CV, compressed once at upload
+    # time (see parsing.py::summarize_cv_text) -- kept short and appended last
+    # (before cv_text_for_cluster's per-cluster "Target roles" suffix) so it adds
+    # nuance the typed attribute rows above necessarily lose (named projects,
+    # leadership scope, domain nuance) without overwhelming the 5000-char budget
+    # _run_final_eval truncates cv_text to, which would otherwise risk cutting off
+    # that suffix.
+    profile = db.get(Profile, profile_id)
+    if profile and profile.cv_summary:
+        cv_lines.append("Additional background context: " + profile.cv_summary)
     cv_text_base = "\n".join(cv_lines) or "General candidate."
     cv_text = (
         "\n".join([*cv_lines, f"Target roles: {', '.join(target_roles)}"])

@@ -11,7 +11,7 @@ from ..schemas import AttributeOut, ConfidenceOut, ParseTextIn, SuggestIn, Sugge
 from ..services.confidence import confidence
 from ..services.harvest import harvest_for_profile
 from ..services.llm import STRONG_MODEL, llm_json
-from ..services.parsing import extract_text_from_upload, parse_text_to_attributes
+from ..services.parsing import extract_text_from_upload, parse_text_to_attributes, summarize_cv_text
 
 router = APIRouter(tags=["onboarding"])
 
@@ -100,6 +100,7 @@ async def parse_cv(
     if not text.strip():
         raise HTTPException(status_code=422, detail="Could not read any text from that file")
     profile.cv_text = text[:40000]
+    profile.cv_summary = summarize_cv_text(text)
     created = parse_text_to_attributes(db, profile.id, text, source="cv_parsed")
     created += _preload_target_roles(db, profile.id, created)
     db.commit()
@@ -117,6 +118,7 @@ def parse_text(
     db: Session = Depends(get_db),
 ):
     profile.cv_text = body.text[:40000]
+    profile.cv_summary = summarize_cv_text(body.text)
     created = parse_text_to_attributes(db, profile.id, body.text, source="text_parsed")
     created += _preload_target_roles(db, profile.id, created)
     db.commit()

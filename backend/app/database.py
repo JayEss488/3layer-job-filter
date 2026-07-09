@@ -46,9 +46,9 @@ def _migrate_columns():
             ("evaluated_at", "DATETIME"),
         ],
         "company_ats": [("keyword", "TEXT")],
-        "search_runs": [("phase_timings", "TEXT")],
+        "search_runs": [("phase_timings", "TEXT"), ("funnel_counts", "TEXT")],
         "roles": [("source", "TEXT")],
-        "profiles": [("cv_text", "TEXT")],
+        "profiles": [("cv_text", "TEXT"), ("cv_summary", "TEXT")],
         "profile_attributes": [("proficiency", "TEXT")],
     }
     for table, cols in additions.items():

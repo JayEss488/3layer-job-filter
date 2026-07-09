@@ -85,6 +85,12 @@ SERPER_SITE_OPERATOR_OK = os.getenv("SERPER_SITE_OPERATOR_OK", "false").strip().
 # Hard cap on (vendor, keyword) query combos per harvest_ats_tokens() call, so
 # one profile edit can't burn through the whole serper/CSE credit balance.
 ATS_HARVEST_MAX_QUERIES = int(os.getenv("ATS_HARVEST_MAX_QUERIES", "30"))
+# Alternate-source lookup on scrape failure (see _find_alternate_posting): when a
+# job's own link can't be scraped (dead link, click-tracking redirect, anti-bot
+# block), search for the same posting elsewhere by title+company before giving up
+# to a bare snippet -- mirrors how a human re-finds a broken listing. Costs one
+# organic-search call per attempt, so capped per run like the ATS harvest above.
+ALT_SOURCE_LOOKUP_MAX_PER_RUN = int(os.getenv("ALT_SOURCE_LOOKUP_MAX_PER_RUN", "15"))
 
 DEBUG_SAVE_RAW = True
 
@@ -99,7 +105,15 @@ if not os.path.exists(CV_PATH):
 
 # ── Global Tuning Hyperparameters ──────────────────────────────────────────────
 CHEAP_MODEL         = "gpt-5.4-nano-2026-03-17"
-EXP_MODEL           = "gpt-5.4"
+# Middle tier, used only where the cheap tier's coarseness is the limiting factor
+# (currently just rank_gate's numeric fit scoring) -- screen_gate stays on
+# CHEAP_MODEL since its binary sector/seniority check doesn't need the extra
+# reasoning power, and this keeps the highest-volume gate call cheapest.
+MID_MODEL           = "gpt-5.4-mini"
+# Phase 6 final judge only (1-3 calls per run, the only exp-tier call in a live
+# search), so a newer/stronger model here costs cents per run, not dollars --
+# the highest-leverage place to spend more.
+EXP_MODEL           = "gpt-5.5"
 EMBED_MODEL         = "text-embedding-3-small"
 
 PROFILE_CACHE_DAYS  = 7
@@ -107,6 +121,13 @@ MAX_CONCURRENT      = 5       # Max general simultaneous crawl requests
 RELEVANCE_THRESHOLD = 0.35    # Balanced threshold preventing snippet penalty
 TOP_CANDIDATES      = 25      # Pool size handed to the final evaluator
 FINAL_PICKS         = 12      # Max results returned, quality-gated
+
+# Category-page expansion (see expand_category_pages): Google-organic discovery
+# has no caching, so this cost repeats every run that surfaces category hits,
+# not once -- kept small and cheap (link-discovery only, no content scrape).
+CATEGORY_EXPAND_MAX_PAGES           = 5     # cap on listing pages expanded per run
+CATEGORY_EXPAND_MAX_LINKS_PER_PAGE  = 15    # cap on postings pulled from one page
+CATEGORY_EXPAND_BUDGET_SECONDS      = 20.0  # wall-clock budget for the whole step
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -165,6 +186,10 @@ async def _pipeline_async() -> list[dict]:
     profile = get_profile()
     profile_embedding = get_profile_embedding(profile)
     raw_jobs = gather_jobs(profile)
+    # This standalone CLI path doesn't wire up category-page expansion (that
+    # lives in engine.py, the backend's pipeline) -- drop tagged category-page
+    # pseudo-rows here so they don't get treated as real candidates.
+    raw_jobs = [j for j in raw_jobs if not j.get("_is_category_page")]
 
     seen, deduped = set(), []
     for job in raw_jobs:
@@ -547,6 +572,78 @@ def _looks_like_category_page(title: str, url: str, host: str) -> bool:
     return False
 
 
+# ── Category-page link filtering (used by expand_category_pages) ───────────
+# Segments that mark a link as site nav/boilerplate rather than a specific
+# posting, wherever they appear in the path (so both /about and /company/about
+# are excluded, but /careers/12345-engineer is NOT, since "careers"/"jobs" is
+# a legitimate directory prefix for real postings, not a slug by itself).
+_LINK_BOILERPLATE_SEGMENTS = {
+    "about", "about-us", "contact", "contact-us", "privacy", "privacy-policy",
+    "login", "signin", "sign-in", "register", "faq", "faqs", "blog", "press",
+    "news", "terms", "terms-of-service", "cookie-policy", "cookies", "sitemap",
+    "rss", "help", "support", "legal", "accessibility",
+}
+# A path whose ONLY segment is one of these is the listing/landing page itself
+# (e.g. "/jobs", "/careers"), not an individual posting.
+_LINK_BARE_LANDING_SEGMENTS = {"jobs", "careers", "job", "career",
+                                "openings", "opportunities", "vacancies"}
+_GENERIC_ANCHOR_RE = re.compile(
+    r"^\s*(home|jobs?|careers?|search|view all|see more|next|previous|"
+    r"apply( now)?|read more|learn more|sign in|log in|register|menu|"
+    r"skip to content)\s*$", re.I,
+)
+_LINK_MIN_ANCHOR_CHARS = 8
+
+
+def _is_boilerplate_or_bare_link(path: str) -> bool:
+    segs = [s for s in (path or "").lower().strip("/").split("/") if s]
+    if not segs:
+        return True  # bare "/" -> homepage
+    if len(segs) == 1 and segs[0] in _LINK_BARE_LANDING_SEGMENTS:
+        return True
+    return bool(set(segs) & _LINK_BOILERPLATE_SEGMENTS)
+
+
+def _same_or_related_host(child_host: str, page_host: str) -> bool:
+    child_host, page_host = (child_host or "").lower(), (page_host or "").lower()
+    if not child_host or not page_host:
+        return False
+    return (child_host == page_host
+            or child_host.endswith("." + page_host)
+            or page_host.endswith("." + child_host))
+
+
+def _is_plausible_posting_link(link, page_host: str) -> bool:
+    """Filters crawl4ai's raw result.links.internal down to links that look
+    like individual job postings, not nav/boilerplate/pagination/other
+    category pages."""
+    href = (getattr(link, "href", "") or "").strip()
+    if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
+        return False
+    try:
+        parts = urlsplit(href)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https", ""):
+        return False
+    path = parts.path.lower()
+    if _is_boilerplate_or_bare_link(path):
+        return False
+    child_host = (parts.netloc or page_host).lower().split(":")[0]
+    if not _same_or_related_host(child_host, page_host):
+        return False
+    text = re.sub(r"\s+", " ", (getattr(link, "text", "") or getattr(link, "title", "") or "").strip())
+    if len(text) < _LINK_MIN_ANCHOR_CHARS or _GENERIC_ANCHOR_RE.match(text):
+        return False
+    # Reject a child link that is itself another category/listing page (e.g. a
+    # "Jobs in Manchester" sub-filter link, or page-2 pagination with
+    # real-looking anchor text) -- reuses the existing detector instead of
+    # inventing a second heuristic.
+    if _looks_like_category_page(text, href, child_host):
+        return False
+    return True
+
+
 def _fetch_google_jobs_serpapi(query: str, clean_loc: str, pages: int) -> List[Dict]:
     """SerpAPI's *structured* Google-Jobs engine (jobs_results). Used only when
     serpapi is the selected provider or the only key present."""
@@ -618,6 +715,14 @@ def fetch_google_jobs(query: str, location: str = "United Kingdom", pages: int =
         raw_title = res.get("title", "")
         if _looks_like_category_page(raw_title, link, host):
             n_category += 1
+            # Followed up rather than dropped: engine.py partitions these out
+            # by the tag below and hands them to expand_category_pages, which
+            # crawls the page and extracts individual postings from it.
+            jobs.append({
+                "board": "google_jobs", "title": raw_title, "company": "",
+                "url": link, "location": clean_loc, "snippet": res.get("snippet", ""),
+                "_is_category_page": True, "_category_host": host,
+            })
             continue
         # Organic titles are often "Role - Company | Board" -- keep the role
         # part; company is unknown here (the final scrape hydrates the page).
@@ -628,8 +733,8 @@ def fetch_google_jobs(query: str, location: str = "United Kingdom", pages: int =
             "snippet": res.get("snippet", ""),
         })
     if n_category:
-        emit(f"   [google_jobs] dropped {n_category} board category/search-listing page(s) "
-             f"(not individual postings)")
+        emit(f"   [google_jobs] found {n_category} board category/search-listing page(s) "
+             f"(not individual postings) -- queued for expansion")
     return jobs
 
 
@@ -911,6 +1016,19 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
                         "snippet": _strip_html(j.get("descriptionPlain", ""))[:3000],
                         "updated_at": j.get("publishedAt")})
     return out
+
+
+def validate_ats_token(vendor: str, token: str) -> int:
+    """Live-validates one (vendor, token) via fetch_ats; returns the number of
+    jobs found (0 = dead/wrong token or feed error). Shared by seed_ats.py's
+    curated-candidate validation and harvest_ats_tokens' live-validation of
+    freshly-harvested tokens, so both paths use one implementation instead of
+    duplicating the try/except-on-fetch_ats pattern."""
+    try:
+        jobs = fetch_ats(vendor, token)
+    except Exception:
+        return 0
+    return len(jobs)
 
 
 # ── Rotation + tiered first run ──────────────────────────────────────────────
@@ -1216,6 +1334,15 @@ def save_company_ats(rows: List[tuple], default_keyword: str = "curated") -> Non
     conn.close()
 
 
+def delete_company_ats(vendor: str, token: str) -> None:
+    """Removes one dead token from the store. Used by seed_ats.py --revalidate
+    to prune boards that no longer return any live postings."""
+    conn = _ats_db()
+    conn.execute("DELETE FROM company_ats WHERE vendor=? AND token=?", (vendor, token))
+    conn.commit()
+    conn.close()
+
+
 def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
     """Maintenance job (not run on every search): finds company ATS board tokens
     via a domain-targeted search, then upserts them into company_ats. Prefers
@@ -1246,7 +1373,7 @@ def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
     token_res = {
         "greenhouse": re.compile(r"greenhouse\.io/([A-Za-z0-9_-]+)"),
         "lever":      re.compile(r"lever\.co/([A-Za-z0-9_-]+)"),
-        "ashby":      re.compile(r"ashbyhq\.com/([A-Za-z0-9_-]+)"),
+        "ashby":      re.compile(r"jobs\.ashbyhq\.com/([A-Za-z0-9_-]+)"),
         "workable":   re.compile(r"apply\.workable\.com/([A-Za-z0-9_-]+)"),
         "recruitee":  re.compile(r"https?://([A-Za-z0-9_-]+)\.recruitee\.com"),
         "personio":   re.compile(r"https?://([A-Za-z0-9_-]+)\.jobs\.personio\."),
@@ -1298,7 +1425,27 @@ def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
                 found.append((token, vendor, token, keyword))
 
     deduped = list({(c, v, t, kw) for c, v, t, kw in found})
-    save_company_ats(deduped)
+    # Live-validate before inserting: harvested tokens come from a regex match
+    # against a search-result URL, not a guaranteed-real board (e.g. a hit on a
+    # vendor's own marketing site, or a company that's since moved off that
+    # ATS) -- unlike seed_ats.py's curated candidates, which were always
+    # validated this way before this fix. An unvalidated dead token otherwise
+    # sits in company_ats forever, re-erroring on every run that selects it.
+    live: List[tuple] = []
+    n_dead = 0
+    if deduped:
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            futs = {ex.submit(validate_ats_token, v, t): (c, v, t, kw) for c, v, t, kw in deduped}
+            for fut in as_completed(futs):
+                c, v, t, kw = futs[fut]
+                if fut.result() >= 1:
+                    live.append((c, v, t, kw))
+                else:
+                    n_dead += 1
+    save_company_ats(live)
+    deduped = live
+    if n_dead:
+        emit(f"   [ats] harvest validation dropped {n_dead} dead token(s) before insert")
     if skipped:
         emit(f"[ats] Harvest budget/circuit-breaker skipped {skipped} of "
              f"{len(combos)} vendor/keyword combos this run.")
@@ -1816,18 +1963,29 @@ Listings:
 
 
 def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
-    """Cheap-model numeric fit ranking over the post-gate survivor pool, so the
-    expensive full-text judge only ever sees a curated top slice instead of every
-    gate survivor. Annotates each candidate with `_rank_score` (0-100, higher is
-    better) in place and returns the full list unfiltered -- the caller applies
-    its own cutoff (e.g. drop the bottom fraction, cap at N). Cached per (profile
-    signature, job id) in gate_cache under gate="rank"; reuses the `reason` text
-    column to hold the score (no schema change needed) since `keep` has no
-    binary meaning here."""
+    """Middle-tier (MID_MODEL) numeric fit ranking over the post-gate survivor
+    pool, so the expensive full-text judge only ever sees a curated top slice
+    instead of every gate survivor. Runs on MID_MODEL rather than CHEAP_MODEL
+    (unlike screen_gate) because a well-calibrated relative ordering across the
+    whole batch benefits more from extra reasoning power than screen_gate's
+    coarser binary sector/seniority check does -- and since only short snippets
+    are sent (not full text), the cost delta over the cheap tier stays small
+    even at this stage's larger volume. Annotates each candidate with
+    `_rank_score` (0-100, higher is better) in place and returns the full list
+    unfiltered -- the caller applies its own cutoff (e.g. drop the bottom
+    fraction, cap at N). Cached per (profile signature, job id) in gate_cache
+    under gate="rank_v2" (bumped from "rank" when this moved to MID_MODEL, to
+    force re-scoring instead of serving stale cheap-tier scores); reuses the
+    `reason` text column to hold the score (no schema change needed) since
+    `keep` has no binary meaning here."""
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    keys = [_gate_cache_key("rank", sig, _gate_job_id(c)) for c in candidates]
+    # "rank_v2" (not "rank"): the gate name doubles as part of the cache key, and
+    # _gate_cache_key has no model field -- bumping it forces every previously
+    # cheap-tier-scored job to be re-ranked under MID_MODEL instead of serving a
+    # stale score forever. Bump again if the rank model/prompt changes again.
+    keys = [_gate_cache_key("rank_v2", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -1853,7 +2011,7 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
         prompt = _rank_prompt(profile, listing_block)
         scores: dict[int, float] = {}
         try:
-            raw = llm(prompt, require_json=True, temperature=0,
+            raw = llm(prompt, require_json=True, temperature=0, model=MID_MODEL,
                       system="You estimate rough candidate-job fit scores. Spread scores out; "
                              "don't cluster everything near one value.")
             for d in json.loads(clean_json(raw)).get("scores", []):
@@ -1923,9 +2081,45 @@ def _looks_like_redirect_stub(markdown: str) -> bool:
     return len(markdown) < 2000 and bool(_REDIRECT_STUB_RE.search(markdown))
 
 
+async def _find_alternate_posting(
+    job: dict, crawler: AsyncWebCrawler, country_code: str = "gb",
+) -> str:
+    """Search for the same job posting on a different site when the original link
+    can't be scraped -- a dead link, a click-tracking redirect stub, or a page an
+    anti-bot wall blocked. Tries each organic result's real page in turn (skipping
+    the original host, which by definition already failed), and returns the first
+    one that reads like a genuine posting. "" if the search itself fails or every
+    candidate page also fails -- callers fall back to the snippet as before."""
+    query = f"{job.get('title', '')} {job.get('company', '')}".strip()
+    if not query:
+        return ""
+    try:
+        results = _google_organic(query, gl=country_code, num=5)
+    except Exception:
+        return ""
+    orig_host = _scrape_host(job.get("url", ""))
+    for r in results:
+        link = r.get("link", "")
+        host = _scrape_host(link)
+        if not link or not host or host == orig_host:
+            continue
+        try:
+            run_config = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS, wait_until="networkidle", page_timeout=20000,
+            )
+            result = await crawler.arun(url=link, config=run_config)
+            markdown = (result.markdown or "").strip()
+            if (result.success and markdown and len(markdown) > 150
+                    and not _looks_like_redirect_stub(markdown)):
+                return markdown[:8000]
+        except Exception:
+            continue
+    return ""
+
+
 async def scrape_full_details(
     jobs: list[dict], crawler: AsyncWebCrawler, blocked_domains: frozenset[str] | set[str] = frozenset(),
-    total_budget_seconds: float = 60.0,
+    total_budget_seconds: float = 60.0, country_code: str = "gb",
 ) -> list[dict]:
     """Fetches each job's real page, capped concurrency, with retries. Every
     source shares one concurrency lane (Adzuna used to be forced single-lane
@@ -1936,14 +2130,20 @@ async def scrape_full_details(
     snippet fallback -- no point paying retries/timeouts for a domain already
     known bad. total_budget_seconds caps the WHOLE phase's wall-clock time (not
     just one job's timeout) -- whatever hasn't finished by then falls back to
-    its snippet rather than letting a handful of slow pages stretch the run."""
+    its snippet rather than letting a handful of slow pages stretch the run.
+    A job that exhausts its own retries tries _find_alternate_posting once
+    before falling back to the snippet, spending from the shared
+    ALT_SOURCE_LOOKUP_MAX_PER_RUN budget -- not applied to blocklist skips,
+    which are a deliberate user opt-out, not a failure worth searching around."""
     emit(f"\n[phase 5] Fetching full pages for {len(jobs)} jobs...")
 
     sem = asyncio.Semaphore(MAX_CONCURRENT)
     blocked_hit = 0
+    alt_found = 0
+    alt_budget = [ALT_SOURCE_LOOKUP_MAX_PER_RUN]
 
     async def fetch_one(job: dict) -> dict:
-        nonlocal blocked_hit
+        nonlocal blocked_hit, alt_found
         url = job.get("url", "")
         host = _scrape_host(url)
         if host and any(host == d or host.endswith("." + d) for d in blocked_domains):
@@ -1980,8 +2180,17 @@ async def scrape_full_details(
 
                 except Exception:
                     if attempt == max_retries:
-                        emit(f"   [!] [PHASE 5 FAILURE] Blocked at {job['company']}. Preserving snippet summary.")
-                        job["full_text"] = job.get("snippet", "")
+                        alt_text = ""
+                        if alt_budget[0] > 0:
+                            alt_budget[0] -= 1
+                            alt_text = await _find_alternate_posting(job, crawler, country_code)
+                        if alt_text:
+                            job["full_text"] = alt_text
+                            alt_found += 1
+                            emit(f"   [ALT-SOURCE] Recovered {job['company']} posting via search after scrape failure")
+                        else:
+                            emit(f"   [!] [PHASE 5 FAILURE] Blocked at {job['company']}. Preserving snippet summary.")
+                            job["full_text"] = job.get("snippet", "")
                     else:
                         emit(f"   [BLOCKED/SHELL] Cool-down applied for {job['company']} (Attempt #{attempt}). Retrying...")
 
@@ -2005,7 +2214,82 @@ async def scrape_full_details(
 
     if blocked_hit:
         emit(f"   [phase 5] skipped {blocked_hit} already-blocklisted domain(s), no scrape attempted")
+    if alt_found:
+        emit(f"   [phase 5] recovered {alt_found} otherwise-failed page(s) via alternate-source search")
     return jobs
+
+
+# ── Category-page expansion (discovery-adjacent, not Phase 5) ───────────────
+
+async def expand_category_pages(
+    category_hits: list[dict], crawler: AsyncWebCrawler,
+    max_pages: int = CATEGORY_EXPAND_MAX_PAGES,
+    max_links_per_page: int = CATEGORY_EXPAND_MAX_LINKS_PER_PAGE,
+    total_budget_seconds: float = CATEGORY_EXPAND_BUDGET_SECONDS,
+) -> list[dict]:
+    """Follows a bounded number of Google-organic hits that
+    _looks_like_category_page flagged as board category/search-listing pages,
+    and extracts individual job-posting links from each, instead of dropping
+    the whole page. Cheap/bounded by design: no snippet is fetched here --
+    extracted candidates flow into the normal pipeline with an empty snippet,
+    and _needs_full_scrape (engine.py) naturally queues them for Phase 5 like
+    any other thin-snippet candidate."""
+    if not category_hits:
+        return []
+    batch = category_hits[:max_pages]
+    if len(category_hits) > max_pages:
+        emit(f"   [category_expand] {len(category_hits)} category page(s) this run; "
+             f"expanding the first {max_pages} (CATEGORY_EXPAND_MAX_PAGES cap)")
+
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    out: list[dict] = []
+
+    async def expand_one(hit: dict) -> None:
+        url = hit.get("url", "")
+        host = hit.get("_category_host") or _scrape_host(url)
+        async with sem:
+            try:
+                run_config = CrawlerRunConfig(
+                    cache_mode=CacheMode.BYPASS, wait_until="networkidle",
+                    page_timeout=15000,
+                )
+                result = await crawler.arun(url=url, config=run_config)
+            except Exception as e:
+                emit(f"   [!] [category_expand] failed to fetch {url}: {e}")
+                return
+            if not result or not result.success:
+                return
+            links = list(getattr(getattr(result, "links", None), "internal", None) or [])
+            kept, seen_urls = 0, set()
+            for link in links:
+                if kept >= max_links_per_page:
+                    break
+                if not _is_plausible_posting_link(link, host):
+                    continue
+                href = link.href
+                if href in seen_urls:
+                    continue
+                seen_urls.add(href)
+                text = re.sub(r"\s+", " ", (link.text or link.title or "").strip())[:140]
+                out.append({
+                    "board": "google_jobs", "title": text, "company": "",
+                    "url": href, "location": hit.get("location", ""), "snippet": "",
+                })
+                kept += 1
+            if kept:
+                emit(f"   [category_expand] {url} -> {kept} individual posting(s) extracted")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*[expand_one(h) for h in batch], return_exceptions=True),
+            timeout=total_budget_seconds,
+        )
+    except asyncio.TimeoutError:
+        emit(f"   [category_expand] hit the {total_budget_seconds:.0f}s budget; "
+             f"stopping (partial results kept)")
+
+    emit(f"   [category_expand] expanded {len(batch)} page(s) -> {len(out)} new candidate posting(s)")
+    return out
 
 
 # ── Phase 6: Final Evaluation ────────────────────────────────────────────────────

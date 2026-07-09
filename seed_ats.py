@@ -14,9 +14,17 @@ Two ways to populate, used together by default:
 Usage:
     ../venv/Scripts/python seed_ats.py
     ../venv/Scripts/python seed_ats.py --harvest "climate" "fintech" "data engineering"
+    ../venv/Scripts/python seed_ats.py --revalidate
 
 Idempotent: company_ats has a UNIQUE(vendor, token) constraint, so re-running
 only adds newly-validated boards.
+
+--revalidate re-checks every existing row in company_ats (not just the curated
+candidates above) and deletes any that no longer return a live role -- run this
+occasionally to prune boards that have moved off their ATS or shut down since
+they were seeded/harvested. Harvested tokens are now validated before insert
+(see full_auto.py::harvest_ats_tokens), but this cleans up anything already in
+the store from before that guard existed, or that's gone dead since.
 """
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -88,11 +96,8 @@ CANDIDATES = {
 
 def validate(vendor: str, token: str):
     """Return (vendor, token, n_jobs) if the feed returns >=1 role, else None."""
-    try:
-        jobs = engine.fetch_ats(vendor, token)
-    except Exception:
-        return None
-    return (vendor, token, len(jobs)) if jobs else None
+    n = engine.validate_ats_token(vendor, token)
+    return (vendor, token, n) if n else None
 
 
 def seed_curated() -> list[tuple]:
@@ -112,8 +117,30 @@ def seed_curated() -> list[tuple]:
     return live
 
 
+def revalidate_existing() -> None:
+    rows = engine.load_company_ats()  # (company, vendor, token, keyword)
+    print(f"[revalidate] Checking {len(rows)} existing ATS boards...")
+    dead = []
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futs = {ex.submit(engine.validate_ats_token, v, t): (c, v, t, kw) for c, v, t, kw in rows}
+        for fut in as_completed(futs):
+            c, v, t, kw = futs[fut]
+            if fut.result() == 0:
+                dead.append((v, t))
+                print(f"   [DEAD] {v:10} {t:18} -- removing")
+    for v, t in dead:
+        engine.delete_company_ats(v, t)
+    print(f"[revalidate] Removed {len(dead)} dead board(s); {len(rows) - len(dead)} remain live.")
+
+
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--revalidate":
+        revalidate_existing()
+        total = len(engine.load_company_ats())
+        print(f"[seed] company_ats now holds {total} tokens total.")
+        return
+
     seed_curated()
 
     if args and args[0] == "--harvest":

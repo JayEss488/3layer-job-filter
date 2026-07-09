@@ -34,6 +34,7 @@ class Profile(Base):
     name = Column(Text, nullable=False)
     is_active = Column(Boolean, default=True)
     cv_text = Column(Text)  # raw uploaded/pasted document text, for target-role regeneration
+    cv_summary = Column(Text)  # LLM-compressed cv_text; extra judge context, see snapshot.py
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 
@@ -181,6 +182,7 @@ class SearchRun(Base):
     started_at = Column(DateTime, default=_now)
     finished_at = Column(DateTime)
     phase_timings = Column(Text)  # JSON-encoded {phase_name: seconds}, for perf analysis
+    funnel_counts = Column(Text)  # JSON-encoded {stage_name: count}, for diagnosing thin results
 
 
 class Setting(Base):

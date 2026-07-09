@@ -677,6 +677,13 @@ def _progress(db: Session, run: SearchRun, message: str) -> None:
 async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base, db, profile_id, run: SearchRun):
     emit = engine.emit  # prints to the backend's own console (see run_search_task)
     timings: dict[str, float] = {}
+    # Stage-by-stage candidate counts, persisted alongside timings (see
+    # run_search_task) so a thin run can be diagnosed from the DB after the
+    # fact instead of requiring a live console watch -- emit() only prints,
+    # nothing else survives past the run. Built incrementally in-line with the
+    # counts each stage already computes; an early return below simply carries
+    # whatever keys were reached so far, same as timings already does.
+    funnel: dict[str, int | bool] = {}
     t0 = time.monotonic()
 
     def _lap(phase: str, since: float) -> float:
@@ -716,12 +723,35 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     _progress(db, run, "Searching job boards…")
     raw_jobs = engine.gather_jobs(eng_profile)
     t0 = _lap("discovery", t0)
+
+    # google_jobs tags board category/search-listing pages (e.g. a charityjob
+    # "N jobs in X" results page) rather than dropping them -- follow a bounded
+    # number of them and extract the individual postings inside, using the same
+    # crawler infra as Phase 5. Runs before every other filter below so expanded
+    # postings flow through blocklist/training/country/salary/dedupe exactly
+    # like any other freshly discovered job.
+    category_hits = [j for j in raw_jobs if j.get("_is_category_page")]
+    raw_jobs = [j for j in raw_jobs if not j.get("_is_category_page")]
+    if category_hits:
+        _progress(db, run, "Expanding job listing pages…")
+        browser_config = engine.BrowserConfig(
+            headless=True, verbose=False, viewport_width=1280, viewport_height=800,
+            user_agent_mode="random",
+        )
+        async with engine.AsyncWebCrawler(config=browser_config) as crawler:
+            expanded = await engine.expand_category_pages(category_hits, crawler)
+        raw_jobs.extend(expanded)
+        t0 = _lap("category_expand", t0)
+
     if ats_stale:
         mark_ats_batch_fetched(db, profile_id)
+    funnel["raw_discovered"] = len(raw_jobs)
     raw_jobs, n_blocked = filter_blocked(raw_jobs, get_blocked_domains(db))
+    funnel["blocklist_dropped"] = n_blocked
     if n_blocked:
         emit(f"[pipeline] spam-domain blocklist dropped {n_blocked} listing(s)")
     raw_jobs, n_training = _filter_training(engine, raw_jobs)
+    funnel["training_dropped"] = n_training
     if n_training:
         emit(f"[pipeline] training/placement-scheme filter dropped {n_training} listing(s)")
     breakdown = _board_breakdown(raw_jobs)
@@ -732,6 +762,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     if country_codes:
         before = len(raw_jobs)
         raw_jobs = _filter_by_country(engine, raw_jobs, country_codes)
+        funnel["country_filter_raw_before"] = before
+        funnel["country_filter_raw_after"] = len(raw_jobs)
         emit(f"[pipeline] country filter {country_codes}: {before} -> {len(raw_jobs)} listings")
 
     local_place = eng_profile.get("local_place") or ""
@@ -748,9 +780,13 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     if salary_floor > 0:
         before = len(raw_jobs)
         raw_jobs = _filter_by_salary(raw_jobs, salary_floor)
+        funnel["salary_filtered"] = before - len(raw_jobs)
         emit(f"[pipeline] salary filter (floor={salary_floor}): {before} -> {len(raw_jobs)} listings")
 
     inserted, refreshed, requeued = _upsert_discovered(db, profile_id, raw_jobs)
+    funnel["store_inserted"] = inserted
+    funnel["store_refreshed"] = refreshed
+    funnel["store_requeued"] = requeued
     store_counts = _store_counts(db, profile_id)
     emit(f"[pipeline] store upsert: +{inserted} new, {refreshed} refreshed, "
          f"{requeued} requeued | store totals for this profile: {store_counts}")
@@ -765,14 +801,16 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
              f"topped up with {len(backlog)} backlog rows -> {len(rows)} total")
     else:
         emit(f"[pipeline] scoring whole 'new' store: {len(rows)} rows")
+    funnel["pool_rows"] = len(rows)
     if not rows:
         emit("[pipeline] STOP: nothing to evaluate (store empty and no backlog) -> 0 results")
-        return [], False, None, timings, None
+        return [], False, None, timings, None, funnel
 
     # FILTER: embed (cached) + cosine-score the whole set against every role
     # cluster, take a fair adaptive pool per cluster.
     _progress(db, run, f"Found {len(rows)} jobs, scoring…")
     n_embedded = _ensure_embeddings(engine, db, rows)
+    funnel["embedded_new"] = n_embedded
     if n_embedded:
         emit(f"[pipeline] embedded {n_embedded} new rows (cached for future runs)")
     t0 = _lap("embed", t0)
@@ -787,6 +825,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     if country_codes:
         before = len(scored)
         scored = _filter_by_country(engine, scored, country_codes)
+        funnel["country_filter_scored_before"] = before
+        funnel["country_filter_scored_after"] = len(scored)
         emit(f"[pipeline] country filter on candidates {country_codes}: "
              f"{before} -> {len(scored)} rows")
     if eng_profile.get("location_scope") == "local" and local_place:
@@ -796,11 +836,14 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
              f"{before} -> {len(scored)} rows")
     top_score = scored[0]["embed_score"] if scored else 0.0
     above_primary = sum(1 for j in scored if j["embed_score"] >= RELEVANCE_PRIMARY)
+    funnel["scored_total"] = len(scored)
+    funnel["above_relevance_primary"] = above_primary
     emit(f"[pipeline] scored {len(scored)} candidates | top_score={top_score:.3f} | "
          f">= RELEVANCE_PRIMARY({RELEVANCE_PRIMARY})={above_primary}")
     _log_score_distribution(emit, scored)
 
     scored, n_prescreen = _heuristic_prescreen(scored, eng_profile)
+    funnel["heuristic_prescreen_dropped"] = n_prescreen
     if n_prescreen:
         emit(f"[pipeline] heuristic prescreen dropped {n_prescreen} obvious seniority mismatch(es) "
              f"before any gate")
@@ -808,11 +851,13 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     pool, harsh, pool_fallbacks = _adaptive_pool_by_cluster(scored)
     for idx, reason in pool_fallbacks.items():
         fallback_notes[idx].add(reason)
+    funnel["adaptive_pool_size"] = len(pool)
+    funnel["pool_harsh"] = harsh
     emit(f"[pipeline] adaptive pool size={len(pool)} (harsh/broadened={harsh}) "
          f"fallbacks={dict(pool_fallbacks)}")
     if not pool:
         emit(f"[pipeline] STOP: no candidates above RELEVANCE_FLOOR({RELEVANCE_FLOOR}) in any cluster -> 0 results")
-        return [], harsh, None, timings, _compose_fallback_warning(role_clusters, fallback_notes)
+        return [], harsh, None, timings, _compose_fallback_warning(role_clusters, fallback_notes), funnel
 
     # GATE: sector fit is judged per role-cluster (each cluster's own roles as
     # the "candidate target roles" signal) so the call isn't confused by a
@@ -872,14 +917,17 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         for idx, items in survivors_by_cluster.items() if items
     }
     selected = _fair_allocate(selected_by_cluster, TARGET_POOL)
-    emit(f"[pipeline] gates: pool={len(pool)} -> survivors={sum(len(v) for v in survivors_by_cluster.values())} "
+    survivors_total = sum(len(v) for v in survivors_by_cluster.values())
+    funnel["gate_survivors_total"] = survivors_total
+    funnel["selected_for_rank"] = len(selected)
+    emit(f"[pipeline] gates: pool={len(pool)} -> survivors={survivors_total} "
          f"-> selected top-{len(selected)} across {len(selected_by_cluster)} cluster(s) for cheap ranking")
     if not selected:
         # Should be unreachable: every cluster in pool_by_cluster gets a
         # guaranteed non-empty fallback above. Kept as a defensive backstop.
         emit("[pipeline] STOP: screen produced nothing despite a non-empty pool -> 0 results")
         return [], True, ([j["_identity"] for j in pool], []), timings, \
-            _compose_fallback_warning(role_clusters, fallback_notes)
+            _compose_fallback_warning(role_clusters, fallback_notes), funnel
 
     # RANK: one more cheap-model call per cluster over that cluster's own gate
     # survivors, estimating a numeric 0-100 fit score per job instead of a
@@ -897,6 +945,9 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # doesn't get persisted, so a job scored out here is still free to
     # resurface (and be re-ranked) on a future run.
     _progress(db, run, "Ranking candidates…")
+    # NB: unrelated to funnel["selected_for_rank"] set above -- that's the
+    # TARGET_POOL-capped count going INTO this stage; this dict is just this
+    # stage's per-cluster grouping of those same jobs.
     selected_for_rank: dict[int, list[dict]] = defaultdict(list)
     for j in selected:
         selected_for_rank[j.get("_cluster", 0)].append(j)
@@ -916,6 +967,9 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
 
     selected = _fair_allocate(rank_by_cluster, JUDGE_POOL)
     t0 = _lap("rank", t0)
+    funnel["rank_scored"] = n_scored
+    funnel["rank_autorejected"] = n_autorejected
+    funnel["judge_pool_size"] = len(selected)
     emit(f"[pipeline] cheap rank: {n_scored} scored across {len(rank_by_cluster)} cluster(s) -> "
          f"{n_autorejected} auto-dropped (bottom {RANK_AUTOREJECT_FRACTION:.0%} per cluster, kept "
          f"for a future run) -> top-{len(selected)} sent to full evaluation")
@@ -936,6 +990,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             else:
                 j["full_text"] = j.get("snippet", "")
                 already_ready.append(j)
+        funnel["scrape_needed"] = len(needs_scrape)
+        funnel["scrape_already_ready"] = len(already_ready)
         emit(f"[pipeline] phase 5: {len(needs_scrape)}/{len(selected)} candidates need a full-page "
              f"scrape ({len(already_ready)} already have enough detail from their source)")
         if needs_scrape:
@@ -946,7 +1002,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             )
             async with engine.AsyncWebCrawler(config=browser_config) as crawler:
                 scraped = await engine.scrape_full_details(
-                    needs_scrape, crawler, blocked_domains=set(get_blocked_domains(db))
+                    needs_scrape, crawler, blocked_domains=set(get_blocked_domains(db)),
+                    country_code=eng_profile.get("adzuna_country_code", "gb"),
                 )
             _persist_scrape(db, profile_id, scraped)  # reuse the page next run, no re-scrape
             to_evaluate = already_ready + scraped
@@ -971,11 +1028,18 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         to_evaluate_by_cluster[j.get("_cluster", 0)].append(j)
 
     final_by_cluster: dict[int, list[dict]] = {}
+    final_fresh_judged = final_reused_from_cache = 0
+    final_strong = final_backup = final_disqualified = 0
     for idx, jobs in to_evaluate_by_cluster.items():
         label = _cluster_label(role_clusters[idx])
         cluster_roles = role_clusters[idx].get("roles") or []
         cv_text = cv_text_for_cluster(cv_text_base, cluster_roles) if cluster_roles else cv_text_base
-        eval_sig = hashlib.sha1(cv_text.encode()).hexdigest()[:16]
+        # Signature includes EXP_MODEL so a judge-model upgrade (e.g. gpt-5.4 ->
+        # gpt-5.5) naturally invalidates every previously stored verdict instead
+        # of serving a stale reject/strong/backup forever -- same fix as
+        # rank_gate's "rank_v2" cache-key bump in full_auto.py, applied here so
+        # existing evaluated jobs actually get re-judged by the new model too.
+        eval_sig = hashlib.sha1(f"{cv_text}|{engine.EXP_MODEL}".encode()).hexdigest()[:16]
 
         # Reuse stored verdicts for jobs already judged under this CV; only send the
         # rest to the expensive model. A prior "reject" under this exact signature
@@ -1001,6 +1065,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                 fresh.append(j)
 
         _progress(db, run, "Final AI review…")
+        final_fresh_judged += len(fresh)
+        final_reused_from_cache += len(jobs) - len(fresh)
         emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}): {len(fresh)} to judge, "
              f"{len(jobs) - len(fresh)} reused from prior verdict (LLM cap={engine.FINAL_PICKS})")
 
@@ -1015,6 +1081,9 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                 strong, backup, disqualified = [], [], []
             else:
                 _persist_verdicts(db, profile_id, fresh, strong, backup, disqualified, eval_sig)
+        final_strong += len(strong)
+        final_backup += len(backup)
+        final_disqualified += len(disqualified)
 
         picks = [dict(p, strong_fit=True) for p in strong] + cached_strong
         if not picks:
@@ -1041,10 +1110,17 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             p["_cluster_label"] = label if len(role_clusters) > 1 else None
         final_by_cluster[idx] = picks
 
+    funnel["final_fresh_judged"] = final_fresh_judged
+    funnel["final_reused_from_cache"] = final_reused_from_cache
+    funnel["final_strong"] = final_strong
+    funnel["final_backup"] = final_backup
+    funnel["final_disqualified"] = final_disqualified
+
     # Same fair-allocation logic as pooling/top-N: total output stays capped at
     # FINAL_PICKS, redistributed across clusters rather than added per cluster.
     final = _fair_allocate(final_by_cluster, engine.FINAL_PICKS)
     t0 = _lap("final_eval", t0)
+    funnel["final_picks"] = len(final)
     _progress(db, run, "Writing up top picks…")
     emit(f"[pipeline] final_evaluation returned {len(final)} picks across "
          f"{sum(1 for v in final_by_cluster.values() if v)} cluster(s)"
@@ -1053,7 +1129,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     processed_ids = [j["_identity"] for j in pool]
     shown_ids = [f.get("_identity") for f in final if f.get("_identity")]
     warning = _compose_fallback_warning(role_clusters, fallback_notes)
-    return final, harsh or bool(fallback_notes), (processed_ids, shown_ids), timings, warning
+    return final, harsh or bool(fallback_notes), (processed_ids, shown_ids), timings, warning, funnel
 
 
 def _prune_previous_roles(db: Session, profile_id: int) -> None:
@@ -1082,7 +1158,7 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         with open(engine.CV_PATH, "w", encoding="utf-8") as f:
             f.write(snap["cv_text"])
 
-        final, harsh, marks, timings, warning = asyncio.run(
+        final, harsh, marks, timings, warning, funnel = asyncio.run(
             _run_engine_pipeline(
                 engine, snap["engine_profile"], snap["weighted_text"], snap["cv_text_base"],
                 db, profile_id, run
@@ -1119,6 +1195,7 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         run.status = "done"
         run.finished_at = datetime.utcnow()
         run.phase_timings = json.dumps(timings)
+        run.funnel_counts = json.dumps(funnel)
         if warning:
             run.warning = warning
         run.message = (
