@@ -6,6 +6,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { api } from "@/lib/api";
+import { useSearchStatus } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
 
 const TABS = [
@@ -20,11 +21,18 @@ export function Nav() {
   const router = useRouter();
   const qc = useQueryClient();
   const { activeId } = useProfiles();
-  const [running, setRunning] = useState(false);
+  const [starting, setStarting] = useState(false);
+  // Reflects the actual backend state for the active profile, not just this
+  // button's own click state -- so a search kicked off from another page
+  // (dashboard/onboarding), or one still running after this component
+  // remounts, correctly disables the button here too.
+  const { data: status } = useSearchStatus(activeId);
+  const searchInFlight = status?.status === "running";
+  const running = starting || searchInFlight;
 
   async function runSearch() {
     if (!activeId || running) return;
-    setRunning(true);
+    setStarting(true);
     try {
       await api.startSearch(activeId);
       qc.invalidateQueries({ queryKey: ["searchStatus", activeId] });
@@ -32,7 +40,7 @@ export function Nav() {
     } catch (e) {
       alert((e as Error).message);
     } finally {
-      setRunning(false);
+      setStarting(false);
     }
   }
 
@@ -53,7 +61,7 @@ export function Nav() {
         </div>
       </div>
       <button className="btn btn-primary" onClick={runSearch} disabled={running || !activeId}>
-        {running ? "Starting…" : "▶ Run New Search"}
+        {starting ? "Starting…" : searchInFlight ? "Search running…" : "▶ Run New Search"}
       </button>
     </div>
   );

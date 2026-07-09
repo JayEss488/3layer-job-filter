@@ -95,6 +95,8 @@ export const api = {
   // search + roles
   startSearch: (id: number) =>
     req<SearchStart>(`/profiles/${id}/search`, { method: "POST" }),
+  cancelSearch: (id: number) =>
+    req<SearchStatus>(`/profiles/${id}/search/cancel`, { method: "POST" }),
   searchStatus: (id: number) =>
     req<SearchStatus | null>(`/profiles/${id}/search/status`),
   roles: (id: number, status?: string) =>

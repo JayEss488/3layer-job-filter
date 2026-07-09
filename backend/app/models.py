@@ -142,6 +142,13 @@ class JobSeen(Base):
     eval_analysis = Column(Text)       # JSON: summary/match_reasons/concerns
     eval_signature = Column(Text)      # profile signature at eval time (validity key)
     evaluated_at = Column(DateTime)
+    # Set only on a HIGH-CONFIDENCE dead/expired-listing signal from Phase 5
+    # scraping (status_404/status_410/expired_phrase, see full_auto.py's
+    # _dead_listing_signal) with no alternate posting found. Deliberately its
+    # own field, not a `state` value or `eval_verdict='reject'`: it's a fact
+    # about the URL, independent of pipeline-progress state and of the
+    # profile/CV (must survive an eval_signature change, unlike a real verdict).
+    dead_reason = Column(Text)
     first_seen = Column(DateTime, default=_now)
     last_seen = Column(DateTime, default=_now, onupdate=_now)
 
@@ -175,7 +182,9 @@ class SearchRun(Base):
 
     id = Column(Integer, primary_key=True)
     profile_id = Column(Integer, ForeignKey("profiles.id"), nullable=False, index=True)
-    status = Column(Text, nullable=False, default="running")  # running|done|error
+    status = Column(Text, nullable=False, default="running")  # running|done|error|cancelled
+    cancel_requested = Column(Boolean, default=False)  # set by POST /search/cancel; see
+                                                        # engine.py's _check_cancelled
     message = Column(Text)  # progress / warning / error text
     warning = Column(Text)  # harsh-filter warning surfaced to the user
     result_count = Column(Integer, default=0)

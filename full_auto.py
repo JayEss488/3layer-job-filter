@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional, List, Dict
 import numpy as np
+import httpx
 from openai import OpenAI
 from crawl4ai import (
     AsyncWebCrawler,
@@ -129,7 +130,11 @@ CATEGORY_EXPAND_MAX_PAGES           = 5     # cap on listing pages expanded per 
 CATEGORY_EXPAND_MAX_LINKS_PER_PAGE  = 15    # cap on postings pulled from one page
 CATEGORY_EXPAND_BUDGET_SECONDS      = 20.0  # wall-clock budget for the whole step
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# The SDK default (httpx.Timeout(600, connect=5.0), max_retries=2) lets a single
+# stalled call block up to ~30 min before raising anything -- with a search
+# running as a background task with no outer watchdog, that stalls the whole
+# pipeline at status="running" with no way to recover short of a restart.
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=httpx.Timeout(90.0, connect=5.0))
 
 
 def run_pipeline(cv_text: str, log_queue: queue.Queue) -> list[dict]:
@@ -2081,6 +2086,74 @@ def _looks_like_redirect_stub(markdown: str) -> bool:
     return len(markdown) < 2000 and bool(_REDIRECT_STUB_RE.search(markdown))
 
 
+def _effective_status_code(result) -> int | None:
+    """Status of the page markdown was actually extracted from. Prefers
+    redirected_status_code (the final landed page after any redirect chain)
+    over status_code, which this crawl4ai build sets to the FIRST hop's status
+    -- a 301/302 when a redirect occurred, not the real final-page status. A
+    dead listing that redirects to a 200 OK "closed" page would otherwise read
+    as a 3xx here and never be caught."""
+    return getattr(result, "redirected_status_code", None) or getattr(result, "status_code", None)
+
+
+_EXPIRED_LISTING_RE = re.compile(
+    r"no longer (?:accepting|taking) applications|"
+    r"applications? (?:are|is) now closed|"
+    r"this (?:vacancy|job|role|position|posting|listing|advert(?:isement)?) "
+        r"(?:has|have) (?:now )?(?:closed|expired)|"
+    r"this (?:vacancy|job|role|position|posting|listing) is no longer (?:available|active|live)|"
+    r"(?:vacancy|position|role) has (?:already )?been filled|"
+    r"job (?:posting|listing|advert) has expired|"
+    r"(?:this )?posting has been removed|"
+    r"sorry,? this job is no longer (?:available|live)",
+    re.I,
+)
+
+
+def _looks_like_expired_listing(markdown: str) -> bool:
+    """True if the rendered page reads as a notice that the listing itself has
+    closed/expired/been filled/removed, on an otherwise-normal 200 OK page --
+    crawl4ai has no way to flag this as a failure since markdown/status look
+    fine on their own. Deliberately BACKWARD-looking phrasing only ("has
+    closed", "no longer accepting applications", "has been filled") -- never
+    forward-looking deadline language ("applications close 15 August", "apply
+    by Friday"), which real, live postings use routinely and must never trip
+    this. Length-gated like _looks_like_redirect_stub, sized larger: a genuine
+    closure notice page usually still carries site nav/related-jobs
+    boilerplate around it, unlike a bare redirect stub."""
+    return len(markdown) < 3000 and bool(_EXPIRED_LISTING_RE.search(markdown))
+
+
+def _dead_listing_signal(result, markdown: str) -> str | None:
+    """A short machine-readable reason ('status_404'/'status_410'/
+    'expired_phrase') ONLY when this fetch is a HIGH-CONFIDENCE signal the
+    listing itself is gone -- as opposed to an ambiguous failure (anti-bot
+    block, rate-limit, timeout, generic 4xx/5xx, empty shell) that must stay
+    on the existing fail-open snippet-fallback path. 403/429/5xx are
+    deliberately excluded: those mean "blocked/rate-limited/erroring", not
+    "gone". Only 404/410 (HTTP-spec "not found"/"permanently gone") and an
+    explicit closure-phrase match count."""
+    status = _effective_status_code(result)
+    if status in (404, 410):
+        return f"status_{status}"
+    if markdown and _looks_like_expired_listing(markdown):
+        return "expired_phrase"
+    return None
+
+
+def _scrape_succeeded(result, markdown: str) -> bool:
+    """Whether this fetch counts as a real-posting scrape success. A >=400
+    status is NEVER a success regardless of markdown length or content --
+    crawl4ai has no way to know an anti-bot/soft-404 error page's rendered
+    text isn't real content."""
+    status = _effective_status_code(result)
+    if status is not None and status >= 400:
+        return False
+    return bool(result.success and markdown and len(markdown) > 150
+                and not _looks_like_redirect_stub(markdown)
+                and not _looks_like_expired_listing(markdown))
+
+
 async def _find_alternate_posting(
     job: dict, crawler: AsyncWebCrawler, country_code: str = "gb",
 ) -> str:
@@ -2109,12 +2182,59 @@ async def _find_alternate_posting(
             )
             result = await crawler.arun(url=link, config=run_config)
             markdown = (result.markdown or "").strip()
-            if (result.success and markdown and len(markdown) > 150
-                    and not _looks_like_redirect_stub(markdown)):
+            if _scrape_succeeded(result, markdown):
                 return markdown[:8000]
         except Exception:
             continue
     return ""
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n\s*\n")
+
+
+def _distinctive_sentence(text: str) -> str | None:
+    """Pick one ~12-30 word sentence from a job's scraped body text, suitable
+    for a quoted duplicate-content search -- prefers a real prose sentence (an
+    "About Us" blurb or similar) over a title/location line or bullet
+    fragment. Splits on blank lines as well as sentence punctuation, so a
+    header block (title/location with no terminal punctuation) doesn't get
+    glued onto the first real prose sentence that follows it. None if nothing
+    in the text looks distinctive enough to search on (verification is
+    skipped in that case, not forced)."""
+    for s in _SENTENCE_SPLIT_RE.split((text or "")[:2000]):
+        s = s.strip()
+        words = s.split()
+        if 12 <= len(words) <= 30 and 60 <= len(s) <= 220 and s[:1].isupper():
+            return s
+    return None
+
+
+def verify_not_duplicated(job: dict, country_code: str = "gb") -> str | None:
+    """Cross-site corroboration for a judge-flagged `scam_suspect` pick: search a
+    distinctive sentence from the listing's own scraped text in quotes, and check
+    whether it verbatim-appears on an unrelated, differently-hosted site --
+    genuine single-employer postings essentially never propagate word-for-word
+    across independent boards. The caller (engine.py) gates this to only the rare
+    already-suspicious pick, bounded by SCAM_VERIFY_MAX_PER_RUN, since it spends a
+    real search call. Fails open: any search/parse issue, or no distinctive
+    sentence available, returns None -- never itself a disqualifier."""
+    sentence = _distinctive_sentence(job.get("full_text", ""))
+    if not sentence:
+        return None
+    orig_host = _scrape_host(job.get("url", ""))
+    try:
+        results = _google_organic(f'"{sentence}"', gl=country_code, num=5)
+    except Exception:
+        return None
+    needle = sentence.lower()
+    for r in results:
+        host = _scrape_host(r.get("link", ""))
+        if not host or host == orig_host:
+            continue
+        haystack = f"{r.get('title','')} {r.get('snippet','')}".lower()
+        if needle in haystack or needle[:40] in haystack:
+            return f"verbatim duplicate content found on {host}"
+    return None
 
 
 async def scrape_full_details(
@@ -2140,10 +2260,11 @@ async def scrape_full_details(
     sem = asyncio.Semaphore(MAX_CONCURRENT)
     blocked_hit = 0
     alt_found = 0
+    dead_confirmed = 0
     alt_budget = [ALT_SOURCE_LOOKUP_MAX_PER_RUN]
 
     async def fetch_one(job: dict) -> dict:
-        nonlocal blocked_hit, alt_found
+        nonlocal blocked_hit, alt_found, dead_confirmed
         url = job.get("url", "")
         host = _scrape_host(url)
         if host and any(host == d or host.endswith("." + d) for d in blocked_domains):
@@ -2153,6 +2274,7 @@ async def scrape_full_details(
 
         async with sem:
             max_retries = 2
+            dead_signal = None
             for attempt in range(1, max_retries + 1):
                 try:
                     await asyncio.sleep(random.uniform(1.5, 3.5))
@@ -2166,13 +2288,15 @@ async def scrape_full_details(
 
                     result = await crawler.arun(url=url, config=run_config)
                     markdown = (result.markdown or "").strip()
+                    dead_signal = _dead_listing_signal(result, markdown)
 
-                    if (result.success and markdown and len(markdown) > 150
-                            and not _looks_like_redirect_stub(markdown)):
+                    if _scrape_succeeded(result, markdown):
                         job["full_text"] = markdown[:8000]
                         if attempt > 1:
                             emit(f"   [RETRY SUCCESS] Bypassed script wall for {job['company']} on attempt #{attempt}")
                         break
+                    elif dead_signal:
+                        raise ValueError(f"Listing appears dead/expired ({dead_signal}).")
                     elif markdown and _looks_like_redirect_stub(markdown):
                         raise ValueError("Scraper landed on a click-tracking redirect stub, not the real posting.")
                     else:
@@ -2188,6 +2312,12 @@ async def scrape_full_details(
                             job["full_text"] = alt_text
                             alt_found += 1
                             emit(f"   [ALT-SOURCE] Recovered {job['company']} posting via search after scrape failure")
+                        elif dead_signal:
+                            job["_dead_reason"] = dead_signal
+                            job["full_text"] = job.get("snippet", "")
+                            dead_confirmed += 1
+                            emit(f"   [CONFIRMED DEAD] {job['company']} -- {dead_signal}; "
+                                 f"no alternate posting found, excluding before final judge")
                         else:
                             emit(f"   [!] [PHASE 5 FAILURE] Blocked at {job['company']}. Preserving snippet summary.")
                             job["full_text"] = job.get("snippet", "")
@@ -2216,6 +2346,9 @@ async def scrape_full_details(
         emit(f"   [phase 5] skipped {blocked_hit} already-blocklisted domain(s), no scrape attempted")
     if alt_found:
         emit(f"   [phase 5] recovered {alt_found} otherwise-failed page(s) via alternate-source search")
+    if dead_confirmed:
+        emit(f"   [phase 5] confirmed {dead_confirmed} listing(s) dead/expired (404/410 or explicit "
+             f"closure notice, no alternate posting found) -- excluded before the final judge")
     return jobs
 
 
@@ -2294,6 +2427,12 @@ async def expand_category_pages(
 
 # ── Phase 6: Final Evaluation ────────────────────────────────────────────────────
 
+# Bumped whenever DISQUALIFIERS/STRONG_RULES/WORDING/SCHEMA changes meaningfully --
+# engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
+# verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
+# "rank_v2" cache-key bump when its model/prompt changed.
+FINAL_EVAL_PROMPT_VERSION = 2
+
 _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job states an explicit experience/seniority requirement
    (years of experience, "senior"/"lead"/"principal" in the title, or prior experience in a specific
    sector/domain). If the job clearly requires meaningfully more experience or specific sector
@@ -2321,7 +2460,35 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
 3. LISTING TYPE: The listing must be a real, direct job vacancy the candidate could be hired into. If
    it is actually a paid training course, "traineeship"/placement programme, bootcamp, or any scheme
    where the candidate enrols in (or pays/finances) training and is only promised a job or interview
-   afterwards rather than being hired directly, exclude it entirely - it is not a job."""
+   afterwards rather than being hired directly, exclude it entirely - it is not a job.
+
+4. SCAM / CV-FARMING RISK: Some listings are not genuine hiring employers but lead-generation or
+   CV-harvesting operations designed to collect applications/CVs rather than fill a real role. Judge on
+   the COMBINATION of signals below, the same way you weigh cumulative fit gaps elsewhere - no single
+   softer signal is automatically disqualifying alone (a genuine small/informal employer can trip one),
+   but TWO OR MORE of the softer signals together should be treated as disqualifying:
+   - Content-free "About Us"/company description: generic corporate language naming no company, no
+     product/service, no domain specifics (e.g. "a leading organization at the forefront of [field],
+     committed to innovation and excellence") - genuine postings, even from small companies, almost
+     always name themselves or say concretely what they build/do.
+   - A "lure" combination aimed at maximizing applicant volume rather than filtering for fit: visa
+     sponsorship offered + a paid training/induction period + an unusually high salary, together, for a
+     genuinely zero-experience graduate-level role.
+   - A posting-volume note in the listing block (when present): the source has posted an unusually high
+     number of differently-titled roles this run with the same templated structure - a pattern
+     associated with template/lead-gen job boards rather than a single real hiring pipeline.
+   These softer signals are ADDITIVE, not independently sufficient - set "scam_suspect": true (see
+   schema below) whenever exactly ONE is present so it can be corroborated before the listing reaches
+   the candidate, and only move straight to "disqualified" when two or more coincide.
+   The following are independently sufficient - either ALONE disqualifies immediately, no combination
+   needed: payment, purchase, bank/financial, or sensitive-ID (passport, National Insurance/SSN) requests
+   as a condition of applying or being hired; contact/apply only via a personal Gmail/Yahoo/Outlook
+   address, WhatsApp, Telegram, or SMS number, with no company website, careers page, or ATS link
+   anywhere in the listing.
+   Do NOT flag a listing merely for imperfect writing, being from a small/unfamiliar company that
+   nonetheless names itself concretely with a specific role description, using a normal ATS apply link,
+   or a normal post-offer background check - only the concrete patterns above, never a vague "feels off"
+   impression."""
 
 _FINAL_EVAL_WORDING = """WORDING: When you reference the candidate's OWN background in "summary", "match_reasons" or "concerns",
 never state a leadership or founder title (e.g. president, chair, founder, co-founder, cofounder, CEO,
@@ -2334,7 +2501,7 @@ initiative"), and never state the bare title with no object at all. If the profi
 name to attach, leave the title out entirely rather than stating it bare - never phrase any of this so it
 could read as company-founding or executive experience."""
 
-_FINAL_EVAL_STRONG_RULES = """4. EVIDENCE STRENGTH: The candidate's background profile may show a qualifier in parentheses next to a
+_FINAL_EVAL_STRONG_RULES = """5. EVIDENCE STRENGTH: The candidate's background profile may show a qualifier in parentheses next to a
    skill, past role, or experience bullet. For skills this is a depth signal, e.g. "Python (Expert)" or
    "Excel (One-time)" - Expert/Proficient stated experience is strong evidence; Familiar/One-time
    exposure is weak evidence - weigh each accordingly. For past roles, the only qualifier used is
@@ -2362,7 +2529,8 @@ optional list, using this item shape for "strong"/"backup":
     "job_number": 1, "title": "...", "company": "...", "url": "...",
     "summary": "1 concise sentence on why this role fits the candidate.",
     "match_reasons": ["concrete alignment factor 1", "concrete alignment factor 2 (max 2)"],
-    "concerns": ["each notable skill gap or prerequisite the candidate lacks, one per item; [] if none"]
+    "concerns": ["each notable skill gap or prerequisite the candidate lacks, one per item; [] if none"],
+    "scam_suspect": false
   }
 ],
  "backup": [ {same item shape} ],
@@ -2372,7 +2540,10 @@ optional list, using this item shape for "strong"/"backup":
 Include a "disqualified" entry for every job you excluded from BOTH lists above because it failed one of
 the DISQUALIFIERS rules -- this is the only place that reasoning needs recording, so it stays auditable.
 Do NOT add an entry for a job that simply wasn't picked among the best-fitting options (one that passed
-the disqualifiers but wasn't chosen for "strong"/"backup") -- leave those out of all three lists."""
+the disqualifiers but wasn't chosen for "strong"/"backup") -- leave those out of all three lists.
+"scam_suspect" (on "strong"/"backup" items only): true if the SCAM/CV-FARMING rule's softer signals
+raised exactly ONE flag on this listing (not enough alone to disqualify it into the list above); false
+otherwise. Omit or leave false when you saw none of those signals."""
 
 # Static system prefix -- identical across every cluster/call, so it's a stable
 # (prompt-cache-friendly) prefix instead of being rebuilt into each user prompt. It
@@ -2400,9 +2571,14 @@ Leave "backup" empty when "strong" already gives good coverage, or when every ro
 def _final_eval_job_block(i: int, j: dict) -> str:
     """One job's payload block. A non-trivial screen note (the merged gate's seniority
     verdict, already computed upstream) is surfaced as a hint so the model focuses its
-    seniority re-check rather than re-deriving it from scratch."""
+    seniority re-check rather than re-deriving it from scratch. A posting-volume note
+    (set upstream in engine.py when this job's company posted an unusually high number
+    of differently-titled roles this run, see _company_title_counts) feeds the SCAM /
+    CV-FARMING disqualifier's combination-of-signals check."""
     reason = j.get("_gate_reason")
     hint = f"[screen note: {reason}]\n" if reason and reason not in ("ok", "gate_error", "missing_decision") else ""
+    volume_hint = j.get("_posting_volume_hint")
+    hint += f"[posting-volume note: {volume_hint}]\n" if volume_hint else ""
     return (f"JOB {i+1}: {j['title']} at {j['company']}\n"
             f"Location: {j.get('location') or 'not stated'}\nURL: {j['url']}\n{hint}\n"
             f"{j.get('full_text','')[:2000]}")
@@ -2438,7 +2614,10 @@ Jobs Payload:
 {jobs_block}"""
 
     try:
-        raw = llm(prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL, require_json=True)
+        # gpt-5.5 (EXP_MODEL) only accepts the default temperature (1) -- rejects
+        # llm()'s 0.2 default with a 400, which silently degraded every real run
+        # to the unverified top-N fallback (see final_evaluation_split's caller).
+        raw = llm(prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL, require_json=True, temperature=1)
         data = json.loads(clean_json(raw))
     except Exception as e:
         emit(f"[phase 6] Final generation evaluation failed: {e}")

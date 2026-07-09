@@ -232,6 +232,13 @@ a { color: inherit; }
   border: 1px solid var(--accent-tint-bd); background: var(--accent-tint); border-radius: var(--r-ctrl);
   padding: 8px 14px; font-size: 12px; color: #6b4028;
 }
+.warning-banner-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+}
+.info-banner {
+  border: 1px solid var(--line); background: var(--surface-3); border-radius: var(--r-ctrl);
+  padding: 8px 14px; font-size: 12px; color: var(--ink-2);
+}
 .meta-row { font-size: 12px; color: var(--muted); }
 .meta-row .count { font-weight: 600; color: var(--ink); }
 

@@ -40,6 +40,17 @@ def start_search(
     profile: Profile = Depends(get_profile_or_404),
     db: Session = Depends(get_db),
 ):
+    already_running = db.execute(
+        select(SearchRun.id)
+        .where(SearchRun.profile_id == profile.id, SearchRun.status == "running")
+        .limit(1)
+    ).first()
+    if already_running:
+        raise HTTPException(
+            status_code=409,
+            detail="A search is already running for this profile.",
+        )
+
     used = _searches_today(db, profile.id)
     if used >= MAX_SEARCHES_PER_DAY:
         raise HTTPException(
@@ -76,6 +87,31 @@ def search_status(
         .order_by(SearchRun.id.desc())
         .limit(1)
     ).scalar_one_or_none()
+    return run
+
+
+@router.post("/profiles/{profile_id}/search/cancel", response_model=SearchStatusOut)
+def cancel_search(
+    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
+):
+    run = db.execute(
+        select(SearchRun)
+        .where(SearchRun.profile_id == profile.id, SearchRun.status == "running")
+        .order_by(SearchRun.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="No running search to cancel")
+
+    # Set status directly (rather than waiting for the background task to notice
+    # cancel_requested) so the frontend gets instant feedback regardless of
+    # whether/when the pipeline actually observes the flag at its next checkpoint.
+    run.cancel_requested = True
+    run.status = "cancelled"
+    run.finished_at = datetime.utcnow()
+    run.message = "Search cancelled."
+    db.commit()
+    db.refresh(run)
     return run
 
 

@@ -34,6 +34,10 @@ export default function SearchPage() {
   };
   const tick = useMutation({ mutationFn: api.tick, onSuccess: invalidate });
   const cross = useMutation({ mutationFn: api.cross, onSuccess: invalidate });
+  const cancelSearch = useMutation({
+    mutationFn: (id: number) => api.cancelSearch(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["searchStatus", activeId] }),
+  });
 
   // useSearchStatus stops polling once the run finishes, but the already-mounted
   // roles query has no idea new rows landed — without this, the list stays stale
@@ -61,13 +65,25 @@ export default function SearchPage() {
         <TrainingBanner />
 
         {running && (
-          <div className="warning-banner">
-            <span className="spinner">◴</span> {status?.message || "Building your matches…"} This
-            can take a couple of minutes (fetching, ranking, and reading full role pages).
+          <div className="warning-banner warning-banner-row">
+            <span>
+              <span className="spinner">◴</span> {status?.message || "Building your matches…"} This
+              can take a couple of minutes (fetching, ranking, and reading full role pages).
+            </span>
+            <button
+              className="btn btn-ghost sm"
+              onClick={() => activeId && cancelSearch.mutate(activeId)}
+              disabled={cancelSearch.isPending}
+            >
+              {cancelSearch.isPending ? "Cancelling…" : "Cancel Search"}
+            </button>
           </div>
         )}
         {status?.status === "error" && (
           <div className="warning-banner">{status.message}</div>
+        )}
+        {status?.status === "cancelled" && (
+          <div className="info-banner">{status.message || "Search cancelled."}</div>
         )}
         {status?.warning && !running && (
           <div className="warning-banner">⚠ {status.warning}</div>

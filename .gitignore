@@ -5,3 +5,4 @@ __pycache__/
 inactive components/key_openai
 venv/
 raw_api_jobs.json
+.offline_test/

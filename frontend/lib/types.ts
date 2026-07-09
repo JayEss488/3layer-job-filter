@@ -105,7 +105,7 @@ export interface Role {
 export interface SearchStatus {
   id: number;
   profile_id: number;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "cancelled";
   message?: string | null;
   warning?: string | null;
   result_count: number;

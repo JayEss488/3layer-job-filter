@@ -32,6 +32,18 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup():
     init_db()
+
+    from .database import SessionLocal
+    from .services.engine import reap_stale_search_runs
+
+    db = SessionLocal()
+    try:
+        n = reap_stale_search_runs(db)
+        if n:
+            print(f"[startup] reaped {n} stale 'running' search run(s) from a previous process lifetime")
+    finally:
+        db.close()
+
     # Populate the shared ATS store with the curated baseline on first boot (only
     # if empty; runs in the background so it never blocks startup).
     from .services.seed import seed_baseline_if_empty

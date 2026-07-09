@@ -13,12 +13,13 @@ import asyncio
 import hashlib
 import json
 import re
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..config import DISCOVERY_ATS_CACHE_TTL_HOURS
@@ -65,6 +66,17 @@ STORE_SCORE_CAP   = 6000   # max 'new' rows relevance-scored per run (whole stor
 # only ever sees a curated top slice instead of every gate survivor.
 JUDGE_POOL = 40               # top-ranked candidates sent on to scrape + judge
 RANK_AUTOREJECT_FRACTION = 0.20  # bottom fraction of the cheap ranking dropped first
+# Same-source posting-volume signal (scam/CV-farming detection, see
+# _company_title_counts): a company posting at least this many DIFFERENT
+# titles in one run's discovery is surfaced to the final judge as a hint --
+# never a hard drop by itself, a legitimate high-volume recruiter/ATS
+# aggregator can trip this too.
+TEMPLATE_FACTORY_TITLE_THRESHOLD = 4
+# Cross-site duplicate-content verification (scam/CV-farming corroboration,
+# see full_auto.verify_not_duplicated): caps how many extra search calls one
+# run will spend confirming a judge-flagged "scam_suspect" pick, regardless
+# of how many are flagged.
+SCAM_VERIFY_MAX_PER_RUN = 5
 
 
 def _external_id(engine, job: dict) -> str:
@@ -272,10 +284,15 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
 def _new_rows(db: Session, profile_id: int, limit: int = STORE_SCORE_CAP) -> list[JobSeen]:
     """Fresh, unprocessed rows. Freshest first. The limit is the whole-store cap:
     relevance scoring runs over all of them (cheap, since embeddings are cached),
-    so a genuinely good role can't be excluded by an arbitrary small slice."""
+    so a genuinely good role can't be excluded by an arbitrary small slice.
+    Excludes rows already confirmed dead/expired (dead_reason set) -- a fact
+    about the URL that costs nothing to keep re-checking here since it's an
+    indexed-free column filter, and saves every downstream stage from ever
+    seeing a listing already known gone."""
     return db.execute(
         select(JobSeen)
-        .where(JobSeen.profile_id == profile_id, JobSeen.state == "new")
+        .where(JobSeen.profile_id == profile_id, JobSeen.state == "new",
+               JobSeen.dead_reason.is_(None))
         .order_by(JobSeen.first_seen.desc())
         .limit(limit)
     ).scalars().all()
@@ -284,10 +301,12 @@ def _new_rows(db: Session, profile_id: int, limit: int = STORE_SCORE_CAP) -> lis
 def _backlog_rows(db: Session, profile_id: int, limit: int) -> list[JobSeen]:
     """Enriched-but-unshown rows. Used to top up a thin run (surfacing the
     backlog) so the user never sees an empty screen. Already-processed, so
-    re-considering them is free apart from one shared LLM call."""
+    re-considering them is free apart from one shared LLM call. Excludes
+    confirmed-dead rows, same reasoning as _new_rows."""
     return db.execute(
         select(JobSeen)
-        .where(JobSeen.profile_id == profile_id, JobSeen.state == "enriched")
+        .where(JobSeen.profile_id == profile_id, JobSeen.state == "enriched",
+               JobSeen.dead_reason.is_(None))
         .order_by(JobSeen.last_seen.desc())
         .limit(limit)
     ).scalars().all()
@@ -343,6 +362,25 @@ def _persist_scrape(db: Session, profile_id: int, jobs: list[dict]) -> None:
     db.commit()
 
 
+def _persist_dead_scrapes(db: Session, profile_id: int, jobs: list[dict]) -> None:
+    """Persist a confirmed-dead listing's reason (see full_auto.py's
+    _dead_listing_signal) so _run_engine_pipeline's rows-assembly filter can
+    exclude it on every future run without re-scraping or re-judging it --
+    dead-ness is a fact about the URL, independent of profile/CV changes."""
+    by_id = {j["_identity"]: j["_dead_reason"] for j in jobs
+             if j.get("_identity") and j.get("_dead_reason")}
+    if not by_id:
+        return
+    rows = db.execute(
+        select(JobSeen).where(
+            JobSeen.profile_id == profile_id, JobSeen.identity_hash.in_(list(by_id))
+        )
+    ).scalars().all()
+    for r in rows:
+        r.dead_reason = by_id.get(r.identity_hash)
+    db.commit()
+
+
 def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
                       strong: list[dict], backup: list[dict], disqualified: list[dict],
                       eval_sig: str) -> None:
@@ -375,6 +413,7 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             "summary": src.get("summary", ""),
             "match_reasons": src.get("match_reasons", []),
             "concerns": src.get("concerns", []),
+            "scam_suspect": bool(src.get("scam_suspect", False)),
         })
         verdicts[ident] = (verdict, analysis)
     rows = db.execute(
@@ -388,6 +427,23 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
         r.eval_analysis = analysis
         r.eval_signature = eval_sig
         r.evaluated_at = now
+    db.commit()
+
+
+def _persist_scam_override(db: Session, profile_id: int, identity: str, reason: str, eval_sig: str) -> None:
+    """Overrides an already-persisted strong/backup verdict to a reject, after
+    verify_not_duplicated corroborates a judge-flagged scam_suspect pick with
+    real cross-site evidence post-hoc. Never resurfaces under this eval_sig,
+    same as any other reject."""
+    row = db.execute(
+        select(JobSeen).where(JobSeen.profile_id == profile_id, JobSeen.identity_hash == identity)
+    ).scalar_one_or_none()
+    if row is None:
+        return
+    row.eval_verdict = "reject"
+    row.eval_analysis = json.dumps({"summary": "", "match_reasons": [], "concerns": [reason]})
+    row.eval_signature = eval_sig
+    row.evaluated_at = datetime.utcnow()
     db.commit()
 
 
@@ -411,6 +467,24 @@ def _board_breakdown(jobs: list[dict]) -> dict[str, int]:
         board = (j.get("board") or "?").split(":")[0]
         counts[board] = counts.get(board, 0) + 1
     return counts
+
+
+def _company_title_counts(jobs: list[dict]) -> dict[str, set[str]]:
+    """company (lowercased) -> distinct job titles seen in this run's filtered
+    discovery. A structural proxy for "this source looks like a templated
+    catalogue of interchangeable roles" (a known lead-gen/CV-harvesting
+    shape) without needing to visit the source site's own listing page --
+    Adzuna/Reed/Google Jobs already surface several of a prolific poster's
+    listings within one run's results when search terms overlap. Purely
+    additive data fed to the final judge (see TEMPLATE_FACTORY_TITLE_THRESHOLD
+    / _posting_volume_hint) -- never a hard filter by itself."""
+    out: dict[str, set[str]] = defaultdict(set)
+    for j in jobs:
+        company = (j.get("company") or "").strip().lower()
+        title = (j.get("title") or "").strip()
+        if company and title:
+            out[company].add(title)
+    return out
 
 
 # ── Adaptive enrichment funnel ───────────────────────────────────────────────
@@ -669,8 +743,38 @@ def _log_score_distribution(emit, scored: list[dict]) -> None:
          f"median={_pct(0.5)} p75={_pct(0.75)} min={scores[-1]:.3f} | buckets={buckets}")
 
 
+class SearchCancelled(Exception):
+    """Raised by _check_cancelled when the user has requested cancellation via
+    POST /search/cancel. Propagates up through _run_engine_pipeline's
+    asyncio.run() call to run_search_task, which catches it distinctly from a
+    generic failure -- the cancel endpoint already set status="cancelled" on
+    its own session/request, and run_search_task must never overwrite that
+    back to "error" or "done"."""
+
+
+def _check_cancelled(db: Session, run: SearchRun) -> None:
+    """Cooperative-cancellation checkpoint, called at each major phase
+    boundary below. The cancel endpoint commits on its own request-scoped
+    session; this session's in-memory `run` won't reflect that commit until
+    reloaded, so db.refresh() (a real SELECT) is required here rather than
+    trusting the attribute already on the object."""
+    db.refresh(run)
+    if run.cancel_requested:
+        raise SearchCancelled()
+
+
 def _progress(db: Session, run: SearchRun, message: str) -> None:
-    run.message = message
+    """Best-effort progress ping shown to the frontend while a phase is
+    in-flight. A conditional UPDATE guarded on status still being "running" --
+    not before every _progress() call, so without this guard a progress ping
+    landing right after a cancel would silently clobber "Search cancelled."
+    with a stale phase string like "Reading full job pages...", even though
+    the run correctly stops at its next _check_cancelled checkpoint."""
+    db.execute(
+        update(SearchRun)
+        .where(SearchRun.id == run.id, SearchRun.status == "running")
+        .values(message=message)
+    )
     db.commit()
 
 
@@ -689,6 +793,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     def _lap(phase: str, since: float) -> float:
         timings[phase] = round(time.monotonic() - since, 2)
         return time.monotonic()
+
+    _check_cancelled(db, run)
 
     # Role clusters: usually one (today's behavior), sometimes several for a
     # candidate targeting genuinely different fields. Each gets its own
@@ -723,6 +829,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     _progress(db, run, "Searching job boards…")
     raw_jobs = engine.gather_jobs(eng_profile)
     t0 = _lap("discovery", t0)
+    _check_cancelled(db, run)
 
     # google_jobs tags board category/search-listing pages (e.g. a charityjob
     # "N jobs in X" results page) rather than dropping them -- follow a bounded
@@ -782,6 +889,13 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         raw_jobs = _filter_by_salary(raw_jobs, salary_floor)
         funnel["salary_filtered"] = before - len(raw_jobs)
         emit(f"[pipeline] salary filter (floor={salary_floor}): {before} -> {len(raw_jobs)} listings")
+
+    # Scam/CV-farming structural signal (see _company_title_counts): computed once
+    # over this run's own fresh discovery batch, before it's merged into the
+    # persistent store -- a proxy for "this source posted an unusually templated
+    # catalogue of roles this run" without needing to visit the source's own
+    # listing page.
+    company_title_counts = _company_title_counts(raw_jobs)
 
     inserted, refreshed, requeued = _upsert_discovered(db, profile_id, raw_jobs)
     funnel["store_inserted"] = inserted
@@ -881,6 +995,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     _progress(db, run, "Screening candidates…")
     survivors_by_cluster: dict[int, list[dict]] = {}
     for idx, cluster_pool in pool_by_cluster.items():
+        _check_cancelled(db, run)
         cluster_profile = dict(eng_profile)
         cluster_profile["search_terms"] = role_clusters[idx].get("roles") or eng_profile.get("search_terms")
         annotated = engine.screen_gate(cluster_pool, cluster_profile)
@@ -955,6 +1070,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     rank_by_cluster: dict[int, list[dict]] = {}
     n_scored = n_autorejected = 0
     for idx, cluster_items in selected_for_rank.items():
+        _check_cancelled(db, run)
         cluster_profile = dict(eng_profile)
         cluster_profile["search_terms"] = role_clusters[idx].get("roles") or eng_profile.get("search_terms")
         cluster_profile["_multi_cluster"] = len(role_clusters) > 1
@@ -973,6 +1089,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     emit(f"[pipeline] cheap rank: {n_scored} scored across {len(rank_by_cluster)} cluster(s) -> "
          f"{n_autorejected} auto-dropped (bottom {RANK_AUTOREJECT_FRACTION:.0%} per cluster, kept "
          f"for a future run) -> top-{len(selected)} sent to full evaluation")
+    _check_cancelled(db, run)
 
     # EVALUATE. When full-page scraping is enabled (default), read each selected
     # job's real page first, so the final LLM judges fit against the actual
@@ -1006,7 +1123,14 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                     country_code=eng_profile.get("adzuna_country_code", "gb"),
                 )
             _persist_scrape(db, profile_id, scraped)  # reuse the page next run, no re-scrape
-            to_evaluate = already_ready + scraped
+            scraped_dead = [j for j in scraped if j.get("_dead_reason")]
+            scraped_live = [j for j in scraped if not j.get("_dead_reason")]
+            _persist_dead_scrapes(db, profile_id, scraped_dead)
+            funnel["dead_dropped"] = len(scraped_dead)
+            if scraped_dead:
+                emit(f"[pipeline] phase 5: {len(scraped_dead)} listing(s) confirmed dead/expired "
+                     f"(no alt-source recovery) -- excluded before final judge")
+            to_evaluate = already_ready + scraped_live
         else:
             to_evaluate = already_ready
         t0 = _lap("scrape", t0)
@@ -1025,21 +1149,31 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # candidates rather than silently contributing nothing.
     to_evaluate_by_cluster: dict[int, list[dict]] = defaultdict(list)
     for j in to_evaluate:
+        company = (j.get("company") or "").strip().lower()
+        n_titles = len(company_title_counts.get(company, ()))
+        if n_titles >= TEMPLATE_FACTORY_TITLE_THRESHOLD:
+            j["_posting_volume_hint"] = f"{n_titles} differently-titled roles from this source this run"
         to_evaluate_by_cluster[j.get("_cluster", 0)].append(j)
 
     final_by_cluster: dict[int, list[dict]] = {}
     final_fresh_judged = final_reused_from_cache = 0
     final_strong = final_backup = final_disqualified = 0
+    final_scam_verified_dropped = 0
+    scam_verify_budget = [SCAM_VERIFY_MAX_PER_RUN]
     for idx, jobs in to_evaluate_by_cluster.items():
+        _check_cancelled(db, run)
         label = _cluster_label(role_clusters[idx])
         cluster_roles = role_clusters[idx].get("roles") or []
         cv_text = cv_text_for_cluster(cv_text_base, cluster_roles) if cluster_roles else cv_text_base
-        # Signature includes EXP_MODEL so a judge-model upgrade (e.g. gpt-5.4 ->
-        # gpt-5.5) naturally invalidates every previously stored verdict instead
+        # Signature includes EXP_MODEL and FINAL_EVAL_PROMPT_VERSION so a judge-model
+        # upgrade (e.g. gpt-5.4 -> gpt-5.5) OR a DISQUALIFIERS/schema prompt edit
+        # naturally invalidates every previously stored verdict instead
         # of serving a stale reject/strong/backup forever -- same fix as
         # rank_gate's "rank_v2" cache-key bump in full_auto.py, applied here so
         # existing evaluated jobs actually get re-judged by the new model too.
-        eval_sig = hashlib.sha1(f"{cv_text}|{engine.EXP_MODEL}".encode()).hexdigest()[:16]
+        eval_sig = hashlib.sha1(
+            f"{cv_text}|{engine.EXP_MODEL}|{engine.FINAL_EVAL_PROMPT_VERSION}".encode()
+        ).hexdigest()[:16]
 
         # Reuse stored verdicts for jobs already judged under this CV; only send the
         # rest to the expensive model. A prior "reject" under this exact signature
@@ -1105,6 +1239,37 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                 fallback_notes[idx].add("eval_fallback")
             # else: the AI reviewed everyone and rejected them all -- contribute
             # nothing for this cluster rather than resurfacing a rejected job.
+        # Cross-site duplicate-content corroboration for judge-flagged scam_suspect
+        # picks (see full_auto.verify_not_duplicated) -- gated to only picks about to
+        # be shown this run and a small shared budget, since it spends a real search
+        # call per check. A corroborated pick is pulled from output and its
+        # persisted verdict overridden to reject so it never resurfaces.
+        if scam_verify_budget[0] > 0:
+            had_picks = bool(picks)
+            verified_picks = []
+            for p in picks:
+                if (scam_verify_budget[0] > 0 and p.get("scam_suspect") and p.get("_identity")):
+                    scam_verify_budget[0] -= 1
+                    dup_reason = engine.verify_not_duplicated(
+                        p, eng_profile.get("adzuna_country_code", "gb"))
+                    if dup_reason:
+                        _persist_scam_override(db, profile_id, p["_identity"], dup_reason, eval_sig)
+                        final_scam_verified_dropped += 1
+                        emit(f"[pipeline] scam-verify: dropped {p.get('title')} @ "
+                             f"{p.get('company')} -- {dup_reason}")
+                        continue
+                verified_picks.append(p)
+            picks = verified_picks
+            if had_picks and not picks and backup:
+                # The only strong/cached pick(s) got corroborated as scam and removed
+                # -- fall back to this cluster's own backup survivors (computed
+                # earlier, discarded above because strong was non-empty) rather than
+                # silently contributing nothing, same posture as the original
+                # empty-picks fallback. Not itself re-verified for scam_suspect --
+                # bounds cost/complexity for what should be a rare double-fallback.
+                picks = [dict(p, strong_fit=False) for p in backup]
+                fallback_notes[idx].add("eval_fallback")
+
         picks.sort(key=lambda p: p.get("embed_score", 0), reverse=True)
         for p in picks:
             p["_cluster_label"] = label if len(role_clusters) > 1 else None
@@ -1115,6 +1280,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     funnel["final_strong"] = final_strong
     funnel["final_backup"] = final_backup
     funnel["final_disqualified"] = final_disqualified
+    funnel["final_scam_verified_dropped"] = final_scam_verified_dropped
 
     # Same fair-allocation logic as pooling/top-N: total output stays capped at
     # FINAL_PICKS, redistributed across clusters rather than added per cluster.
@@ -1132,6 +1298,26 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     return final, harsh or bool(fallback_notes), (processed_ids, shown_ids), timings, warning, funnel
 
 
+def reap_stale_search_runs(db: Session) -> int:
+    """Called once at process startup (see main.py). Any SearchRun still
+    status="running" was orphaned by the PREVIOUS process lifetime -- crash,
+    `uvicorn --reload` restart, manual kill, etc. -- since run_search_task's
+    worker thread died with that process and nothing else will ever revisit
+    the row. Left alone it permanently occupies the profile's daily
+    search-cap slot and /search/status serves a run stuck at "running"
+    forever. Returns the number of rows reaped."""
+    stale = db.execute(select(SearchRun).where(SearchRun.status == "running")).scalars().all()
+    if not stale:
+        return 0
+    now = datetime.utcnow()
+    for run in stale:
+        run.status = "error"
+        run.message = "Search was interrupted by a server restart. Please run a new search."
+        run.finished_at = now
+    db.commit()
+    return len(stale)
+
+
 def _prune_previous_roles(db: Session, profile_id: int) -> None:
     """Second-search semantics: crossed and leftover unactioned 'new' (inbox)
     roles both age out to deleted. saved/applied are left untouched."""
@@ -1141,13 +1327,28 @@ def _prune_previous_roles(db: Session, profile_id: int) -> None:
     db.commit()
 
 
+def _safe_print(msg: str) -> None:
+    """Mirrors full_auto.emit()'s fallback: some consoles (cp1252, seen on this
+    repo's own venv under some Windows launch paths) can't encode the
+    box-drawing dashes these pipeline logs use, and raise UnicodeEncodeError.
+    That's fatal for the FIRST call below -- it happens before
+    run_search_task's own try/except is entered, so an uncaught crash there
+    permanently orphans the SearchRun at status="running" with nothing ever
+    marking it "error"."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "ascii"
+        print(msg.encode(enc, errors="backslashreplace").decode(enc, errors="replace"))
+
+
 def run_search_task(profile_id: int, run_id: int) -> None:
     """Background entry point. Owns its own DB session (runs off-request).
     Progress is logged with print()/emit(), which lands in the same console
     that's running `uvicorn app.main:app` (the backend terminal/window)."""
     db = SessionLocal()
     run = db.get(SearchRun, run_id)
-    print(f"\n[pipeline] ── search run {run_id} for profile {profile_id} starting ──")
+    _safe_print(f"\n[pipeline] ── search run {run_id} for profile {profile_id} starting ──")
     try:
         import full_auto as engine  # lazy: pulls in crawl4ai only now
         engine.init_db()  # ensures gate_cache/jobs/profile_cache tables exist
@@ -1164,6 +1365,17 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 db, profile_id, run
             )
         )
+
+        # A checkpoint inside the pipeline may not have caught a cancel that
+        # landed after the last one ran (e.g. mid-scrape, or between the
+        # pipeline's return and this line). Re-check right before persisting
+        # anything, so a late-finishing run can't clobber the "cancelled"
+        # status the endpoint already set, or dump results the user no longer
+        # expects to see.
+        db.refresh(run)
+        if run.cancel_requested:
+            _safe_print(f"[pipeline] ── search run {run_id} cancelled (caught before persisting results) ──\n")
+            return
 
         # Prune only after the pipeline has succeeded, so a failed run leaves the
         # previous "new"/"crossed" roles intact instead of wiping them with nothing
@@ -1202,8 +1414,13 @@ def run_search_task(profile_id: int, run_id: int) -> None:
             "No new roles found. Try widening your profile or location." if not final else None
         )
         db.commit()
-        print(f"[pipeline] ── search run {run_id} done: {len(final)} results "
-              f"(harsh={harsh}) ──\n")
+        _safe_print(f"[pipeline] ── search run {run_id} done: {len(final)} results "
+                    f"(harsh={harsh}) ──\n")
+    except SearchCancelled:
+        # The cancel endpoint already set status="cancelled"/finished_at/message
+        # on its own session -- don't touch `run` here, just stop cleanly.
+        db.rollback()
+        _safe_print(f"[pipeline] ── search run {run_id} cancelled mid-run ──\n")
     except Exception as e:  # never let the worker thread die silently
         import traceback
         traceback.print_exc()  # full stack trace to the backend console
@@ -1213,6 +1430,6 @@ def run_search_task(profile_id: int, run_id: int) -> None:
             run.message = f"Search failed: {e!r}" if str(e) else f"Search failed: {type(e).__name__} (see backend console for traceback)"
             run.finished_at = datetime.utcnow()
             db.commit()
-        print(f"[pipeline] ── search run {run_id} FAILED, see traceback above ──\n")
+        _safe_print(f"[pipeline] ── search run {run_id} FAILED, see traceback above ──\n")
     finally:
         db.close()
