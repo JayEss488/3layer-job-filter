@@ -27,7 +27,7 @@ export function AttributeRow({
   enableSuggest = false,
   placeholder,
 }: Props) {
-  const { add, remove, update, clearAll } = useAttributeMutations(profileId);
+  const { add, remove, update } = useAttributeMutations(profileId);
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [suggestions, setSuggestions] = useState<string[]>([]);
@@ -36,7 +36,6 @@ export function AttributeRow({
   const existing = new Set(attributes.map((a) => a.value.toLowerCase()));
   const showProficiency = type === "skill";
   const showInformalToggle = type === "past_role";
-  const isLongText = type === "experience";
 
   function commit(value: string) {
     const v = value.trim();
@@ -68,15 +67,8 @@ export function AttributeRow({
       <div className="field col">
         <div className="field">
           {attributes.map((a) => (
-            <span
-              key={a.id}
-              style={
-                isLongText
-                  ? { display: "block", width: "100%" }
-                  : { display: "inline-flex", alignItems: "center", gap: 4 }
-              }
-            >
-              <Chip label={a.value} onRemove={() => remove.mutate(a.id)} variant={isLongText ? "exp" : undefined} />
+            <span key={a.id} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <Chip label={a.value} onRemove={() => remove.mutate(a.id)} />
               {showProficiency && (
                 <select
                   className="input"
@@ -146,20 +138,6 @@ export function AttributeRow({
               style={loadingSuggest ? { opacity: 0.5 } : undefined}
             >
               ✦ suggest
-            </button>
-          )}
-
-          {type === "target_role" && attributes.length > 0 && (
-            <button
-              className="ghost"
-              onClick={() => {
-                if (window.confirm(`Clear all ${attributes.length} target roles?`)) {
-                  clearAll.mutate(attributes.map((a) => a.id));
-                }
-              }}
-              disabled={clearAll.isPending}
-            >
-              ✕ clear all
             </button>
           )}
         </div>

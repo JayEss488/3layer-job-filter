@@ -142,14 +142,9 @@ a { color: inherit; }
   white-space: nowrap;
 }
 .chip .x { opacity: .4; cursor: pointer; }
+.chip .pin-toggle { cursor: pointer; opacity: .7; }
 .chip.tinted { background: var(--accent-tint); border-color: var(--accent-tint-bd); }
 .chip.solid { background: #f4f0e7; border-color: var(--accent-tint-bd); }
-.chip.exp {
-  border-radius: 9px; padding: 7px 12px; background: var(--surface-3); border-color: #ebe4d6;
-  color: #3d382f; gap: 9px; white-space: normal; display: flex; align-items: flex-start;
-  width: 100%; max-width: 640px; box-sizing: border-box;
-}
-.chip.exp .x { margin-top: 2px; }
 .tag-informal {
   display: inline-flex; align-items: center; border-radius: var(--r-pill); border: 1px solid var(--accent-tint-bd);
   background: var(--accent-tint); color: #6b4028; font-size: 10.5px; padding: 3px 8px; cursor: pointer;
@@ -215,6 +210,14 @@ a { color: inherit; }
 .funnel-seg.selected { background: var(--accent); }
 .funnel-counts { display: flex; gap: 10px; width: 150px; flex-shrink: 0; justify-content: flex-end; font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--muted); }
 .funnel-counts span { width: 32px; text-align: right; }
+.funnel-counts.funnel-counts-5 { width: 200px; }
+
+/* ── Cross-stage run funnel (Settings, all pipeline stages for one run) ──── */
+.funnel-seg.rf-entering { background: rgba(127,127,127,.25); }
+.funnel-seg.rf-embedding { background: rgba(191,92,58,.25); }
+.funnel-seg.rf-gates { background: rgba(191,92,58,.45); }
+.funnel-seg.rf-judge { background: rgba(191,92,58,.65); }
+.funnel-seg.rf-shown { background: var(--accent); }
 
 /* ── Bottom actions / misc rows ──────────────────────────────────────────── */
 .bottom-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }

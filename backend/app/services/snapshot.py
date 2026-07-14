@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..models import Profile, ProfileAttribute
 from .llm import llm_json
+from .profile_intel import read_cached_intel
 
 _WORK_TYPES = {"remote", "hybrid", "on-site", "onsite"}
 
@@ -245,7 +246,6 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     target_roles = _values(g.get("target_role", []))
     past_roles = _values(g.get("past_role", []))
     skills = _values(g.get("skill", []))
-    experience = _values(g.get("experience", []))
     qualifications = _values(g.get("qualification", []))
     seniorities = _values(g.get("seniority", []))
     sector_targets = _values(g.get("sector_target", []))
@@ -269,7 +269,7 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     for t in target_roles:
         if t not in search_terms:
             search_terms.append(t)
-    search_terms = search_terms[:14] or ["jobs"]
+    search_terms = search_terms[:20] or ["jobs"]
 
     # Location scope: how far the candidate's stated location/country should be
     # trusted as a hard filter. Single-value, like seniority. No row yet ->
@@ -322,7 +322,18 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         for grp in role_groups
     ]
 
+    # Cached profile-intel artifacts (see profile_intel.py): a header for the final
+    # judge's CV text and a candidate-specific requirements checklist for the cheap
+    # gate's flexible axis. Pure read, no LLM call -- {} until profile_intel has run
+    # at least once for this profile (e.g. before the first search).
+    intel = read_cached_intel(db, profile_id)
+    header = intel.get("header") or ""
+    requirements = intel.get("requirements") or []
+
     engine_profile = {
+        # Scopes full_auto's shared rotation cursor (boards_cache.db is one file
+        # for every profile) so concurrent profiles don't share one rotation position.
+        "profile_id": profile_id,
         "sectors": region["sectors"],
         "seniority": seniority,
         "key_skills": skills[:10],
@@ -341,6 +352,10 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # pre-filter. Omits neutral-weight values entirely (see _weight_tier).
         "target_role_weight_tiers": _weight_tiers(g.get("target_role", [])),
         "skill_weight_tiers": _weight_tiers(g.get("skill", [])),
+        # Candidate-specific must-have/must-not-have bullets for screen_gate's
+        # requirements_ok axis (see full_auto.py::_screen_prompt). [] means none
+        # generated yet or none stated.
+        "requirements": requirements,
     }
 
     weighted_text = _weighted_text(g, region["sectors"], seniority, search_terms)
@@ -349,8 +364,12 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     # cv_text_base omits the "Target roles" line -- see cv_text_for_cluster,
     # which appends it scoped to one role cluster at a time, instead of always
     # listing every target role the candidate has (which invites the judge to
-    # weigh fit against all of them at once).
-    cv_lines = []
+    # weigh fit against all of them at once). Starts with the profile_intel
+    # header (a distilled "Looking for X. Must have Y. Must not have Z."
+    # synthesis) so it survives _run_final_eval's 5000-char truncation -- kept
+    # alongside, not replacing, the verbatim intent_text line below; the
+    # redundancy is harmless token cost, not a bug.
+    cv_lines = [header] if header else []
     if past_roles:
         cv_lines.append("Past roles: " + ", ".join(_labeled(g.get("past_role", []))))
     if qualifications:
@@ -359,8 +378,6 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append("Seniority: " + ", ".join(seniorities))
     if skills:
         cv_lines.append("Skills: " + ", ".join(_labeled(g.get("skill", []))))
-    if experience:
-        cv_lines.append("Experience: " + "; ".join(_labeled(g.get("experience", []))))
     if sector_targets:
         cv_lines.append("Sector interests: " + "; ".join(sector_targets))
     if location or work_types:
@@ -375,6 +392,15 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     # _run_final_eval truncates cv_text to, which would otherwise risk cutting off
     # that suffix.
     profile = db.get(Profile, profile_id)
+    # The candidate's own free-text statement of what they want, given authoritative
+    # weight -- this is the direct answer to "what roles is this person actually after",
+    # which the typed target_role chips only approximate. Deliberately fed to the final
+    # judge (via cv_text_base) but NOT into the cosine embedding text (_weighted_text):
+    # a free paragraph would re-diffuse the very centroid the clean target roles sharpen.
+    if profile and profile.intent_text:
+        cv_lines.append(
+            "What the candidate is looking for (in their own words): " + profile.intent_text.strip()
+        )
     if profile and profile.cv_summary:
         cv_lines.append("Additional background context: " + profile.cv_summary)
     cv_text_base = "\n".join(cv_lines) or "General candidate."

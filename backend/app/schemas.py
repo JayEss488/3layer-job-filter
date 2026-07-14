@@ -17,12 +17,14 @@ class ProfileCreate(BaseModel):
 class ProfileUpdate(BaseModel):
     name: Optional[str] = None
     is_active: Optional[bool] = None
+    intent_text: Optional[str] = None
 
 
 class ProfileOut(ORMModel):
     id: int
     name: str
     is_active: bool
+    intent_text: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

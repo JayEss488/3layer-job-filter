@@ -80,8 +80,9 @@ than expecting structured logs.
   the engine can weight them differently.
 - **`Role`**: one row per listing surfaced to the user in a given search run, with a
   lifecycle `status` (`new → saved/crossed/ignored → applied → deleted`) driving both the
-  UI tabs and re-search semantics (crossed/leftover-new roles are pruned before each new
-  run; saved/applied persist).
+  UI tabs and re-search semantics (only `crossed` roles are pruned before each new run,
+  resetting the "passed this session" list; `new`/inbox roles persist indefinitely until
+  the user acts on them, and saved/applied are never touched).
 - **`JobSeen`**: the *persistent discovery store* — every listing ever seen for a
   profile, separate from `Role` (which is just what got shown). Discovery upserts here
   (deduped by `identity_hash`); scoring/backlog top-up reads from here across runs so a
@@ -129,12 +130,21 @@ idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
    to its single best-scoring cluster → free heuristic prescreen (`_heuristic_prescreen`:
    title-regex drops obvious seniority mismatches — Director/VP for a junior, Intern for
    a senior — before any LLM spends a token) → adaptive strict/broadened pool per cluster
-   (`TARGET_POOL` = 90) → **one merged sector+seniority screen per cluster**
-   (`full_auto.screen_gate`, a cached cheap-model call that *annotates* rather than
-   drops): the backend then hard-drops only off-sector jobs, **demotes rather than
-   drops** seniority failures, auto-admits the top `AUTO_PASS_TOP` by embed_score, and
-   **guarantees a per-cluster floor** so the cheap gate can never starve a cluster to
-   zero (the full-text final AI stays the real seniority judge) → fair-allocate to
+   (`TARGET_POOL` = 90) → **one merged sector+seniority+requirements screen per cluster**
+   (`full_auto.screen_gate`, a cached cheap-model call judging all three axes in one
+   response): `sector_ok` is the one unconditional hard drop. `seniority_ok` and
+   `requirements_ok` are individually soft — a job failing only *one* of them still
+   proceeds to `rank_gate` (which gives it a real per-job fit score) and reaches the
+   final judge carrying it as a hint, same as before — but a job failing **both**
+   is demoted into a backfill-only tier: two independent clear-mismatch signals
+   agreeing is confident enough to skip paying for `rank_gate`/the expensive judge on
+   it, without the risk either signal carries alone (the prompt only marks an axis
+   false on a *clear* mismatch, defaulting true when unsure, so a wrong demotion needs
+   two independent misfires). **Guarantees a per-cluster floor** (`MIN_RESULTS`) via a
+   three-tier backfill — primary (passed, or failed only one axis) → demoted
+   (failed both) by embed_score → full pool by embed_score — so the cheap gate can
+   never starve a cluster to zero (the full-text final AI stays the real
+   seniority/requirements judge for anything that rides through) → fair-allocate to
    `TARGET_POOL` → **cheap numeric rank stage** (`full_auto.rank_gate`, also run once
    *per cluster* with that cluster's own roles — a profile-wide call was diluting a
    minority cluster's fit scores with the candidate's other target-role cluster's
@@ -155,18 +165,29 @@ idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
    had zero captured reasoning, which made a past investigation into thin results unable
    to see why anything was excluded); jobs already judged under the current profile are
    served from their stored verdict and never re-sent, and a job with a stored `reject`
-   verdict under the current signature is never resurfaced — including by the
+   verdict under the current signature is never resurfaced — including by either
    fallback below, which used to pull from the full unfiltered candidate list and could
-   re-show exactly these rejects as an "inconclusive, showing anyway" placeholder → a
-   deterministic top-N fallback fires **only when the expensive call itself failed**
-   (exception/malformed response) — never when it succeeded and genuinely rejected
-   everyone, which now correctly contributes zero picks for that cluster rather than
-   padding a wrong-function role into the results → fair-allocate the combined
-   per-cluster picks to a final cap (`FINAL_PICKS` = 12) → persisted as `Role` rows.
-   Historical note: this stage used to run two separate gates (sector per-cluster,
-   seniority once globally) and a strict-then-relaxed two-call final eval. The global
-   seniority gate over-pruned and starved clusters, which is why fallbacks fired as the
-   *main* path; the merge + keep-floor + single-call design above replaced that.
+   re-show exactly these rejects as an "inconclusive, showing anyway" placeholder. If a
+   cluster's judge call *succeeds* but comes back with fewer than `MIN_RESULTS` picks, a
+   **single bounded retry** pulls the next-highest-`rank_gate`-scored candidates that
+   lost the `JUDGE_POOL` cut (still held in `rank_by_cluster`, judged on whatever text
+   is already available — no second scrape pass) and judges them too, once, merging any
+   results in. Separately, a deterministic top-N fallback fires **only when the
+   expensive call itself failed** (exception/malformed response) — never when it
+   succeeded and genuinely rejected everyone (or rejected everyone in the retry too),
+   which correctly contributes zero picks for that cluster rather than padding a
+   wrong-function role into the results → fair-allocate the combined per-cluster picks
+   to a final cap (`FINAL_PICKS` = 12) → persisted as `Role` rows.
+   Historical note: the gate stage has gone through three designs. Originally two
+   separate gates (sector per-cluster, seniority once globally) with a
+   strict-then-relaxed two-call final eval — the global seniority gate over-pruned and
+   starved clusters, which is why fallbacks fired as the *main* path. That was replaced
+   by a merged per-cluster annotate-only screen (sector hard-dropped; seniority/
+   requirements purely informational — no hard drop at all). The current
+   compounding-failure demotion (described above) is narrower than either predecessor —
+   per-cluster, floor-protected, and requires two independent clear-mismatch signals
+   agreeing — specifically to get some of the original design's cost savings back
+   without reproducing its starvation failure.
 3. Cluster/stream identity is used internally (gate routing, per-cluster LLM calls) but
    is **not** currently exposed as UI grouping — by design, not an oversight; it only
    ever surfaces as an optional "Matched via: X track" clause in `ai_analysis` when more
@@ -174,7 +195,8 @@ idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
 
 Key cost/reliability guards layered into this pipeline (tune via env vars, see
 `config.py` / top of `full_auto.py`):
-- `MAX_SEARCHES_PER_DAY` (default 5) — per-profile daily search cap.
+- `MAX_SEARCHES_PER_DAY` (default 6) — global daily search cap, shared across all
+  profiles (not per-profile).
 - `DISCOVERY_ATS_CACHE_TTL_HOURS` (default 4) — skips re-querying the ~40-company ATS
   batch on back-to-back searches within the window; the term-based API sources always
   fetch fresh.
@@ -186,9 +208,8 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
 - The domain blocklist (Settings → Blocked domains, `moderation.py`) is consulted both
   at discovery time (drops listings before they enter the store) and inside Phase 5
   scraping (skips retrying a known-bad domain instead of paying retries/timeouts on it).
-- `AUTO_PASS_TOP` (default 2, `engine.py`) — per cluster, the highest-embed_score
-  candidates skip the gate's seniority veto and go straight to the expensive AI.
-- `MIN_RESULTS` (default 3) — the per-cluster keep-floor the merged screen backfills to.
+- `MIN_RESULTS` (default 3) — the per-cluster keep-floor the merged screen backfills to,
+  and the same floor that triggers the final-judge stage's bounded backfill retry.
 - `JUDGE_POOL` (default 40) / `RANK_AUTOREJECT_FRACTION` (default 0.20, `engine.py`) —
   the cheap rank stage's cap and per-cluster autoreject fraction, see pipeline step 2.
 - Google-organic discovery (`full_auto.fetch_google_jobs`/`_looks_like_category_page`)

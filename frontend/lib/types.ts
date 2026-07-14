@@ -1,7 +1,6 @@
 export type AttributeType =
   | "past_role"
   | "skill"
-  | "experience"
   | "qualification"
   | "seniority"
   | "target_role"
@@ -16,6 +15,7 @@ export interface Profile {
   id: number;
   name: string;
   is_active: boolean;
+  intent_text?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -39,6 +39,16 @@ export interface SourceStat {
   gated: number;
   shown: number;
   selected: number;
+}
+
+export interface RunFunnel {
+  run_id: number | null;
+  finished_at?: string | null;
+  entering: number;
+  passed_heuristic_embedding: number;
+  passed_gates: number;
+  final_judge: number;
+  shown: number;
 }
 
 export interface Blocklist {

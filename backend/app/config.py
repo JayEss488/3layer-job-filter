@@ -31,8 +31,8 @@ FRONTEND_ORIGINS = os.getenv(
     "FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",")
 
-# Cost guard: max live searches per profile per calendar day.
-MAX_SEARCHES_PER_DAY = int(os.getenv("MAX_SEARCHES_PER_DAY", "5"))
+# Cost guard: max live searches, shared across all profiles, per calendar day.
+MAX_SEARCHES_PER_DAY = int(os.getenv("MAX_SEARCHES_PER_DAY", "6"))
 
 # Cost/time guard: skip re-querying the ~40-company ATS rotation batch (the
 # single largest chunk of a run's discovery calls) when the last fetch for
@@ -43,17 +43,23 @@ DISCOVERY_ATS_CACHE_TTL_HOURS = float(os.getenv("DISCOVERY_ATS_CACHE_TTL_HOURS",
 # Below this many semantic-filter survivors we warn the filters may be too harsh.
 HARSH_FILTER_THRESHOLD = 5
 
+# Nothing ever re-scrapes an already-shown "new" role to check whether the
+# listing has since closed -- Phase 5 only scrapes a job the first time it's
+# evaluated. Past this many days unreviewed, auto-move it to "ignored" (not
+# "deleted": reversible via the Ignored tab's re-save) on the assumption a
+# listing that old has very likely expired.
+ROLE_STALE_DAYS = int(os.getenv("ROLE_STALE_DAYS", "30"))
+
 # ── Controlled vocabulary of attribute types ────────────────────────────────
 # Keep this small. New categories should generally reuse a type, not add
 # columns. "qualification" and "sector_target" are deliberate exceptions:
 # formal credentials (degree class, certifications) and explicit sector/
 # mission-targeting language (cover-letter angles) are structurally distinct
-# from skill/experience bullets and job titles, and previously had no field
-# to land in at all -- see the profile-builder fidelity fix.
+# from skill bullets and job titles, and previously had no field to land in
+# at all -- see the profile-builder fidelity fix.
 ATTRIBUTE_TYPES = [
     "past_role",
     "skill",
-    "experience",
     "qualification",
     "seniority",
     "target_role",
@@ -69,7 +75,6 @@ ATTRIBUTE_TYPES = [
 ATTRIBUTE_DIRECTION = {
     "past_role": "background",
     "skill": "background",
-    "experience": "background",
     "qualification": "background",
     "seniority": "background",
     "target_role": "target",
@@ -135,6 +140,5 @@ TYPE_LABELS = {
     "location": "location",
     "salary": "salary range",
     "past_role": "past roles",
-    "experience": "experience",
     "custom": "extra preferences",
 }

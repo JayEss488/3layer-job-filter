@@ -6,9 +6,11 @@ import { useRef, useState } from "react";
 
 import { AttributeRow } from "@/components/AttributeRow";
 import { ConfidenceBar } from "@/components/ConfidenceBar";
+import { IntentEditor } from "@/components/IntentEditor";
 import { LocationPicker } from "@/components/LocationPicker";
 import { SalarySlider } from "@/components/SalarySlider";
 import { SeniorityPicker } from "@/components/SeniorityPicker";
+import { TargetRoleChips } from "@/components/TargetRoleChips";
 import { api } from "@/lib/api";
 import { useAttributes, useConfidence } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
@@ -164,7 +166,6 @@ export default function OnboardingPage() {
               </div>
               <AttributeRow label="Past roles" profileId={activeId} type="past_role" attributes={g?.past_role ?? []} />
               <AttributeRow label="Skills" profileId={activeId} type="skill" attributes={g?.skill ?? []} enableSuggest />
-              <AttributeRow label="Experience" profileId={activeId} type="experience" attributes={g?.experience ?? []} />
               <AttributeRow
                 label="Qualifications"
                 profileId={activeId}
@@ -182,14 +183,8 @@ export default function OnboardingPage() {
               <div className="profile-section-label">
                 What you&apos;re looking for — your next role
               </div>
-              <AttributeRow
-                label="Target roles"
-                profileId={activeId}
-                type="target_role"
-                attributes={g?.target_role ?? []}
-                enableSuggest
-                placeholder="e.g. Engineering Manager, Principal Engineer"
-              />
+              <IntentEditor profileId={activeId} />
+              <TargetRoleChips profileId={activeId} attributes={g?.target_role ?? []} />
               <AttributeRow
                 label="Sector / mission interests"
                 profileId={activeId}

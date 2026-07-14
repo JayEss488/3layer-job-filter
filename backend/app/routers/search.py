@@ -24,11 +24,12 @@ router = APIRouter(tags=["search"])
 _VALID_APP_STATUS = {"pending", "interview", "rejected"}
 
 
-def _searches_today(db: Session, profile_id: int) -> int:
+def _searches_today(db: Session) -> int:
+    """Global count across all profiles -- the daily cap is shared, not per-profile."""
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     return (
         db.query(func.count(SearchRun.id))
-        .filter(SearchRun.profile_id == profile_id, SearchRun.started_at >= start)
+        .filter(SearchRun.started_at >= start)
         .scalar()
         or 0
     )
@@ -51,17 +52,21 @@ def start_search(
             detail="A search is already running for this profile.",
         )
 
-    used = _searches_today(db, profile.id)
+    used = _searches_today(db)
     if used >= MAX_SEARCHES_PER_DAY:
         raise HTTPException(
             status_code=429,
             detail=f"Daily search limit reached ({MAX_SEARCHES_PER_DAY}/day). Try again tomorrow.",
         )
 
-    # "Run first search" confirms everything onboarding parsed.
+    # "Run first search" confirms everything onboarding parsed -- except target_role,
+    # where confirmed doubles as "pinned" (survives profile_intel regeneration). Bulk-
+    # confirming those here would silently pin every AI-generated role after the very
+    # first search ever run, defeating the whole pin/regenerate mechanic.
     db.query(ProfileAttribute).filter(
         ProfileAttribute.profile_id == profile.id,
         ProfileAttribute.confirmed.is_(False),
+        ProfileAttribute.type != "target_role",
     ).update({ProfileAttribute.confirmed: True}, synchronize_session=False)
 
     run = SearchRun(profile_id=profile.id, status="running")

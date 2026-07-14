@@ -56,6 +56,10 @@ def update_profile(
         profile.name = body.name.strip()
     if body.is_active is not None:
         profile.is_active = body.is_active
+    if body.intent_text is not None:
+        # Free-text "what I'm looking for" -- stored durable judge context and the
+        # input to target-role regeneration. Empty string clears it back to None.
+        profile.intent_text = body.intent_text.strip() or None
     db.commit()
     db.refresh(profile)
     return profile

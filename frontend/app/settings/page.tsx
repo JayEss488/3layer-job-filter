@@ -35,6 +35,11 @@ export default function SettingsPage() {
     queryFn: () => api.sourceStats(),
   });
 
+  const { data: runFunnel } = useQuery({
+    queryKey: ["runFunnel"],
+    queryFn: () => api.runFunnel(),
+  });
+
   const total = (sources ?? []).reduce((n, s) => n + s.last_count, 0);
 
   async function toggleScrape() {
@@ -277,6 +282,72 @@ export default function SettingsPage() {
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-h">Search funnel (last run)</div>
+          <div className="panel-b">
+            <div className="annotation">
+              How far this run&apos;s candidates got, stage by stage: raw listings
+              discovered, how many survived the free heuristic/embedding pre-filter, how
+              many survived the cheap AI gates, how many the expensive final AI judge
+              accepted, and how many you were actually shown. The per-source view above
+              shows this split out by source, all-time — this is all stages together for
+              one run.
+            </div>
+            {runFunnel && runFunnel.run_id ? (
+              <>
+                <div className="funnel-row funnel-header" style={{ marginTop: 12 }}>
+                  <div className="funnel-label" />
+                  <div className="funnel-track" />
+                  <div className="funnel-counts funnel-counts-5">
+                    <span>Enter</span>
+                    <span>Embed</span>
+                    <span>Gates</span>
+                    <span>Judge</span>
+                    <span>Shown</span>
+                  </div>
+                </div>
+                <div className="funnel-row">
+                  <div className="funnel-label">
+                    {runFunnel.finished_at
+                      ? new Date(runFunnel.finished_at).toLocaleString()
+                      : "Latest run"}
+                  </div>
+                  <div className="funnel-track">
+                    <div className="funnel-seg rf-entering" style={{ width: "100%" }} />
+                    <div
+                      className="funnel-seg rf-embedding"
+                      style={{ width: `${funnelPct(runFunnel.passed_heuristic_embedding, runFunnel.entering)}%` }}
+                    />
+                    <div
+                      className="funnel-seg rf-gates"
+                      style={{ width: `${funnelPct(runFunnel.passed_gates, runFunnel.entering)}%` }}
+                    />
+                    <div
+                      className="funnel-seg rf-judge"
+                      style={{ width: `${funnelPct(runFunnel.final_judge, runFunnel.entering)}%` }}
+                    />
+                    <div
+                      className="funnel-seg rf-shown"
+                      style={{ width: `${funnelPct(runFunnel.shown, runFunnel.entering)}%` }}
+                    />
+                  </div>
+                  <div className="funnel-counts funnel-counts-5">
+                    <span>{runFunnel.entering}</span>
+                    <span>{runFunnel.passed_heuristic_embedding}</span>
+                    <span>{runFunnel.passed_gates}</span>
+                    <span>{runFunnel.final_judge}</span>
+                    <span>{runFunnel.shown}</span>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="annotation" style={{ marginTop: 12 }}>
+                No completed search run yet.
+              </div>
+            )}
           </div>
         </div>
 

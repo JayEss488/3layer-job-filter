@@ -35,6 +35,7 @@ class Profile(Base):
     is_active = Column(Boolean, default=True)
     cv_text = Column(Text)  # raw uploaded/pasted document text, for target-role regeneration
     cv_summary = Column(Text)  # LLM-compressed cv_text; extra judge context, see snapshot.py
+    intent_text = Column(Text)  # free-text "what I'm looking for"; feeds the final judge and target-role regeneration
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 

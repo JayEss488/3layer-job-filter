@@ -6,6 +6,7 @@ import type {
   Confidence,
   Profile,
   Role,
+  RunFunnel,
   ScrapeSetting,
   SearchStart,
   SearchStatus,
@@ -40,7 +41,10 @@ export const api = {
   listProfiles: () => req<Profile[]>("/profiles"),
   createProfile: (name?: string) =>
     req<Profile>("/profiles", { method: "POST", body: JSON.stringify({ name }) }),
-  updateProfile: (id: number, body: Partial<Pick<Profile, "name" | "is_active">>) =>
+  updateProfile: (
+    id: number,
+    body: Partial<Pick<Profile, "name" | "is_active" | "intent_text">>
+  ) =>
     req<Profile>(`/profiles/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteProfile: (id: number) =>
     req<void>(`/profiles/${id}`, { method: "DELETE" }),
@@ -90,6 +94,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ type, context }),
     }),
+  regenerateTargetRoles: (id: number) =>
+    req<Attribute[]>(`/profiles/${id}/regenerate-target-roles`, { method: "POST" }),
   confidence: (id: number) => req<Confidence>(`/profiles/${id}/confidence`),
 
   // search + roles
@@ -118,6 +124,7 @@ export const api = {
   // settings
   sources: () => req<SourceInfo[]>("/settings/sources"),
   sourceStats: () => req<SourceStat[]>("/settings/source-stats"),
+  runFunnel: () => req<RunFunnel>("/settings/run-funnel"),
   setSources: (disabled: string[]) =>
     req<SourceInfo[]>("/settings/sources", {
       method: "PUT",

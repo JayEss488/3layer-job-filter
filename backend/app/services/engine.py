@@ -16,15 +16,16 @@ import re
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
-from ..config import DISCOVERY_ATS_CACHE_TTL_HOURS
+from ..config import DISCOVERY_ATS_CACHE_TTL_HOURS, ROLE_STALE_DAYS
 from ..database import SessionLocal
 from ..models import Role, SearchRun, JobSeen
+from .profile_intel import ensure_profile_intel
 from .snapshot import build_snapshot, cv_text_for_cluster
 from .moderation import filter_blocked, get_blocked_domains
 from .sources import (
@@ -39,10 +40,21 @@ from .sources import (
 )
 
 # ── Adaptive funnel tuning ───────────────────────────────────────────────────
-# Funnel: TARGET_POOL candidates survive embedding+gate -> cheap numeric rank_gate
-# scores all of them -> bottom RANK_AUTOREJECT_FRACTION dropped -> top JUDGE_POOL
-# go to the expensive full-text judge -> engine.FINAL_PICKS capped final results.
-TARGET_POOL       = 90     # candidates fed to the cheap gate + cheap rank stage
+# Funnel: per cluster, batches of embed-score-ranked candidates are fed through
+# gate+rank (see _gate_rank_refill_cluster) until TARGET_POOL gate survivors
+# accumulate and JUDGE_POOL rank-floor survivors accumulate, or the cluster's
+# candidate queue is exhausted, or ABSOLUTE_POOL_CAP total have been examined
+# -- unlike a one-shot capped batch, this keeps pulling from the idle
+# above-RELEVANCE_FLOOR pool instead of leaving hundreds of unexamined,
+# fair-scoring candidates on the table every run. Survivors -> expensive
+# full-text judge -> engine.FINAL_PICKS capped final results.
+TARGET_POOL       = 90     # gate-survivor checkpoint per cluster per refill round
+# Hard ceiling on total candidates examined (gated) per cluster per run, across
+# all refill rounds -- bounds worst-case latency/cost when a harsher gate or
+# the rank floor leaves a cluster chronically short of JUDGE_POOL. 3x
+# TARGET_POOL: enough headroom for a harsh gate without risking an unbounded
+# run on a single cluster with a huge idle backlog.
+ABSOLUTE_POOL_CAP = TARGET_POOL * 3
 MIN_RESULTS       = 3      # below this many strong matches, broaden the threshold
 # Below this many characters, a job's discovery-time snippet is assumed too
 # thin (e.g. a short Google-organic blurb) to judge fit against without
@@ -52,10 +64,6 @@ MIN_RESULTS       = 3      # below this many strong matches, broaden the thresho
 # that or every Adzuna snippet waves through as "sufficient" purely because
 # its truncation length happens to land on the threshold.
 SNIPPET_SUFFICIENT_CHARS = 600
-# Highest-relevance candidates per cluster (by embed_score) that skip the cheap
-# gate's seniority veto and go straight to the expensive AI (the real judge),
-# using the score we already computed rather than risking loss at the gate.
-AUTO_PASS_TOP = 2
 RELEVANCE_PRIMARY = 0.35   # strict strong-fit threshold
 RELEVANCE_FLOOR    = 0.20  # never include anything weaker than this
 BACKLOG_TOPUP     = 40     # enriched rows pulled in when fresh discovery is thin
@@ -65,7 +73,15 @@ STORE_SCORE_CAP   = 6000   # max 'new' rows relevance-scored per run (whole stor
 # survivors 0-100 on fit instead of a boolean pass/fail, so the expensive judge
 # only ever sees a curated top slice instead of every gate survivor.
 JUDGE_POOL = 40               # top-ranked candidates sent on to scrape + judge
-RANK_AUTOREJECT_FRACTION = 0.20  # bottom fraction of the cheap ranking dropped first
+# Absolute cutoff on rank_gate's 0-100 fit score, replacing the old relative
+# bottom-20%-of-whatever-batch trim (RANK_AUTOREJECT_FRACTION). MID_MODEL is a
+# materially stronger model now (see full_auto.py's model tier comments), so
+# its numeric score is worth trusting as an absolute judgment rather than only
+# a relative ranking within whatever batch happened to be fed in -- anything
+# scoring below this is dropped regardless of how large the surviving pool is,
+# so the expensive judge never spends a call on a candidate the mid tier
+# already knows doesn't fit.
+RANK_REJECT_SCORE_FLOOR = 40
 # Same-source posting-volume signal (scam/CV-farming detection, see
 # _company_title_counts): a company posting at least this many DIFFERENT
 # titles in one run's discovery is surfaced to the final judge as a hint --
@@ -83,6 +99,13 @@ def _external_id(engine, job: dict) -> str:
     return engine.make_job_id(job.get("board", ""), job.get("url", ""))
 
 
+# Adzuna's /jobs/land/ad/... click-tracking redirect resolves 200 OK but is just a
+# "you're being redirected" interstitial, not the posting -- full_auto's
+# _looks_like_redirect_stub already catches this by content, but only after paying
+# for a full fetch (with retries). The URL pattern itself is a free, pre-fetch tell.
+_KNOWN_DEAD_END_URL_RE = re.compile(r"/jobs/land/ad/")
+
+
 def _needs_full_scrape(job: dict) -> bool:
     """Whether phase 5 should bother reading this job's real page before final
     evaluation. ATS-sourced snippets (greenhouse/lever/ashby/workable/
@@ -96,6 +119,8 @@ def _needs_full_scrape(job: dict) -> bool:
         return False  # a real page was scraped and persisted on a prior run
     if canonical_key(job.get("board")) in ATS_KEYS:
         return False
+    if _KNOWN_DEAD_END_URL_RE.search(job.get("url") or ""):
+        return False  # known-dead redirect stub -- skip straight to snippet fallback
     return len((job.get("snippet") or "").strip()) < SNIPPET_SUFFICIENT_CHARS
 
 
@@ -161,10 +186,11 @@ def _compose_analysis(entry: dict) -> str:
 
 
 def _compose_fallback_warning(role_clusters: list[dict], fallback_notes: dict[int, set[str]]) -> str | None:
-    """Turn per-cluster fallback tags (set by _adaptive_pool_by_cluster's
+    """Turn per-cluster fallback tags (set by _cluster_candidate_queues's
     "broadened"/"floor_fallback" and _run_engine_pipeline's "gate_fallback"/
-    "eval_fallback") into a user-facing message. Names the specific role when
-    only one cluster needed a fallback; generic wording otherwise."""
+    "eval_fallback"/"cluster_skipped") into a user-facing message. Names the
+    specific role when only one cluster needed a fallback; generic wording
+    otherwise."""
     affected = [idx for idx, tags in fallback_notes.items() if tags]
     if not affected:
         return None
@@ -174,6 +200,8 @@ def _compose_fallback_warning(role_clusters: list[dict], fallback_notes: dict[in
     idx = affected[0]
     label = _cluster_label(role_clusters[idx])
     tags = fallback_notes[idx]
+    if "cluster_skipped" in tags:
+        return f'"{label}" wasn\'t searched this run — it\'ll come up again in a future search.'
     if "eval_fallback" in tags:
         return (f'"{label}" matches were thin this run — showing the closest available '
                 f"instead of only confident picks.")
@@ -215,6 +243,41 @@ def identity_hash(job: dict) -> str:
     return hashlib.sha1(basis.encode()).hexdigest()
 
 
+# identity_hash's URL-canonical branch treats two different real URLs (e.g. Reed's own
+# jobUrl vs. a Google-indexed employer link) as different identities even when they're
+# the same real posting, and its text-hash fallback branch requires an exact location
+# match even when two sources just report location at different granularity (Adzuna's
+# regional display_name vs. a structured neighbourhood-level address). This corroborated
+# soft-match catches that case without keying on (title, company) alone: it additionally
+# requires the two locations to share a real place-name token, so two genuinely distinct
+# open reqs with the same title at the same company in different real locations still
+# stay separate.
+_LOCATION_STOPWORDS = {
+    "uk", "gb", "united", "kingdom", "great", "britain", "england", "scotland",
+    "wales", "ireland", "usa", "us", "remote", "hybrid", "onsite", "office",
+    "home", "based",
+}
+
+
+def _location_tokens(location: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z]+", (location or "").lower())
+            if len(t) > 2 and t not in _LOCATION_STOPWORDS}
+
+
+def _find_soft_duplicate(job: dict, candidates: list["JobSeen"]) -> "JobSeen | None":
+    title, company = _norm(job.get("title", "")), _norm(job.get("company", ""))
+    if not title or not company:
+        return None
+    job_tokens = _location_tokens(job.get("location", ""))
+    if not job_tokens:
+        return None
+    for cand in candidates:
+        if _norm(cand.title) == title and _norm(cand.company or "") == company \
+                and job_tokens & _location_tokens(cand.location or ""):
+            return cand
+    return None
+
+
 def _parse_iso(s: str):
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
@@ -235,6 +298,12 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
     # same role under two categories). autoflush is off, so a freshly-added row is
     # not yet visible to the SELECT below; track it here to avoid a duplicate INSERT.
     seen_this_batch: dict[str, JobSeen] = {}
+    # Every row touched this batch (new or refreshed), for _find_soft_duplicate's
+    # in-batch pass below -- also needed because a freshly-added row isn't visible
+    # to a SELECT yet (autoflush is off), so the same-run duplicate this was built
+    # for (two sources surfacing one real posting in one discovery pass) would
+    # otherwise slip past the DB-backed soft-match query entirely.
+    batch_rows: list[JobSeen] = []
     inserted = refreshed = requeued = 0
     for job in raw_jobs:
         title = job.get("title", "")
@@ -252,6 +321,24 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             ).scalar_one_or_none()
 
         if existing is None:
+            # No exact identity match -- the same real posting can still reach us
+            # under a different identity_hash (a different URL per source, or a
+            # location string at different granularity), see _find_soft_duplicate.
+            # Check in-batch candidates first, then the persisted store (coarse
+            # SQL company pre-filter, refined by the exact normalized comparison
+            # inside _find_soft_duplicate).
+            existing = _find_soft_duplicate(job, batch_rows)
+            if existing is None:
+                company_norm = _norm(job.get("company", ""))
+                db_candidates = db.execute(
+                    select(JobSeen).where(
+                        JobSeen.profile_id == profile_id,
+                        func.lower(JobSeen.company) == company_norm,
+                    )
+                ).scalars().all() if company_norm else []
+                existing = _find_soft_duplicate(job, db_candidates)
+
+        if existing is None:
             row = JobSeen(
                 profile_id=profile_id, identity_hash=h, source=job.get("board", ""),
                 title=title, company=job.get("company"), location=job.get("location"),
@@ -260,6 +347,7 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             )
             db.add(row)
             seen_this_batch[h] = row
+            batch_rows.append(row)
             inserted += 1
         else:
             existing.last_seen = now
@@ -277,6 +365,7 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             else:
                 refreshed += 1
             seen_this_batch[h] = existing
+            batch_rows.append(existing)
     db.commit()
     return inserted, refreshed, requeued
 
@@ -298,18 +387,27 @@ def _new_rows(db: Session, profile_id: int, limit: int = STORE_SCORE_CAP) -> lis
     ).scalars().all()
 
 
-def _backlog_rows(db: Session, profile_id: int, limit: int) -> list[JobSeen]:
-    """Enriched-but-unshown rows. Used to top up a thin run (surfacing the
-    backlog) so the user never sees an empty screen. Already-processed, so
-    re-considering them is free apart from one shared LLM call. Excludes
-    confirmed-dead rows, same reasoning as _new_rows."""
-    return db.execute(
-        select(JobSeen)
-        .where(JobSeen.profile_id == profile_id, JobSeen.state == "enriched",
-               JobSeen.dead_reason.is_(None))
-        .order_by(JobSeen.last_seen.desc())
-        .limit(limit)
-    ).scalars().all()
+def _backlog_rows(
+    db: Session, profile_id: int, limit: int,
+    *, verdicts: tuple[str, ...] | None = None, exclude_rejects: bool = False,
+) -> list[JobSeen]:
+    """Enriched-but-unshown rows, for resurfacing previously-seen roles across runs.
+    Already-processed, so re-considering them is free apart from cache-served gate/
+    rank/judge calls. Excludes confirmed-dead rows, same reasoning as _new_rows.
+    `verdicts` restricts to a specific set of final-AI verdicts (e.g. only the roles
+    the judge already liked -- 'strong'/'backup'); `exclude_rejects` instead keeps
+    everything except an expensive-AI 'reject' (used as a thin-run empty-screen
+    safety net). Rejects are never resurfaced by default -- re-piping a known reject
+    every run only to have it filtered again at the judge cache wastes pool slots."""
+    q = select(JobSeen).where(
+        JobSeen.profile_id == profile_id, JobSeen.state == "enriched",
+        JobSeen.dead_reason.is_(None),
+    )
+    if verdicts is not None:
+        q = q.where(JobSeen.eval_verdict.in_(verdicts))
+    elif exclude_rejects:
+        q = q.where(or_(JobSeen.eval_verdict.is_(None), JobSeen.eval_verdict != "reject"))
+    return db.execute(q.order_by(JobSeen.last_seen.desc()).limit(limit)).scalars().all()
 
 
 def _rows_to_dicts(rows: list[JobSeen]) -> list[dict]:
@@ -366,7 +464,17 @@ def _persist_dead_scrapes(db: Session, profile_id: int, jobs: list[dict]) -> Non
     """Persist a confirmed-dead listing's reason (see full_auto.py's
     _dead_listing_signal) so _run_engine_pipeline's rows-assembly filter can
     exclude it on every future run without re-scraping or re-judging it --
-    dead-ness is a fact about the URL, independent of profile/CV changes."""
+    dead-ness is a fact about the URL, independent of profile/CV changes.
+
+    Also auto-hides any already-shown, still-unreviewed Role for the same
+    listing (matched via Role.external_id == JobSeen.identity_hash, see
+    where Role rows get created). This is the only point where a
+    previously-surfaced role ever gets checked against reality post-hoc --
+    Phase 5 only ever scrapes a given job once, so without this an expired
+    listing the user hasn't acted on would sit in the inbox forever. Moved to
+    "ignored" rather than "deleted": reversible via the Ignored tab's
+    re-save, in case the dead-detection was a false positive. saved/applied/
+    crossed roles are left untouched -- the user has already acted on those."""
     by_id = {j["_identity"]: j["_dead_reason"] for j in jobs
              if j.get("_identity") and j.get("_dead_reason")}
     if not by_id:
@@ -378,6 +486,11 @@ def _persist_dead_scrapes(db: Session, profile_id: int, jobs: list[dict]) -> Non
     ).scalars().all()
     for r in rows:
         r.dead_reason = by_id.get(r.identity_hash)
+    db.query(Role).filter(
+        Role.profile_id == profile_id,
+        Role.status == "new",
+        Role.external_id.in_(list(by_id)),
+    ).update({Role.status: "ignored"}, synchronize_session=False)
     db.commit()
 
 
@@ -572,56 +685,180 @@ def _fair_allocate(by_group: dict[int, list[dict]], total: int) -> list[dict]:
     return out[:total]
 
 
+def _clusters_without_fresh_terms(eng_profile: dict, role_clusters: list[dict]) -> set[int]:
+    """Cluster indices that got none of their own terms in this run's
+    TERMS_PER_RUN rotation window (eng_profile['search_terms_batch'], set by
+    full_auto.select_sources_for_run as a side effect of gather_jobs). A
+    single-cluster profile is never skipped, and this never skips every
+    cluster at once (a rotation window that only reaches N-1 clusters still
+    leaves at least one live)."""
+    if len(role_clusters) <= 1:
+        return set()
+    batch = {t.strip().lower() for t in (eng_profile.get("search_terms_batch") or []) if t}
+    if not batch:
+        return set()
+    skipped = {
+        idx for idx, cluster in enumerate(role_clusters)
+        if (roles := {r.strip().lower() for r in (cluster.get("roles") or [])}) and not (roles & batch)
+    }
+    return skipped if len(skipped) < len(role_clusters) else set()
+
+
 def _cluster_label(cluster: dict) -> str:
     roles = cluster.get("roles") or []
     return roles[0] if roles else "General"
 
 
-def _adaptive_pool_by_cluster(scored: list[dict]) -> tuple[list[dict], bool, dict[int, str]]:
-    """Per-cluster version of the strict/broaden pool: strict when a cluster's
-    own matches are plentiful, broadened when sparse, and -- unlike before --
-    never contributes zero for a cluster that has ANY scored candidates at
-    all (falls back to its top few by score rather than silently vanishing).
-    Slots are then fairly split across clusters (_fair_allocate) so one
-    cluster's abundant supply can't crowd out another's sparse-but-real one.
-    Returns (pool, harsh, fallback_reasons); fallback_reasons maps cluster
-    index -> a short tag, only for clusters that needed broadening/fallback."""
+def _cluster_candidate_queues(scored: list[dict]) -> tuple[dict[int, list[dict]], bool, dict[int, str]]:
+    """Groups already-sorted-desc `scored` candidates by cluster into the full
+    ordered queue _gate_rank_refill_cluster pulls batches from -- unlike the
+    old single-shot TARGET_POOL-capped pool, nothing is truncated here; each
+    cluster's own refill loop decides how much of its queue to actually
+    examine (up to ABSOLUTE_POOL_CAP). Returns (queues, harsh, fallback_reasons):
+    `harsh` is True if ANY cluster has fewer than MIN_RESULTS candidates
+    clearing RELEVANCE_PRIMARY (relying on floor-broadened matches or worse);
+    fallback_reasons maps cluster index -> a short tag, only for clusters that
+    needed broadening/fallback."""
     by_cluster: dict[int, list[dict]] = defaultdict(list)
     for j in scored:                      # `scored` is already sorted desc
         by_cluster[j.get("_cluster", 0)].append(j)
 
-    cluster_lists: dict[int, list[dict]] = {}
+    queues: dict[int, list[dict]] = {}
     harsh = False
     fallback_reasons: dict[int, str] = {}
     for key, items in by_cluster.items():
         strong = [j for j in items if j["embed_score"] >= RELEVANCE_PRIMARY]
-        if len(strong) >= TARGET_POOL:
-            cluster_lists[key] = strong[:TARGET_POOL]
-            continue
-        if len(strong) >= MIN_RESULTS:
-            cluster_lists[key] = strong
-            continue
         broadened = [j for j in items if j["embed_score"] >= RELEVANCE_FLOOR]
-        if broadened:
-            cluster_lists[key] = broadened[:TARGET_POOL]
+        if len(strong) < MIN_RESULTS:
             harsh = True
-            fallback_reasons[key] = "broadened"
+        if broadened:
+            if len(strong) < MIN_RESULTS:
+                fallback_reasons[key] = "broadened"
+            queues[key] = broadened
             continue
         # Nothing clears even the floor. Still surface the best few UNLESS the
         # top score is exactly 0.0 -- that means embedding the store's rows
         # failed for this batch (see _ensure_embeddings), not a genuine niche
-        # result, so don't misreport it as "filters too strict".
+        # result, so don't misreport it as "filters too strict". Kept small
+        # (MIN_RESULTS) and explicit rather than opening the whole cluster to
+        # refill -- this is a last resort, not a normal queue.
         if items and items[0]["embed_score"] > 0.0:
-            cluster_lists[key] = items[:MIN_RESULTS]
-            harsh = True
+            queues[key] = items[:MIN_RESULTS]
             fallback_reasons[key] = "floor_fallback"
         else:
-            cluster_lists[key] = []
+            queues[key] = []
             if items:
                 fallback_reasons[key] = "embedding_failure"
 
-    pool = _fair_allocate(cluster_lists, TARGET_POOL)
-    return pool, harsh, fallback_reasons
+    return queues, harsh, fallback_reasons
+
+
+def _gate_rank_refill_cluster(
+    queue: list[dict], cluster_profile: dict, engine, db: Session, run: SearchRun,
+) -> tuple[list[dict], dict]:
+    """Iteratively gates then ranks batches of one cluster's embed-score-ordered
+    candidate queue (already restricted to >= RELEVANCE_FLOOR, or the small
+    last-resort floor_fallback list -- see _cluster_candidate_queues) instead
+    of a one-shot TARGET_POOL-capped gate call. A harsher gate (2+ soft-axis
+    failures hard-drops, see full_auto.screen_gate) or the RANK_REJECT_SCORE_FLOOR
+    absolute cutoff can leave a cluster short of JUDGE_POOL even though hundreds
+    of decent-scoring candidates sit unexamined in the store; this keeps pulling
+    batches until JUDGE_POOL rank-floor survivors accumulate, the queue is
+    exhausted, or ABSOLUTE_POOL_CAP total candidates have been examined.
+
+    Returns (judge_eligible_sorted, gate_survivors, stats). judge_eligible is a
+    strict subset of gate_survivors (excludes rank-floor rejects, unless
+    promoted by the rank-side floor backfill) -- callers that need "everything
+    that passed the gate, regardless of rank outcome" (e.g. deciding which
+    examined rows should stay 'new' to resurface vs. be marked enriched) want
+    gate_survivors, not judge_eligible. stats carries the funnel numbers for
+    this cluster's log line (examined/queue_len/gate_survivors/judge_eligible/
+    stop_reason); `queue[:stats['examined']]` recovers exactly the subset of
+    the queue this call looked at."""
+    pos = 0
+    examined = 0
+    gate_survivors: list[dict] = []    # in-sector, <2 soft-axis failures (all rounds)
+    hard_dropped: list[dict] = []      # in-sector, >=2 soft-axis failures
+    off_sector: list[dict] = []        # sector_ok=False
+    judge_eligible: list[dict] = []    # ranked, >= RANK_REJECT_SCORE_FLOOR
+    below_rank_floor: list[dict] = []  # ranked, < RANK_REJECT_SCORE_FLOOR
+    stop_reason = "pool_exhausted"
+
+    while pos < len(queue):
+        if len(judge_eligible) >= JUDGE_POOL:
+            stop_reason = "target_reached"
+            break
+        if examined >= ABSOLUTE_POOL_CAP:
+            stop_reason = "absolute_pool_cap"
+            break
+        _check_cancelled(db, run)
+        batch_size = min(len(queue) - pos, TARGET_POOL, ABSOLUTE_POOL_CAP - examined)
+        batch = queue[pos:pos + batch_size]
+        pos += batch_size
+        examined += len(batch)
+
+        annotated = engine.screen_gate(batch, cluster_profile)
+        round_survivors = []
+        for j in annotated:
+            if not j.get("_sector_ok", True):
+                off_sector.append(j)
+                continue
+            fails = sum(1 for axis in engine.SOFT_GATE_AXES if not j.get(axis, True))
+            if fails >= 2:
+                hard_dropped.append(j)
+            else:
+                gate_survivors.append(j)
+                round_survivors.append(j)
+
+        if round_survivors:
+            ranked = engine.rank_gate(round_survivors, cluster_profile)
+            for j in ranked:
+                if j.get("_rank_score", 50.0) >= RANK_REJECT_SCORE_FLOOR:
+                    judge_eligible.append(j)
+                else:
+                    below_rank_floor.append(j)
+
+    # Gate-side floor backfill: never let a cluster reach rank with fewer than
+    # MIN_RESULTS in-sector candidates, mirroring the pre-refill design (a
+    # purely hard-drop gate starved clusters once before -- see CLAUDE.md).
+    backfilled = False
+    if len(gate_survivors) < MIN_RESULTS:
+        need = MIN_RESULTS - len(gate_survivors)
+        topup = sorted(hard_dropped + off_sector, key=lambda x: x.get("embed_score", 0),
+                        reverse=True)[:need]
+        if topup:
+            backfilled = True
+            for j in engine.rank_gate(topup, cluster_profile):
+                gate_survivors.append(j)
+                if j.get("_rank_score", 50.0) >= RANK_REJECT_SCORE_FLOOR:
+                    judge_eligible.append(j)
+                else:
+                    below_rank_floor.append(j)
+
+    rank_floor_rejected = len(below_rank_floor)
+
+    # Rank-side floor backfill: never send the judge fewer than MIN_RESULTS
+    # for a cluster that has any gate survivors at all -- an absolute score
+    # cutoff (unlike the old relative bottom-20% trim) can in principle reject
+    # every candidate in a genuinely weak cluster.
+    floor_target = min(MIN_RESULTS, len(gate_survivors))
+    if len(judge_eligible) < floor_target:
+        need = floor_target - len(judge_eligible)
+        promoted = sorted(below_rank_floor, key=lambda x: x.get("_rank_score", 0), reverse=True)[:need]
+        if promoted:
+            backfilled = True
+        judge_eligible.extend(promoted)
+        rank_floor_rejected -= len(promoted)
+
+    judge_eligible.sort(key=lambda j: j.get("_rank_score", 50.0), reverse=True)
+    stats = {
+        "examined": examined, "queue_len": len(queue),
+        "gate_survivors": len(gate_survivors), "hard_dropped": len(hard_dropped),
+        "off_sector": len(off_sector), "rank_floor_rejected": rank_floor_rejected,
+        "judge_eligible": len(judge_eligible), "stop_reason": stop_reason,
+        "backfilled": backfilled,
+    }
+    return judge_eligible, gate_survivors, stats
 
 
 _TRAINING_COMPANY_CONTAGION = 2  # >= this many flagged listings => whole company is a farm
@@ -660,12 +897,29 @@ def _filter_training(engine, jobs: list[dict]) -> tuple[list[dict], int]:
     return kept, dropped
 
 
+# Location-field values that carry no place information at all -- just a
+# work-arrangement descriptor. Distinct from a genuine-but-unrecognised place
+# name (e.g. "Riga, Latvia"): those must NOT fall back to the snippet (see
+# _filter_by_country's docstring), but these carry no location claim to trust
+# or distrust in the first place, so they're safe to treat like a blank field.
+_LOCATION_SCOPE_DESCRIPTORS = {
+    "hybrid", "remote", "distributed", "in-office", "in office", "onsite",
+    "on-site", "on site", "flexible", "wfh", "work from home",
+}
+
+
+def _is_location_scope_descriptor(location: str) -> bool:
+    return (location or "").strip().lower() in _LOCATION_SCOPE_DESCRIPTORS
+
+
 def _filter_by_country(engine, jobs: list[dict], country_codes: list[str]) -> list[dict]:
     """Hard-drop jobs whose location isn't the selected country. A job is only
     kept if it positively matches an allowed country. The snippet is only
-    consulted when location is genuinely blank -- a known-but-unrecognised
-    location (e.g. "Riga, Latvia" when our token list doesn't cover Latvia)
-    must NOT fall back to scanning the description, since a global company's
+    consulted when location is inconclusive -- either genuinely blank, or a
+    bare work-arrangement descriptor ("Hybrid"/"Distributed"/"In-Office") that
+    carries no place information at all. A known-but-unrecognised REAL place
+    name (e.g. "Riga, Latvia" when our token list doesn't cover Latvia) must
+    NOT fall back to scanning the description, since a global company's
     boilerplate ("headquartered in London...") will false-positive-match the
     HQ's country for a role based somewhere else entirely. country_codes == []
     means "Global" -- no filtering. Anything we can't positively confirm is
@@ -676,7 +930,9 @@ def _filter_by_country(engine, jobs: list[dict], country_codes: list[str]) -> li
     kept = []
     for j in jobs:
         location = j.get("location", "") or ""
-        cc = engine.country_of(location) if location.strip() else engine.country_of(j.get("snippet", "") or "")
+        cc = engine.country_of(location)
+        if cc is None and (not location.strip() or _is_location_scope_descriptor(location)):
+            cc = engine.country_of(j.get("snippet", "") or "")
         if cc in allowed:
             kept.append(j)
     return kept
@@ -824,10 +1080,13 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     eng_profile["disabled_sources"] = disabled
     emit(f"[pipeline] discovery start (first_run={eng_profile['first_run']}, "
          f"disabled={sorted(eng_profile['disabled_sources'])}, "
-         f"ats_batch={'querying fresh' if ats_stale else 'skipped (cached, within TTL)'}, "
-         f"terms={eng_profile.get('search_terms', [])[:5]})")
+         f"ats_batch={'querying fresh' if ats_stale else 'skipped (cached, within TTL)'})")
     _progress(db, run, "Searching job boards…")
     raw_jobs = engine.gather_jobs(eng_profile)
+    # search_terms_batch is set as a side effect of gather_jobs (select_sources_for_run
+    # mutates the same eng_profile dict) -- log the terms this run actually queried,
+    # not the full profile term list, since TERMS_PER_RUN rotates only a window of them.
+    emit(f"[pipeline] discovery queried terms this run: {eng_profile.get('search_terms_batch') or []}")
     t0 = _lap("discovery", t0)
     _check_cancelled(db, run)
 
@@ -905,17 +1164,32 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     emit(f"[pipeline] store upsert: +{inserted} new, {refreshed} refreshed, "
          f"{requeued} requeued | store totals for this profile: {store_counts}")
 
-    # ASSEMBLE the candidate rows: the whole 'new' store, topped up from the
-    # enriched backlog when discovery was thin (this is "surfacing the backlog").
+    # ASSEMBLE the candidate rows: the whole 'new' store, PLUS previously-seen roles
+    # the judge already liked but that were never shown. Without this second part, a
+    # good match seen once but out-ranked for a FINAL_PICKS slot stayed frozen in the
+    # store forever -- the old top-up only pulled from the backlog when fresh 'new'
+    # rows fell below TARGET_POOL, which rarely happens on an active profile, so the
+    # backlog was effectively write-only. Resurfacing runs every time now; it's cheap
+    # because a resurfaced row's gate/rank/judge results are all served from cache.
     rows = _new_rows(db, profile_id)
+    seen_ids = {r.identity_hash for r in rows}
+    resurfaced = [r for r in _backlog_rows(db, profile_id, BACKLOG_TOPUP, verdicts=("strong", "backup"))
+                  if r.identity_hash not in seen_ids]
+    rows = rows + resurfaced
+    seen_ids.update(r.identity_hash for r in resurfaced)
+    n_fresh = len(rows) - len(resurfaced)
     if len(rows) < TARGET_POOL:
-        backlog = _backlog_rows(db, profile_id, BACKLOG_TOPUP)
-        rows = rows + backlog
-        emit(f"[pipeline] 'new' rows={len(rows) - len(backlog)} (< TARGET_POOL={TARGET_POOL}); "
-             f"topped up with {len(backlog)} backlog rows -> {len(rows)} total")
-    else:
-        emit(f"[pipeline] scoring whole 'new' store: {len(rows)} rows")
+        # Thin-run safety net (the original behaviour): still short of a full pool, so
+        # top up with any other enriched rows (except known rejects) to avoid an empty
+        # screen.
+        extra = [r for r in _backlog_rows(db, profile_id, BACKLOG_TOPUP, exclude_rejects=True)
+                 if r.identity_hash not in seen_ids]
+        rows = rows + extra
+        resurfaced = resurfaced + extra
+    emit(f"[pipeline] pool assembled: {n_fresh} fresh 'new' + {len(resurfaced)} "
+         f"resurfaced backlog row(s) -> {len(rows)} total")
     funnel["pool_rows"] = len(rows)
+    funnel["pool_resurfaced"] = len(resurfaced)
     if not rows:
         emit("[pipeline] STOP: nothing to evaluate (store empty and no backlog) -> 0 results")
         return [], False, None, timings, None, funnel
@@ -962,133 +1236,97 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         emit(f"[pipeline] heuristic prescreen dropped {n_prescreen} obvious seniority mismatch(es) "
              f"before any gate")
 
-    pool, harsh, pool_fallbacks = _adaptive_pool_by_cluster(scored)
+    skipped_clusters = _clusters_without_fresh_terms(eng_profile, role_clusters)
+    if skipped_clusters:
+        before = len(scored)
+        scored = [j for j in scored if j.get("_cluster", 0) not in skipped_clusters]
+        funnel["skipped_clusters"] = sorted(skipped_clusters)
+        for idx in skipped_clusters:
+            fallback_notes[idx].add("cluster_skipped")
+        emit(f"[pipeline] cluster(s) {sorted(skipped_clusters)} got no fresh search terms "
+             f"this run's rotation window -- skipping ({before - len(scored)} candidate(s) "
+             f"excluded); full budget goes to the remaining cluster(s), its turn comes on a future run")
+
+    queues, harsh, pool_fallbacks = _cluster_candidate_queues(scored)
     for idx, reason in pool_fallbacks.items():
         fallback_notes[idx].add(reason)
-    funnel["adaptive_pool_size"] = len(pool)
+    total_queued = sum(len(q) for q in queues.values())
+    funnel["candidate_queue_size"] = total_queued
     funnel["pool_harsh"] = harsh
-    emit(f"[pipeline] adaptive pool size={len(pool)} (harsh/broadened={harsh}) "
+    emit(f"[pipeline] candidate queues: {total_queued} total across {len(queues)} cluster(s) "
+         f"available to gate (>= RELEVANCE_FLOOR) (harsh/broadened={harsh}) "
          f"fallbacks={dict(pool_fallbacks)}")
-    if not pool:
+    if not any(queues.values()):
         emit(f"[pipeline] STOP: no candidates above RELEVANCE_FLOOR({RELEVANCE_FLOOR}) in any cluster -> 0 results")
         return [], harsh, None, timings, _compose_fallback_warning(role_clusters, fallback_notes), funnel
 
-    # GATE: sector fit is judged per role-cluster (each cluster's own roles as
-    # the "candidate target roles" signal) so the call isn't confused by a
-    # candidate's OTHER, unrelated target roles; seniority is profile-wide, so
-    # it runs once on the combined sector-gate survivors. Discarded roles stay
-    # in the store (marked enriched below) and can resurface via backlog, but
-    # won't be re-judged while the profile signature is unchanged (gate cache)
-    # -- each cluster's own search_terms naturally land in separate cache rows.
-    pool_by_cluster: dict[int, list[dict]] = defaultdict(list)
-    for j in pool:
-        pool_by_cluster[j.get("_cluster", 0)].append(j)
-
-    # GATE: one merged sector+seniority screen per cluster (each cluster's own roles
-    # as the sector signal). The screen ANNOTATES rather than drops; we then hard-drop
-    # only off-sector jobs, DEMOTE (never drop) seniority failures, and guarantee a
-    # per-cluster floor -- so the cheap gate can't starve a cluster to zero, and the
-    # full-text final AI stays the authoritative seniority judge. Discarded roles stay
-    # in the store (marked enriched below) and won't be re-judged while the profile
-    # signature is unchanged (gate cache) -- each cluster's own search_terms naturally
-    # land in separate cache rows.
-    _progress(db, run, "Screening candidates…")
-    survivors_by_cluster: dict[int, list[dict]] = {}
-    for idx, cluster_pool in pool_by_cluster.items():
-        _check_cancelled(db, run)
-        cluster_profile = dict(eng_profile)
-        cluster_profile["search_terms"] = role_clusters[idx].get("roles") or eng_profile.get("search_terms")
-        annotated = engine.screen_gate(cluster_pool, cluster_profile)
-        annotated.sort(key=lambda x: x.get("embed_score", 0), reverse=True)
-
-        in_sector = [j for j in annotated if j.get("_sector_ok", True)]
-        # Auto-admit the top few by relevance regardless of the seniority veto -- send
-        # the highest-cosine candidates straight to the expensive AI (the real judge).
-        auto_ids = {id(j) for j in in_sector[:AUTO_PASS_TOP]}
-        primary = [j for j in in_sector if j.get("_seniority_ok", True) or id(j) in auto_ids]
-
-        if len(primary) >= MIN_RESULTS:
-            survivors = primary
-        elif in_sector:
-            # Keep floor: backfill from demoted (in-sector, seniority-failed) jobs by
-            # score so a cluster with a real pool never reaches final eval starved.
-            primary_ids = {id(j) for j in primary}
-            demoted = [j for j in in_sector if id(j) not in primary_ids]
-            survivors = primary + demoted[:max(0, MIN_RESULTS - len(primary))]
-            if len(survivors) > len(primary):
-                fallback_notes[idx].add("gate_fallback")
-        else:
-            # Sector wiped everything (genuinely wrong field): fall back to this
-            # cluster's own top pool slice rather than contributing nothing.
-            survivors = sorted(cluster_pool, key=lambda x: x.get("embed_score", 0),
-                               reverse=True)[:MIN_RESULTS]
-            if survivors:
-                fallback_notes[idx].add("gate_fallback")
-        survivors_by_cluster[idx] = survivors
-    t0 = _lap("gate", t0)
-
-    selected_by_cluster = {
-        idx: sorted(items, key=lambda x: x.get("embed_score", 0), reverse=True)
-        for idx, items in survivors_by_cluster.items() if items
-    }
-    selected = _fair_allocate(selected_by_cluster, TARGET_POOL)
-    survivors_total = sum(len(v) for v in survivors_by_cluster.values())
-    funnel["gate_survivors_total"] = survivors_total
-    funnel["selected_for_rank"] = len(selected)
-    emit(f"[pipeline] gates: pool={len(pool)} -> survivors={survivors_total} "
-         f"-> selected top-{len(selected)} across {len(selected_by_cluster)} cluster(s) for cheap ranking")
-    if not selected:
-        # Should be unreachable: every cluster in pool_by_cluster gets a
-        # guaranteed non-empty fallback above. Kept as a defensive backstop.
-        emit("[pipeline] STOP: screen produced nothing despite a non-empty pool -> 0 results")
-        return [], True, ([j["_identity"] for j in pool], []), timings, \
-            _compose_fallback_warning(role_clusters, fallback_notes), funnel
-
-    # RANK: one more cheap-model call per cluster over that cluster's own gate
-    # survivors, estimating a numeric 0-100 fit score per job instead of a
-    # boolean pass/fail, so the expensive full-text judge only ever sees a
-    # curated top slice (JUDGE_POOL) instead of every gate survivor (up to
-    # TARGET_POOL). Scoped per cluster (own cluster_profile, mirroring the gate
-    # loop above) rather than once across the whole cross-cluster pool -- a
-    # profile-wide call was scoring a minority cluster's jobs against a
-    # candidate description dominated by the OTHER cluster's target roles,
-    # which measurably tanked its scores. The bottom RANK_AUTOREJECT_FRACTION is
-    # dropped PER CLUSTER (not off the merged pool) so a cluster that happens to
-    # score lower can't lose more than its own share before fair-allocate ever
-    # gets a chance to protect it. This is a per-run funnel decision, not a
-    # permanent verdict -- unlike an expensive-AI reject, a cheap-rank exclusion
-    # doesn't get persisted, so a job scored out here is still free to
-    # resurface (and be re-ranked) on a future run.
-    _progress(db, run, "Ranking candidates…")
-    # NB: unrelated to funnel["selected_for_rank"] set above -- that's the
-    # TARGET_POOL-capped count going INTO this stage; this dict is just this
-    # stage's per-cluster grouping of those same jobs.
-    selected_for_rank: dict[int, list[dict]] = defaultdict(list)
-    for j in selected:
-        selected_for_rank[j.get("_cluster", 0)].append(j)
-
+    # GATE + RANK, combined per cluster with refill: each cluster's own
+    # embed-score-ordered queue is fed through screen_gate then rank_gate in
+    # batches (see _gate_rank_refill_cluster) until JUDGE_POOL rank-floor
+    # survivors accumulate, the queue is exhausted, or ABSOLUTE_POOL_CAP total
+    # have been examined -- unlike the old one-shot TARGET_POOL-capped gate
+    # call, this keeps pulling from the idle above-floor pool instead of
+    # accepting a thin result when a harsher gate or the rank floor
+    # (RANK_REJECT_SCORE_FLOOR) leaves a cluster short. sector_ok stays the
+    # one unconditional hard drop within screen_gate; 2+ of the 5 soft axes
+    # failing (seniority/requirements/skills/salary/work-arrangement) is now
+    # ALSO a hard drop (see full_auto.screen_gate/SOFT_GATE_AXES), with the
+    # cluster-level MIN_RESULTS floor backfill in _gate_rank_refill_cluster
+    # as the safety net against starving a cluster to zero -- the same failure
+    # mode a purely hard-drop seniority gate caused once before (see CLAUDE.md).
+    _progress(db, run, "Screening & ranking candidates…")
     rank_by_cluster: dict[int, list[dict]] = {}
-    n_scored = n_autorejected = 0
-    for idx, cluster_items in selected_for_rank.items():
-        _check_cancelled(db, run)
+    examined_ids: set[str] = set()
+    gate_survivor_ids: set[str] = set()
+    total_examined = total_gate_survivors = total_judge_eligible = 0
+    for idx, queue in queues.items():
+        if not queue:
+            continue
         cluster_profile = dict(eng_profile)
         cluster_profile["search_terms"] = role_clusters[idx].get("roles") or eng_profile.get("search_terms")
         cluster_profile["_multi_cluster"] = len(role_clusters) > 1
-        ranked = engine.rank_gate(cluster_items, cluster_profile)
-        ranked_sorted = sorted(ranked, key=lambda j: j.get("_rank_score", 50.0), reverse=True)
-        keep_n = max(1, int(len(ranked_sorted) * (1 - RANK_AUTOREJECT_FRACTION)))
-        rank_by_cluster[idx] = ranked_sorted[:keep_n]
-        n_scored += len(ranked_sorted)
-        n_autorejected += len(ranked_sorted) - keep_n
+        judge_eligible, gate_survivors, stats = _gate_rank_refill_cluster(
+            queue, cluster_profile, engine, db, run
+        )
+        rank_by_cluster[idx] = judge_eligible
+        examined_ids.update(j["_identity"] for j in queue[:stats["examined"]])
+        gate_survivor_ids.update(j["_identity"] for j in gate_survivors)
+        total_examined += stats["examined"]
+        total_gate_survivors += stats["gate_survivors"]
+        total_judge_eligible += stats["judge_eligible"]
+        if stats["backfilled"]:
+            # Same tag/message as the old one-shot design's starvation backfill
+            # (see _compose_fallback_warning) -- MIN_RESULTS safety net had to
+            # promote a hard-dropped/off-sector/rank-floor-rejected candidate,
+            # a genuine "results were thin" signal. Hitting ABSOLUTE_POOL_CAP or
+            # exhausting the queue without reaching JUDGE_POOL is NOT tagged
+            # here -- that's the normal, expected outcome for a niche cluster
+            # with fewer than JUDGE_POOL decent candidates in the store at all.
+            fallback_notes[idx].add("gate_fallback")
+        emit(f"[gate+rank] cluster[{idx}] ({_cluster_label(role_clusters[idx])}) fed "
+             f"{stats['examined']}/{stats['queue_len']} qualifying candidates -> "
+             f"{stats['gate_survivors']} gate survivors -> {stats['judge_eligible']} judge-eligible "
+             f"(hard_dropped={stats['hard_dropped']}, off_sector={stats['off_sector']}, "
+             f"rank_floor_rejected={stats['rank_floor_rejected']}) "
+             f"(stopped: {stats['stop_reason']})")
+    t0 = _lap("gate", t0)
 
     selected = _fair_allocate(rank_by_cluster, JUDGE_POOL)
     t0 = _lap("rank", t0)
-    funnel["rank_scored"] = n_scored
-    funnel["rank_autorejected"] = n_autorejected
+    funnel["gate_survivors_total"] = total_gate_survivors
+    funnel["rank_scored"] = total_examined
+    funnel["judge_eligible_total"] = total_judge_eligible
     funnel["judge_pool_size"] = len(selected)
-    emit(f"[pipeline] cheap rank: {n_scored} scored across {len(rank_by_cluster)} cluster(s) -> "
-         f"{n_autorejected} auto-dropped (bottom {RANK_AUTOREJECT_FRACTION:.0%} per cluster, kept "
-         f"for a future run) -> top-{len(selected)} sent to full evaluation")
+    emit(f"[pipeline] gate+rank across {len(rank_by_cluster)} cluster(s): {total_examined} examined -> "
+         f"{total_gate_survivors} gate survivors -> {total_judge_eligible} judge-eligible -> "
+         f"top-{len(selected)} sent to full evaluation")
+    if not selected:
+        # Should be unreachable: every cluster with a non-empty queue gets a
+        # guaranteed non-empty fallback in _gate_rank_refill_cluster. Kept as
+        # a defensive backstop.
+        emit("[pipeline] STOP: gate+rank produced nothing despite non-empty queues -> 0 results")
+        return [], True, ([j["_identity"] for j in scored], []), timings, \
+            _compose_fallback_warning(role_clusters, fallback_notes), funnel
     _check_cancelled(db, run)
 
     # EVALUATE. When full-page scraping is enabled (default), read each selected
@@ -1206,7 +1444,10 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
 
         strong, backup, disqualified, call_failed = [], [], [], False
         if fresh:
+            _cluster_eval_start = time.monotonic()
             strong, backup, disqualified = engine.final_evaluation_split(fresh, eng_profile, cv_text=cv_text)
+            emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}) took "
+                 f"{time.monotonic() - _cluster_eval_start:.1f}s for {len(fresh)} job(s)")
             if strong is None:
                 # The call itself failed (exception/malformed response) -- nothing
                 # was actually judged. Don't persist any verdict, and don't treat
@@ -1219,10 +1460,22 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         final_backup += len(backup)
         final_disqualified += len(disqualified)
 
-        picks = [dict(p, strong_fit=True) for p in strong] + cached_strong
+        # Tiered assembly: strong-tier (fresh this run, then cached) always
+        # ranks above backup-tier (cached backup verdicts, then fresh backup),
+        # which is only used as filler when a cluster has zero strong picks --
+        # previously cached "backup" verdicts were folded unconditionally into
+        # the same list as strong picks here, so a stale lenient verdict could
+        # ride along as a full peer to a genuine strong match into the
+        # embed_score sort below (removed) that decided display order.
+        strong_tier = ([dict(p, strong_fit=True) for p in strong]
+                       + [p for p in cached_strong if p.get("strong_fit")])
+        backup_tier = ([p for p in cached_strong if not p.get("strong_fit")]
+                       + [dict(p, strong_fit=False) for p in backup])
+
+        picks = strong_tier
         if not picks:
-            if backup:
-                picks = [dict(p, strong_fit=False) for p in backup]
+            if backup_tier:
+                picks = backup_tier
                 fallback_notes[idx].add("eval_fallback")
             elif call_failed:
                 # Only fall back to an unverified top-N when the AI call itself
@@ -1239,6 +1492,65 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                 fallback_notes[idx].add("eval_fallback")
             # else: the AI reviewed everyone and rejected them all -- contribute
             # nothing for this cluster rather than resurfacing a rejected job.
+
+        # Bounded single-retry backfill: the judge call genuinely succeeded (not
+        # call_failed) but this cluster still came back thin. rank_by_cluster
+        # still holds the candidates this cluster lost to the JUDGE_POOL cut --
+        # pull the next-highest-ranked of those and judge them too, once. Never
+        # loops (no repeat backfill within a run), and never resurfaces a job
+        # already rejected under this exact profile signature (same guard as
+        # the main pass above).
+        if not call_failed and len(picks) < MIN_RESULTS:
+            already_ids = {j.get("_identity") for j in jobs}
+            extras = [c for c in rank_by_cluster.get(idx, [])
+                      if c.get("_identity") not in already_ids][:engine.FINAL_EVAL_MAX_JOBS_PER_CALL]
+            if extras:
+                extras_fresh, extras_cached = [], []
+                for c in extras:
+                    if c.get("_eval_signature") == eval_sig and c.get("_eval_verdict"):
+                        if c["_eval_verdict"] in ("strong", "backup"):
+                            try:
+                                analysis = json.loads(c.get("_eval_analysis") or "{}")
+                            except (ValueError, TypeError):
+                                analysis = {}
+                            extras_cached.append(dict(c, strong_fit=(c["_eval_verdict"] == "strong"), **analysis))
+                        # else: cached "reject" under the current signature -- excluded, never retried
+                    else:
+                        extras_fresh.append(c)
+                final_reused_from_cache += len(extras) - len(extras_fresh)
+                # So judged_ids (computed from to_evaluate after this loop, used to
+                # mark JobSeen rows "enriched") picks these up same as any other
+                # judged job -- otherwise a backfilled-and-judged extra would keep
+                # reappearing in next run's "new, unprocessed" pool despite already
+                # carrying a persisted verdict.
+                to_evaluate.extend(extras_fresh + extras_cached)
+
+                b_strong, b_backup = [], []
+                if extras_fresh:
+                    b_strong, b_backup, b_disqualified = engine.final_evaluation_split(
+                        extras_fresh, eng_profile, cv_text=cv_text)
+                    if b_strong is None:
+                        b_strong, b_backup = [], []  # call failed -- no persist, no backfill picks from it
+                    else:
+                        _persist_verdicts(db, profile_id, extras_fresh, b_strong, b_backup,
+                                           b_disqualified, eval_sig)
+                        final_fresh_judged += len(extras_fresh)
+                        final_strong += len(b_strong)
+                        final_backup += len(b_backup)
+                        final_disqualified += len(b_disqualified)
+
+                backfill_picks = (
+                    [dict(p, strong_fit=True) for p in b_strong]
+                    + [p for p in extras_cached if p.get("strong_fit")]
+                    + [p for p in extras_cached if not p.get("strong_fit")]
+                    + [dict(p, strong_fit=False) for p in b_backup]
+                )
+                if backfill_picks:
+                    picks = picks + backfill_picks
+                    fallback_notes[idx].add("judge_backfill")
+                    emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}) backfill: "
+                         f"retried {len(extras)} next-ranked candidate(s), now {len(picks)} pick(s)")
+
         # Cross-site duplicate-content corroboration for judge-flagged scam_suspect
         # picks (see full_auto.verify_not_duplicated) -- gated to only picks about to
         # be shown this run and a small shared budget, since it spends a real search
@@ -1260,17 +1572,22 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                         continue
                 verified_picks.append(p)
             picks = verified_picks
-            if had_picks and not picks and backup:
+            if had_picks and not picks and backup_tier:
                 # The only strong/cached pick(s) got corroborated as scam and removed
-                # -- fall back to this cluster's own backup survivors (computed
+                # -- fall back to this cluster's own backup tier (computed
                 # earlier, discarded above because strong was non-empty) rather than
                 # silently contributing nothing, same posture as the original
                 # empty-picks fallback. Not itself re-verified for scam_suspect --
                 # bounds cost/complexity for what should be a rare double-fallback.
-                picks = [dict(p, strong_fit=False) for p in backup]
+                picks = backup_tier
                 fallback_notes[idx].add("eval_fallback")
 
-        picks.sort(key=lambda p: p.get("embed_score", 0), reverse=True)
+        # No re-sort by embed_score here: strong_tier/backup_tier above already
+        # preserve tier priority and the LLM's own best-first order within a
+        # tier (fresh) or existing order (cached) -- sorting by raw embedding
+        # cosine similarity used to discard both, letting a topically-close
+        # but evidentially-weak backup/cached pick outrank a genuine strong
+        # match. embed_score stays on each dict for display/debugging only.
         for p in picks:
             p["_cluster_label"] = label if len(role_clusters) > 1 else None
         final_by_cluster[idx] = picks
@@ -1291,8 +1608,28 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     emit(f"[pipeline] final_evaluation returned {len(final)} picks across "
          f"{sum(1 for v in final_by_cluster.values() if v)} cluster(s)"
          + ("" if final else " -- nothing survived evaluation"))
+    emit(f"[pipeline] phase timings (s): "
+         + ", ".join(f"{phase}={secs}" for phase, secs in timings.items()))
 
-    processed_ids = [j["_identity"] for j in pool]
+    # Mark 'enriched' only the rows this run actually resolved: those that reached the
+    # judge (they now carry a cached verdict), plus off-sector/hard-dropped gate drops
+    # (a genuine quality rejection). On-sector gate survivors that never reached the
+    # judge -- trimmed by the rank floor or by fair-allocate's judge budget -- stay
+    # 'new' so they re-compete and reach the judge on a later run with spare capacity,
+    # instead of being frozen after one look. This is what the rank stage's own "free
+    # to resurface on a future run" comment promises, but which marking the whole
+    # examined batch enriched would silently break. Off-sector/hard-dropped rows are
+    # NOT kept 'new' (they'd otherwise re-fill the queue by relevance every run while
+    # always failing the same gate axes -- exactly the wildcard rows we suppress).
+    # gate_survivor_ids/examined_ids were accumulated per cluster during the gate+rank
+    # refill loop above (gate_survivors -- every cluster's <2-soft-axis-failure
+    # in-sector candidates across all rounds -- and the exact examined subset of each
+    # cluster's queue, respectively).
+    judged_ids = {j["_identity"] for j in to_evaluate}
+    processed_ids = [
+        identity for identity in examined_ids
+        if identity in judged_ids or identity not in gate_survivor_ids
+    ]
     shown_ids = [f.get("_identity") for f in final if f.get("_identity")]
     warning = _compose_fallback_warning(role_clusters, fallback_notes)
     return final, harsh or bool(fallback_notes), (processed_ids, shown_ids), timings, warning, funnel
@@ -1303,9 +1640,9 @@ def reap_stale_search_runs(db: Session) -> int:
     status="running" was orphaned by the PREVIOUS process lifetime -- crash,
     `uvicorn --reload` restart, manual kill, etc. -- since run_search_task's
     worker thread died with that process and nothing else will ever revisit
-    the row. Left alone it permanently occupies the profile's daily
-    search-cap slot and /search/status serves a run stuck at "running"
-    forever. Returns the number of rows reaped."""
+    the row. Left alone it permanently occupies a daily search-cap slot
+    and /search/status serves a run stuck at "running" forever. Returns
+    the number of rows reaped."""
     stale = db.execute(select(SearchRun).where(SearchRun.status == "running")).scalars().all()
     if not stale:
         return 0
@@ -1319,11 +1656,29 @@ def reap_stale_search_runs(db: Session) -> int:
 
 
 def _prune_previous_roles(db: Session, profile_id: int) -> None:
-    """Second-search semantics: crossed and leftover unactioned 'new' (inbox)
-    roles both age out to deleted. saved/applied are left untouched."""
+    """Second-search semantics: only 'crossed' roles age out to deleted, so the
+    "passed this session" list resets on each fresh run. 'new' (inbox) roles are
+    never auto-pruned -- an unreviewed role must persist until the user acts on
+    it (tick/cross/delete), not disappear just because another search ran.
+    saved/applied are left untouched either way."""
     db.query(Role).filter(
-        Role.profile_id == profile_id, Role.status.in_(["crossed", "new"])
+        Role.profile_id == profile_id, Role.status == "crossed"
     ).update({Role.status: "deleted"}, synchronize_session=False)
+    db.commit()
+
+
+def _expire_stale_roles(db: Session, profile_id: int) -> None:
+    """Nothing else ever revisits an already-shown 'new' role to check
+    whether the listing has since closed (Phase 5 only scrapes a given job
+    once -- see _persist_dead_scrapes for the other, signal-based half of
+    this). As a cheap fallback for the common case where the posting simply
+    goes stale without ever being re-scraped, auto-move 'new' roles older
+    than ROLE_STALE_DAYS to 'ignored' -- reversible via the Ignored tab's
+    re-save, unlike 'deleted'."""
+    cutoff = datetime.utcnow() - timedelta(days=ROLE_STALE_DAYS)
+    db.query(Role).filter(
+        Role.profile_id == profile_id, Role.status == "new", Role.created_at < cutoff,
+    ).update({Role.status: "ignored"}, synchronize_session=False)
     db.commit()
 
 
@@ -1353,6 +1708,10 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         import full_auto as engine  # lazy: pulls in crawl4ai only now
         engine.init_db()  # ensures gate_cache/jobs/profile_cache tables exist
 
+        # Cached: only actually calls the LLM when the profile's inputs changed
+        # since the last run (or never ran). See profile_intel.py.
+        ensure_profile_intel(db, profile_id)
+
         snap = build_snapshot(db, profile_id)
 
         # Engine's expensive-AI step reads the CV from a file; hand it our synthesis.
@@ -1378,9 +1737,10 @@ def run_search_task(profile_id: int, run_id: int) -> None:
             return
 
         # Prune only after the pipeline has succeeded, so a failed run leaves the
-        # previous "new"/"crossed" roles intact instead of wiping them with nothing
+        # previous "crossed" roles intact instead of wiping them with nothing
         # to replace them.
         _prune_previous_roles(db, profile_id)
+        _expire_stale_roles(db, profile_id)
 
         for rank, entry in enumerate(final, start=1):
             db.add(Role(

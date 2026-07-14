@@ -5,11 +5,13 @@ import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 
 import { AttributeRow } from "@/components/AttributeRow";
+import { IntentEditor } from "@/components/IntentEditor";
 import { LocationPicker } from "@/components/LocationPicker";
 import { Nav } from "@/components/Nav";
 import { ProfileTabs } from "@/components/ProfileTabs";
 import { SalarySlider } from "@/components/SalarySlider";
 import { SeniorityPicker } from "@/components/SeniorityPicker";
+import { TargetRoleChips } from "@/components/TargetRoleChips";
 import { api } from "@/lib/api";
 import { useAttributes, useStats } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
@@ -96,14 +98,8 @@ export default function DashboardPage() {
         <div className="panel">
           <div className="panel-h">What you&apos;re looking for</div>
           <div className="panel-b">
-            <AttributeRow
-              label="Target roles"
-              profileId={activeId}
-              type="target_role"
-              attributes={g?.target_role ?? []}
-              enableSuggest
-              placeholder="e.g. Engineering Manager"
-            />
+            <IntentEditor profileId={activeId} />
+            <TargetRoleChips profileId={activeId} attributes={g?.target_role ?? []} />
             <AttributeRow
               label="Past roles"
               profileId={activeId}
@@ -116,12 +112,6 @@ export default function DashboardPage() {
               type="skill"
               attributes={g?.skill ?? []}
               enableSuggest
-            />
-            <AttributeRow
-              label="Experience"
-              profileId={activeId}
-              type="experience"
-              attributes={g?.experience ?? []}
             />
             <AttributeRow
               label="Qualifications"

@@ -9,13 +9,15 @@ from functools import lru_cache
 import httpx
 from openai import OpenAI
 
-# Match the model family the engine uses for cheap calls.
+# Match the model family the engine uses for cheap calls. Deliberately stays on
+# the older/cheaper nano tier (matches full_auto.py's CHEAP_MODEL) rather than
+# GPT-5.6 Luna -- nano is meaningfully cheaper and plenty for these calls.
 CHEAP_MODEL = os.getenv("CHEAP_MODEL", "gpt-5.4-nano-2026-03-17")
 # Reserved for low-frequency, high-value calls (CV parsing, target-role
 # suggestions) where reasoning quality matters more than per-call cost.
-# Matches full_auto.py's EXP_MODEL; kept as a plain string here so this module
-# stays independent of full_auto/crawl4ai (see module docstring).
-STRONG_MODEL = os.getenv("STRONG_MODEL", "gpt-5.4")
+# Matches full_auto.py's EXP_MODEL (GPT-5.6 Terra); kept as a plain string here
+# so this module stays independent of full_auto/crawl4ai (see module docstring).
+STRONG_MODEL = os.getenv("STRONG_MODEL", "gpt-5.6-terra")
 
 
 @lru_cache(maxsize=1)
@@ -38,19 +40,32 @@ def _clean_json(raw: str) -> str:
     )
 
 
+# Some tiers (gpt-5.5, gpt-5.6-terra) reject any non-default temperature outright
+# (400 Unsupported value) -- mirrors full_auto.py's llm()/EXP_MODEL handling, kept
+# duplicated rather than shared since this module deliberately stays independent
+# of full_auto.py (see module docstring). Confirmed via a live 400 that silently
+# emptied every CV parse for months: llm_json swallowed the exception below and
+# returned {}, which looked identical to "the model found nothing on this CV".
+_FIXED_TEMPERATURE_MODELS = ("gpt-5.5", "gpt-5.6-terra")
+
+
 def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
-    """Call the model and parse a JSON object out of the reply. Returns {} on failure."""
+    """Call the model and parse a JSON object out of the reply. Returns {} on failure
+    (logged to stdout so a failure is at least visible in the server console instead
+    of being indistinguishable from a genuine "nothing found" response)."""
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
+    temperature = 1 if model in _FIXED_TEMPERATURE_MODELS else 0.2
     try:
         resp = _client().chat.completions.create(
             model=model,
             messages=msgs,
-            temperature=0.2,
+            temperature=temperature,
             response_format={"type": "json_object"},
         )
         return json.loads(_clean_json(resp.choices[0].message.content))
-    except Exception:
+    except Exception as e:
+        print(f"[llm_json] call failed (model={model}): {e}")
         return {}

@@ -49,7 +49,7 @@ def _migrate_columns():
         "company_ats": [("keyword", "TEXT")],
         "search_runs": [("phase_timings", "TEXT"), ("funnel_counts", "TEXT"), ("cancel_requested", "BOOLEAN")],
         "roles": [("source", "TEXT")],
-        "profiles": [("cv_text", "TEXT"), ("cv_summary", "TEXT")],
+        "profiles": [("cv_text", "TEXT"), ("cv_summary", "TEXT"), ("intent_text", "TEXT")],
         "profile_attributes": [("proficiency", "TEXT")],
     }
     for table, cols in additions.items():
