@@ -18,6 +18,7 @@ class ProfileUpdate(BaseModel):
     name: Optional[str] = None
     is_active: Optional[bool] = None
     intent_text: Optional[str] = None
+    search_feedback: Optional[str] = None
 
 
 class ProfileOut(ORMModel):
@@ -25,6 +26,7 @@ class ProfileOut(ORMModel):
     name: str
     is_active: bool
     intent_text: Optional[str] = None
+    search_feedback: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -37,6 +39,10 @@ class AttributeCreate(BaseModel):
     confirmed: bool = True
     weight: Optional[float] = None
     proficiency: Optional[str] = None
+    evidence_origin: Optional[str] = None
+    family_id: Optional[int] = None
+    pinned: Optional[bool] = None
+    enforcement: Optional[str] = None
 
 
 class AttributeUpdate(BaseModel):
@@ -44,6 +50,10 @@ class AttributeUpdate(BaseModel):
     confirmed: Optional[bool] = None
     weight: Optional[float] = None
     proficiency: Optional[str] = None
+    evidence_origin: Optional[str] = None
+    family_id: Optional[int] = None
+    pinned: Optional[bool] = None
+    enforcement: Optional[str] = None
 
 
 class AttributeOut(ORMModel):
@@ -55,6 +65,33 @@ class AttributeOut(ORMModel):
     source: str
     confirmed: bool
     proficiency: Optional[str] = None
+    evidence_origin: Optional[str] = None
+    family_id: Optional[int] = None
+    pinned: bool = False
+    # Null means "never set" -- the frontend resolves it through the same
+    # per-type defaults the backend uses (config.enforcement_for), which is why
+    # this stays nullable rather than being backfilled on read.
+    enforcement: Optional[str] = None
+
+
+# ── Role families ───────────────────────────────────────────────────────────
+class FamilyCreate(BaseModel):
+    name: str
+    tier: Optional[str] = None
+
+
+class FamilyUpdate(BaseModel):
+    name: Optional[str] = None
+    tier: Optional[str] = None
+    position: Optional[int] = None
+
+
+class FamilyOut(ORMModel):
+    id: int
+    profile_id: int
+    name: str
+    tier: str
+    position: int
 
 
 # ── Onboarding / parsing ────────────────────────────────────────────────────
@@ -77,10 +114,19 @@ class ConfidenceOut(BaseModel):
     tip: str
 
 
+class ContextHeaderOut(BaseModel):
+    """What the AI is told about the candidate, read-only (see profile_intel)."""
+
+    header: str
+    requirements: list[str]
+    cv_summary: str
+
+
 # ── Roles ───────────────────────────────────────────────────────────────────
 class RoleOut(ORMModel):
     id: int
     profile_id: int
+    search_run_id: Optional[int] = None
     external_id: Optional[str] = None
     title: str
     company: Optional[str] = None
@@ -91,6 +137,10 @@ class RoleOut(ORMModel):
     source: Optional[str] = None
     fit_rank: Optional[int] = None
     ai_analysis: Optional[str] = None
+    verdict: Optional[str] = None
+    work_style: Optional[str] = None
+    seniority_level: Optional[str] = None
+    deadline_text: Optional[str] = None
     status: str
     application_status: Optional[str] = None
     applied_at: Optional[datetime] = None

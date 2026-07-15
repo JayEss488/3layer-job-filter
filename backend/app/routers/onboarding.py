@@ -6,7 +6,14 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..deps import get_profile_or_404
 from ..models import Profile
-from ..schemas import AttributeOut, ConfidenceOut, ParseTextIn, SuggestIn, SuggestOut
+from ..schemas import (
+    AttributeOut,
+    ConfidenceOut,
+    ContextHeaderOut,
+    ParseTextIn,
+    SuggestIn,
+    SuggestOut,
+)
 from ..services.confidence import confidence
 from ..services.harvest import harvest_for_profile
 from ..services.llm import llm_json
@@ -16,9 +23,29 @@ from ..services.parsing import (
     parse_text_to_attributes,
     summarize_cv_text,
 )
-from ..services.profile_intel import ensure_profile_intel
+from ..services.profile_intel import ensure_profile_intel, read_cached_intel
 
 router = APIRouter(tags=["onboarding"])
+
+
+@router.get("/profiles/{profile_id}/context-header", response_model=ContextHeaderOut)
+def get_context_header(
+    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
+):
+    """The distilled "who this candidate is" header the final judge is given,
+    plus the CV summary underneath it, read-only.
+
+    Surfaced so the Memory tab can show what the AI actually reads about the
+    candidate rather than leaving it a black box -- it's generated from the
+    memory on that page, so seeing it is how you tell whether an edit landed.
+    Pure cache read (see profile_intel.read_cached_intel): empty until
+    profile_intel has run at least once, e.g. before the first search."""
+    intel = read_cached_intel(db, profile.id)
+    return ContextHeaderOut(
+        header=intel.get("header") or "",
+        requirements=intel.get("requirements") or [],
+        cv_summary=profile.cv_summary or "",
+    )
 
 
 @router.post("/profiles/{profile_id}/parse-cv", response_model=list[AttributeOut])

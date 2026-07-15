@@ -47,10 +47,15 @@ def _migrate_columns():
             ("dead_reason", "TEXT"),
         ],
         "company_ats": [("keyword", "TEXT")],
-        "search_runs": [("phase_timings", "TEXT"), ("funnel_counts", "TEXT"), ("cancel_requested", "BOOLEAN")],
-        "roles": [("source", "TEXT")],
-        "profiles": [("cv_text", "TEXT"), ("cv_summary", "TEXT"), ("intent_text", "TEXT")],
-        "profile_attributes": [("proficiency", "TEXT")],
+        "search_runs": [("phase_timings", "TEXT"), ("funnel_counts", "TEXT"), ("cancel_requested", "BOOLEAN"),
+                         ("snapshot_samples", "TEXT")],
+        "roles": [("source", "TEXT"), ("search_run_id", "INTEGER"), ("verdict", "TEXT"),
+                   ("work_style", "TEXT"), ("seniority_level", "TEXT"), ("deadline_text", "TEXT")],
+        "profiles": [("cv_text", "TEXT"), ("cv_summary", "TEXT"), ("intent_text", "TEXT"),
+                     ("search_feedback", "TEXT")],
+        "profile_attributes": [("proficiency", "TEXT"), ("evidence_origin", "TEXT"),
+                                ("family_id", "INTEGER"), ("pinned", "BOOLEAN DEFAULT 0"),
+                                ("enforcement", "TEXT")],
     }
     for table, cols in additions.items():
         if not insp.has_table(table):

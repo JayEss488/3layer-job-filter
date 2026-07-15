@@ -8,6 +8,9 @@ import type { Attribute, AttributeType } from "@/lib/types";
 import { Chip, SuggestChip } from "./Chip";
 
 const PROFICIENCY_CHOICES = ["Expert", "Proficient", "Familiar", "One-time"];
+// Mirrors backend/app/config.py's EVIDENCE_ORIGIN_CHOICES (no shared import
+// across the Python/TS boundary, same as PROFICIENCY_CHOICES above).
+const EVIDENCE_ORIGIN_CHOICES = ["Commercial", "Self-directed", "Academic", "AI-assisted"];
 
 interface Props {
   label: string;
@@ -80,6 +83,20 @@ export function AttributeRow({
                   <option value="">— proficiency —</option>
                   {PROFICIENCY_CHOICES.map((p) => (
                     <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              )}
+              {showProficiency && (
+                <select
+                  className="input"
+                  style={{ fontSize: 11, padding: "3px 5px" }}
+                  value={a.evidence_origin ?? ""}
+                  onChange={(e) => update.mutate({ id: a.id, evidence_origin: e.target.value })}
+                  title="Where was this earned — paid work, or self-directed/academic/AI-assisted?"
+                >
+                  <option value="">— origin —</option>
+                  {EVIDENCE_ORIGIN_CHOICES.map((o) => (
+                    <option key={o} value={o}>{o}</option>
                   ))}
                 </select>
               )}

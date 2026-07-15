@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import FRONTEND_ORIGINS
 from .database import init_db
-from .routers import attributes, onboarding, profiles, search, settings
+from .routers import attributes, families, onboarding, profiles, search, settings
 
 app = FastAPI(title="Omni Board API", version="1.0.0")
 
@@ -58,6 +58,7 @@ def health():
 
 app.include_router(profiles.router)
 app.include_router(attributes.router)
+app.include_router(families.router)
 app.include_router(onboarding.router)
 app.include_router(search.router)
 app.include_router(settings.router)

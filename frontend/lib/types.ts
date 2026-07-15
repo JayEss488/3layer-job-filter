@@ -9,13 +9,16 @@ export type AttributeType =
   | "location"
   | "country"
   | "location_scope"
-  | "custom";
+  | "custom"
+  | "avoid"
+  | "must_have";
 
 export interface Profile {
   id: number;
   name: string;
   is_active: boolean;
   intent_text?: string | null;
+  search_feedback?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -48,11 +51,65 @@ export interface RunFunnel {
   passed_heuristic_embedding: number;
   passed_gates: number;
   final_judge: number;
+  final_judge_rejected: number;
   shown: number;
+}
+
+export interface SnapshotJob {
+  title: string;
+  company: string;
+  url: string;
+}
+
+export interface SnapshotStage {
+  stage: string;
+  label: string;
+  count: number;
+  samples: SnapshotJob[];
+}
+
+export interface Snapshot {
+  run_id: number | null;
+  finished_at?: string | null;
+  stages: SnapshotStage[];
 }
 
 export interface Blocklist {
   domains: string[];
+}
+
+/** How literally a constraint row is applied — mirrors backend config.py. */
+export type Enforcement = "hard" | "soft";
+
+/** Mirrors backend config.ENFORCEMENT_DEFAULT + WORK_TYPE_VALUES. A null
+ *  `enforcement` on a row means "never set" and must resolve through here, the
+ *  same way the backend resolves it via config.enforcement_for — the two are
+ *  kept in manual sync, as there's no shared import across the Python/TS
+ *  boundary (same convention as PROFICIENCY_CHOICES in AttributeRow). */
+const WORK_TYPE_VALUES = new Set(["remote", "hybrid", "on-site", "onsite"]);
+const ENFORCEMENT_DEFAULT: Partial<Record<AttributeType, Enforcement>> = {
+  avoid: "hard",
+  must_have: "hard",
+  location: "hard",
+  seniority: "soft",
+  salary: "soft",
+};
+
+export function enforcementOf(attr: Attribute): Enforcement {
+  if (attr.enforcement) return attr.enforcement;
+  if (attr.type === "location" && WORK_TYPE_VALUES.has(attr.value.toLowerCase().trim()))
+    return "soft";
+  return ENFORCEMENT_DEFAULT[attr.type] ?? "soft";
+}
+
+export type FamilyTier = "core" | "secondary";
+
+export interface RoleFamily {
+  id: number;
+  profile_id: number;
+  name: string;
+  tier: FamilyTier;
+  position: number;
 }
 
 export interface Attribute {
@@ -64,6 +121,11 @@ export interface Attribute {
   source: string;
   confirmed: boolean;
   proficiency?: string | null;
+  evidence_origin?: string | null;
+  family_id?: number | null;
+  pinned?: boolean;
+  /** Null means "never set" — read it through enforcementOf, not directly. */
+  enforcement?: Enforcement | null;
 }
 
 export interface AttributesResponse {
@@ -75,6 +137,13 @@ export interface Confidence {
   score: number;
   missing: string[];
   tip: string;
+}
+
+/** What the AI is told about the candidate — read-only, shown on /memory. */
+export interface ContextHeader {
+  header: string;
+  requirements: string[];
+  cv_summary: string;
 }
 
 export interface Stats {
@@ -93,9 +162,20 @@ export type RoleStatus =
 
 export type ApplicationStatus = "pending" | "interview" | "rejected";
 
+/** The final judge's fit grade — mirrors full_auto's _FINAL_EVAL_SCHEMA. */
+export type RoleVerdict = "very_strong" | "strong" | "ok" | "stretch";
+
+export const VERDICT_LABEL: Record<RoleVerdict, string> = {
+  very_strong: "Very strong fit",
+  strong: "Strong fit",
+  ok: "Ok fit",
+  stretch: "Stretch fit",
+};
+
 export interface Role {
   id: number;
   profile_id: number;
+  search_run_id?: number | null;
   external_id?: string | null;
   title: string;
   company?: string | null;
@@ -106,6 +186,12 @@ export interface Role {
   source?: string | null;
   fit_rank?: number | null;
   ai_analysis?: string | null;
+  /** The final judge's grade. Null on rows judged before it existed. */
+  verdict?: RoleVerdict | null;
+  /** Facts the judge read off the listing. Null where the listing was silent. */
+  work_style?: string | null;
+  seniority_level?: string | null;
+  deadline_text?: string | null;
   status: RoleStatus;
   application_status?: ApplicationStatus | null;
   applied_at?: string | null;

@@ -20,6 +20,7 @@ import random
 import re
 import sqlite3
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -1355,9 +1356,15 @@ def init_db():
             cache_key TEXT PRIMARY KEY,
             keep INTEGER,
             reason TEXT,
+            requirements_json TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Additive migration for gate_cache rows created before key_requirements
+    # extraction existed (see screen_gate/screen_v5).
+    gate_cache_cols = {r["name"] for r in conn.execute("PRAGMA table_info(gate_cache)")}
+    if "requirements_json" not in gate_cache_cols:
+        conn.execute("ALTER TABLE gate_cache ADD COLUMN requirements_json TEXT")
     conn.commit()
     conn.close()
     emit("[db] Tables ready and schema initialized.")
@@ -1757,6 +1764,8 @@ def _profile_signature(profile: dict) -> str:
         "key_skills": sorted(s.lower() for s in (profile.get("key_skills") or [])),
         "search_terms": sorted(s.lower() for s in (profile.get("search_terms") or [])),
         "requirements": sorted(r.lower() for r in (profile.get("requirements") or [])),
+        "avoid": sorted(a.lower() for a in (profile.get("avoid") or [])),
+        "must_have": sorted(m.lower() for m in (profile.get("must_have") or [])),
     }, sort_keys=True)
     return hashlib.sha1(basis.encode()).hexdigest()[:12]
 
@@ -1770,31 +1779,36 @@ def _gate_cache_key(gate: str, sig: str, job_id: str) -> str:
     return hashlib.sha1(f"{gate}|{sig}|{job_id}".encode()).hexdigest()
 
 
-def _gate_cache_lookup(keys: list[str]) -> dict[str, tuple[bool, str]]:
+def _gate_cache_lookup(keys: list[str]) -> dict[str, tuple[bool, str, str | None]]:
+    """Third tuple element is requirements_json (screen_gate's key_requirements,
+    JSON-encoded) -- None for every other gate, which never writes it."""
     if not keys:
         return {}
     conn = get_db()
-    out: dict[str, tuple[bool, str]] = {}
+    out: dict[str, tuple[bool, str, str | None]] = {}
     # SQLite caps variables per statement; chunk to stay well under it.
     for i in range(0, len(keys), 400):
         chunk = keys[i:i + 400]
         placeholders = ",".join("?" * len(chunk))
         for r in conn.execute(
-            f"SELECT cache_key, keep, reason FROM gate_cache WHERE cache_key IN ({placeholders})",
+            f"SELECT cache_key, keep, reason, requirements_json FROM gate_cache "
+            f"WHERE cache_key IN ({placeholders})",
             chunk,
         ).fetchall():
-            out[r["cache_key"]] = (bool(r["keep"]), r["reason"] or "")
+            out[r["cache_key"]] = (bool(r["keep"]), r["reason"] or "", r["requirements_json"])
     conn.close()
     return out
 
 
-def _gate_cache_store(entries: list[tuple[str, bool, str]]) -> None:
+def _gate_cache_store(entries: list[tuple[str, bool, str, str | None]]) -> None:
+    """Fourth element is requirements_json (screen_gate only) -- pass None from
+    every other gate."""
     if not entries:
         return
     conn = get_db()
     conn.executemany(
-        "INSERT OR REPLACE INTO gate_cache(cache_key, keep, reason) VALUES(?,?,?)",
-        [(k, 1 if keep else 0, reason) for (k, keep, reason) in entries],
+        "INSERT OR REPLACE INTO gate_cache(cache_key, keep, reason, requirements_json) VALUES(?,?,?,?)",
+        [(k, 1 if keep else 0, reason, req_json) for (k, keep, reason, req_json) in entries],
     )
     conn.commit()
     conn.close()
@@ -1815,14 +1829,14 @@ def _run_gate(gate: str, candidates: list[dict], profile: dict,
     to_judge: list[tuple[int, dict]] = []   # (original index, job) needing an LLM call
     for c, key in zip(candidates, keys):
         if key in cached:
-            keep, _reason = cached[key]
+            keep, _reason, _req_json = cached[key]
             if keep:
                 kept.append(c)
         else:
             to_judge.append((c, key))
 
     n_cached = len(candidates) - len(to_judge)
-    new_entries: list[tuple[str, bool, str]] = []
+    new_entries: list[tuple[str, bool, str, str | None]] = []
     for start in range(0, len(to_judge), _GATE_BATCH):
         batch = to_judge[start:start + _GATE_BATCH]
         listing_block = "\n".join(
@@ -1844,7 +1858,7 @@ def _run_gate(gate: str, candidates: list[dict], profile: dict,
 
         for i, (c, key) in enumerate(batch):
             keep, reason = decisions.get(i + 1, (True, "missing_decision"))
-            new_entries.append((key, keep, reason))
+            new_entries.append((key, keep, reason, None))
             if keep:
                 kept.append(c)
 
@@ -1912,25 +1926,56 @@ def seniority_gate(candidates: list[dict], profile: dict) -> list[dict]:
 _SENIORITY_BAD_CODES = ("seniority_high", "seniority_low", "too_many_gaps")
 
 
-def _annotate_with_weight_tiers(values: list[str], tiers: dict[str, str] | None) -> str:
+def _annotate_with_weight_tiers(
+    values: list[str], tiers: dict[str, str] | None, evidence_tiers: dict[str, str] | None = None
+) -> str:
     """Comma-joined list, appending each value's feedback-weight priority tier
     (from tick/cross history on past results, see snapshot.py's _weight_tier)
-    when it's non-neutral -- so the cheap gate/rank models get some signal from
-    the candidate's own feedback, not just a flat attribute list. Values with no
-    tier (neutral weight) are rendered plain."""
+    and, when given, its weak-evidence tier (see snapshot.py's _evidence_tier --
+    shallow proficiency and/or non-commercial evidence_origin) -- so the cheap
+    gate/rank models get some signal both from the candidate's own feedback and
+    from how their evidence for a skill was earned, not just a flat attribute
+    list. Values with neither annotation are rendered plain."""
     if not values:
         return "n/a"
     tiers = tiers or {}
-    return ", ".join(f"{v} ({tiers[v]})" if v in tiers else v for v in values)
+    evidence_tiers = evidence_tiers or {}
+    parts = []
+    for v in values:
+        labels = [t for t in (tiers.get(v), evidence_tiers.get(v)) if t]
+        parts.append(f"{v} ({'; '.join(labels)})" if labels else v)
+    return ", ".join(parts)
 
 
 def _screen_prompt(profile: dict, listing_block: str) -> str:
-    reqs = profile.get("requirements") or []
+    # The candidate's own requirement chips reach this prompt in two groups (see
+    # snapshot.build_snapshot): the ones they marked Hard drive the unconditional
+    # hard_gate_ok drop, the ones they marked Soft are folded into the
+    # candidate-specific requirements axis, which is soft. Only the wording
+    # differs here -- the actual drop/demote decision is engine.py's.
+    reqs = list(profile.get("requirements") or [])
+    for m in profile.get("soft_must_have") or []:
+        reqs.append(f"Prefers a role that offers: {m} (a preference, not a hard requirement)")
+    for a in profile.get("soft_avoid") or []:
+        reqs.append(f"Would rather avoid: {a} (a preference, not a hard exclusion)")
     req_block = "\n".join(f"- {r}" for r in reqs) if reqs else "None stated."
     salary_floor = profile.get("salary_floor") or 0
     salary_line = (f"Candidate stated salary floor: {salary_floor}"
                    if salary_floor else "Candidate stated salary floor: none stated.")
-    return f"""You are screening job listings for ONE candidate. For EACH listing judge SIX things independently.
+    avoids = profile.get("avoid") or []
+    must_haves = profile.get("must_have") or []
+    avoid_block = ", ".join(avoids) if avoids else "none stated"
+    must_block = ", ".join(must_haves) if must_haves else "none stated"
+    # Axes the candidate promoted to non-negotiable. The model still judges each
+    # axis the same way (a CLEAR mismatch only) -- this just tells it the stakes,
+    # so it doesn't wave through a borderline case on an axis the caller is about
+    # to hard-drop on. See snapshot._hard_axes / engine._hard_enforced_axes.
+    hard_axes = set(profile.get("hard_axes") or [])
+    def _strict(axis: str) -> str:
+        return (" The candidate has marked this NON-NEGOTIABLE: a clear mismatch here removes the "
+                "role outright, so judge it carefully -- but still only say false on a CLEAR "
+                "mismatch, never on silence or ambiguity." if axis in hard_axes else "")
+    return f"""You are screening job listings for ONE candidate. For EACH listing judge SEVEN things independently.
 
 SECTOR/DOMAIN FIT
 Candidate target sectors/domains: {', '.join(profile.get('sectors') or []) or 'n/a'}
@@ -1938,22 +1983,42 @@ Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms')
 - sector_ok=true if the role is in one of these sectors/domains, or clearly adjacent.
 - sector_ok=false only if it is CLEARLY in an unrelated field. When unsure or genuinely
   ambiguous, sector_ok=true.
-(This is the only axis below that acts as an unconditional hard drop -- the other five are
-judged independently and the caller decides how many failures a listing can tolerate.)
+(This axis, together with CANDIDATE HARD FILTERS below, acts as an unconditional hard drop -- the
+other five are judged independently and the caller decides how many failures a listing can tolerate.)
+
+CANDIDATE HARD FILTERS (the candidate's OWN stated non-negotiables)
+Will REJECT a role that involves any of (avoid): {avoid_block}
+REQUIRES a role to satisfy all of (must-have): {must_block}
+- hard_gate_ok=false only if the listing CLEARLY involves one of the avoid items, OR clearly
+  contradicts / cannot satisfy one of the must-have items (e.g. a must-have of "fully remote" but
+  the listing is plainly on-site with no remote option). When the listing is silent on the point or
+  it is genuinely ambiguous, hard_gate_ok=true -- do NOT drop on absence of confirmation. If both
+  lists are "none stated", hard_gate_ok=true always.
 
 SENIORITY / EXPERIENCE / HARD REQUIREMENTS
 Candidate seniority: {profile.get('seniority', 'mid-level')}
-Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'))}
+Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'), profile.get('skill_evidence_tiers'))}
 (Stated multi-year durations are stronger evidence than brief/undated mentions. A target role or skill
 tagged "strongly preferred"/"preferred" reflects the candidate's own past tick feedback -- weigh sector fit
 a little more favorably toward it. One tagged "deprioritize"/"lower priority" reflects past cross feedback
--- don't let it alone satisfy a hard requirement or sector match.)
+-- don't let it alone satisfy a hard requirement or sector match. A skill tagged "familiar evidence only",
+"one-time evidence only", "self-directed evidence only", "academic evidence only", or "ai-assisted evidence
+only" means the candidate's evidence for it is shallow and/or not from paid/commercial work -- don't let it
+alone satisfy a requirement that clearly expects professional/production-level competency.)
 - seniority_ok=false if the listing clearly implies a seniority level well ABOVE or well
   BELOW the candidate (e.g. Director/VP/Head/Principal for a mid-level candidate, or
   Intern/Graduate/Entry for a senior candidate), OR if it states a minimum years-of-experience
   requirement (e.g. "3+ years") that the candidate's stated background clearly doesn't meet, OR
   if it states more than {MAX_MUST_HAVE_GAPS} hard must-have requirements the candidate clearly lacks.
-- otherwise seniority_ok=true. When unsure or genuinely ambiguous, seniority_ok=true.
+- A stated salary/pay figure is also a real signal of the listing's TRUE seniority band, often
+  more reliable than the title -- a title can be inflated or watered down, a number the employer
+  is actually paying usually can't. If the listing states a salary, weigh it alongside the title
+  and description: a rate that reads as clearly entry-level pay for the sector/region points to a
+  junior/graduate role even under a fancier title, and a rate that reads as clearly senior pay
+  points to a more senior role even under a modest-sounding title. Use ordinary judgement for the
+  sector/region/currency shown -- there is no fixed number, it varies by country and field. Don't
+  invent a mismatch from salary alone when the figure is genuinely ambiguous or absent.
+- otherwise seniority_ok=true. When unsure or genuinely ambiguous, seniority_ok=true.{_strict("_seniority_ok")}
 
 CANDIDATE-SPECIFIC REQUIREMENTS
 {req_block}
@@ -1964,7 +2029,7 @@ CANDIDATE-SPECIFIC REQUIREMENTS
   those here.
 
 CORE SKILLS OVERLAP
-Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'))}
+Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'), profile.get('skill_evidence_tiers'))}
 - skills_ok=false only if the listing's stated requirements clearly share almost NONE of the
   candidate's core skills (a fundamentally different toolset/discipline), not merely a partial
   overlap or a skill or two missing. When unsure or genuinely ambiguous, skills_ok=true.
@@ -1973,18 +2038,33 @@ SALARY FIT
 {salary_line}
 - salary_ok=false only if the listing states a salary/range and it is CLEARLY below the
   candidate's stated floor. If the listing states no salary, or the candidate has no stated
-  floor, or the ranges could plausibly overlap, salary_ok=true.
+  floor, or the ranges could plausibly overlap, salary_ok=true.{_strict("_salary_ok")}
 
 WORK ARRANGEMENT
-- work_arrangement_ok=false only if the candidate's own requirements/preferences above clearly
-  state a remote/hybrid/onsite requirement AND the listing clearly states a conflicting
-  arrangement. If neither side states a clear preference, or they could match,
-  work_arrangement_ok=true.
+Candidate stated work-type preference: {', '.join(profile.get('work_types') or []) or 'none stated'}
+Candidate location: {profile.get('location') or 'n/a'}
+- First classify the LISTING's own work arrangement as remote, hybrid, or on-site: if it explicitly
+  says remote/distributed/work-from-home, it's remote; if it explicitly says hybrid, it's hybrid;
+  otherwise -- including when it states a specific city/office location and simply doesn't mention
+  remote/hybrid/work-from-home at all -- treat it as on-site at that location. Don't default an
+  unlabeled listing to remote just because remote wasn't ruled out.
+- work_arrangement_ok=false only if the candidate stated a work-type preference above AND the
+  listing's classified arrangement clearly conflicts with it (e.g. candidate wants remote-only and
+  the listing is on-site with no remote mention). If the candidate stated no preference, or the
+  listing's arrangement could match, work_arrangement_ok=true.{_strict("_work_arrangement_ok")}
+
+KEY REQUIREMENTS (context for the final judge -- not a filter here)
+Also extract up to 4 of the listing's most important, CONCRETE requirements (a specific tool,
+technology, certification, or a stated years/type-of-experience bar) as "key_requirements". For
+each: "necessity" is "required" if the listing states or clearly implies it's mandatory, else
+"nice_to_have"; "professional_level_expected" is true only if the listing's own wording implies
+real-world/production/paid-level competency is expected for it (not just familiarity or exposure).
+Omit the list entirely if the listing states no concrete requirements worth flagging.
 
 reason: short code for the MOST significant failure (or "ok" if all pass) -- "ok" |
 "seniority_high" | "seniority_low" | "too_many_gaps" | "requirement_gap" | "skills_gap" |
-"salary_mismatch" | "arrangement_mismatch" | "off_sector".
-Output ONLY JSON: {{"decisions":[{{"n":1,"sector_ok":true,"seniority_ok":true,"requirements_ok":true,"skills_ok":true,"salary_ok":true,"work_arrangement_ok":true,"reason":"ok"}}]}}
+"salary_mismatch" | "arrangement_mismatch" | "off_sector" | "hard_filter".
+Output ONLY JSON: {{"decisions":[{{"n":1,"sector_ok":true,"hard_gate_ok":true,"seniority_ok":true,"requirements_ok":true,"skills_ok":true,"salary_ok":true,"work_arrangement_ok":true,"reason":"ok","key_requirements":[{{"item":"SQL","necessity":"required","professional_level_expected":true}}]}}]}}
 Include one object per listing, numbered exactly as shown.
 
 Listings:
@@ -1995,58 +2075,120 @@ _REQUIREMENTS_BAD_CODE = "requirement_gap"
 _SKILLS_BAD_CODE = "skills_gap"
 _SALARY_BAD_CODE = "salary_mismatch"
 _WORK_ARRANGEMENT_BAD_CODE = "arrangement_mismatch"
-# Soft axes (everything except sector_ok, which stays the sole unconditional
-# hard drop) -- a listing failing 2 or more of these is hard-dropped rather
-# than merely demoted. Kept as a tuple of attribute names so engine.py's gate
-# loop and this module agree on exactly what counts without duplicating the
-# list.
+_HARD_GATE_BAD_CODE = "hard_filter"
+# Soft axes (everything except sector_ok AND hard_gate_ok, which are the two
+# unconditional hard drops) -- a listing failing 2 or more of these is
+# hard-dropped rather than merely demoted. Kept as a tuple of attribute names so
+# engine.py's gate loop and this module agree on exactly what counts without
+# duplicating the list. hard_gate_ok (the candidate's own avoid/must-have
+# non-negotiables) is deliberately NOT here: like sector_ok it drops
+# unconditionally in engine.py, not on a 2-failure threshold.
 SOFT_GATE_AXES = ("_seniority_ok", "_requirements_ok", "_skills_ok", "_salary_ok",
                    "_work_arrangement_ok")
 
 
+def dynamic_hard_drop_threshold(soft_fail_counts: list[int]) -> int:
+    """Given each in-sector candidate's soft-axis failure count for one gate
+    round, decide how many failures should hard-drop a listing. Fixed at 2+
+    normally (two independent LLM signals agreeing on a mismatch), but when
+    over half the round is sailing through every axis clean, that's a sign the
+    round is thin on real mismatches rather than that everyone genuinely fits
+    -- tighten to 1+ so a single confirmed mismatch is enough, instead of
+    waiting for a second signal that a lax round is unlikely to produce.
+    Shared by screen_gate's own diagnostic log and engine.py's actual
+    hard-drop decision so the two can't disagree on what "hard-dropped" means."""
+    if not soft_fail_counts:
+        return 2
+    clean = sum(1 for n in soft_fail_counts if n == 0)
+    return 1 if clean / len(soft_fail_counts) > 0.5 else 2
+
+
+def _sanitize_key_requirements(raw) -> list[dict]:
+    """Validate/cap the cheap model's key_requirements output (see _screen_prompt)
+    -- at most 4 concrete requirement items, each normalised to a fixed shape, so
+    a malformed or oversized response can't corrupt gate_cache or blow up the
+    final-eval hint text."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for r in raw[:4]:
+        if not isinstance(r, dict):
+            continue
+        item = str(r.get("item", "")).strip()
+        if not item:
+            continue
+        necessity = "required" if str(r.get("necessity", "")).lower() == "required" else "nice_to_have"
+        out.append({
+            "item": item[:60],
+            "necessity": necessity,
+            "professional_level_expected": bool(r.get("professional_level_expected", False)),
+        })
+    return out
+
+
 def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
-    """Merged sector+seniority+requirements+skills+salary+work-arrangement screen
-    (cheap model, temperature 0) that replaces the two separate gate calls in the
+    """Merged sector+hard-filter+seniority+requirements+skills+salary+work-arrangement
+    screen (cheap model, temperature 0) that replaces the two separate gate calls in the
     backend path. Unlike sector_gate/seniority_gate it does NOT filter -- it
-    ANNOTATES every candidate in place with `_sector_ok` plus the 5 SOFT_GATE_AXES
-    booleans and `_gate_reason`, and returns the full list. The backend hard-drops
-    off-sector jobs unconditionally; the 5 soft axes are individually informational,
-    but engine.py hard-drops a job that fails 2 or more of them (see engine.py's
-    gate loop) rather than merely demoting it, since two independent LLM signals
-    agreeing on a clear mismatch is confident enough to skip rank_gate/the judge.
+    ANNOTATES every candidate in place with `_sector_ok` and `_hard_gate_ok` plus
+    the 5 SOFT_GATE_AXES
+    booleans, `_gate_reason`, and `_key_requirements`, and returns the full list.
+    The backend hard-drops off-sector jobs unconditionally, and likewise any job
+    failing `_hard_gate_ok` (the candidate's own avoid/must-have non-negotiables);
+    the 5 soft axes are
+    individually informational, but engine.py hard-drops a job that fails 2 or
+    more of them (see engine.py's gate loop) rather than merely demoting it,
+    since two independent LLM signals agreeing on a clear mismatch is confident
+    enough to skip rank_gate/the judge.
 
     Cached per (profile signature, job id) in the shared gate_cache under
-    gate="screen_v3" (bumped from "screen_v2" when skills_ok/salary_ok/
-    work_arrangement_ok were added). `keep` column stores sector_ok; `reason`
-    stores "{seniority_code}|{requirements_code}|{skills_code}|{salary_code}|
-    {arrangement_code}" -- gate_cache has no dedicated column per axis, so this
-    keeps reusing the existing reason-text column, just packing 5 codes instead
-    of 2."""
+    gate="screen_v6" (bumped from "screen_v5" when the packed reason gained a 6th
+    code for the hard-filter axis -- old v5 rows carry no such verdict and must
+    not be reused as if they had passed it; "screen_v5" itself was the bump for
+    the capped key_requirements breakdown per listing -- necessity
+    (required/nice_to_have) and whether professional-level evidence is expected).
+    `keep` column stores sector_ok; `reason` stores
+    "{seniority_code}|{requirements_code}|{skills_code}|{salary_code}|
+    {arrangement_code}|{hard_filter_code}" -- gate_cache has no dedicated column
+    per axis, so this
+    keeps reusing the existing reason-text column, just packing 6 codes instead
+    of 2. `requirements_json` stores the JSON-encoded key_requirements list (or
+    NULL when the listing had none worth flagging).
+
+    Note the candidate's avoid/must_have values are part of _profile_signature, so
+    editing either naturally misses the cache and re-screens every job."""
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    keys = [_gate_cache_key("screen_v3", sig, _gate_job_id(c)) for c in candidates]
+    # screen_v6 (from screen_v5): the packed reason now carries a 6th code for the
+    # candidate's own hard-filter axis (avoid/must-have) -- old v5 rows have no
+    # such data, so they must not be reused as if they passed it.
+    keys = [_gate_cache_key("screen_v6", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
     for c, key in zip(candidates, keys):
         if key in cached:
-            sector_ok, packed_reason = cached[key]
-            seniority_code, req_code, skills_code, salary_code, arr_code = (
-                list(packed_reason.split("|", 4)) + ["ok"] * 5
-            )[:5]
+            sector_ok, packed_reason, req_json = cached[key]
+            (seniority_code, req_code, skills_code, salary_code, arr_code,
+             hard_code) = (list(packed_reason.split("|")) + ["ok"] * 6)[:6]
             c["_sector_ok"] = sector_ok
             c["_seniority_ok"] = seniority_code not in _SENIORITY_BAD_CODES
             c["_requirements_ok"] = (req_code or "ok") != _REQUIREMENTS_BAD_CODE
             c["_skills_ok"] = (skills_code or "ok") != _SKILLS_BAD_CODE
             c["_salary_ok"] = (salary_code or "ok") != _SALARY_BAD_CODE
             c["_work_arrangement_ok"] = (arr_code or "ok") != _WORK_ARRANGEMENT_BAD_CODE
+            c["_hard_gate_ok"] = (hard_code or "ok") != _HARD_GATE_BAD_CODE
             c["_gate_reason"] = packed_reason
+            try:
+                c["_key_requirements"] = json.loads(req_json) if req_json else []
+            except (TypeError, ValueError):
+                c["_key_requirements"] = []
         else:
             to_judge.append((c, key))
 
     n_cached = len(candidates) - len(to_judge)
-    new_entries: list[tuple[str, bool, str]] = []
+    new_entries: list[tuple[str, bool, str, str | None]] = []
     for start in range(0, len(to_judge), _GATE_BATCH):
         batch = to_judge[start:start + _GATE_BATCH]
         listing_block = "\n".join(
@@ -2056,32 +2198,37 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             for i, (c, _k) in enumerate(batch)
         )
         prompt = _screen_prompt(profile, listing_block)
-        decisions: dict[int, tuple[bool, bool, bool, bool, bool, bool, str]] = {}
+        decisions: dict[int, tuple[bool, bool, bool, bool, bool, bool, bool, str]] = {}
+        key_reqs_by_n: dict[int, list[dict]] = {}
         try:
             raw = llm(prompt, require_json=True, temperature=0,
-                      system="You screen job listings for sector, seniority, requirements, "
-                             "skills, salary, and work-arrangement fit. Be inclusive when unsure.")
+                      system="You screen job listings for sector, the candidate's own hard filters, "
+                             "seniority, requirements, skills, salary, and work-arrangement fit. "
+                             "Be inclusive when unsure.")
             for d in json.loads(clean_json(raw)).get("decisions", []):
                 n = d.get("n")
                 if isinstance(n, int):
                     decisions[n] = (bool(d.get("sector_ok", True)),
+                                    bool(d.get("hard_gate_ok", True)),
                                     bool(d.get("seniority_ok", True)),
                                     bool(d.get("requirements_ok", True)),
                                     bool(d.get("skills_ok", True)),
                                     bool(d.get("salary_ok", True)),
                                     bool(d.get("work_arrangement_ok", True)),
                                     str(d.get("reason", "ok")))
+                    key_reqs_by_n[n] = _sanitize_key_requirements(d.get("key_requirements"))
         except Exception as e:
             emit(f"[gate:screen] batch parse failed ({e}); keeping batch (fail-open).")
-            decisions = {i + 1: (True, True, True, True, True, True, "gate_error")
+            decisions = {i + 1: (True, True, True, True, True, True, True, "gate_error")
                          for i in range(len(batch))}
 
         for i, (c, key) in enumerate(batch):
-            (sector_ok, seniority_ok, requirements_ok, skills_ok, salary_ok,
+            (sector_ok, hard_gate_ok, seniority_ok, requirements_ok, skills_ok, salary_ok,
              work_arrangement_ok, reason) = decisions.get(
-                i + 1, (True, True, True, True, True, True, "missing_decision")
+                i + 1, (True, True, True, True, True, True, True, "missing_decision")
             )
             c["_sector_ok"] = sector_ok
+            c["_hard_gate_ok"] = hard_gate_ok
             c["_seniority_ok"] = seniority_ok
             c["_requirements_ok"] = requirements_ok
             c["_skills_ok"] = skills_ok
@@ -2101,9 +2248,12 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             skills_code = "ok" if skills_ok else _SKILLS_BAD_CODE
             salary_code = "ok" if salary_ok else _SALARY_BAD_CODE
             arr_code = "ok" if work_arrangement_ok else _WORK_ARRANGEMENT_BAD_CODE
-            packed_reason = f"{seniority_code}|{req_code}|{skills_code}|{salary_code}|{arr_code}"
+            hard_code = "ok" if hard_gate_ok else _HARD_GATE_BAD_CODE
+            packed_reason = f"{seniority_code}|{req_code}|{skills_code}|{salary_code}|{arr_code}|{hard_code}"
             c["_gate_reason"] = packed_reason
-            new_entries.append((key, sector_ok, packed_reason))
+            key_reqs = key_reqs_by_n.get(i + 1, [])
+            c["_key_requirements"] = key_reqs
+            new_entries.append((key, sector_ok, packed_reason, json.dumps(key_reqs) if key_reqs else None))
 
     _gate_cache_store(new_entries)
     in_sector = sum(1 for c in candidates if c.get("_sector_ok"))
@@ -2112,9 +2262,10 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
         for c in candidates if c.get("_sector_ok")
     ]
     all_soft_ok = sum(1 for n in soft_fail_counts if n == 0)
-    hard_dropped = sum(1 for n in soft_fail_counts if n >= 2)
+    threshold = dynamic_hard_drop_threshold(soft_fail_counts)
+    hard_dropped = sum(1 for n in soft_fail_counts if n >= threshold)
     emit(f"[gate:screen] {len(candidates)} in -> {in_sector} in-sector, "
-         f"{all_soft_ok} pass all soft axes, {hard_dropped} hard-dropped (2+ soft-axis "
+         f"{all_soft_ok} pass all soft axes, {hard_dropped} hard-dropped ({threshold}+ soft-axis "
          f"failures) ({n_cached} from cache)")
     return candidates
 
@@ -2140,7 +2291,7 @@ def _rank_prompt(profile: dict, listing_block: str) -> str:
 Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms') or [], profile.get('target_role_weight_tiers'))}
 Candidate target sectors/domains: {', '.join(profile.get('sectors') or []) or 'n/a'}
 Candidate seniority: {profile.get('seniority', 'mid-level')}
-Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'))}
+Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'), profile.get('skill_evidence_tiers'))}
 {multi_note}
 For EACH listing, give a fit_score from 0 (clearly wrong fit) to 100 (excellent fit) for how well the
 role, seniority, and sector align with the candidate. Judge relatively across the whole batch -- spread
@@ -2185,7 +2336,7 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     to_judge: list[tuple[dict, str]] = []
     for c, key in zip(candidates, keys):
         if key in cached:
-            _keep, reason = cached[key]
+            _keep, reason, _req_json = cached[key]
             try:
                 c["_rank_score"] = float(reason)
             except (TypeError, ValueError):
@@ -2194,7 +2345,7 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
             to_judge.append((c, key))
 
     n_cached = len(candidates) - len(to_judge)
-    new_entries: list[tuple[str, bool, str]] = []
+    new_entries: list[tuple[str, bool, str, str | None]] = []
     for start in range(0, len(to_judge), _GATE_BATCH):
         batch = to_judge[start:start + _GATE_BATCH]
         listing_block = "\n".join(
@@ -2210,28 +2361,90 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
         # job scored a flat neutral 50.0, i.e. no real ranking signal at all)
         # until this was added.
         rank_temperature = 1 if MID_MODEL in _FIXED_TEMPERATURE_MODELS else 0
+        rank_system = ("You estimate rough candidate-job fit scores. Spread scores out; "
+                        "don't cluster everything near one value.")
+
+        raw = None
         try:
             raw = llm(prompt, require_json=True, temperature=rank_temperature, model=MID_MODEL,
-                      system="You estimate rough candidate-job fit scores. Spread scores out; "
-                             "don't cluster everything near one value.")
-            for d in json.loads(clean_json(raw)).get("scores", []):
-                n = d.get("n")
-                if isinstance(n, int):
-                    try:
-                        scores[n] = max(0.0, min(100.0, float(d.get("fit_score", 50))))
-                    except (TypeError, ValueError):
-                        scores[n] = 50.0
+                      system=rank_system)
         except Exception as e:
-            emit(f"[gate:rank] batch parse failed ({e}); scoring batch as neutral (fail-open).")
-            scores = {i + 1: 50.0 for i in range(len(batch))}
+            status = getattr(e, "status_code", None)
+            resp = getattr(e, "response", None)
+            req_id = resp.headers.get("x-request-id") if resp is not None else None
+            retry_after = resp.headers.get("retry-after") if resp is not None else None
+            try:
+                wait = float(retry_after) if retry_after else 2.0
+            except (TypeError, ValueError):
+                wait = 2.0
+            # A permission-flavored error on MID_MODEL that only hits some batches
+            # (not every call) looks like a burst/short-window cap rather than a
+            # persistent per-key model restriction -- retry the SAME model once
+            # after a short pause before falling back, since a burst cap should
+            # clear within a second or two while a real scoping error wouldn't.
+            emit(f"[gate:rank] {MID_MODEL} call failed (status={status}, "
+                 f"request_id={req_id}, retry_after={retry_after}): {e}; "
+                 f"retrying same model after {wait}s.")
+            time.sleep(wait)
+            try:
+                raw = llm(prompt, require_json=True, temperature=rank_temperature, model=MID_MODEL,
+                          system=rank_system)
+            except Exception as e2:
+                status2 = getattr(e2, "status_code", None)
+                emit(f"[gate:rank] {MID_MODEL} retry also failed (status={status2}): {e2}; "
+                     f"falling back to {CHEAP_MODEL}.")
+                try:
+                    raw = llm(prompt, require_json=True, temperature=0, model=CHEAP_MODEL,
+                              system=rank_system)
+                except Exception as e3:
+                    emit(f"[gate:rank] {CHEAP_MODEL} fallback also failed ({e3}); "
+                         f"no rank signal for this batch.")
+                    raw = None
+
+        batch_failed = raw is None
+        if raw is not None:
+            try:
+                for d in json.loads(clean_json(raw)).get("scores", []):
+                    n = d.get("n")
+                    if isinstance(n, int):
+                        try:
+                            scores[n] = max(0.0, min(100.0, float(d.get("fit_score", 50))))
+                        except (TypeError, ValueError):
+                            scores[n] = 50.0
+            except Exception as e4:
+                emit(f"[gate:rank] batch response parse failed ({e4}); no rank signal for this batch.")
+                batch_failed = True
+
+        if batch_failed:
+            emit(f"[gate:rank] no rank signal for {len(batch)} candidate(s) in this batch -- "
+                 f"fail-open (bypassing RANK_REJECT_SCORE_FLOOR).")
 
         for i, (c, key) in enumerate(batch):
-            score = scores.get(i + 1, 50.0)
-            c["_rank_score"] = score
-            new_entries.append((key, True, str(score)))
+            if batch_failed:
+                # Cosmetic placeholder only -- _rank_gate_failed (not this score) is
+                # what engine.py's floor check actually keys off of. Not cached: a
+                # failure that isn't fully understood yet should retry fresh next
+                # run instead of permanently poisoning gate_cache with no signal.
+                c["_rank_score"] = 50.0
+                c["_rank_gate_failed"] = True
+            else:
+                score = scores.get(i + 1, 50.0)
+                c["_rank_score"] = score
+                new_entries.append((key, True, str(score), None))
 
     _gate_cache_store(new_entries)
-    emit(f"[gate:rank] scored {len(candidates)} candidates ({n_cached} from cache)")
+    # Score-distribution diagnostic: a rank stage that never rejects anything
+    # is indistinguishable from a healthy one in the old "(N from cache)"-only
+    # log line -- this surfaces the actual spread so a run where the mid-tier
+    # model is clustering everything above the reject floor is visible without
+    # having to separately query gate_cache.
+    all_scores = [c.get("_rank_score", 50.0) for c in candidates]
+    n_failed = sum(1 for c in candidates if c.get("_rank_gate_failed"))
+    if all_scores:
+        emit(f"[gate:rank] scored {len(candidates)} candidates ({n_cached} from cache, "
+             f"{n_failed} fail-open/no-signal) -- "
+             f"min={min(all_scores):.0f} max={max(all_scores):.0f} "
+             f"avg={sum(all_scores)/len(all_scores):.0f}")
     return candidates
 
 
@@ -2593,7 +2806,20 @@ async def expand_category_pages(
             if not result or not result.success:
                 emit(f"   [category_expand] {url} -> fetch reported failure, 0 links available")
                 return
-            links = list(getattr(getattr(result, "links", None), "internal", None) or [])
+            # crawl4ai classifies internal/external by comparing each <a href>'s
+            # netloc against the page's FINAL resolved URL, not the requested
+            # `url` above -- a bare-domain-to-www (or http-to-https) redirect on
+            # the category page can put every real posting link into `external`
+            # instead of `internal`, which a fetch-succeeded 0-internal-links
+            # result can't distinguish from "the page genuinely has no links yet"
+            # (e.g. not-yet-hydrated JS). Pull both lists and let
+            # _posting_link_reject_reason's own _same_or_related_host check
+            # (which already tolerates a subdomain relationship) do the actual
+            # host filtering, rather than trusting crawl4ai's split.
+            links_obj = getattr(result, "links", None)
+            internal_links = list(getattr(links_obj, "internal", None) or [])
+            external_links = list(getattr(links_obj, "external", None) or [])
+            links = internal_links + external_links
             from collections import Counter
             reject_reasons: Counter = Counter()
             kept, seen_urls = 0, set()
@@ -2619,7 +2845,8 @@ async def expand_category_pages(
             if kept:
                 emit(f"   [category_expand] {url} -> {kept} individual posting(s) extracted")
             else:
-                emit(f"   [category_expand] {url} -> 0 kept; raw internal links={len(links)}, "
+                emit(f"   [category_expand] {url} -> 0 kept; raw links={len(links)} "
+                     f"(internal={len(internal_links)}, external={len(external_links)}), "
                      f"rejected breakdown={dict(reject_reasons)}")
 
     try:
@@ -2641,7 +2868,7 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
-FINAL_EVAL_PROMPT_VERSION = 5
+FINAL_EVAL_PROMPT_VERSION = 9
 
 _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job states an explicit experience/seniority requirement
    (years of experience, "senior"/"lead"/"principal" in the title, or prior experience in a specific
@@ -2650,17 +2877,28 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    the role unless the candidate's transferable experience genuinely closes the gap. If the requirement
    is soft, negotiable, or not stated, judge fit on skills/interests as normal - don't invent a
    seniority objection that isn't in the text.
+   A stated salary/pay figure is a real signal of the role's TRUE seniority band and often more
+   trustworthy than the title itself (titles get inflated or watered down; what an employer is
+   actually paying usually doesn't). Weigh it alongside the title/description when judging the real
+   bar in axis A below -- ordinary judgement for the sector/region/currency shown, not a fixed
+   number, and never a disqualifier from salary alone when the figure is ambiguous or absent.
    If the job specifically requires COMMERCIAL, PROFESSIONAL, or PAID employment experience (e.g. "1-2
    years commercial software development experience"), personal projects, academic coursework,
    hackathons, and other unpaid/self-initiated work do NOT satisfy it, even if they demonstrate real
    skill - treat that as a genuine gap unless the candidate has actual paid/commercial evidence closing
    it. The candidate's background profile marks an unpaid/self-initiated past role explicitly as
-   "(Informal)" - use that tag to tell commercial from non-commercial evidence rather than assuming.
+   "(Informal)", and a self-directed/academic/AI-assisted skill explicitly with an origin tag like
+   "(Self-directed)", "(Academic)", or "(AI-assisted)" next to it (see EVIDENCE STRENGTH below) - use
+   those tags to tell commercial from non-commercial evidence rather than assuming.
 
-2. LOCATION/VISA/RELOCATION: If the role's location (or an explicit on-site/relocation/visa/work-
+2. LOCATION/VISA/RELOCATION: First classify the listing's own work arrangement: if it explicitly says
+   remote/distributed/work-from-home, treat it as remote; if it explicitly says hybrid, treat it as
+   hybrid; otherwise -- including when it states a specific city/office location and simply doesn't
+   mention remote/hybrid/work-from-home at all -- treat it as on-site at that location, not remote.
+   If the role's location under that classification (or an explicit on-site/relocation/visa/work-
    authorization requirement in the text) clearly puts it outside where the candidate can realistically
-   work, exclude it. If location is remote, unstated, or plainly compatible with the candidate's
-   location above, do not raise a location objection.
+   work, exclude it. If location is remote, or plainly compatible with the candidate's location above,
+   do not raise a location objection.
    If the listing's own location/eligibility signals are internally contradictory (e.g. a "compatible
    timezone" framing alongside an explicit country-selector or eligibility list that excludes the
    candidate's country), do not silently resolve the contradiction either way - keep the role but add a
@@ -2717,7 +2955,15 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    certification/license, or a named tool/technology stated as mandatory (not "nice to have") - and the
    candidate's profile shows no evidence of it, treat this as disqualifying. If the requirement is
    phrased as preferred/a plus/negotiable, or the candidate's profile directly shows the
-   language/certification/tool, do not raise this objection."""
+   language/certification/tool, do not raise this objection.
+
+7. CANDIDATE HARD FILTERS: The candidate's profile may state their OWN non-negotiables as
+   "HARD REQUIREMENTS (a role must satisfy all of these)" and/or "HARD EXCLUSIONS (reject a role that
+   clearly involves any of these)". Exclude a role that CLEARLY involves one of the hard exclusions, or
+   that clearly contradicts / cannot satisfy one of the hard requirements. Apply the same clear-violation
+   bar as the rules above: when the listing is silent on the point or it is genuinely ambiguous, do NOT
+   exclude on that basis - keep the role and, if the point is material, note it as a concern for the
+   candidate to verify. If the profile states no such hard filters, this rule does not apply."""
 
 _FINAL_EVAL_WORDING = """WORDING: When you reference the candidate's OWN background in "summary", "match_reasons" or "concerns",
 never state a leadership or founder title (e.g. president, chair, founder, co-founder, cofounder, CEO,
@@ -2730,23 +2976,62 @@ initiative"), and never state the bare title with no object at all. If the profi
 name to attach, leave the title out entirely rather than stating it bare - never phrase any of this so it
 could read as company-founding or executive experience."""
 
-_FINAL_EVAL_STRONG_RULES = """7. EVIDENCE STRENGTH: The candidate's background profile may show a qualifier in parentheses next to a
-   skill or past role. For skills this is a depth signal, e.g. "Python (Expert)" or "Excel (One-time)" -
-   Expert/Proficient stated experience is strong evidence; Familiar/One-time exposure is weak evidence -
-   weigh each accordingly. For past roles, the only qualifier used is "(Informal)", which flags a
-   student-club, society, or volunteer position rather than paid employment, e.g. "President (Informal)".
-   Treat an Informal-tagged past role as materially weaker evidence of professional/commercial competency
-   than an untagged (real employment) past role of similar or even longer standing - a multi-year unpaid
-   club position does not substitute for paid work experience. When the candidate's only support for a
-   specific hard requirement (a named tool, a specific process like invoice/expense handling or
-   diary/calendar management, a certification) is a generic or unrelated soft-skill/reliability anecdote
-   (e.g. safety-critical responsibility, leadership of an unrelated activity, or an Informal-tagged role),
-   that is NOT evidence the requirement is met unless the connection to the requirement is direct and
-   explicitly stated - do not present it as satisfying the requirement in "match_reasons". Put any such
-   gap in "concerns" instead.
+_FINAL_EVAL_STRONG_RULES = """8. EVIDENCE STRENGTH: The candidate's background profile may show one or two qualifiers in
+   parentheses next to a skill or past role. For skills the first is a depth signal, e.g. "Python (Expert)"
+   or "Excel (One-time)" - Expert/Proficient stated experience is strong evidence; Familiar/One-time
+   exposure is weak evidence - weigh each accordingly. A skill may ALSO carry an origin tag - "Commercial",
+   "Self-directed", "Academic", or "AI-assisted", e.g. "SQL (Proficient, AI-assisted)" or "Salesforce
+   (Self-directed)" - showing where that depth was actually earned, separate from how deep it is. Treat
+   Self-directed/Academic/AI-assisted-tagged skill evidence as MATERIALLY WEAKER support for any
+   requirement that implies real-world, production, or independent professional competency than the same
+   depth would be if untagged or tagged Commercial - this applies whenever the requirement itself implies
+   professional-level use, NOT only when the job listing explicitly uses the word "commercial" (see the
+   [key requirements] hint on each job below, where "professional-level expected" items should be weighed
+   this way in particular). A candidate practicing a tool alone in a sandbox, on a personal project, in
+   coursework, or leaning on AI assistance has NOT demonstrated the same thing as someone who used it
+   professionally, even at similar stated depth.
+   For past roles, the only qualifier used is "(Informal)", which flags a student-club, society, or
+   volunteer position rather than paid employment, e.g. "President (Informal)". Treat an Informal-tagged
+   past role as materially weaker evidence of professional/commercial competency than an untagged (real
+   employment) past role of similar or even longer standing - a multi-year unpaid club position does not
+   substitute for paid work experience.
+   When the candidate's only support for a specific hard requirement (a named tool, a specific process
+   like invoice/expense handling or diary/calendar management, a certification) is a generic or unrelated
+   soft-skill/reliability anecdote (e.g. safety-critical responsibility, leadership of an unrelated
+   activity, an Informal-tagged role, or a Self-directed/Academic/AI-assisted-tagged skill), that is NOT
+   evidence the requirement is met unless the connection to the requirement is direct and explicitly
+   stated - do not present it as satisfying the requirement in "match_reasons". Put any such gap in
+   "concerns" instead, naming the specific origin/depth limitation (e.g. "Salesforce experience is
+   self-directed/sandbox, not production or paid use").
    Also weigh CUMULATIVE nice-to-have gaps: several compounding smaller gaps (e.g. no fintech background
    AND no dbt AND no BI tooling) can together make a role a weak fit even when no single gap is
    disqualifying. Report each such gap separately in "concerns"."""
+
+_FINAL_EVAL_REASONING = """HOW TO JUDGE EACH ROLE -- work through this reasoning before deciding which list a role belongs in.
+This is a genuine fit assessment, NOT a keyword/similarity check: presence of a matching word is not
+evidence the requirement is met.
+A. READ THE JOB on three axes, not at face value (it is a marketing document as much as a spec):
+   - Required vs nice-to-have: separate the genuinely mandatory requirements from the wish-list. Use the
+     [key requirements] hint where present, and also read the full text -- listings pad their requirements.
+   - The REAL seniority bar: an "entry-level"/"junior-friendly"/"graduate" label can be marketing. If the
+     listed responsibilities, years, or scope imply a higher bar than the label, judge against the REAL bar.
+     A stated salary is one of the more reliable signals here too -- see the SENIORITY/EXPERIENCE
+     disqualifier above.
+   - Actual day-to-day vs aspirational language: what will this person actually DO most days, as distinct
+     from the mission/impact framing the listing leads with.
+B. Assess WANT-FIT and CAN-DO-FIT SEPARATELY -- they are different questions:
+   - want-fit: does the candidate actually WANT this role -- judged against their target roles, stated
+     sector interests, and their OWN words about what they're looking for? A role the candidate is
+     well-qualified for but clearly does NOT want (wrong function, a domain they've moved away from,
+     something their own words rule out) is NOT a strong fit however well the skills line up. A strong
+     can-do-fit must never paper over a weak want-fit.
+   - can-do-fit: can the candidate actually DO the job to the REAL bar from A -- weighing evidence
+     STRENGTH, not mere presence (see EVIDENCE STRENGTH). "Used professionally, 2 years" is strong
+     evidence; "self-directed, one project" is weak evidence for the very same skill tag.
+   A role belongs in "strong" only when BOTH want-fit and can-do-fit are genuinely strong.
+C. Name the SINGLE WEAKEST LINK: the one thing most likely to sink this application (a specific missing
+   requirement, a want-fit mismatch, weak evidence for a load-bearing skill, or a seniority gap). Every
+   "strong"/"backup" pick must carry this in "weakest_link"."""
 
 _FINAL_EVAL_SCHEMA = """Output ONLY a valid JSON object (no markdown), with two required lists and one
 optional list, using this item shape for "strong"/"backup":
@@ -2754,8 +3039,16 @@ optional list, using this item shape for "strong"/"backup":
   {
     "job_number": 1, "title": "...", "company": "...", "url": "...",
     "summary": "1 concise, factual sentence describing what this role actually involves or is responsible for (not why it fits the candidate).",
+    "fit_level": "very_strong" | "strong" | "ok" | "stretch",
+    "want_fit": "1 short sentence: does the candidate actually WANT this (vs their target roles/sector interests/own words), separate from whether they're qualified.",
+    "can_do_fit": "1 short sentence: can they DO it to the role's real bar, weighing evidence STRENGTH not just presence.",
+    "weakest_link": "the single thing most likely to sink this application, one short phrase.",
     "match_reasons": ["concrete alignment factor 1", "concrete alignment factor 2 (max 2)"],
     "concerns": ["each notable skill gap or prerequisite the candidate lacks, one per item; [] if none"],
+    "role_salary": "the salary or range the LISTING states, verbatim and short (e.g. \\"GBP 35,000-42,000\\"); null if it states none",
+    "work_style": "Remote" | "Hybrid" | "On-site" | null,
+    "role_seniority": "the role's REAL seniority bar from axis A (e.g. \\"Graduate\\", \\"Junior\\", \\"Mid\\", \\"Senior\\"); null if you genuinely can't tell",
+    "deadline": "the application deadline the listing states, short (e.g. \\"15 August\\", \\"rolling\\"); null if it states none",
     "scam_suspect": false
   }
 ],
@@ -2769,7 +3062,19 @@ Do NOT add an entry for a job that simply wasn't picked among the best-fitting o
 the disqualifiers but wasn't chosen for "strong"/"backup") -- leave those out of all three lists.
 "scam_suspect" (on "strong"/"backup" items only): true if the SCAM/CV-FARMING rule's softer signals
 raised exactly ONE flag on this listing (not enough alone to disqualify it into the list above); false
-otherwise. Omit or leave false when you saw none of those signals."""
+otherwise. Omit or leave false when you saw none of those signals.
+
+"fit_level" grades the pick more finely than the list it's in, and must agree with that list:
+items in "strong" are "very_strong" (both want-fit and can-do-fit are compelling, no serious
+weakest link) or "strong" (genuinely strong, one real but surmountable weakest link); items in
+"backup" are "ok" (a plausible fit with real gaps) or "stretch" (they'd be reaching for it).
+Grade honestly -- "very_strong" should be rare.
+
+"role_salary"/"work_style"/"role_seniority"/"deadline" are FACTS READ OFF THE LISTING, not
+judgements about the candidate. Report only what the listing actually says: use null when it is
+silent, and never infer or estimate. For "work_style" apply the same classification as the
+LOCATION/VISA/RELOCATION rule -- a stated office location with no remote/hybrid/work-from-home
+wording anywhere is "On-site", not null and not "Remote"."""
 
 # Static system prefix -- identical across every cluster/call, so it's a stable
 # (prompt-cache-friendly) prefix instead of being rebuilt into each user prompt. It
@@ -2789,6 +3094,8 @@ it passes the DISQUALIFIERS above. In this list, evidence weakness and cumulativ
 EXPECTED and ACCEPTABLE -- do NOT use them to exclude a role, only note them honestly in "concerns".
 Leave "backup" empty when "strong" already gives good coverage, or when every role is disqualified.
 
+{_FINAL_EVAL_REASONING}
+
 {_FINAL_EVAL_WORDING}
 
 {_FINAL_EVAL_SCHEMA}"""
@@ -2800,7 +3107,11 @@ def _final_eval_job_block(i: int, j: dict) -> str:
     seniority re-check rather than re-deriving it from scratch. A posting-volume note
     (set upstream in engine.py when this job's company posted an unusually high number
     of differently-titled roles this run, see _company_title_counts) feeds the SCAM /
-    CV-FARMING disqualifier's combination-of-signals check."""
+    CV-FARMING disqualifier's combination-of-signals check. A key-requirements note
+    (screen_gate's capped requirements breakdown -- see _sanitize_key_requirements)
+    gives the judge a pre-graded JD side to cross-reference against the candidate's
+    own evidence_origin tags (see EVIDENCE STRENGTH), instead of re-deriving which
+    requirements are load-bearing from the raw text on every call."""
     # _gate_reason is packed as "{seniority_code}|{requirements_code}|{skills_code}|
     # {salary_code}|{arrangement_code}" (see screen_gate) -- split and surface only
     # the non-"ok" parts as the hint.
@@ -2809,6 +3120,14 @@ def _final_eval_job_block(i: int, j: dict) -> str:
     hint = f"[screen note: {', '.join(parts)}]\n" if parts else ""
     volume_hint = j.get("_posting_volume_hint")
     hint += f"[posting-volume note: {volume_hint}]\n" if volume_hint else ""
+    key_reqs = j.get("_key_requirements") or []
+    if key_reqs:
+        req_text = ", ".join(
+            f"{r['item']} ({r['necessity']}"
+            + (", professional-level expected)" if r.get("professional_level_expected") else ")")
+            for r in key_reqs
+        )
+        hint += f"[key requirements: {req_text}]\n"
     return (f"JOB {i+1}: {j['title']} at {j['company']}\n"
             f"Location: {j.get('location') or 'not stated'}\nURL: {j['url']}\n{hint}\n"
             f"{j.get('full_text','')[:FINAL_EVAL_JOB_TEXT_CHARS]}")

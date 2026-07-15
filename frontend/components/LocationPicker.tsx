@@ -6,14 +6,27 @@ import { api } from "@/lib/api";
 import { useAttributeMutations } from "@/lib/hooks";
 import type { Attribute } from "@/lib/types";
 
-const WORK_TYPES = ["On-site", "Hybrid", "Remote"];
-const WORK_SET = new Set(WORK_TYPES.map((w) => w.toLowerCase()));
+// Work types share the `location` attribute type with the free-text place name
+// (the backend splits them apart on exactly this set — see config.WORK_TYPE_VALUES
+// and snapshot.build_snapshot). They render as their own preference row now
+// (WorkStylePicker), because they're a different constraint with its own
+// Hard/Soft: the place drives the country prefilter, the work type drives the
+// screen's work-arrangement axis. This picker still has to know the set so it
+// can tell a place row from a work-type row.
+export const WORK_TYPES = ["On-site", "Hybrid", "Remote"];
+export const WORK_SET = new Set([...WORK_TYPES.map((w) => w.toLowerCase()), "onsite"]);
 
+// Ordered narrowest -> broadest: each scope is a superset of the ones before it
+// (national search results already include local-place matches; international
+// already includes national + local, since it just drops the country filter).
+// The UI highlights every choice up to and including the selected one so that
+// superset relationship is visible, not just the single active radio value.
 const SCOPE_CHOICES: { value: string; label: string }[] = [
   { value: "local", label: "Local" },
   { value: "national", label: "National" },
   { value: "international", label: "International" },
 ];
+const SCOPE_ORDER = SCOPE_CHOICES.map((s) => s.value);
 
 const COUNTRY_CHOICES: { code: string; label: string }[] = [
   { code: "global", label: "Global (no filter)" },
@@ -69,7 +82,7 @@ function detectCountry(text: string): string | null {
   return null;
 }
 
-/** City/region free text + work-type multi-choice. Each stored as a location attr. */
+/** City/region free text, how far to search from it, and which countries count. */
 export function LocationPicker({
   profileId,
   attributes,
@@ -84,11 +97,6 @@ export function LocationPicker({
   const { add, remove, invalidate } = useAttributeMutations(profileId);
 
   const cityAttr = attributes.find((a) => !WORK_SET.has(a.value.toLowerCase()));
-  const workTypes = new Map(
-    attributes
-      .filter((a) => WORK_SET.has(a.value.toLowerCase()))
-      .map((a) => [a.value.toLowerCase(), a])
-  );
 
   const selectedCountries = new Map(
     countryAttributes.map((a) => [a.value.toLowerCase(), a])
@@ -143,18 +151,12 @@ export function LocationPicker({
     }
   }
 
-  function toggleWork(w: string) {
-    const existing = workTypes.get(w.toLowerCase());
-    if (existing) remove.mutate(existing.id);
-    else add.mutate({ type: "location", value: w });
-  }
-
   return (
     <div className="location-row">
       <div className="location-line">
         <input
           className="input"
-          style={{ width: 160 }}
+          style={{ width: 170 }}
           placeholder="City or region…"
           value={city}
           onChange={(e) => setCity(e.target.value)}
@@ -162,27 +164,18 @@ export function LocationPicker({
           onKeyDown={(e) => e.key === "Enter" && persistCity()}
         />
         <div className="choice-row">
-          {WORK_TYPES.map((w) => (
+          {SCOPE_CHOICES.map((s) => (
             <button
-              key={w}
-              className={`toggle ${workTypes.has(w.toLowerCase()) ? "on" : "off"}`}
-              onClick={() => toggleWork(w)}
+              key={s.value}
+              className={`toggle ${
+                SCOPE_ORDER.indexOf(s.value) <= SCOPE_ORDER.indexOf(scope) ? "on" : "off"
+              }`}
+              onClick={() => setScope(s.value)}
             >
-              {w}
+              {s.label}
             </button>
           ))}
         </div>
-      </div>
-      <div className="choice-row">
-        {SCOPE_CHOICES.map((s) => (
-          <button
-            key={s.value}
-            className={`toggle ${scope === s.value ? "on" : "off"}`}
-            onClick={() => setScope(s.value)}
-          >
-            {s.label}
-          </button>
-        ))}
       </div>
       {showCountryChips && (
         <div className="choice-row" style={{ flexWrap: "wrap" }}>

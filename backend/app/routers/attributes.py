@@ -3,14 +3,33 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..config import ATTRIBUTE_TYPES, DEFAULT_WEIGHT
+from ..config import ATTRIBUTE_TYPES, DEFAULT_WEIGHT, ENFORCEMENT_CHOICES
 from ..database import get_db
 from ..deps import current_user_id, get_profile_or_404
-from ..models import Profile, ProfileAttribute
+from ..models import Profile, ProfileAttribute, RoleFamily
 from ..schemas import AttributeCreate, AttributeOut, AttributeUpdate
 from ..services.feedback import clear_memory
 
 router = APIRouter(tags=["attributes"])
+
+
+def _check_enforcement(value: str | None) -> None:
+    """"" is allowed and means "clear back to the type's default" -- see
+    config.enforcement_for, which is why a null enforcement is meaningful."""
+    if value and value not in ENFORCEMENT_CHOICES:
+        raise HTTPException(status_code=422, detail=f"Unknown enforcement: {value}")
+
+
+def _check_family(db: Session, profile_id: int, family_id: int | None) -> int | None:
+    """Reject a family belonging to a different profile -- attaching a target
+    role to someone else's family would silently move it out of this profile's
+    clusters and into theirs."""
+    if family_id is None:
+        return None
+    family = db.get(RoleFamily, family_id)
+    if not family or family.profile_id != profile_id:
+        raise HTTPException(status_code=404, detail="Role family not found")
+    return family_id
 
 
 def _get_attr_or_404(db: Session, attr_id: int) -> ProfileAttribute:
@@ -53,6 +72,7 @@ def add_attribute(
     value = body.value.strip()
     if not value:
         raise HTTPException(status_code=422, detail="Value cannot be empty")
+    _check_enforcement(body.enforcement)
 
     attr = ProfileAttribute(
         profile_id=profile.id,
@@ -62,6 +82,10 @@ def add_attribute(
         confirmed=body.confirmed,
         weight=body.weight if body.weight is not None else DEFAULT_WEIGHT,
         proficiency=body.proficiency,
+        evidence_origin=body.evidence_origin,
+        family_id=_check_family(db, profile.id, body.family_id),
+        pinned=bool(body.pinned),
+        enforcement=body.enforcement,
     )
     db.add(attr)
     db.commit()
@@ -80,6 +104,15 @@ def update_attribute(attr_id: int, body: AttributeUpdate, db: Session = Depends(
         attr.weight = body.weight
     if body.proficiency is not None:
         attr.proficiency = body.proficiency or None  # "" clears it back to unset
+    if body.evidence_origin is not None:
+        attr.evidence_origin = body.evidence_origin or None  # "" clears it back to unset
+    if body.family_id is not None:
+        attr.family_id = _check_family(db, attr.profile_id, body.family_id)
+    if body.pinned is not None:
+        attr.pinned = body.pinned
+    if body.enforcement is not None:
+        _check_enforcement(body.enforcement)
+        attr.enforcement = body.enforcement or None  # "" clears it back to the type default
     db.commit()
     db.refresh(attr)
     return attr

@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from ..models import Profile, ProfileAttribute, Setting
 from .llm import STRONG_MODEL, llm_json
 
-PROFILE_INTEL_VERSION = 1
+PROFILE_INTEL_VERSION = 2
 SIG_KEY = "profile_intel_signature"
 RESULT_KEY = "profile_intel_result"
 TARGET_ROLE_HARD_CAP = 20
@@ -133,15 +133,21 @@ def _prompt(background: str, pinned: list[str], intent_missing: bool) -> str:
 {pinned_block}
 
 TASK 1 -- TARGET ROLES
-Silently identify how many genuinely distinct job-function interests this candidate
-has. STRONGLY prefer finding just ONE -- only call out more than one when the
-interests are in truly unrelated professional fields (e.g. "marketing" vs "nursing"),
-never for different specialisations, seniority levels, or sub-disciplines within the
-same broader field. Then propose however many distinct, meaningfully different,
-board-standard job titles genuinely fit those interest(s) -- don't pad with
-near-duplicates, and don't invent extra job-function interests just to generate more
-titles. Never return more than 20 titles total, combined across all interests -- treat
-that as a safety ceiling, not a target to reach.
+Silently identify the candidate's genuinely distinct job-function interest(s). Most
+candidates have one; some genuinely have two or three (e.g. "data analysis" AND
+"policy research" as separate career paths) -- only call out more than one when the
+interests are in truly different professional fields, never for different
+specialisations, seniority levels, or sub-disciplines within the same broader field
+(those all stay ONE interest, e.g. "marketing coordinator" and "brand manager" are
+one interest, not two). For EACH genuine interest, propose a real BREADTH of
+distinct, meaningfully different, board-standard job titles that fit it -- covering
+different specialisations, closely-adjacent titles, and seniority phrasings that
+plausibly apply to this candidate, not just one or two safe picks. Two or three
+titles for a genuine interest is usually too narrow unless the candidate's own
+background is itself that narrow -- don't under-generate out of caution. Still don't
+pad with near-duplicates, and don't invent extra job-function interests just to
+generate more titles. Never return more than 20 titles total, combined across all
+interests -- treat that as a safety ceiling, not a target to reach.
 {_TARGET_ROLE_GUIDANCE}
 
 TASK 2 -- HEADER

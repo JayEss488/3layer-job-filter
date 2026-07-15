@@ -9,10 +9,14 @@ import { api } from "@/lib/api";
 import { useSearchStatus } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
 
+// Profile = what the candidate WANTS (role families, requirements, preferences).
+// Memory = who they ARE (past roles, qualifications, skills, CV context). The
+// split is the whole organising idea of both pages -- see app/memory/page.tsx.
 const TABS = [
   { href: "/search", label: "Search" },
   { href: "/my-roles", label: "My Roles" },
   { href: "/dashboard", label: "Profile" },
+  { href: "/memory", label: "Memory" },
   { href: "/settings", label: "Settings" },
 ];
 

@@ -34,6 +34,12 @@ export default function OnboardingPage() {
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["attributes", activeId] });
     qc.invalidateQueries({ queryKey: ["confidence", activeId] });
+    // A parse can autofill Profile-table fields too (cv_summary, and intent_text
+    // when it was empty -- see profile_intel._apply), which IntentEditor reads
+    // from the ["profiles"] cache. Without this, a first-time CV upload's
+    // drafted intent text silently doesn't appear until something else
+    // invalidates that cache (e.g. navigating away and back).
+    qc.invalidateQueries({ queryKey: ["profiles"] });
   };
 
   async function onUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -165,7 +171,6 @@ export default function OnboardingPage() {
                 Your background — what you have done
               </div>
               <AttributeRow label="Past roles" profileId={activeId} type="past_role" attributes={g?.past_role ?? []} />
-              <AttributeRow label="Skills" profileId={activeId} type="skill" attributes={g?.skill ?? []} enableSuggest />
               <AttributeRow
                 label="Qualifications"
                 profileId={activeId}
@@ -186,11 +191,18 @@ export default function OnboardingPage() {
               <IntentEditor profileId={activeId} />
               <TargetRoleChips profileId={activeId} attributes={g?.target_role ?? []} />
               <AttributeRow
-                label="Sector / mission interests"
+                label="Must have"
                 profileId={activeId}
-                type="sector_target"
-                attributes={g?.sector_target ?? []}
-                placeholder="e.g. Clean energy / net-zero policy"
+                type="must_have"
+                attributes={g?.must_have ?? []}
+                placeholder="e.g. Visa sponsorship"
+              />
+              <AttributeRow
+                label="Avoid"
+                profileId={activeId}
+                type="avoid"
+                attributes={g?.avoid ?? []}
+                placeholder="e.g. No cold-calling"
               />
               <div className="row pref">
                 <div className="label">Salary range</div>
@@ -209,13 +221,6 @@ export default function OnboardingPage() {
                   />
                 </div>
               </div>
-              <AttributeRow
-                label="Anything else"
-                profileId={activeId}
-                type="custom"
-                attributes={g?.custom ?? []}
-                placeholder="e.g. Only Series B+ startups, must offer visa sponsorship"
-              />
             </div>
           </div>
         </div>

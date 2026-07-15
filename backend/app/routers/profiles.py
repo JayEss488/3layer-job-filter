@@ -60,6 +60,10 @@ def update_profile(
         # Free-text "what I'm looking for" -- stored durable judge context and the
         # input to target-role regeneration. Empty string clears it back to None.
         profile.intent_text = body.intent_text.strip() or None
+    if body.search_feedback is not None:
+        # Free-text feedback on recent search results -- fed to the final judge on
+        # the next run (see snapshot.build_snapshot). Empty string clears it.
+        profile.search_feedback = body.search_feedback.strip() or None
     db.commit()
     db.refresh(profile)
     return profile

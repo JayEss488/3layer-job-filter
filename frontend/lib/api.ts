@@ -4,12 +4,17 @@ import type {
   AttributeType,
   Blocklist,
   Confidence,
+  ContextHeader,
+  Enforcement,
+  FamilyTier,
   Profile,
   Role,
+  RoleFamily,
   RunFunnel,
   ScrapeSetting,
   SearchStart,
   SearchStatus,
+  Snapshot,
   SourceInfo,
   SourceStat,
   Stats,
@@ -43,7 +48,7 @@ export const api = {
     req<Profile>("/profiles", { method: "POST", body: JSON.stringify({ name }) }),
   updateProfile: (
     id: number,
-    body: Partial<Pick<Profile, "name" | "is_active" | "intent_text">>
+    body: Partial<Pick<Profile, "name" | "is_active" | "intent_text" | "search_feedback">>
   ) =>
     req<Profile>(`/profiles/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteProfile: (id: number) =>
@@ -54,7 +59,17 @@ export const api = {
   attributes: (id: number) => req<AttributesResponse>(`/profiles/${id}/attributes`),
   addAttribute: (
     id: number,
-    body: { type: AttributeType; value: string; source?: string; confirmed?: boolean; proficiency?: string }
+    body: {
+      type: AttributeType;
+      value: string;
+      source?: string;
+      confirmed?: boolean;
+      proficiency?: string;
+      evidence_origin?: string;
+      family_id?: number;
+      pinned?: boolean;
+      enforcement?: Enforcement;
+    }
   ) =>
     req<Attribute>(`/profiles/${id}/attributes`, {
       method: "POST",
@@ -62,7 +77,16 @@ export const api = {
     }),
   updateAttribute: (
     attrId: number,
-    body: { value?: string; confirmed?: boolean; weight?: number; proficiency?: string }
+    body: {
+      value?: string;
+      confirmed?: boolean;
+      weight?: number;
+      proficiency?: string;
+      evidence_origin?: string;
+      family_id?: number;
+      pinned?: boolean;
+      enforcement?: Enforcement;
+    }
   ) =>
     req<Attribute>(`/attributes/${attrId}`, {
       method: "PATCH",
@@ -72,6 +96,26 @@ export const api = {
     req<void>(`/attributes/${attrId}`, { method: "DELETE" }),
   clearMemory: (id: number) =>
     req<void>(`/profiles/${id}/clear-memory`, { method: "POST" }),
+
+  // role families (the engine's per-stream clusters)
+  families: (id: number) => req<RoleFamily[]>(`/profiles/${id}/families`),
+  addFamily: (id: number, body: { name: string; tier?: FamilyTier }) =>
+    req<RoleFamily>(`/profiles/${id}/families`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateFamily: (
+    familyId: number,
+    body: { name?: string; tier?: FamilyTier; position?: number }
+  ) =>
+    req<RoleFamily>(`/families/${familyId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteFamily: (familyId: number) =>
+    req<void>(`/families/${familyId}`, { method: "DELETE" }),
+  regenerateFamily: (familyId: number) =>
+    req<Attribute[]>(`/families/${familyId}/regenerate`, { method: "POST" }),
 
   // onboarding
   parseText: (id: number, text: string) =>
@@ -97,6 +141,7 @@ export const api = {
   regenerateTargetRoles: (id: number) =>
     req<Attribute[]>(`/profiles/${id}/regenerate-target-roles`, { method: "POST" }),
   confidence: (id: number) => req<Confidence>(`/profiles/${id}/confidence`),
+  contextHeader: (id: number) => req<ContextHeader>(`/profiles/${id}/context-header`),
 
   // search + roles
   startSearch: (id: number) =>
@@ -125,6 +170,7 @@ export const api = {
   sources: () => req<SourceInfo[]>("/settings/sources"),
   sourceStats: () => req<SourceStat[]>("/settings/source-stats"),
   runFunnel: () => req<RunFunnel>("/settings/run-funnel"),
+  snapshot: () => req<Snapshot>("/settings/snapshot"),
   setSources: (disabled: string[]) =>
     req<SourceInfo[]>("/settings/sources", {
       method: "PUT",

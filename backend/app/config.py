@@ -40,6 +40,12 @@ MAX_SEARCHES_PER_DAY = int(os.getenv("MAX_SEARCHES_PER_DAY", "6"))
 # API sources (Reed/Adzuna/Google Jobs/etc.) are unaffected.
 DISCOVERY_ATS_CACHE_TTL_HOURS = float(os.getenv("DISCOVERY_ATS_CACHE_TTL_HOURS", "4"))
 
+# Category-page expansion (full_auto.expand_category_pages). Currently recovers
+# ~0 jobs in practice -- crawl4ai finds 0 raw links on JS-hydrated category pages
+# -- while still paying full crawl cost (~4-5s/page). Off by default until
+# extraction is revisited. Internal/ops knob, not exposed in the Settings UI.
+CATEGORY_EXPAND_ENABLED = os.getenv("CATEGORY_EXPAND_ENABLED", "false").strip().lower() == "true"
+
 # Below this many semantic-filter survivors we warn the filters may be too harsh.
 HARSH_FILTER_THRESHOLD = 5
 
@@ -69,7 +75,93 @@ ATTRIBUTE_TYPES = [
     "country",
     "location_scope",
     "custom",
+    # Candidate's own hard filters, editable as chips and auto-filled from the CV
+    # (parsing.py). "avoid" = things to reject on; "must_have" = non-negotiables.
+    # Enforced as hard drops at the cheap gate + final judge (LLM-adjudicated on a
+    # CLEAR violation only) -- distinct from the softer LLM-derived "requirements".
+    "avoid",
+    "must_have",
 ]
+
+# Where a skill's depth was earned -- distinct from proficiency (which grades
+# depth, not origin). Set by CV parsing (parsing.py) or edited by the user via
+# AttributeRow.tsx's dropdown (kept in manual sync there, same as the
+# proficiency choices below have no shared frontend import). Only meaningful
+# for skill rows; omitted means no origin signal available -- never defaults
+# to "Commercial".
+EVIDENCE_ORIGIN_CHOICES = ["Commercial", "Self-directed", "Academic", "AI-assisted"]
+
+# The work-type tokens that share the `location` attribute type with the
+# free-text place name. snapshot.build_snapshot splits the two apart on exactly
+# this set -- keep it in sync with LocationPicker.tsx's WORK_TYPES.
+WORK_TYPE_VALUES = {"remote", "hybrid", "on-site", "onsite"}
+
+# ── Hard/soft enforcement ───────────────────────────────────────────────────
+# How literally a constraint row is applied. "hard" = an unconditional drop the
+# moment the listing CLEARLY violates it (screen_gate drops it outright; the
+# final judge carries it as a DISQUALIFIER). "soft" = a stated preference the
+# judge weighs and the cheap gate counts as one ordinary soft-axis failure, but
+# which can never on its own remove a listing.
+#
+# Only meaningful on the constraint types below; null elsewhere. Each type's
+# default is the behaviour that type already had before enforcement existed, so
+# an un-migrated row keeps working identically:
+#   avoid/must_have -> hard   (they have always been unconditional drops)
+#   location        -> hard   (the country/city prefilter is fail-closed by
+#                              design -- see CLAUDE.md's location-scope section;
+#                              defaulting it to soft would silently un-close it)
+#   seniority/salary -> soft  (they have always been soft screen_gate axes)
+ENFORCEMENT_CHOICES = ["hard", "soft"]
+
+ENFORCEMENT_DEFAULT = {
+    "avoid": "hard",
+    "must_have": "hard",
+    "location": "hard",
+    "seniority": "soft",
+    "salary": "soft",
+}
+
+
+def enforcement_for(attr_type: str, value: str | None) -> str:
+    """The stored enforcement, or the type's pre-enforcement default.
+
+    Work-type rows (Remote/Hybrid/On-site) share the `location` type with the
+    free-text city but are NOT the fail-closed country prefilter -- they feed
+    screen_gate's soft work_arrangement axis. So they default to "soft" while a
+    place row defaults to "hard"; both are still overridable per row."""
+    if attr_type == "location" and (value or "").lower().strip() in WORK_TYPE_VALUES:
+        return "soft"
+    return ENFORCEMENT_DEFAULT.get(attr_type, "soft")
+
+
+# ── Role families ───────────────────────────────────────────────────────────
+# A family is one user-editable "stream" of target roles (e.g. "Data Analyst"
+# holding "Data Analyst", "CRM Data Analyst", "Data Officer"). Families ARE the
+# engine's clusters: the pipeline scores, gates, and judges each one
+# independently (see CLAUDE.md's search-pipeline section). They replace the
+# per-run LLM clustering call, which now only ever runs once to SEED families
+# from a freshly parsed CV (see services/families.py).
+FAMILY_TIER_CHOICES = ["core", "secondary"]
+FAMILY_TIER_DEFAULT = "core"
+
+# Emphasis multipliers applied in snapshot._weighted_text, alongside (not
+# instead of) the learned feedback weight -- tier and pin are the candidate's
+# declared priority, weight is what their tick/cross history revealed, and the
+# two are deliberately orthogonal signals that multiply together.
+FAMILY_TIER_MULT = {"core": 1.0, "secondary": 0.6}
+PINNED_ROLE_MULT = 1.4
+
+# Same cap the LLM clustering path has always enforced: discovery volume is
+# fixed per run, not scaled by cluster count, so more clusters only thins each
+# one's candidate pool. Families past this cap are merged into the last one
+# (core families first -- see families.ordered_for_engine).
+MAX_ROLE_CLUSTERS = 3
+
+# How many fresh title suggestions a single family's "regenerate" action asks
+# the LLM for (see services/families.regenerate_family). Deliberately more
+# generous than a bare minimum -- a family card with only 1-2 roles thins its
+# own discovery pool for no reason when the theme plausibly supports more.
+FAMILY_REGEN_TARGET_COUNT = 8
 
 # Direction is used by the engine mapping + weighting.
 ATTRIBUTE_DIRECTION = {
@@ -84,6 +176,8 @@ ATTRIBUTE_DIRECTION = {
     "country": "constraint",
     "location_scope": "constraint",
     "custom": "constraint",
+    "avoid": "constraint",
+    "must_have": "constraint",
 }
 
 # How far the candidate's stated location/country should be trusted as a hard

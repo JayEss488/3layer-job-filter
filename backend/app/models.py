@@ -18,7 +18,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 
-from .config import CURRENT_USER_ID, DEFAULT_WEIGHT
+from .config import CURRENT_USER_ID, DEFAULT_WEIGHT, FAMILY_TIER_DEFAULT
 from .database import Base
 
 
@@ -36,6 +36,11 @@ class Profile(Base):
     cv_text = Column(Text)  # raw uploaded/pasted document text, for target-role regeneration
     cv_summary = Column(Text)  # LLM-compressed cv_text; extra judge context, see snapshot.py
     intent_text = Column(Text)  # free-text "what I'm looking for"; feeds the final judge and target-role regeneration
+    # Free-text feedback on recent search RESULTS ("too senior", "stop showing sales
+    # roles"), edited from the /search page itself. Distinct from intent_text (which
+    # drives target-role generation): this just feeds the final judge as extra
+    # context on the next run -- see snapshot.build_snapshot.
+    search_feedback = Column(Text)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 
@@ -45,6 +50,42 @@ class Profile(Base):
     roles = relationship(
         "Role", back_populates="profile", cascade="all, delete-orphan"
     )
+    families = relationship(
+        "RoleFamily", back_populates="profile", cascade="all, delete-orphan"
+    )
+
+
+class RoleFamily(Base):
+    """One user-editable stream of target roles -- and the engine's cluster unit.
+
+    The pipeline scores, gates, and judges each family independently, so a
+    candidate targeting two unrelated fields is judged fairly on each rather
+    than against a blend of both (see CLAUDE.md's search-pipeline section).
+    This table is what made those clusters user-editable and stable: they used
+    to be re-derived by an LLM call every run (snapshot.cluster_target_roles),
+    which now only ever runs to SEED families from a fresh CV.
+
+    A family owns its target_role rows via ProfileAttribute.family_id. Deleting
+    a family orphans (family_id -> NULL) rather than deletes its roles -- see
+    routers/families.py; losing target roles because a card was removed would
+    be a surprising amount of collateral damage for a grouping edit."""
+
+    __tablename__ = "role_families"
+
+    id = Column(Integer, primary_key=True)
+    profile_id = Column(
+        Integer, ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name = Column(Text, nullable=False)
+    # core|secondary -- the candidate's declared priority for this stream. Feeds
+    # an emphasis multiplier in snapshot._weighted_text (config.FAMILY_TIER_MULT)
+    # and orders which families survive the MAX_ROLE_CLUSTERS cap.
+    tier = Column(Text, nullable=False, default=FAMILY_TIER_DEFAULT)
+    position = Column(Integer, nullable=False, default=0)  # display order
+    created_at = Column(DateTime, default=_now)
+    updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+    profile = relationship("Profile", back_populates="families")
 
 
 class ProfileAttribute(Base):
@@ -65,6 +106,32 @@ class ProfileAttribute(Base):
     # "one-off, one week". Free text, set by CV parsing or edited by the user;
     # only meaningful for skill/past_role rows, null everywhere else.
     proficiency = Column(Text, nullable=True)
+    # Where a skill's depth was earned -- Commercial|Self-directed|Academic|
+    # AI-assisted (see config.EVIDENCE_ORIGIN_CHOICES). Orthogonal to
+    # proficiency (which grades depth, not origin): a skill can be a
+    # long-practiced but still unpaid/self-directed one. Only meaningful for
+    # skill rows -- past_role already has its own paid/unpaid signal via
+    # proficiency=="Informal", null everywhere else.
+    evidence_origin = Column(Text, nullable=True)
+    # Which RoleFamily this target_role belongs to. Only meaningful for
+    # target_role rows; null everywhere else, and null on a target_role means
+    # "not yet grouped" -- families.ensure_families seeds those into a family on
+    # first sight (and snapshot falls back to in-memory LLM clustering if it
+    # somehow still sees ungrouped roles at search time, so a run can never fail
+    # for want of a family row).
+    family_id = Column(Integer, ForeignKey("role_families.id", ondelete="SET NULL"),
+                       nullable=True, index=True)
+    # The candidate's "this one especially" pin within its family. Only
+    # meaningful for target_role rows. Deliberately separate from `weight`:
+    # weight is what tick/cross feedback LEARNED, pinned is what the candidate
+    # DECLARED, and snapshot._weighted_text multiplies the two rather than
+    # letting either overwrite the other.
+    pinned = Column(Boolean, nullable=False, default=False)
+    # hard|soft -- see config.enforcement_for for which types this applies to
+    # and what each type defaults to when null (which every pre-existing row is).
+    # Null is meaningful: it means "never set, use the type's default", so
+    # reading this must always go through config.enforcement_for.
+    enforcement = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 
@@ -81,6 +148,11 @@ class Role(Base):
         Integer, ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
     )
     external_id = Column(Text)  # dedupe key from source
+    # Which SearchRun produced this row. Nullable: rows created before this
+    # column existed have no run to point to. Lets the frontend separate "this
+    # run"'s inbox from a still-unreviewed ('new') role left over from an
+    # earlier run, instead of interleaving every past run's picks by fit_rank.
+    search_run_id = Column(Integer, ForeignKey("search_runs.id"), nullable=True, index=True)
     title = Column(Text, nullable=False)
     company = Column(Text)
     location = Column(Text)
@@ -90,11 +162,26 @@ class Role(Base):
     source = Column(Text)  # board this role was discovered on (see JobSeen.source)
     fit_rank = Column(Integer)  # 1..N within a search batch
     ai_analysis = Column(Text)  # the expensive-AI justification
+    # very_strong|strong|ok|stretch -- the final judge's own verdict, a finer
+    # grade than the strong/backup list it landed in (see full_auto's
+    # _FINAL_EVAL_SCHEMA). Leads the result card. Null on rows judged before
+    # FINAL_EVAL_PROMPT_VERSION 8, and on an inconclusive-call fallback pick.
+    verdict = Column(Text)
+    # Facts the judge read out of the JD while it already had the full text in
+    # hand, for the card to show instead of the generic skill tags: Remote/
+    # Hybrid/On-site, the role's REAL seniority bar (not its label), and the
+    # application deadline as stated. Free text, null when the listing is silent
+    # -- a null renders as no chip rather than a guess. deadline_text is text
+    # rather than a DateTime because the honest answer is often "rolling" or
+    # "until filled". (An unused `deadline` DateTime column predates this and
+    # was never read or written; it lingers in existing SQLite files.)
+    work_style = Column(Text)
+    seniority_level = Column(Text)
+    deadline_text = Column(Text)
     status = Column(Text, nullable=False, default="new")
     # new|saved|crossed|ignored|applied|deleted
     application_status = Column(Text)  # pending|interview|rejected (null until applied)
     applied_at = Column(DateTime)
-    deadline = Column(DateTime)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 
@@ -193,6 +280,11 @@ class SearchRun(Base):
     finished_at = Column(DateTime)
     phase_timings = Column(Text)  # JSON-encoded {phase_name: seconds}, for perf analysis
     funnel_counts = Column(Text)  # JSON-encoded {stage_name: count}, for diagnosing thin results
+    # JSON-encoded {stage_name: [{title, company, url}, ...]} -- a few sample roles
+    # per pipeline stage, so a run can be inspected (and fed to an AI) to see which
+    # stage is actually weak, not just how many rows it dropped. Sits alongside
+    # funnel_counts rather than inside it: that stays ints/bools only.
+    snapshot_samples = Column(Text)
 
 
 class Setting(Base):

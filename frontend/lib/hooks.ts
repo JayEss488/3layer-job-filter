@@ -3,7 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "./api";
-import type { AttributeType } from "./types";
+import type { AttributeType, Enforcement, FamilyTier } from "./types";
 
 // ── Queries ─────────────────────────────────────────────────────────────────
 export function useAttributes(profileId: number | null) {
@@ -14,10 +14,26 @@ export function useAttributes(profileId: number | null) {
   });
 }
 
+export function useFamilies(profileId: number | null) {
+  return useQuery({
+    queryKey: ["families", profileId],
+    queryFn: () => api.families(profileId!),
+    enabled: !!profileId,
+  });
+}
+
 export function useConfidence(profileId: number | null) {
   return useQuery({
     queryKey: ["confidence", profileId],
     queryFn: () => api.confidence(profileId!),
+    enabled: !!profileId,
+  });
+}
+
+export function useContextHeader(profileId: number | null) {
+  return useQuery({
+    queryKey: ["contextHeader", profileId],
+    queryFn: () => api.contextHeader(profileId!),
     enabled: !!profileId,
   });
 }
@@ -58,13 +74,32 @@ export function useAttributeMutations(profileId: number) {
   };
 
   const add = useMutation({
-    mutationFn: (v: { type: AttributeType; value: string; source?: string; proficiency?: string }) =>
-      api.addAttribute(profileId, { confirmed: true, ...v }),
+    mutationFn: (v: {
+      type: AttributeType;
+      value: string;
+      source?: string;
+      proficiency?: string;
+      evidence_origin?: string;
+      family_id?: number;
+      pinned?: boolean;
+      enforcement?: Enforcement;
+    }) => api.addAttribute(profileId, { confirmed: true, ...v }),
     onSuccess: invalidate,
   });
   const update = useMutation({
-    mutationFn: (v: { id: number; value?: string; confirmed?: boolean; proficiency?: string }) =>
-      api.updateAttribute(v.id, { value: v.value, confirmed: v.confirmed, proficiency: v.proficiency }),
+    mutationFn: (v: {
+      id: number;
+      value?: string;
+      confirmed?: boolean;
+      proficiency?: string;
+      evidence_origin?: string;
+      family_id?: number;
+      pinned?: boolean;
+      enforcement?: Enforcement;
+    }) => {
+      const { id, ...body } = v;
+      return api.updateAttribute(id, body);
+    },
     onSuccess: invalidate,
   });
   const remove = useMutation({
@@ -73,4 +108,38 @@ export function useAttributeMutations(profileId: number) {
   });
 
   return { add, update, remove, invalidate };
+}
+
+// ── Role-family mutations ────────────────────────────────────────────────────
+export function useFamilyMutations(profileId: number) {
+  const qc = useQueryClient();
+  // Deleting a family deletes its target roles too (see routers/families.py),
+  // and adding one can change how attributes group — so both caches refresh.
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["families", profileId] });
+    qc.invalidateQueries({ queryKey: ["attributes", profileId] });
+    qc.invalidateQueries({ queryKey: ["confidence", profileId] });
+  };
+
+  const add = useMutation({
+    mutationFn: (v: { name: string; tier?: FamilyTier }) => api.addFamily(profileId, v),
+    onSuccess: invalidate,
+  });
+  const update = useMutation({
+    mutationFn: (v: { id: number; name?: string; tier?: FamilyTier; position?: number }) => {
+      const { id, ...body } = v;
+      return api.updateFamily(id, body);
+    },
+    onSuccess: invalidate,
+  });
+  const remove = useMutation({
+    mutationFn: (id: number) => api.deleteFamily(id),
+    onSuccess: invalidate,
+  });
+  const regenerate = useMutation({
+    mutationFn: (id: number) => api.regenerateFamily(id),
+    onSuccess: invalidate,
+  });
+
+  return { add, update, remove, regenerate, invalidate };
 }

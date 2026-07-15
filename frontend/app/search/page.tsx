@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react";
 
 import { Nav } from "@/components/Nav";
 import { RoleCard } from "@/components/RoleCard";
+import { SearchFeedbackBox } from "@/components/SearchFeedbackBox";
 import { TrainingBanner } from "@/components/TrainingBanner";
 import { api } from "@/lib/api";
 import { useRoles, useSearchStatus } from "@/lib/hooks";
@@ -58,10 +59,29 @@ export default function SearchPage() {
   const active = (roles ?? []).filter((r) => r.status !== "crossed");
   const crossed = (roles ?? []).filter((r) => r.status === "crossed");
 
+  // Second-search semantics: an unreviewed ('new') role left over from an
+  // earlier run shouldn't interleave with this run's fresh picks by fit_rank
+  // (each run numbers its own 1..N) -- it moves into its own section below.
+  // 'saved' roles are a completed decision, not pending review, so they stay
+  // in the main section regardless of which run surfaced them. A null
+  // search_run_id (rows from before this field existed) is treated as
+  // current rather than hidden, since we have no run to compare it against.
+  const latestRunId = active.reduce<number | null>(
+    (max, r) => (r.search_run_id != null && (max === null || r.search_run_id > max) ? r.search_run_id : max),
+    null
+  );
+  const current = active.filter(
+    (r) => r.status !== "new" || r.search_run_id == null || r.search_run_id === latestRunId
+  );
+  const previous = active.filter(
+    (r) => r.status === "new" && r.search_run_id != null && r.search_run_id !== latestRunId
+  );
+
   return (
     <div className="app">
       <Nav />
       <div className="page-body">
+        <SearchFeedbackBox profileId={activeId} />
         <TrainingBanner />
 
         {running && (
@@ -102,7 +122,7 @@ export default function SearchPage() {
           </div>
         )}
 
-        {!running && active.map((role: Role) => {
+        {!running && current.map((role: Role) => {
           const saved = role.status === "saved";
           return (
             <RoleCard
@@ -128,6 +148,38 @@ export default function SearchPage() {
             />
           );
         })}
+
+        {!running && previous.length > 0 && (
+          <>
+            <div className="crossed-section-label">from earlier searches</div>
+            {previous.map((role) => {
+              const saved = role.status === "saved";
+              return (
+                <RoleCard
+                  key={role.id}
+                  role={role}
+                  showRank
+                  showAnalysis
+                  indentActions
+                  actions={
+                    <>
+                      <button
+                        className={`btn ${saved ? "btn-primary" : "btn-secondary"}`}
+                        onClick={() => tick.mutate(role.id)}
+                        disabled={saved}
+                      >
+                        {saved ? "✓ Saved" : "✓ Save"}
+                      </button>
+                      <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
+                        ✗ Pass
+                      </button>
+                    </>
+                  }
+                />
+              );
+            })}
+          </>
+        )}
 
         {!running && crossed.length > 0 && (
           <>

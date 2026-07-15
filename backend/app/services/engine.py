@@ -12,6 +12,7 @@ even without crawl4ai/playwright present, and only a real search pays that cost.
 import asyncio
 import hashlib
 import json
+import random
 import re
 import sys
 import time
@@ -22,7 +23,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
-from ..config import DISCOVERY_ATS_CACHE_TTL_HOURS, ROLE_STALE_DAYS
+from ..config import CATEGORY_EXPAND_ENABLED, DISCOVERY_ATS_CACHE_TTL_HOURS, ROLE_STALE_DAYS
 from ..database import SessionLocal
 from ..models import Role, SearchRun, JobSeen
 from .profile_intel import ensure_profile_intel
@@ -81,7 +82,16 @@ JUDGE_POOL = 40               # top-ranked candidates sent on to scrape + judge
 # scoring below this is dropped regardless of how large the surviving pool is,
 # so the expensive judge never spends a call on a candidate the mid tier
 # already knows doesn't fit.
-RANK_REJECT_SCORE_FLOOR = 40
+# Raised from 40 -> 55: live runs were showing e.g. "85 gate survivors -> 85
+# judge-eligible" -- literally nothing scored below 40, which made this floor
+# a no-op rather than a real cutoff. 40 out of a 0-100 "how well does this fit"
+# scale is a low bar (below-average-but-not-terrible still clears it); 55
+# requires an actual above-the-middle score. The MIN_RESULTS rank-side floor
+# backfill below still guarantees a cluster with any gate survivors reaches
+# the judge with at least MIN_RESULTS candidates, so raising this can't
+# starve a cluster to zero -- it can only promote the harsher floor's
+# rejects back in when a cluster is otherwise thin.
+RANK_REJECT_SCORE_FLOOR = 55
 # Same-source posting-volume signal (scam/CV-farming detection, see
 # _company_title_counts): a company posting at least this many DIFFERENT
 # titles in one run's discovery is surfaced to the final judge as a hint --
@@ -171,17 +181,85 @@ def _salary_text(job: dict) -> str | None:
     return m.group(0).strip() if m else None
 
 
+SNAPSHOT_SAMPLE_SIZE = 3  # sample roles kept per pipeline stage (see _sample_stage)
+
+
+def _sample_stage(items, n: int = SNAPSHOT_SAMPLE_SIZE) -> list[dict]:
+    """A few random roles from one pipeline stage, for the Settings > Snapshot
+    panel. Random rather than head-of-list on purpose: every stage from the
+    embedding onward is score-sorted, so the first N would always be that
+    stage's best and would never show what it's actually letting through.
+
+    Handles both shapes the pipeline carries: plain dicts (every stage except
+    the pool) and JobSeen ORM rows (the pool). `url` is the normalised key every
+    source is mapped onto (Adzuna's redirect_url included) -- there is no `link`."""
+    def _field(it, key: str) -> str:
+        val = it.get(key) if isinstance(it, dict) else getattr(it, key, None)
+        return (val or "").strip() if isinstance(val, str) else (val or "")
+
+    pool = list(items or [])
+    picked = random.sample(pool, n) if len(pool) > n else pool
+    return [{"title": _field(it, "title"), "company": _field(it, "company"),
+             "url": _field(it, "url")} for it in picked]
+
+
+# The judge's fit_level grades (full_auto's _FINAL_EVAL_SCHEMA), mapped to the
+# label the card leads with. Kept here rather than in the frontend so an
+# unrecognised grade degrades to the strong/backup fallback below instead of
+# rendering a raw enum at the user.
+_VERDICT_GRADES = ("very_strong", "strong", "ok", "stretch")
+
+
+def _verdict_of(entry: dict) -> str | None:
+    """The pick's verdict grade. Falls back to the list it landed in for a
+    verdict judged before fit_level existed (FINAL_EVAL_PROMPT_VERSION < 8) or
+    for an inconclusive-call fallback pick, so the card always has something
+    honest to lead with rather than a blank corner."""
+    level = (entry.get("fit_level") or "").strip().lower()
+    if level in _VERDICT_GRADES:
+        return level
+    if entry.get("strong_fit") is True:
+        return "strong"
+    if entry.get("strong_fit") is False:
+        return "ok"
+    return None
+
+
 def _compose_analysis(entry: dict) -> str:
+    """The card's analysis text. Structured as three labelled sections rather
+    than one flat list of ✓/⚠ lines: the judge answers two genuinely different
+    questions -- why the role matches what the candidate is after (want-fit,
+    match_reasons) and whether they could actually do it (can-do-fit, concerns,
+    weakest link) -- and rendering both as an undifferentiated row of ticks made
+    them look like one repeated point. RoleCard.tsx splits on these markers."""
     parts = []
     if entry.get("_cluster_label"):
         parts.append(f"Matched via: {entry['_cluster_label']} track")
     if entry.get("strong_fit") is False:
         parts.append("⚠ Closest available match — no role fully met the bar this run.")
     parts.append(entry.get("summary", "").strip())
-    for r in entry.get("match_reasons", []) or []:
-        parts.append(f"✓ {r}")
-    for c in entry.get("concerns", []) or []:
-        parts.append(f"⚠ {c}")
+
+    # Why it matched: the candidate's own wants, not their qualifications.
+    match: list[str] = []
+    if entry.get("want_fit"):
+        match.append(entry["want_fit"].strip())
+    match.extend(str(r).strip() for r in (entry.get("match_reasons") or []))
+    if match:
+        parts.append("§why-matched")
+        parts.extend(f"✓ {m}" for m in match if m)
+
+    # Why they'd be good at it -- and what would sink it. Concerns and the
+    # weakest link live here, next to the can-do claim they qualify, rather
+    # than trailing the whole block.
+    fit: list[str] = []
+    if entry.get("can_do_fit"):
+        fit.append(f"✓ {entry['can_do_fit'].strip()}")
+    fit.extend(f"⚠ {c}" for c in (entry.get("concerns") or []) if str(c).strip())
+    if entry.get("weakest_link"):
+        fit.append(f"⚠ Weakest link: {entry['weakest_link'].strip()}")
+    if fit:
+        parts.append("§your-fit")
+        parts.extend(fit)
     return "\n".join(p for p in parts if p)
 
 
@@ -524,8 +602,26 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             verdict, src = "reject", j
         analysis = json.dumps({
             "summary": src.get("summary", ""),
+            # The judge's explicit reasoning split (see full_auto's
+            # _FINAL_EVAL_REASONING): want-fit and can-do-fit are judged
+            # separately, and every pick names its single weakest link. Persisted
+            # alongside the rest so a cache-served verdict renders identically to
+            # a freshly-judged one.
+            "want_fit": src.get("want_fit", ""),
+            "can_do_fit": src.get("can_do_fit", ""),
+            "weakest_link": src.get("weakest_link", ""),
             "match_reasons": src.get("match_reasons", []),
             "concerns": src.get("concerns", []),
+            # The judge's finer verdict grade and the facts it read off the JD,
+            # for the result card. Persisted here for the same reason as the
+            # reasoning split above: these are merged straight back onto a
+            # cache-served pick, so a reused verdict must render identically to a
+            # freshly-judged one.
+            "fit_level": src.get("fit_level") or "",
+            "role_salary": src.get("role_salary") or "",
+            "work_style": src.get("work_style") or "",
+            "role_seniority": src.get("role_seniority") or "",
+            "deadline": src.get("deadline") or "",
             "scam_suspect": bool(src.get("scam_suspect", False)),
         })
         verdicts[ident] = (verdict, analysis)
@@ -705,8 +801,10 @@ def _clusters_without_fresh_terms(eng_profile: dict, role_clusters: list[dict]) 
 
 
 def _cluster_label(cluster: dict) -> str:
-    roles = cluster.get("roles") or []
-    return roles[0] if roles else "General"
+    """The family name the candidate gave this stream, falling back to its first
+    role for a cluster built without a family (see snapshot.build_snapshot's
+    ungrouped-roles fallback)."""
+    return cluster.get("label") or (cluster.get("roles") or ["General"])[0]
 
 
 def _cluster_candidate_queues(scored: list[dict]) -> tuple[dict[int, list[dict]], bool, dict[int, str]]:
@@ -753,14 +851,36 @@ def _cluster_candidate_queues(scored: list[dict]) -> tuple[dict[int, list[dict]]
     return queues, harsh, fallback_reasons
 
 
+def _hard_enforced_axes(engine, cluster_profile: dict) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split screen_gate's soft axes into (still-soft, promoted-to-hard) for this
+    run, from the enforcement the candidate chose per constraint
+    (snapshot._hard_axes -> eng_profile["hard_axes"]).
+
+    A promoted axis behaves exactly like _hard_gate_ok: a clear failure removes
+    the listing outright and it is NOT eligible for the MIN_RESULTS floor
+    backfill -- backfilling a role the candidate declared non-negotiable-ly wrong
+    would defeat the point of the toggle, same reasoning as the avoid/must-have
+    chips. It also stops counting toward the soft-failure threshold, since it can
+    no longer contribute to a demotion it has already prevented.
+
+    Intersected with SOFT_GATE_AXES rather than trusted verbatim, so a stale or
+    malformed axis name in a snapshot can't silently become a filter no axis
+    actually feeds."""
+    hard = tuple(a for a in engine.SOFT_GATE_AXES if a in set(cluster_profile.get("hard_axes") or []))
+    soft = tuple(a for a in engine.SOFT_GATE_AXES if a not in hard)
+    return soft, hard
+
+
 def _gate_rank_refill_cluster(
     queue: list[dict], cluster_profile: dict, engine, db: Session, run: SearchRun,
 ) -> tuple[list[dict], dict]:
     """Iteratively gates then ranks batches of one cluster's embed-score-ordered
     candidate queue (already restricted to >= RELEVANCE_FLOOR, or the small
     last-resort floor_fallback list -- see _cluster_candidate_queues) instead
-    of a one-shot TARGET_POOL-capped gate call. A harsher gate (2+ soft-axis
-    failures hard-drops, see full_auto.screen_gate) or the RANK_REJECT_SCORE_FLOOR
+    of a one-shot TARGET_POOL-capped gate call. A harsher gate (2+, or 1+ when
+    the round's dynamic threshold tightens -- see
+    full_auto.dynamic_hard_drop_threshold -- soft-axis failures hard-drops)
+    or the RANK_REJECT_SCORE_FLOOR
     absolute cutoff can leave a cluster short of JUDGE_POOL even though hundreds
     of decent-scoring candidates sit unexamined in the store; this keeps pulling
     batches until JUDGE_POOL rank-floor survivors accumulate, the queue is
@@ -775,11 +895,13 @@ def _gate_rank_refill_cluster(
     this cluster's log line (examined/queue_len/gate_survivors/judge_eligible/
     stop_reason); `queue[:stats['examined']]` recovers exactly the subset of
     the queue this call looked at."""
+    soft_axes, hard_axes = _hard_enforced_axes(engine, cluster_profile)
     pos = 0
     examined = 0
-    gate_survivors: list[dict] = []    # in-sector, <2 soft-axis failures (all rounds)
-    hard_dropped: list[dict] = []      # in-sector, >=2 soft-axis failures
+    gate_survivors: list[dict] = []    # in-sector, below this round's hard-drop threshold (all rounds)
+    hard_dropped: list[dict] = []      # in-sector, at/above this round's hard-drop threshold
     off_sector: list[dict] = []        # sector_ok=False
+    hard_gate_failed: list[dict] = []  # _hard_gate_ok=False, or a candidate-promoted hard axis failed
     judge_eligible: list[dict] = []    # ranked, >= RANK_REJECT_SCORE_FLOOR
     below_rank_floor: list[dict] = []  # ranked, < RANK_REJECT_SCORE_FLOOR
     stop_reason = "pool_exhausted"
@@ -798,13 +920,46 @@ def _gate_rank_refill_cluster(
         examined += len(batch)
 
         annotated = engine.screen_gate(batch, cluster_profile)
+        # The candidate's OWN hard filters drop unconditionally, like off-sector.
+        # Unlike a soft-axis or sector drop, these are removed from the round
+        # entirely and are NOT eligible for the floor backfill below --
+        # resurfacing a job the candidate explicitly said to avoid (or that
+        # plainly can't meet a stated must-have) would defeat the point. That
+        # covers both the avoid/must-have chips (_hard_gate_ok) and any normally-
+        # soft axis the candidate marked Hard (hard_axes, see _hard_enforced_axes).
+        def _clears_hard(j: dict) -> bool:
+            return j.get("_hard_gate_ok", True) and all(j.get(a, True) for a in hard_axes)
+
+        def _clears_rank_floor(j: dict) -> bool:
+            # rank_gate had no real signal for this job (same-model retry and
+            # cheap-tier fallback both failed, see full_auto.rank_gate) -- pass it
+            # through instead of comparing a fabricated neutral score against
+            # RANK_REJECT_SCORE_FLOOR, which would silently guarantee rejection.
+            # Still bounded by the JUDGE_POOL cap in the while loop above.
+            return j.get("_rank_gate_failed", False) or j.get("_rank_score", 50.0) >= RANK_REJECT_SCORE_FLOOR
+
+        hard_gate_failed.extend(j for j in annotated if not _clears_hard(j))
+        annotated = [j for j in annotated if _clears_hard(j)]
+        in_sector = [j for j in annotated if j.get("_sector_ok", True)]
+        off_sector.extend(j for j in annotated if not j.get("_sector_ok", True))
+
+        # Dynamic strictness (engine.dynamic_hard_drop_threshold, shared with
+        # screen_gate's own diagnostic log so the two can't disagree): drops
+        # to a 1-failure hard-drop threshold when most of this round is
+        # sailing through every soft axis clean, since that's a sign the
+        # round is thin on real mismatches, not that everyone genuinely fits.
+        # Only the still-soft axes count here: an axis the candidate promoted to
+        # Hard has already removed its failures above, so leaving it in the count
+        # would just be summing a column of zeroes.
+        soft_fail_counts = [
+            sum(1 for axis in soft_axes if not j.get(axis, True))
+            for j in in_sector
+        ]
+        hard_drop_threshold = engine.dynamic_hard_drop_threshold(soft_fail_counts)
+
         round_survivors = []
-        for j in annotated:
-            if not j.get("_sector_ok", True):
-                off_sector.append(j)
-                continue
-            fails = sum(1 for axis in engine.SOFT_GATE_AXES if not j.get(axis, True))
-            if fails >= 2:
+        for j, fails in zip(in_sector, soft_fail_counts):
+            if fails >= hard_drop_threshold:
                 hard_dropped.append(j)
             else:
                 gate_survivors.append(j)
@@ -813,7 +968,7 @@ def _gate_rank_refill_cluster(
         if round_survivors:
             ranked = engine.rank_gate(round_survivors, cluster_profile)
             for j in ranked:
-                if j.get("_rank_score", 50.0) >= RANK_REJECT_SCORE_FLOOR:
+                if _clears_rank_floor(j):
                     judge_eligible.append(j)
                 else:
                     below_rank_floor.append(j)
@@ -830,7 +985,7 @@ def _gate_rank_refill_cluster(
             backfilled = True
             for j in engine.rank_gate(topup, cluster_profile):
                 gate_survivors.append(j)
-                if j.get("_rank_score", 50.0) >= RANK_REJECT_SCORE_FLOOR:
+                if _clears_rank_floor(j):
                     judge_eligible.append(j)
                 else:
                     below_rank_floor.append(j)
@@ -855,6 +1010,7 @@ def _gate_rank_refill_cluster(
         "examined": examined, "queue_len": len(queue),
         "gate_survivors": len(gate_survivors), "hard_dropped": len(hard_dropped),
         "off_sector": len(off_sector), "rank_floor_rejected": rank_floor_rejected,
+        "hard_gate_dropped": len(hard_gate_failed),
         "judge_eligible": len(judge_eligible), "stop_reason": stop_reason,
         "backfilled": backfilled,
     }
@@ -1043,12 +1199,29 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # nothing else survives past the run. Built incrementally in-line with the
     # counts each stage already computes; an early return below simply carries
     # whatever keys were reached so far, same as timings already does.
-    funnel: dict[str, int | bool] = {}
+    # `samples` rides inside funnel under the "samples" key so the pipeline's
+    # return arity (and its four early returns) stay untouched; run_search_task
+    # pops it back out into its own SearchRun column, keeping funnel_counts
+    # ints/bools only. See _sample_stage / the Settings > Snapshot panel.
+    funnel: dict = {}
+    samples: dict[str, list[dict]] = {}
+    funnel["samples"] = samples
     t0 = time.monotonic()
 
     def _lap(phase: str, since: float) -> float:
         timings[phase] = round(time.monotonic() - since, 2)
         return time.monotonic()
+
+    def _snap(stage: str, items) -> None:
+        """Record this stage's own total plus a few sample roles. The count is
+        stored here rather than cross-referenced out of `funnel` because several
+        stages (e.g. post-filter discovery) have no single funnel key of their
+        own. Never let diagnostics break a real run."""
+        try:
+            seq = list(items or [])
+            samples[stage] = {"count": len(seq), "samples": _sample_stage(seq)}
+        except Exception:
+            samples[stage] = {"count": 0, "samples": []}
 
     _check_cancelled(db, run)
 
@@ -1098,7 +1271,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # like any other freshly discovered job.
     category_hits = [j for j in raw_jobs if j.get("_is_category_page")]
     raw_jobs = [j for j in raw_jobs if not j.get("_is_category_page")]
-    if category_hits:
+    if category_hits and CATEGORY_EXPAND_ENABLED:
         _progress(db, run, "Expanding job listing pages…")
         browser_config = engine.BrowserConfig(
             headless=True, verbose=False, viewport_width=1280, viewport_height=800,
@@ -1112,6 +1285,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     if ats_stale:
         mark_ats_batch_fetched(db, profile_id)
     funnel["raw_discovered"] = len(raw_jobs)
+    _snap("discovery", raw_jobs)
     raw_jobs, n_blocked = filter_blocked(raw_jobs, get_blocked_domains(db))
     funnel["blocklist_dropped"] = n_blocked
     if n_blocked:
@@ -1155,6 +1329,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # catalogue of roles this run" without needing to visit the source's own
     # listing page.
     company_title_counts = _company_title_counts(raw_jobs)
+    _snap("after_filters", raw_jobs)
 
     inserted, refreshed, requeued = _upsert_discovered(db, profile_id, raw_jobs)
     funnel["store_inserted"] = inserted
@@ -1190,6 +1365,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
          f"resurfaced backlog row(s) -> {len(rows)} total")
     funnel["pool_rows"] = len(rows)
     funnel["pool_resurfaced"] = len(resurfaced)
+    _snap("pool", rows)
     if not rows:
         emit("[pipeline] STOP: nothing to evaluate (store empty and no backlog) -> 0 results")
         return [], False, None, timings, None, funnel
@@ -1229,12 +1405,14 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     emit(f"[pipeline] scored {len(scored)} candidates | top_score={top_score:.3f} | "
          f">= RELEVANCE_PRIMARY({RELEVANCE_PRIMARY})={above_primary}")
     _log_score_distribution(emit, scored)
+    _snap("scored", scored)
 
     scored, n_prescreen = _heuristic_prescreen(scored, eng_profile)
     funnel["heuristic_prescreen_dropped"] = n_prescreen
     if n_prescreen:
         emit(f"[pipeline] heuristic prescreen dropped {n_prescreen} obvious seniority mismatch(es) "
              f"before any gate")
+    _snap("heuristic_survivors", scored)
 
     skipped_clusters = _clusters_without_fresh_terms(eng_profile, role_clusters)
     if skipped_clusters:
@@ -1279,6 +1457,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     examined_ids: set[str] = set()
     gate_survivor_ids: set[str] = set()
     total_examined = total_gate_survivors = total_judge_eligible = 0
+    total_hard_gate_dropped = 0
     for idx, queue in queues.items():
         if not queue:
             continue
@@ -1294,6 +1473,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         total_examined += stats["examined"]
         total_gate_survivors += stats["gate_survivors"]
         total_judge_eligible += stats["judge_eligible"]
+        total_hard_gate_dropped += stats["hard_gate_dropped"]
         if stats["backfilled"]:
             # Same tag/message as the old one-shot design's starvation backfill
             # (see _compose_fallback_warning) -- MIN_RESULTS safety net had to
@@ -1316,7 +1496,12 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     funnel["gate_survivors_total"] = total_gate_survivors
     funnel["rank_scored"] = total_examined
     funnel["judge_eligible_total"] = total_judge_eligible
+    funnel["hard_gate_dropped"] = total_hard_gate_dropped
     funnel["judge_pool_size"] = len(selected)
+    # Flatten the per-cluster judge-eligible lists for sampling: the Snapshot
+    # panel reports the pipeline stage-by-stage, not cluster-by-cluster.
+    _snap("judge_eligible", [j for jl in rank_by_cluster.values() for j in jl])
+    _snap("judge_pool", selected)
     emit(f"[pipeline] gate+rank across {len(rank_by_cluster)} cluster(s): {total_examined} examined -> "
          f"{total_gate_survivors} gate survivors -> {total_judge_eligible} judge-eligible -> "
          f"top-{len(selected)} sent to full evaluation")
@@ -1374,6 +1559,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         t0 = _lap("scrape", t0)
     else:
         emit("[pipeline] full-page scraping disabled in settings; evaluating on snippets")
+    _snap("scraped", to_evaluate)
 
     # Final judgment runs once PER CLUSTER, each given a cv_text scoped to just
     # that cluster's roles (see cv_text_for_cluster) -- so the judge weighs fit
@@ -1446,8 +1632,12 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         if fresh:
             _cluster_eval_start = time.monotonic()
             strong, backup, disqualified = engine.final_evaluation_split(fresh, eng_profile, cv_text=cv_text)
+            _rejected_this_call = len(fresh) - len(strong) - len(backup) if strong is not None else 0
             emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}) took "
-                 f"{time.monotonic() - _cluster_eval_start:.1f}s for {len(fresh)} job(s)")
+                 f"{time.monotonic() - _cluster_eval_start:.1f}s for {len(fresh)} job(s) -> "
+                 f"{len(strong) if strong is not None else 0} strong, "
+                 f"{len(backup) if strong is not None else 0} backup, {_rejected_this_call} rejected "
+                 f"({len(disqualified) if strong is not None else 0} with a disqualifier reason)")
             if strong is None:
                 # The call itself failed (exception/malformed response) -- nothing
                 # was actually judged. Don't persist any verdict, and don't treat
@@ -1604,6 +1794,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     final = _fair_allocate(final_by_cluster, engine.FINAL_PICKS)
     t0 = _lap("final_eval", t0)
     funnel["final_picks"] = len(final)
+    _snap("final_picks", final)
     _progress(db, run, "Writing up top picks…")
     emit(f"[pipeline] final_evaluation returned {len(final)} picks across "
          f"{sum(1 for v in final_by_cluster.values() if v)} cluster(s)"
@@ -1745,16 +1936,24 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         for rank, entry in enumerate(final, start=1):
             db.add(Role(
                 profile_id=profile_id,
+                search_run_id=run.id,
                 external_id=entry.get("_identity") or _external_id(engine, entry),
                 title=entry.get("title", "Untitled role"),
                 company=entry.get("company"),
                 location=entry.get("location"),
                 url=entry.get("url"),
                 tags=_derive_tags(entry, snap["skills"], snap["seniority_label"]),
-                salary_text=_salary_text(entry),
+                # The judge read the salary off the full JD; the regex only ever
+                # saw whatever text was to hand. Prefer the judge, fall back to
+                # the regex for a pick it had nothing to say about.
+                salary_text=(entry.get("role_salary") or "").strip() or _salary_text(entry),
                 source=entry.get("board"),
                 fit_rank=rank,
                 ai_analysis=_compose_analysis(entry),
+                verdict=_verdict_of(entry),
+                work_style=(entry.get("work_style") or "").strip() or None,
+                seniority_level=(entry.get("role_seniority") or "").strip() or None,
+                deadline_text=(entry.get("deadline") or "").strip() or None,
                 status="new",
             ))
 
@@ -1767,6 +1966,10 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         run.status = "done"
         run.finished_at = datetime.utcnow()
         run.phase_timings = json.dumps(timings)
+        # Samples ride inside `funnel` purely to keep the pipeline's return arity
+        # (and its early returns) unchanged -- split back out here so
+        # funnel_counts stays ints/bools only, as get_run_funnel expects.
+        run.snapshot_samples = json.dumps(funnel.pop("samples", {}))
         run.funnel_counts = json.dumps(funnel)
         if warning:
             run.warning = warning

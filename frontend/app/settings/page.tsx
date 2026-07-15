@@ -40,6 +40,11 @@ export default function SettingsPage() {
     queryFn: () => api.runFunnel(),
   });
 
+  const { data: snapshot } = useQuery({
+    queryKey: ["snapshot"],
+    queryFn: () => api.snapshot(),
+  });
+
   const total = (sources ?? []).reduce((n, s) => n + s.last_count, 0);
 
   async function toggleScrape() {
@@ -342,6 +347,10 @@ export default function SettingsPage() {
                     <span>{runFunnel.shown}</span>
                   </div>
                 </div>
+                <div className="annotation" style={{ marginTop: 4 }}>
+                  Judge stage rejected {runFunnel.final_judge_rejected} of{" "}
+                  {runFunnel.final_judge + runFunnel.final_judge_rejected} evaluated.
+                </div>
               </>
             ) : (
               <div className="annotation" style={{ marginTop: 12 }}>
@@ -368,6 +377,64 @@ export default function SettingsPage() {
             {harvestMsg && (
               <div className="annotation" style={{ marginTop: 8 }}>
                 {harvestMsg}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-h">Snapshot (last run, stage by stage)</div>
+          <div className="panel-b">
+            <div className="annotation">
+              What was actually at each stage of the last search — the count plus a
+              few random example roles (not the top-ranked ones, so they show what a
+              stage really lets through). Copy a stage into an AI to analyse why it
+              kept or dropped what it did.
+            </div>
+            {snapshot && snapshot.run_id ? (
+              <>
+                <div className="annotation" style={{ marginTop: 4 }}>
+                  Run #{snapshot.run_id}
+                  {snapshot.finished_at
+                    ? ` · ${new Date(snapshot.finished_at).toLocaleString()}`
+                    : ""}
+                </div>
+                {snapshot.stages.map((st) => (
+                  <div key={st.stage} className="snapshot-stage">
+                    <div className="snapshot-stage-h">
+                      <span>{st.label}</span>
+                      <span className="snapshot-count">{st.count}</span>
+                    </div>
+                    {st.samples.length > 0 ? (
+                      <ul className="snapshot-jobs">
+                        {st.samples.map((j, i) => (
+                          <li key={`${st.stage}-${i}`} className="snapshot-job">
+                            <span className="snapshot-job-title">
+                              {j.title || "(untitled)"}
+                              {j.company ? ` — ${j.company}` : ""}
+                            </span>
+                            {j.url && (
+                              <a
+                                href={j.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="snapshot-job-url"
+                              >
+                                {j.url}
+                              </a>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="annotation">Nothing reached this stage.</div>
+                    )}
+                  </div>
+                ))}
+              </>
+            ) : (
+              <div className="annotation" style={{ marginTop: 12 }}>
+                No completed search run yet.
               </div>
             )}
           </div>
