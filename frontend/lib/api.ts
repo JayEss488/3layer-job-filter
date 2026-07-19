@@ -54,6 +54,8 @@ export const api = {
   deleteProfile: (id: number) =>
     req<void>(`/profiles/${id}`, { method: "DELETE" }),
   stats: (id: number) => req<Stats>(`/profiles/${id}/stats`),
+  interpretFeedback: (id: number) =>
+    req<Attribute[]>(`/profiles/${id}/interpret-feedback`, { method: "POST" }),
 
   // attributes
   attributes: (id: number) => req<AttributesResponse>(`/profiles/${id}/attributes`),

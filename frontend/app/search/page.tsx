@@ -81,7 +81,7 @@ export default function SearchPage() {
     <div className="app">
       <Nav />
       <div className="page-body">
-        <SearchFeedbackBox profileId={activeId} />
+        {!running && <SearchFeedbackBox profileId={activeId} />}
         <TrainingBanner />
 
         {running && (

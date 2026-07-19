@@ -47,6 +47,11 @@ export default function DashboardPage() {
   return <ProfileBody key={activeId} profileId={activeId} />;
 }
 
+// Mirrors backend config.MAX_USER_ROLE_FAMILIES -- the engine only ever
+// clusters into 3 streams (MAX_ROLE_CLUSTERS), so this caps manual additions
+// one above that: at most one family ever needs folding into another.
+const MAX_ROLE_FAMILIES = 4;
+
 // Split out so every hook below runs unconditionally: the page above returns
 // early until a profile id exists, and useAttributeMutations needs a real one.
 function ProfileBody({ profileId }: { profileId: number }) {
@@ -57,6 +62,7 @@ function ProfileBody({ profileId }: { profileId: number }) {
   const { data: stats } = useStats(profileId);
   const fileRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const { update } = useAttributeMutations(profileId);
   const fam = useFamilyMutations(profileId);
   const g = attrs?.by_type;
@@ -99,7 +105,7 @@ function ProfileBody({ profileId }: { profileId: number }) {
   async function onUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    setBusy(true);
+    setUploading(true);
     try {
       await api.parseCv(profileId, file);
       qc.invalidateQueries({ queryKey: ["attributes", profileId] });
@@ -114,7 +120,7 @@ function ProfileBody({ profileId }: { profileId: number }) {
     } catch (err) {
       alert((err as Error).message);
     } finally {
-      setBusy(false);
+      setUploading(false);
       if (fileRef.current) fileRef.current.value = "";
     }
   }
@@ -160,6 +166,12 @@ function ProfileBody({ profileId }: { profileId: number }) {
           <div className="subhead">Role types</div>
           <button
             className="ghost"
+            disabled={(families?.length ?? 0) >= MAX_ROLE_FAMILIES}
+            title={
+              (families?.length ?? 0) >= MAX_ROLE_FAMILIES
+                ? `Limit reached (${MAX_ROLE_FAMILIES} max)`
+                : undefined
+            }
             onClick={() => fam.add.mutate({ name: "New role family", tier: "secondary" })}
           >
             ＋ add role family
@@ -176,9 +188,26 @@ function ProfileBody({ profileId }: { profileId: number }) {
           ))}
           {families?.length === 0 && (
             <div className="info-banner">
-              No role families yet — upload a CV on the{" "}
-              <a href="/memory">Memory</a> tab and they&apos;ll be built for you, or add one
-              above.
+              {uploading ? (
+                <>
+                  <span className="spinner">◴</span> Reading your CV — the AI reads it closely, so
+                  this can take 15-20 seconds.
+                </>
+              ) : (
+                <>
+                  No role families yet —{" "}
+                  <a
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      fileRef.current?.click();
+                    }}
+                  >
+                    upload a CV
+                  </a>{" "}
+                  and they&apos;ll be built for you, or add one above.
+                </>
+              )}
             </div>
           )}
         </div>
@@ -262,16 +291,21 @@ function ProfileBody({ profileId }: { profileId: number }) {
 
         <div className="bottom-row">
           <div className="action-row">
-            <button className="btn btn-primary" onClick={runSearch} disabled={busy}>
-              ▶ Run New Search
+            <button className="btn btn-primary" onClick={runSearch} disabled={busy || uploading}>
+              {busy ? "Starting…" : "▶ Run New Search"}
             </button>
             <button
               className="btn btn-secondary"
               onClick={() => fileRef.current?.click()}
-              disabled={busy}
+              disabled={busy || uploading}
             >
-              ↑ Upload new CV
+              {uploading ? "Reading CV…" : "↑ Upload new CV"}
             </button>
+            {uploading && (
+              <span className="annotation" style={{ marginLeft: 8 }}>
+                <span className="spinner">◴</span> Takes 15-20 seconds.
+              </span>
+            )}
             <input ref={fileRef} type="file" accept=".pdf,.docx,.txt" hidden onChange={onUpload} />
           </div>
           <button className="btn btn-ghost" onClick={clearMemory}>

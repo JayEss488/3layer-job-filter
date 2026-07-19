@@ -120,30 +120,6 @@ def _evidence_tiers(group: list[ProfileAttribute]) -> dict[str, str]:
     return out
 
 
-# Depth signal for skill emphasis (Expert/Proficient/Familiar/One-time) and the
-# past_role employment-type flag (Informal = student club/volunteer/unpaid, not
-# a paid job) -- how many extra times a value is repeated in the embedding text
-# on top of the existing feedback-weight multiplier. Substring-matched so it
-# still works with values the user typed by hand, not just the parser's output.
-_PROFICIENCY_MULT = {
-    "expert": 2.0,
-    "proficient": 1.5,
-    "familiar": 1.0,
-    "one-time": 0.5,
-    "informal": 0.5,
-}
-
-
-def _proficiency_multiplier(proficiency: str | None) -> float:
-    if not proficiency:
-        return 1.0
-    text = proficiency.lower()
-    for key, mult in _PROFICIENCY_MULT.items():
-        if key in text:
-            return mult
-    return 1.0
-
-
 def _infer_region(skills: list[str], roles: list[str], location: str) -> dict:
     """One cheap call to infer sectors + Adzuna country code the engine needs but
     our schema doesn't store directly. Falls back to safe defaults."""
@@ -161,17 +137,25 @@ Location: {location or 'United Kingdom'}"""
 
 
 # Embedding pre-filter is cosine similarity, which rewards a tight, topical
-# query -- so it's deliberately narrower than the full profile. target_role is
-# the direct signal for "what job"; sector_target adds domain/mission context.
-# skill/past_role/qualification/experience used to be blended in too, but a
-# generic skill list matches broadly across unrelated postings, and free-text
-# experience bullets (unbounded in count, sometimes full sentences) diluted
-# the query further the richer a candidate's history was -- exactly backwards,
-# since a well-documented candidate should score BETTER, not worse. All of
-# that detail still reaches the final AI judge in full (cv_text_base) and
-# still shapes the cheap gate/rank prompts (skill_weight_tiers) -- only the
-# cosine pre-filter stops using it.
-_BASE_EMPHASIS = {"target_role": 3, "sector_target": 2}
+# query -- so it's deliberately narrower than the full profile: target_role
+# ONLY, the direct signal for "what job". skill/past_role/qualification/
+# experience used to be blended in too, but a generic skill list matches
+# broadly across unrelated postings, and free-text experience bullets
+# (unbounded in count, sometimes full sentences) diluted the query further
+# the richer a candidate's history was -- exactly backwards, since a
+# well-documented candidate should score BETTER, not worse. sector_target
+# (repeated) plus the LLM-inferred sector guess and seniority (appended once)
+# used to be blended in here too, but neither is scoped by role_filter, so
+# every cluster's text carried the exact identical sector/seniority tokens
+# regardless of that cluster's own roles -- diluting each cluster's centroid
+# with generic words instead of sharpening it, and actively working against
+# the reason per-cluster scoping exists at all. A live diagnostic re-score
+# (analyze_embedding_gate.py) confirmed two unrelated clusters sharing one
+# identical sector/seniority tail and prompted dropping it. All of that
+# detail still reaches the final AI judge in full (cv_text_base, which still
+# gets "Sector interests: ..." and seniority) and sector_target still shapes
+# the cheap gate/rank prompts -- only the cosine pre-filter stops using it.
+_BASE_EMPHASIS = 3  # times a target_role repeats per unit of weight
 
 
 def _declared_priority_multiplier(
@@ -190,14 +174,13 @@ def _declared_priority_multiplier(
 
 
 def _weighted_text(
-    g: dict[str, list[ProfileAttribute]], sectors: list[str], seniority: str,
-    search_terms: list[str], role_filter: set[str] | None = None,
-    tier_by_family: dict[int, str] | None = None,
+    g: dict[str, list[ProfileAttribute]], search_terms: list[str],
+    role_filter: set[str] | None = None, tier_by_family: dict[int, str] | None = None,
 ) -> str:
     """Weighted emphasis text driving the embedding pre-filter: repeat each
-    value roughly in proportion to its learned weight so feedback actually
-    shifts results both up (sustained ticks) and down (sustained crosses).
-    Previously this used `max(1, round(base * max(1, round(a.weight)) * mult))`
+    target_role value roughly in proportion to its learned weight so feedback
+    actually shifts results both up (sustained ticks) and down (sustained
+    crosses). Previously this used `max(1, round(base * max(1, round(a.weight)) * mult))`
     -- the INNER max(1, round(weight)) alone already floored the effective
     weight at 1 for anything below ~1.5, and the OUTER max(1, ...) floored the
     final count too, so a value crossed all the way down to WEIGHT_MIN (0.1)
@@ -210,22 +193,18 @@ def _weighted_text(
     included -- this is what lets each role cluster get its own scoped
     embedding text instead of one blend of every target role the candidate has.
     tier_by_family maps family id -> core/secondary so a target role also carries
-    its family's declared priority (see _declared_priority_multiplier)."""
+    its family's declared priority (see _declared_priority_multiplier).
+
+    target_role ONLY -- see the comment above _BASE_EMPHASIS for why
+    sector_target/sectors/seniority were dropped from here."""
     emphasis: list[str] = []
     tiers = tier_by_family or {}
-    for group_name in ("target_role", "sector_target"):
-        base = _BASE_EMPHASIS[group_name]
-        for a in g.get(group_name, []):
-            if group_name == "target_role" and role_filter is not None and a.value.strip() not in role_filter:
-                continue
-            if group_name == "target_role":
-                mult = _declared_priority_multiplier(a, tiers)
-            else:
-                mult = _proficiency_multiplier(a.proficiency)
-            count = max(0, round(base * a.weight * mult))
-            emphasis.extend([a.value] * count)
-    emphasis.extend(sectors)
-    emphasis.append(seniority)
+    for a in g.get("target_role", []):
+        if role_filter is not None and a.value.strip() not in role_filter:
+            continue
+        mult = _declared_priority_multiplier(a, tiers)
+        count = max(0, round(_BASE_EMPHASIS * a.weight * mult))
+        emphasis.extend([a.value] * count)
     return " ".join(emphasis) or " ".join(search_terms)
 
 
@@ -421,7 +400,7 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     role_groups, tier_by_family = _role_groups(db, profile_id, g)
     role_clusters = [
         {"label": label, "roles": grp,
-         "weighted_text": _weighted_text(g, region["sectors"], seniority, search_terms,
+         "weighted_text": _weighted_text(g, search_terms,
                                           role_filter=set(grp), tier_by_family=tier_by_family)}
         for label, grp in role_groups
     ]
@@ -433,6 +412,7 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     intel = read_cached_intel(db, profile_id)
     header = intel.get("header") or ""
     requirements = intel.get("requirements") or []
+    analytical_brief = intel.get("analytical_brief") or ""
 
     engine_profile = {
         # Scopes full_auto's shared rotation cursor (boards_cache.db is one file
@@ -469,6 +449,11 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # weight tiers above so weak/self-directed/AI-assisted skill evidence has
         # some influence at the cheap gate/rank stage, not only at the final judge.
         "skill_evidence_tiers": _evidence_tiers(g.get("skill", [])),
+        # Evidence-focused narrative brief (profile_intel.py's TASK 5) -- named
+        # projects/tools/outcomes the tier labels above can't carry. "" until
+        # profile_intel has run at least once, or when the CV text gave nothing
+        # concrete beyond the typed attribute rows.
+        "candidate_brief": analytical_brief,
         # Candidate-specific must-have/must-not-have bullets for screen_gate's
         # requirements_ok axis (see full_auto.py::_screen_prompt). [] means none
         # generated yet or none stated.
@@ -494,18 +479,42 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         "hard_axes": _hard_axes(g, work_types_hard),
     }
 
-    weighted_text = _weighted_text(g, region["sectors"], seniority, search_terms)
+    weighted_text = _weighted_text(g, search_terms)
+
+    profile = db.get(Profile, profile_id)
 
     # Synthetic CV text for the expensive-AI final evaluation (engine reads a file).
     # cv_text_base omits the "Target roles" line -- see cv_text_for_cluster,
     # which appends it scoped to one role cluster at a time, instead of always
     # listing every target role the candidate has (which invites the judge to
-    # weigh fit against all of them at once). Starts with the profile_intel
-    # header (a distilled "Looking for X. Must have Y. Must not have Z."
-    # synthesis) so it survives _run_final_eval's 5000-char truncation -- kept
-    # alongside, not replacing, the verbatim intent_text line below; the
-    # redundancy is harmless token cost, not a bug.
-    cv_lines = [header] if header else []
+    # weigh fit against all of them at once).
+    #
+    # Deliberately de-duplicated rather than concatenating every available
+    # synthesis: the profile_intel `header` ("Looking for X. Must have Y. Must
+    # not have Z.") is an AI paraphrase of the same background this whole
+    # function reads, and profile.intent_text -- the candidate's OWN words,
+    # when they've given any -- is both more authoritative and richer, so
+    # header is only a fallback for profiles with no intent_text yet.
+    # Similarly `analytical_brief` (profile_intel TASK 5) and profile.cv_summary
+    # (parsing.py::summarize_cv_text) are two separately-generated compressions
+    # of the SAME raw CV text for the SAME purpose (evidence detail a typed
+    # attribute list drops) -- analytical_brief supersedes cv_summary once it
+    # exists (named project/tool citations, not just a generic paragraph), so
+    # only one is included, not both. A judge reading a wall of near-duplicate
+    # paragraphs doesn't gain signal, and the genuinely load-bearing detail
+    # (concrete evidence origin -- see EVIDENCE STRENGTH in full_auto.py) risks
+    # getting diluted or, worse, truncated off by _run_final_eval's char budget
+    # if it isn't the LAST thing repeated. So analytical_brief is placed right
+    # after skills (where it's most useful and safest from truncation), not at
+    # the end.
+    if profile and profile.intent_text:
+        cv_lines = [
+            "What the candidate is looking for (in their own words): " + profile.intent_text.strip()
+        ]
+    elif header:
+        cv_lines = [header]
+    else:
+        cv_lines = []
     if past_roles:
         cv_lines.append("Past roles: " + ", ".join(_labeled(g.get("past_role", []))))
     if qualifications:
@@ -514,6 +523,10 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append("Seniority: " + ", ".join(seniorities))
     if skills:
         cv_lines.append("Skills: " + ", ".join(_labeled(g.get("skill", []))))
+    if analytical_brief:
+        cv_lines.append("Skill evidence detail: " + analytical_brief)
+    elif profile and profile.cv_summary:
+        cv_lines.append("Additional background context: " + profile.cv_summary)
     if sector_targets:
         cv_lines.append("Sector interests: " + "; ".join(sector_targets))
     if location or work_types:
@@ -522,7 +535,7 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append("Constraints: " + "; ".join(customs))
     # Candidate's own hard filters, surfaced prominently so the judge's HARD
     # EXCLUSIONS/REQUIREMENTS disqualifier can enforce them. Kept out of
-    # _weighted_text (embedding) on purpose -- see the intent_text note below.
+    # _weighted_text (embedding) on purpose -- see the intent_text note above.
     if must_haves:
         cv_lines.append("HARD REQUIREMENTS (a role must satisfy all of these): " + "; ".join(must_haves))
     if avoids:
@@ -534,34 +547,17 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append("PREFERENCES (wanted, but NOT grounds to reject a role): " + "; ".join(soft_must_haves))
     if soft_avoids:
         cv_lines.append("DISLIKES (count against a role, but NOT grounds to reject it): " + "; ".join(soft_avoids))
-    # Extra unstructured context from the original CV, compressed once at upload
-    # time (see parsing.py::summarize_cv_text) -- kept short and appended last
-    # (before cv_text_for_cluster's per-cluster "Target roles" suffix) so it adds
-    # nuance the typed attribute rows above necessarily lose (named projects,
-    # leadership scope, domain nuance) without overwhelming the 5000-char budget
-    # _run_final_eval truncates cv_text to, which would otherwise risk cutting off
-    # that suffix.
-    profile = db.get(Profile, profile_id)
-    # The candidate's own free-text statement of what they want, given authoritative
-    # weight -- this is the direct answer to "what roles is this person actually after",
-    # which the typed target_role chips only approximate. Deliberately fed to the final
-    # judge (via cv_text_base) but NOT into the cosine embedding text (_weighted_text):
-    # a free paragraph would re-diffuse the very centroid the clean target roles sharpen.
-    if profile and profile.intent_text:
-        cv_lines.append(
-            "What the candidate is looking for (in their own words): " + profile.intent_text.strip()
-        )
     # Feedback the candidate typed on the /search page about recent RESULTS (not
-    # what they want, which is intent_text above) -- e.g. "these are too senior"
-    # or "stop showing sales roles". Surfaced to the judge as a steer for this run,
-    # not enforced like a hard filter.
+    # what they want, which is intent_text/header above) -- e.g. "these are too
+    # senior" or "stop showing sales roles". Surfaced to the judge as a steer
+    # for this run, not enforced like a hard filter. Appended last (before
+    # cv_text_for_cluster's per-cluster "Target roles" suffix) since it's the
+    # most disposable line if _run_final_eval's char budget ever does truncate.
     if profile and profile.search_feedback:
         cv_lines.append(
             "Candidate's feedback on recent search results (take this into account this run): "
             + profile.search_feedback.strip()
         )
-    if profile and profile.cv_summary:
-        cv_lines.append("Additional background context: " + profile.cv_summary)
     cv_text_base = "\n".join(cv_lines) or "General candidate."
     cv_text = (
         "\n".join([*cv_lines, f"Target roles: {', '.join(target_roles)}"])

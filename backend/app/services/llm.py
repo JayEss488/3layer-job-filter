@@ -4,6 +4,7 @@ Kept independent of the search engine (full_auto.py) so the app's lightweight LL
 calls don't drag in crawl4ai/playwright at import time."""
 import json
 import os
+import time
 from functools import lru_cache
 
 import httpx
@@ -52,20 +53,39 @@ _FIXED_TEMPERATURE_MODELS = ("gpt-5.5", "gpt-5.6-terra")
 def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
     """Call the model and parse a JSON object out of the reply. Returns {} on failure
     (logged to stdout so a failure is at least visible in the server console instead
-    of being indistinguishable from a genuine "nothing found" response)."""
+    of being indistinguishable from a genuine "nothing found" response).
+
+    Retries once on the same model after a short pause -- mirrors
+    full_auto.py's rank_gate handling of MID_MODEL/EXP_MODEL: a "permission"-flavored
+    error that clears on an immediate retry is a burst/short-window cap, not a real
+    per-key model restriction, and this module's calls (CV parsing, suggestions) are
+    one-shot and user-facing, so a single transient hiccup shouldn't surface as a
+    hard failure. Confirmed live: an identical STRONG_MODEL call 401'd, then
+    succeeded seconds later with no code or key change."""
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
     temperature = 1 if model in _FIXED_TEMPERATURE_MODELS else 0.2
-    try:
-        resp = _client().chat.completions.create(
-            model=model,
-            messages=msgs,
-            temperature=temperature,
-            response_format={"type": "json_object"},
-        )
-        return json.loads(_clean_json(resp.choices[0].message.content))
-    except Exception as e:
-        print(f"[llm_json] call failed (model={model}): {e}")
-        return {}
+    for attempt in (1, 2):
+        try:
+            resp = _client().chat.completions.create(
+                model=model,
+                messages=msgs,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(_clean_json(resp.choices[0].message.content))
+        except Exception as e:
+            if attempt == 2:
+                print(f"[llm_json] call failed (model={model}): {e}")
+                return {}
+            status = getattr(e, "status_code", None)
+            resp_obj = getattr(e, "response", None)
+            retry_after = resp_obj.headers.get("retry-after") if resp_obj is not None else None
+            try:
+                wait = float(retry_after) if retry_after else 2.0
+            except (TypeError, ValueError):
+                wait = 2.0
+            print(f"[llm_json] {model} call failed (status={status}): {e}; retrying after {wait}s.")
+            time.sleep(wait)

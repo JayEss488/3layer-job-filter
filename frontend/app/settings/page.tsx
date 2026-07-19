@@ -348,8 +348,22 @@ export default function SettingsPage() {
                   </div>
                 </div>
                 <div className="annotation" style={{ marginTop: 4 }}>
-                  Judge stage rejected {runFunnel.final_judge_rejected} of{" "}
-                  {runFunnel.final_judge + runFunnel.final_judge_rejected} evaluated.
+                  {(() => {
+                    const evaluated = runFunnel.final_judge + runFunnel.final_judge_rejected;
+                    const extra = evaluated - runFunnel.judge_pool_size;
+                    return (
+                      <>
+                        Judge stage rejected {runFunnel.final_judge_rejected} of {evaluated} evaluated
+                        {extra > 0 && (
+                          <>
+                            {" "}(judge pool: {runFunnel.judge_pool_size}; {extra} more came from
+                            thin-cluster backfill retries)
+                          </>
+                        )}
+                        .
+                      </>
+                    );
+                  })()}
                 </div>
               </>
             ) : (
@@ -413,6 +427,9 @@ export default function SettingsPage() {
                               {j.title || "(untitled)"}
                               {j.company ? ` — ${j.company}` : ""}
                             </span>
+                            {j.note && (
+                              <span className="snapshot-job-note">{j.note}</span>
+                            )}
                             {j.url && (
                               <a
                                 href={j.url}

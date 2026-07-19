@@ -66,9 +66,11 @@ class RoleFamily(Base):
     which now only ever runs to SEED families from a fresh CV.
 
     A family owns its target_role rows via ProfileAttribute.family_id. Deleting
-    a family orphans (family_id -> NULL) rather than deletes its roles -- see
-    routers/families.py; losing target roles because a card was removed would
-    be a surprising amount of collateral damage for a grouping edit."""
+    a family deletes its target_role rows too, not just the family -- see
+    routers/families.py::delete_family. Orphaning them instead reads as safer
+    but isn't: the card is the only place a target role renders, so an orphan
+    would be invisible while still driving discovery, and the next
+    ensure_families call would silently re-seed it into a brand-new card."""
 
     __tablename__ = "role_families"
 
@@ -100,7 +102,7 @@ class ProfileAttribute(Base):
     type = Column(Text, nullable=False)  # controlled vocab, see config.ATTRIBUTE_TYPES
     value = Column(Text, nullable=False)
     weight = Column(Float, nullable=False, default=DEFAULT_WEIGHT)
-    source = Column(Text, nullable=False)  # cv_parsed|text_parsed|user_added|engine_inferred
+    source = Column(Text, nullable=False)  # cv_parsed|text_parsed|user_added|engine_inferred|ai_suggested|feedback_derived
     confirmed = Column(Boolean, default=False)
     # Depth/duration signal for skill|past_role, e.g. "expert, 5+ years" or
     # "one-off, one week". Free text, set by CV parsing or edited by the user;
@@ -227,7 +229,7 @@ class JobSeen(Base):
     # source-updated row is re-queued so a changed posting is re-scraped/re-judged.
     full_text = Column(Text)           # scraped page text, persisted so no re-scrape
     eval_verdict = Column(Text)        # strong|backup|reject (final-AI decision)
-    eval_analysis = Column(Text)       # JSON: summary/match_reasons/concerns
+    eval_analysis = Column(Text)       # JSON: summary/top_match_reason/concerns
     eval_signature = Column(Text)      # profile signature at eval time (validity key)
     evaluated_at = Column(DateTime)
     # Set only on a HIGH-CONFIDENCE dead/expired-listing signal from Phase 5

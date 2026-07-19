@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..config import FAMILY_TIER_CHOICES, FAMILY_TIER_DEFAULT
+from ..config import FAMILY_TIER_CHOICES, FAMILY_TIER_DEFAULT, MAX_USER_ROLE_FAMILIES
 from ..database import get_db
 from ..deps import current_user_id, get_profile_or_404
 from ..models import Profile, ProfileAttribute, RoleFamily
@@ -52,6 +52,11 @@ def add_family(
     if body.tier and body.tier not in FAMILY_TIER_CHOICES:
         raise HTTPException(status_code=422, detail=f"Unknown tier: {body.tier}")
     existing = list_families(db, profile.id)
+    if len(existing) >= MAX_USER_ROLE_FAMILIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"You can have at most {MAX_USER_ROLE_FAMILIES} role families",
+        )
     family = RoleFamily(
         profile_id=profile.id,
         name=name,

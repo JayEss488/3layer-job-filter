@@ -157,6 +157,14 @@ PINNED_ROLE_MULT = 1.4
 # (core families first -- see families.ordered_for_engine).
 MAX_ROLE_CLUSTERS = 3
 
+# How many family CARDS the candidate can manually create, enforced in
+# routers/families.py::add_family. Deliberately one more than MAX_ROLE_CLUSTERS
+# above -- LLM seeding already never exceeds that cap, so this only bounds
+# manual additions, and capping at +1 means at most one family ever needs to
+# be folded into another at search time instead of an unbounded amount of
+# fold-in damage.
+MAX_USER_ROLE_FAMILIES = 4
+
 # How many fresh title suggestions a single family's "regenerate" action asks
 # the LLM for (see services/families.regenerate_family). Deliberately more
 # generous than a bare minimum -- a family card with only 1-2 roles thins its

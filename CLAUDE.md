@@ -2,6 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## User preferences
+Don't run a full end to end search in testing because it uses real API credits.
+
 ## What this is
 
 JobMatch: an AI job-matching app that parses a CV into structured "memory" (profile
@@ -163,20 +166,37 @@ idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
    to its single best-scoring cluster → free heuristic prescreen (`_heuristic_prescreen`:
    title-regex drops obvious seniority mismatches — Director/VP for a junior, Intern for
    a senior — before any LLM spends a token) → adaptive strict/broadened pool per cluster
-   (`TARGET_POOL` = 90) → **one merged six-axis screen per cluster**
-   (`full_auto.screen_gate`, a cached cheap-model call judging sector, seniority,
-   candidate-specific requirements, core-skills overlap, salary, and work arrangement in
+   (`TARGET_POOL` = 90) → **one merged eight-axis screen per cluster**
+   (`full_auto.screen_gate`, a cached cheap-model call judging role-function fit,
+   whether the text is even a real single job posting, seniority, candidate-specific
+   requirements, core-skills overlap, salary, and work arrangement in
    one response — grown from an original three-axis sector+seniority+requirements design;
    `SOFT_GATE_AXES` in both `full_auto.py` and `engine.py` is the single source of truth
    for which axes count, so the two modules can't quietly disagree on how many there
-   are): `sector_ok` and `hard_gate_ok` are the two unconditional hard drops.
-   `hard_gate_ok` enforces the candidate's OWN stated non-negotiables — the `avoid` and
+   are): `sector_ok`, `hard_gate_ok`, and `listing_ok` are the three unconditional hard
+   drops. Despite its name, `sector_ok` no longer judges INDUSTRY sector — it used to
+   also weigh an LLM-inferred `sectors` guess (`snapshot._infer_region`, invisible/
+   uneditable in the UI, recomputed fresh each run from skills+past/target roles), which
+   could drift from the candidate's actual current target roles and let a
+   same-industry-different-function listing (e.g. a Lead Product Manager role surfacing
+   for a Data & Insights candidate) through as "adjacent enough" — a live gate-harness
+   diagnostic (`tests/gate_harness.py`) caught exactly this on a real profile. It now
+   judges purely on job-FUNCTION similarity to the candidate's own stated target roles,
+   which were already part of this axis's prompt anyway; `rank_gate`'s prompt dropped the
+   same `sectors` guess for the same reason. `listing_ok` catches listings that clearly
+   aren't one specific job posting at all — a job board's own search-results/category
+   page or generic aggregator blurb that slipped past discovery-time filtering (e.g.
+   `_looks_like_category_page`, which only runs at discovery time on Google-organic
+   results and can't see this in a stored snippet) — since re-scraping/ranking/judging
+   non-job text wastes every downstream stage. `hard_gate_ok` enforces the candidate's OWN stated non-negotiables — the `avoid` and
    `must_have` attribute chips (see the data model above) — and is false only when the
    listing *clearly* involves an avoid item or clearly can't satisfy a must-have,
    defaulting to true when the listing is silent, so a thin listing isn't dropped for
-   merely failing to confirm. Unlike a sector or soft-axis drop, a `hard_gate_ok` failure
+   merely failing to confirm. Unlike a sector or soft-axis drop, a `hard_gate_ok` (or
+   `listing_ok`) failure
    is also excluded from the `MIN_RESULTS` floor backfill below: resurfacing a job the
-   candidate explicitly said to avoid would defeat the point of asking. The other five
+   candidate explicitly said to avoid (or that isn't a real job posting at all) would
+   defeat the point of asking. The other five
    axes are individually
    soft — a job failing only *one* of them still proceeds to `rank_gate` (which gives it
    a real per-job fit score) and reaches the final judge carrying it as a hint, same as
@@ -307,6 +327,17 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   scraping (skips retrying a known-bad domain instead of paying retries/timeouts on it).
 - `MIN_RESULTS` (default 3) — the per-cluster keep-floor the merged screen backfills to,
   and the same floor that triggers the final-judge stage's bounded backfill retry.
+- `RELEVANCE_PRIMARY` / `RELEVANCE_FLOOR` (`engine.py`, both 0.39) — the embedding
+  cosine-score cutoffs. `RELEVANCE_FLOOR`, not `RELEVANCE_PRIMARY`, is the actual
+  pool-admission gate: `_cluster_candidate_queues` always admits everything scoring
+  `>= RELEVANCE_FLOOR` regardless of `RELEVANCE_PRIMARY` (which only flags a cluster as
+  `harsh`/labels a `broadened` fallback for logging). Raised twice from an original 0.35:
+  first to 0.37 after a diagnostic re-score (`analyze_embedding_gate.py`) found the
+  lowest genuinely-decent match sitting at 0.379; then `RELEVANCE_FLOOR` raised from 0.20
+  to 0.39 (with `RELEVANCE_PRIMARY` raised in lockstep, since floor must never exceed
+  primary) after a live `tests/gate_harness.py` run confirmed jobs scoring below ~0.39
+  were reliably screened out later anyway — admitting them at all just burned gate/rank
+  calls on jobs with no realistic path to a final pick.
 - `JUDGE_POOL` (default 40, `engine.py`) / `RANK_REJECT_SCORE_FLOOR` (default 55,
   `engine.py`) — the cheap rank stage's cap and absolute per-job score cutoff, see
   pipeline step 2. `full_auto.rank_gate`'s fail-open path (its `llm()` call erroring,

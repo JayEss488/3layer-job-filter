@@ -62,6 +62,7 @@ class RunFunnelOut(BaseModel):
     passed_gates: int = 0                # gate_survivors_total
     final_judge: int = 0                 # final_strong + final_backup
     final_judge_rejected: int = 0        # final_fresh_judged - final_strong - final_backup
+    judge_pool_size: int = 0             # initial judge pool, capped at JUDGE_POOL (engine.py)
     shown: int = 0                       # final_picks
 
 
@@ -69,6 +70,10 @@ class SnapshotJobOut(BaseModel):
     title: str = ""
     company: str = ""
     url: str = ""
+    # Only populated for stages that carry a per-item audit reason (currently
+    # "rank_rejected" -- rank_gate's score + short note, see engine.py::_sample_stage).
+    # "" everywhere else.
+    note: str = ""
 
 
 class SnapshotStageOut(BaseModel):
@@ -98,6 +103,7 @@ _SNAPSHOT_STAGES = [
     ("scored", "Embedded & cosine-scored"),
     ("heuristic_survivors", "Survived heuristic prescreen"),
     ("judge_eligible", "Survived cheap gate + rank floor"),
+    ("rank_rejected", "Cut by the rank-score floor (below cutoff)"),
     ("judge_pool", "Selected for the judge (fair-allocated)"),
     ("scraped", "Full text ready (scraped or snippet)"),
     ("final_picks", "Final picks shown"),
@@ -158,6 +164,7 @@ def get_run_funnel(db: Session = Depends(get_db)):
             counts.get("final_fresh_judged", 0) - counts.get("final_strong", 0)
             - counts.get("final_backup", 0)
         ),
+        judge_pool_size=counts.get("judge_pool_size", 0),
         shown=counts.get("final_picks", 0),
     )
 

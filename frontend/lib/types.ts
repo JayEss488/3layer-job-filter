@@ -52,6 +52,7 @@ export interface RunFunnel {
   passed_gates: number;
   final_judge: number;
   final_judge_rejected: number;
+  judge_pool_size: number;
   shown: number;
 }
 
@@ -59,6 +60,7 @@ export interface SnapshotJob {
   title: string;
   company: string;
   url: string;
+  note?: string;
 }
 
 export interface SnapshotStage {

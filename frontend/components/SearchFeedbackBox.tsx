@@ -38,6 +38,27 @@ export function SearchFeedbackBox({ profileId }: { profileId: number }) {
       setStatus("Saved — will be taken into account next search.");
     } catch (e) {
       setStatus((e as Error).message);
+      return;
+    }
+    // Best-effort: turn actionable feedback into a reviewable avoid/must-have
+    // filter. Kept out of the try/catch above -- the feedback text is already
+    // safely saved either way, so a failure here shouldn't look like a save error.
+    try {
+      const created = await api.interpretFeedback(profileId);
+      if (created.length > 0) {
+        await Promise.all([
+          qc.invalidateQueries({ queryKey: ["attributes", profileId] }),
+          qc.invalidateQueries({ queryKey: ["confidence", profileId] }),
+        ]);
+        const names = created
+          .map((a) => `${a.type === "avoid" ? "avoid" : "need"}: "${a.value}"`)
+          .join(", ");
+        setStatus(
+          `Saved — added ${created.length} filter${created.length > 1 ? "s" : ""} (${names}) — review on your dashboard.`
+        );
+      }
+    } catch {
+      /* silent -- the feedback text itself already saved fine */
     }
   }
 

@@ -46,7 +46,7 @@ export default function OnboardingPage() {
     const file = e.target.files?.[0];
     if (!file) return;
     setBusy(true);
-    setStatus("Reading your CV…");
+    setStatus("Reading your CV — the AI reads it closely, so this can take 15-20 seconds…");
     try {
       const created = await api.parseCv(activeId!, file);
       invalidate();
@@ -62,7 +62,7 @@ export default function OnboardingPage() {
   async function parseText() {
     if (!text.trim()) return;
     setBusy(true);
-    setStatus("Reading your notes…");
+    setStatus("Reading your notes — the AI reads them closely, so this can take 15-20 seconds…");
     try {
       const created = await api.parseText(activeId!, text);
       invalidate();

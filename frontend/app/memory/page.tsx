@@ -187,6 +187,12 @@ export default function MemoryPage() {
           >
             {busy ? "Reading CV…" : "↑ Upload new CV"}
           </button>
+          {busy && (
+            <span className="annotation" style={{ marginLeft: 8 }}>
+              <span className="spinner">◴</span> The AI reads it closely, so this can take 15-20
+              seconds.
+            </span>
+          )}
           <input ref={fileRef} type="file" accept=".pdf,.docx,.txt" hidden onChange={onUpload} />
         </div>
 

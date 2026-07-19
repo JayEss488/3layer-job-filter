@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..deps import current_user_id, get_profile_or_404
 from ..models import Profile, Role
-from ..schemas import ProfileCreate, ProfileOut, ProfileUpdate, StatsOut
+from ..schemas import AttributeOut, ProfileCreate, ProfileOut, ProfileUpdate, StatsOut
+from ..services.feedback_intel import interpret_search_feedback
 
 router = APIRouter(prefix="/profiles", tags=["profiles"])
 
@@ -67,6 +68,20 @@ def update_profile(
     db.commit()
     db.refresh(profile)
     return profile
+
+
+@router.post("/{profile_id}/interpret-feedback", response_model=list[AttributeOut])
+def interpret_feedback(
+    profile: Profile = Depends(get_profile_or_404),
+    db: Session = Depends(get_db),
+):
+    """Reads the profile's current search_feedback and, if it states an
+    actionable rule, creates new unconfirmed avoid/must_have attributes for
+    it -- see services/feedback_intel.py. Called by the frontend right after
+    a successful PATCH of search_feedback, kept as its own endpoint so the
+    plain field-save above stays fast for its other callers (rename,
+    intent_text)."""
+    return interpret_search_feedback(db, profile.id)
 
 
 @router.delete("/{profile_id}", status_code=204)

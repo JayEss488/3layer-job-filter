@@ -1,5 +1,7 @@
 """Onboarding/parsing: CV upload + free text -> attributes, AI suggestions,
 and the confidence indicator."""
+import asyncio
+
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
@@ -60,11 +62,18 @@ async def parse_cv(
     if not text.strip():
         raise HTTPException(status_code=422, detail="Could not read any text from that file")
     profile.cv_text = text[:40000]
-    profile.cv_summary = summarize_cv_text(text)
+    # summarize_cv_text and parse_text_to_attributes each only need the raw text,
+    # not each other's output, so run their (both STRONG_MODEL) LLM calls
+    # concurrently instead of back-to-back -- cuts one of the three sequential
+    # calls off the upload wait without changing either prompt/model.
     try:
-        created = parse_text_to_attributes(db, profile.id, text, source="cv_parsed")
+        summary, created = await asyncio.gather(
+            asyncio.to_thread(summarize_cv_text, text),
+            asyncio.to_thread(parse_text_to_attributes, db, profile.id, text, source="cv_parsed"),
+        )
     except CVParseFailed as e:
         raise HTTPException(status_code=502, detail=f"Couldn't parse that CV automatically: {e}") from e
+    profile.cv_summary = summary
     db.commit()
     created += ensure_profile_intel(db, profile.id)
     # Grow the ATS company set for this profile's sectors, off-request. Skips its
@@ -74,18 +83,21 @@ async def parse_cv(
 
 
 @router.post("/profiles/{profile_id}/parse-text", response_model=list[AttributeOut])
-def parse_text(
+async def parse_text(
     body: ParseTextIn,
     background: BackgroundTasks,
     profile: Profile = Depends(get_profile_or_404),
     db: Session = Depends(get_db),
 ):
     profile.cv_text = body.text[:40000]
-    profile.cv_summary = summarize_cv_text(body.text)
     try:
-        created = parse_text_to_attributes(db, profile.id, body.text, source="text_parsed")
+        summary, created = await asyncio.gather(
+            asyncio.to_thread(summarize_cv_text, body.text),
+            asyncio.to_thread(parse_text_to_attributes, db, profile.id, body.text, source="text_parsed"),
+        )
     except CVParseFailed as e:
         raise HTTPException(status_code=502, detail=f"Couldn't parse that text automatically: {e}") from e
+    profile.cv_summary = summary
     db.commit()
     created += ensure_profile_intel(db, profile.id)
     background.add_task(harvest_for_profile, profile.id)

@@ -1,8 +1,9 @@
 """Cached "profile intelligence": one LLM call per meaningful profile edit that
 expands target roles, drafts a short CV header ("Looking for X. Must have Y. Must
-not have Z.") for the final judge, and a candidate-specific requirements checklist
-for the cheap gate's flexible axis -- plus, only when empty, a starter draft of
-intent_text.
+not have Z.") for the final judge, a candidate-specific requirements checklist
+for the cheap gate's flexible axis, and an evidence-focused analytical brief
+(named projects/tools, not just tier labels) fed to the cheap/mid gates and the
+final judge alike -- plus, only when empty, a starter draft of intent_text.
 
 Mirrors harvest.py's Setting-table signature-hash pattern: skip the LLM call
 entirely when nothing this call depends on has changed since the last run."""
@@ -17,7 +18,7 @@ from sqlalchemy.orm import Session
 from ..models import Profile, ProfileAttribute, Setting
 from .llm import STRONG_MODEL, llm_json
 
-PROFILE_INTEL_VERSION = 2
+PROFILE_INTEL_VERSION = 4
 SIG_KEY = "profile_intel_signature"
 RESULT_KEY = "profile_intel_result"
 TARGET_ROLE_HARD_CAP = 20
@@ -72,14 +73,36 @@ def _pinned_target_roles(db: Session, profile_id: int) -> list[str]:
     ).scalars().all()
 
 
+def _all_target_roles(db: Session, profile_id: int) -> list[str]:
+    """Every target_role value regardless of confirmed state -- used only in
+    the signature (see _signature below), not the generation prompt itself.
+    Deleting a whole role family (services/families.py::delete_family) mostly
+    removes unconfirmed/ai_suggested rows, which _pinned_target_roles alone
+    would never notice -- that left the cached header describing tracks the
+    candidate had just deleted. Needs the full set so any target_role
+    addition/deletion, confirmed or not, invalidates the cache."""
+    return db.execute(
+        select(ProfileAttribute.value).where(
+            ProfileAttribute.profile_id == profile_id,
+            ProfileAttribute.type == "target_role",
+        )
+    ).scalars().all()
+
+
 def _context(db: Session, profile_id: int) -> dict:
     """Everything the generation prompt (and its cache signature) depends on --
     computed once per call so signature-checking and generation never disagree
     about what "the current inputs" are."""
+    profile = db.get(Profile, profile_id)
     return {
-        "profile": db.get(Profile, profile_id),
+        "profile": profile,
         "by_type": _grouped_values(db, profile_id, _BACKGROUND_TYPES),
         "pinned": _pinned_target_roles(db, profile_id),
+        "all_target_roles": _all_target_roles(db, profile_id),
+        # Raw CV/notes text, not the compressed cv_summary -- only the analytical
+        # brief task (TASK 5) needs this, for the concrete named-project/tool
+        # detail that summarize_cv_text's 100-word compression already drops.
+        "cv_text": ((profile.cv_text or "").strip()[:12000] if profile else ""),
     }
 
 
@@ -109,13 +132,18 @@ def _signature(ctx: dict) -> str:
         "version": PROFILE_INTEL_VERSION,
         "intent_text": ((profile.intent_text or "").strip() if profile else ""),
         "cv_summary": ((profile.cv_summary or "").strip() if profile else ""),
+        # Belt-and-suspenders: a fresh CV upload already changes cv_summary and
+        # re-parsed attributes too, but hashing the raw text directly means a
+        # changed cv_text alone is never missed even if those happen to collide.
+        "cv_text": ctx["cv_text"],
         "confirmed_target_roles": sorted(v.strip().lower() for v in ctx["pinned"]),
+        "all_target_roles": sorted(v.strip().lower() for v in ctx["all_target_roles"]),
         **{t: sorted(v.strip().lower() for v in by_type.get(t, [])) for t in _BACKGROUND_TYPES},
     }, sort_keys=True)
     return hashlib.sha256(basis.encode()).hexdigest()
 
 
-def _prompt(background: str, pinned: list[str], intent_missing: bool) -> str:
+def _prompt(background: str, pinned: list[str], intent_missing: bool, cv_text: str) -> str:
     pinned_block = (
         "The candidate has already PINNED these target roles -- do not repeat or reword "
         "them, only propose complementary/additional titles:\n" + "\n".join(f"- {r}" for r in pinned)
@@ -126,6 +154,35 @@ def _prompt(background: str, pinned: list[str], intent_missing: bool) -> str:
         "and level this candidate is after, based only on the background above."
         if intent_missing else
         'The candidate already has an intent statement -- return "" for this field, it will be ignored.'
+    )
+    brief_task = (
+        f"""
+
+TASK 5 -- ANALYTICAL BRIEF
+Write a dense, evidence-focused brief (max 220 words) for another AI that will be
+judging job-fit, using the ORIGINAL CV/notes text below (not the summarized
+background above) -- it has detail a normalised skills list drops. Structure:
+1. One sentence grounding seniority concretely -- qualification/stage plus real
+   evidence of where the candidate actually is (e.g. "BSc Physics, First Class,
+   July 2026 -- no full-time analyst role yet, but multiple completed data
+   projects"), not just a generic seniority word.
+2. One evidence bullet per skill/tool the CV text actually names, citing the
+   SPECIFIC project, dataset, technology, or outcome involved (e.g. "SQL: wrote
+   extraction queries via Python/psycopg2 against live production data
+   (Supabase) -- AI-assisted, not from scratch, but functional and used in a
+   real pipeline"). Skip a skill entirely if the source gives nothing concrete
+   to cite -- do not pad with a generic restatement of the skill name.
+3. One "Evidence style" line characterising the pattern across the evidence
+   (e.g. self-directed personal projects with real data vs. coursework vs.
+   professional/commercial work).
+Be faithful to the source -- never invent or embellish a detail that isn't in
+the CV text below. If the CV text is empty or gives nothing concrete beyond
+what's already in the background above, return "" for this field.
+
+Original CV/notes text:
+{cv_text[:12000] or 'None on file.'}"""
+        if cv_text else
+        '\n\nTASK 5 -- ANALYTICAL BRIEF\nNo original CV/notes text on file -- return "" for this field.'
     )
     return f"""Candidate background:
 {background or 'No background on file yet.'}
@@ -163,8 +220,9 @@ fully remote", "no cold-calling/sales roles", "no relocation"). Empty list if no
 
 TASK 4 -- INTENT DRAFT
 {intent_task}
+{brief_task}
 
-Return ONLY JSON: {{"target_roles": ["..."], "header": "...", "requirements": ["..."], "intent_draft": "..."}}"""
+Return ONLY JSON: {{"target_roles": ["..."], "header": "...", "requirements": ["..."], "intent_draft": "...", "analytical_brief": "..."}}"""
 
 
 def _generate(ctx: dict) -> dict | None:
@@ -189,7 +247,7 @@ def _generate(ctx: dict) -> dict | None:
         return None  # nothing to derive anything from
 
     intent_missing = not (profile and (profile.intent_text or "").strip())
-    data = llm_json(_prompt(background, pinned, intent_missing), model=STRONG_MODEL)
+    data = llm_json(_prompt(background, pinned, intent_missing, ctx["cv_text"]), model=STRONG_MODEL)
 
     target_roles = data.get("target_roles") if isinstance(data.get("target_roles"), list) else []
     target_roles = [str(t).strip() for t in target_roles if str(t).strip()][:TARGET_ROLE_HARD_CAP]
@@ -202,6 +260,7 @@ def _generate(ctx: dict) -> dict | None:
         "header": str(data.get("header") or "").strip(),
         "requirements": [str(r).strip() for r in requirements if str(r).strip()][:5],
         "intent_draft": str(data.get("intent_draft") or "").strip(),
+        "analytical_brief": str(data.get("analytical_brief") or "").strip(),
     }
 
 
@@ -250,9 +309,9 @@ def _setting(db: Session, profile_id: int, key: str) -> Setting | None:
 
 
 def read_cached_intel(db: Session, profile_id: int) -> dict:
-    """Pure read (no LLM) of the cached {"header": str, "requirements": [str]} --
-    called every build_snapshot run, zero cost when nothing has changed. {} if
-    profile_intel has never run for this profile."""
+    """Pure read (no LLM) of the cached {"header": str, "requirements": [str],
+    "analytical_brief": str} -- called every build_snapshot run, zero cost when
+    nothing has changed. {} if profile_intel has never run for this profile."""
     row = _setting(db, profile_id, RESULT_KEY)
     if not row or not row.value:
         return {}
@@ -282,7 +341,11 @@ def ensure_profile_intel(db: Session, profile_id: int, *, force: bool = False) -
 
     new_attrs = _apply(db, profile_id, data)
 
-    result_json = json.dumps({"header": data["header"], "requirements": data["requirements"]})
+    result_json = json.dumps({
+        "header": data["header"],
+        "requirements": data["requirements"],
+        "analytical_brief": data["analytical_brief"],
+    })
     result_row = _setting(db, profile_id, RESULT_KEY)
     if result_row is not None:
         result_row.value = result_json
