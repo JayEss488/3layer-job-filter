@@ -2,9 +2,11 @@
 
 Kept independent of the search engine (full_auto.py) so the app's lightweight LLM
 calls don't drag in crawl4ai/playwright at import time."""
+import contextvars
 import json
 import os
 import time
+from contextlib import contextmanager
 from functools import lru_cache
 
 import httpx
@@ -14,11 +16,41 @@ from openai import OpenAI
 # the older/cheaper nano tier (matches full_auto.py's CHEAP_MODEL) rather than
 # GPT-5.6 Luna -- nano is meaningfully cheaper and plenty for these calls.
 CHEAP_MODEL = os.getenv("CHEAP_MODEL", "gpt-5.4-nano-2026-03-17")
-# Reserved for low-frequency, high-value calls (CV parsing, target-role
-# suggestions) where reasoning quality matters more than per-call cost.
-# Matches full_auto.py's EXP_MODEL (GPT-5.6 Terra); kept as a plain string here
-# so this module stays independent of full_auto/crawl4ai (see module docstring).
+# Middle tier (GPT-5.6 Luna, matches full_auto.py's MID_MODEL). The profile-
+# formation calls (CV extraction, the "understand" summary/header/role-family
+# call) run here rather than on STRONG_MODEL: at ~4400 words a CV parse was
+# taking 23s/call on the strong tier, and Luna gives most of the reasoning
+# quality at a fraction of the latency/cost -- and those calls now run two at a
+# time in parallel, so the strong tier's extra seconds hurt twice over.
+MID_MODEL = os.getenv("MID_MODEL", "gpt-5.6-luna")
+# Reserved for low-frequency, high-value calls where reasoning quality matters
+# more than per-call cost. Matches full_auto.py's EXP_MODEL (GPT-5.6 Terra);
+# kept as a plain string here so this module stays independent of
+# full_auto/crawl4ai (see module docstring).
 STRONG_MODEL = os.getenv("STRONG_MODEL", "gpt-5.6-terra")
+
+
+# Per-context trace sink for llm_json calls. None = tracing off (the default,
+# so every existing call site is untouched and pays nothing). The CV-parse
+# timing diagnostic (services/diagnostics.py) sets this via capture_llm_calls()
+# to attribute latency/tokens to individual model calls without threading a
+# collector through every function in the parse pipeline.
+_llm_trace: contextvars.ContextVar[list | None] = contextvars.ContextVar("_llm_trace", default=None)
+
+
+@contextmanager
+def capture_llm_calls():
+    """Collect a trace ({model, prompt_chars, duration_s, attempts, ok, tokens})
+    of every llm_json call made in this context. Set once per stage by the timing
+    diagnostic; a no-op for all other callers. Not designed to nest -- an inner
+    capture shadows the outer for its own scope (fine, since the diagnostic wraps
+    each stage separately rather than nesting)."""
+    calls: list[dict] = []
+    token = _llm_trace.set(calls)
+    try:
+        yield calls
+    finally:
+        _llm_trace.reset(token)
 
 
 @lru_cache(maxsize=1)
@@ -47,7 +79,7 @@ def _clean_json(raw: str) -> str:
 # of full_auto.py (see module docstring). Confirmed via a live 400 that silently
 # emptied every CV parse for months: llm_json swallowed the exception below and
 # returned {}, which looked identical to "the model found nothing on this CV".
-_FIXED_TEMPERATURE_MODELS = ("gpt-5.5", "gpt-5.6-terra")
+_FIXED_TEMPERATURE_MODELS = ("gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra")
 
 
 def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
@@ -67,7 +99,15 @@ def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
     temperature = 1 if model in _FIXED_TEMPERATURE_MODELS else 0.2
+
+    trace = _llm_trace.get()
+    started = time.perf_counter()
+    result: dict = {}
+    usage = None
+    ok = False
+    attempts_used = 0
     for attempt in (1, 2):
+        attempts_used = attempt
         try:
             resp = _client().chat.completions.create(
                 model=model,
@@ -75,11 +115,14 @@ def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
                 temperature=temperature,
                 response_format={"type": "json_object"},
             )
-            return json.loads(_clean_json(resp.choices[0].message.content))
+            result = json.loads(_clean_json(resp.choices[0].message.content))
+            usage = getattr(resp, "usage", None)
+            ok = True
+            break
         except Exception as e:
             if attempt == 2:
                 print(f"[llm_json] call failed (model={model}): {e}")
-                return {}
+                break
             status = getattr(e, "status_code", None)
             resp_obj = getattr(e, "response", None)
             retry_after = resp_obj.headers.get("retry-after") if resp_obj is not None else None
@@ -89,3 +132,16 @@ def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
                 wait = 2.0
             print(f"[llm_json] {model} call failed (status={status}): {e}; retrying after {wait}s.")
             time.sleep(wait)
+
+    if trace is not None:
+        trace.append({
+            "model": model,
+            "prompt_chars": len(prompt) + len(system or ""),
+            "duration_s": round(time.perf_counter() - started, 3),
+            "attempts": attempts_used,
+            "ok": ok,
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        })
+    return result

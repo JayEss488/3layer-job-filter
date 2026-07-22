@@ -7,7 +7,7 @@ Don't run a full end to end search in testing because it uses real API credits.
 
 ## What this is
 
-JobMatch: an AI job-matching app that parses a CV into structured "memory" (profile
+Four in a Thousand: an AI job-matching app that parses a CV into structured "memory" (profile
 attributes), runs a multi-stage search/ranking pipeline against several job boards and
 ATS vendors, and learns from tick/cross feedback (no retraining — just weight nudges).
 Single-user prototype (`user_id` hardcoded, but present everywhere so multi-user auth is
@@ -82,17 +82,22 @@ than expecting structured logs.
   flag, not a blob — see `config.ATTRIBUTE_TYPES`/`ATTRIBUTE_DIRECTION`. `target_role`
   (what they want) is deliberately kept separate from `past_role` (what they've done) so
   the engine can weight them differently. `avoid`/`must_have` are the candidate's own
-  hard filters (auto-filled from the CV by `parsing.py`'s `_parse_prompt`, editable as
+  hard filters (auto-filled from the CV by `parsing.py`'s extraction call, editable as
   chips below target roles): unlike the soft, LLM-derived `requirements` list
   (`profile_intel.py`), they drive an *unconditional* drop at the cheap gate
   (`hard_gate_ok`) and a DISQUALIFIER rule at the final judge — see the pipeline section.
-  **Some attribute types are deliberately UI-hidden but still live**: `skill`,
-  `sector_target`, and `custom` no longer render on the dashboard/onboarding pages (the
-  profile shifted from "match on paper" to "the candidate wants this"), but they still
-  auto-fill from the CV and still feed the engine — `skill` the evidence tiers and CV
-  text, `sector_target` one of only two embedding pre-filter signals
-  (`snapshot._BASE_EMPHASIS`), `custom` the "Constraints" CV line. Don't delete them as
-  dead code because no UI references them.
+  **Some attribute types are deliberately UI-hidden but still live**: `sector_target` and
+  `custom` no longer render on the dashboard/onboarding pages (the profile shifted from
+  "match on paper" to "the candidate wants this"), but they still auto-fill from the CV
+  and still feed the engine — `sector_target` one of only two embedding pre-filter signals
+  (`snapshot._BASE_EMPHASIS`), `custom` the "Constraints" CV line. `skill` and
+  `qualification` are also still-live-but-hidden types, but as of the formation rewrite
+  they are **no longer auto-extracted from the CV at all** — the profile shifted the
+  concrete skill/qualification detail into the `cv_summary` narrative (written by the
+  formation "understand" call), which is what the gates and final judge now read for it
+  (`snapshot.candidate_brief`); the types still exist so a user can add rows by hand and
+  so their weight/evidence tiers still feed the gate prompts when present. Don't delete
+  any of them as dead code because no UI references them.
 - **`Role`**: one row per listing surfaced to the user in a given search run, with a
   lifecycle `status` (`new → saved/crossed/ignored → applied → deleted`) driving both the
   UI tabs and re-search semantics (only `crossed` roles are pruned before each new run,
@@ -126,10 +131,19 @@ than expecting structured logs.
 - **`FeedbackLog`**: append-only tick/cross/ignore/apply audit trail.
 - **`SearchRun`**: one row per kicked-off search; drives `/search/status` polling and the
   daily search cap. Also the per-run diagnostics store, all written at the end of
-  `run_search_task`: `phase_timings` and `funnel_counts` (JSON, ints/bools only — read by
+  `run_search_task`: `phase_timings` (per-phase wall time, read by
+  `GET /settings/run-timings` → the Settings "Search run timings" panel) and
+  `funnel_counts` (JSON, ints/bools only — read by
   `GET /settings/run-funnel`), plus `snapshot_samples` (JSON
   `{stage: {"count": N, "samples": [{title, company, url}]}}`, read by
   `GET /settings/snapshot` and rendered by the Settings page's bottom "Snapshot" panel).
+  `snapshot_samples` also carries a `_clusters` key — the PER-CLUSTER funnel
+  (queue/examined/gate/judge/picks/stop_reason per role family), which the run-wide
+  `funnel_counts` sums away and so cannot show: a strong track and a starving one average
+  into numbers that look healthy. It rides in that column rather than a new one because
+  the payload is free-form JSON and `get_run_snapshot` iterates a fixed stage list,
+  ignoring unknown keys — so it needed no `_migrate_columns` entry. `GET
+  /settings/run-timings` reads it back out alongside the timings.
   The snapshot answers what the funnel counts can't: *which* roles were actually at each
   stage, with URLs, so a weak stage can be inspected (or pasted into an AI) rather than
   inferred from a drop in the numbers. Samples are **random, not head-of-list**
@@ -145,17 +159,80 @@ than expecting structured logs.
 Schema changes are **not** Alembic — `database.py::_migrate_columns()` is a hand-rolled,
 idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
 
+### Profile formation (CV/notes → memory)
+
+A CV upload or text paste (`routers/onboarding.py::parse_cv`/`parse_text` →
+`services/formation.py`) runs **three `MID_MODEL` (gpt-5.6-luna) LLM calls IN PARALLEL**
+(`asyncio.gather` over `to_thread`; the calls are deliberately DB-free so the threads
+never share a session — writes happen back on the request thread in one commit):
+
+1. **Extraction** (`parsing.extract_attributes`) → the structured, engine-load-bearing
+   chips only: PAID `past_role` (title alone; informal/unpaid roles are skipped),
+   `seniority`, `sector_target`, `location`+work-types, `salary`, `custom`, `must_have`,
+   `avoid`. It **no longer extracts `skill`, `qualification`, or a `cv_summary`** — those
+   were noise as chips, and the concrete detail now lives in the summary the other call
+   writes.
+2. **Families** (`profile_intel.generate_families`) → the candidate's **role families**
+   (`[{label, roles[]}]`, 1–3, generated *with their titles in one pass*) and a
+   first-person `intent_draft` (only used if `intent_text` is empty).
+3. **Summary** (`profile_intel.generate_summary`) → the `cv_summary` (the evidence brief
+   the judge/gates read) and the "Looking for…" `header` (told explicitly NOT to restate
+   the summary — they used to overlap). For a short CV (`< CV_SHORT_WORD_THRESHOLD`)
+   **this whole call is skipped** and the raw text is stored as the summary verbatim.
+
+Calls 2 and 3 were one "understand" call until the split. That call alone generated
+~1300 output tokens and *was* the block's critical path (~11.2s of an 11.3s parse) while
+extraction finished in ~4.6s and idled. They share nothing but the source document, so
+splitting them costs one extra copy of the CV in input tokens and takes the families/
+intent generation off the summary's critical path. The task prompts moved across
+verbatim — only the per-call task numbering and JSON field list differ — so neither
+output's calibration changed. Note the remaining floor: the summary call is intrinsically
+the long pole (a ~450-word evidence brief), so the parse now costs about what that one
+call costs; trimming it further trades directly against what the final judge can read.
+
+`formation.persist_formation` writes the attributes, the summary, the families
+(`families.seed_families_from_groups` — creates `RoleFamily` rows + their `target_role`
+attributes directly, capped at `MAX_ROLE_CLUSTERS`), a drafted intent, and then
+`profile_intel.store_seeded_intel` — which writes a profile-intel cache signature matching
+the freshly-seeded state so the **pre-search `ensure_profile_intel` (engine.py) is a
+no-op** and doesn't regenerate a flat role list that would reshuffle the seeded families.
+
+This replaced a **serial chain of three STRONG calls** (parse → profile_intel → a separate
+re-cluster), which was both slow (~52s on a 4400-word CV; two ~23s STRONG calls back-to-
+back) and the source of the family over-split/over-merge: generating a flat title list and
+then re-clustering it lost the grouping boundaries, so the cluster call re-guessed them and
+disagreed. Generating families+titles together, biased toward ONE family and grouping by
+day-to-day job function (not seniority/specialisation), fixes that — see the
+`_FAMILIES_TASK` prompt in `profile_intel.py` before assuming it's miscalibrated.
+
+The **regenerate/edit path is separate**: `ensure_profile_intel` (cached, signature-gated,
+also `MID_MODEL` now) re-derives a *flat* target-role list + header from the profile's
+current state, and `ensure_families` slots any newly-ungrouped roles into the EXISTING
+families — family count/identity only ever changes via an explicit user action. A family
+rename/delete's `cv_summary` reconciliation (`reconcile_summary_after_family_change`) now
+runs **off-request** (`BackgroundTasks` → `_bg` wrapper with its own session) and is
+skipped entirely when `cv_summary` is just the raw CV (`_summary_is_raw_cv`), so deleting a
+family card is instant.
+
+The Settings → "CV parse timing" panel (`routers/settings.py` + `services/diagnostics.py`)
+measures this whole flow stage-by-stage against a throwaway profile (captures each LLM
+call's model/tokens/duration via `llm.capture_llm_calls`); it costs the same MID calls
+a real upload does, so it's user-triggered only. Its search-side counterpart is the
+Settings → "Search run timings" panel (`GET /settings/run-timings`), which is a pure read
+of what the last finished run already recorded — see the search-pipeline section.
+
 ### The search pipeline (the part that touches the most files)
 
 1. **`backend/app/services/snapshot.py::build_snapshot`** turns a profile's attributes
-   into the engine's input contract. It clusters the profile's `target_role` values into
-   1-3 "streams" by underlying job function (`cluster_target_roles`, one LLM call,
-   strongly biased toward a single cluster — see the prompt before assuming clustering
-   is broken; over-splitting was a real bug fixed once already). Each cluster gets its
-   own weighted embedding text (`_weighted_text`, scoped to just that cluster's target
-   roles) and its own scoped synthetic-CV text (`cv_text_for_cluster`) for the final
-   judge — this is what lets a candidate targeting two unrelated fields get judged fairly
-   on each, instead of being averaged into a fit-for-neither blend.
+   into the engine's input contract. The "streams" it scores per-cluster ARE the
+   candidate's role families (`RoleFamily` rows — user-editable, seeded once from the CV;
+   see the profile-formation section above), read straight off `list_families`;
+   `cluster_target_roles` survives only as an in-memory FALLBACK for a `target_role` that
+   somehow reaches the engine still ungrouped (`_role_groups`), not the primary path. Each
+   cluster gets its own weighted embedding text (`_weighted_text`, scoped to just that
+   cluster's target roles) and its own scoped synthetic-CV text (`cv_text_for_cluster`)
+   for the final judge — this is what lets a candidate targeting two unrelated fields get
+   judged fairly on each, instead of being averaged into a fit-for-neither blend.
 2. **`backend/app/services/engine.py::_run_engine_pipeline`** orchestrates, per run:
    discovery (`full_auto.gather_jobs` — Reed/Adzuna/Google-Jobs-via-serper.dev/JSearch/
    Remotive + the ATS vendor batch; search terms sent to the board APIs are the
@@ -166,7 +243,11 @@ idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
    to its single best-scoring cluster → free heuristic prescreen (`_heuristic_prescreen`:
    title-regex drops obvious seniority mismatches — Director/VP for a junior, Intern for
    a senior — before any LLM spends a token) → adaptive strict/broadened pool per cluster
-   (`TARGET_POOL` = 90) → **one merged eight-axis screen per cluster**
+   (`TARGET_POOL` = 90) → **Reed full-description enrichment**
+   (`engine._enrich_reed_full_text` → `full_auto.fetch_reed_details`, see the
+   text-supply note at the end of this section) → **one merged eight-axis screen per
+   cluster, all clusters concurrently** (see the concurrency note at the end of this
+   section)
    (`full_auto.screen_gate`, a cached cheap-model call judging role-function fit,
    whether the text is even a real single job posting, seniority, candidate-specific
    requirements, core-skills overlap, salary, and work arrangement in
@@ -241,7 +322,8 @@ idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
    gate_cache query. The rank-side `MIN_RESULTS` floor backfill (below) still guarantees
    a cluster with any gate survivors reaches the judge, so raising the cutoff can't
    starve a cluster to zero, only make it lean harder on that backfill → optional
-   Phase 5 full-page scrape (skipped
+   Phase 5 full-page scrape, **run per cluster and pipelined straight into that
+   cluster's Phase 6 judge** (skipped
    for ATS-sourced jobs, for any snippet already long enough to judge —
    `SNIPPET_SUFFICIENT_CHARS`, deliberately above Adzuna's exact-500-char API truncation
    so Adzuna snippets don't wave through as "sufficient" by coincidence — and for
@@ -305,6 +387,80 @@ idempotent `ALTER TABLE ADD COLUMN` dict. Add new columns there.
    isn't discriminating, see `dynamic_hard_drop_threshold` above) — specifically to get
    some of the original design's cost savings back without reproducing its starvation
    failure.
+
+   **Text supply: what the cheap stages can actually read.** `GATE_LISTING_TEXT_CHARS`
+   (2000) and `RANK_LISTING_TEXT_CHARS` (3000) are *ceilings*, and for most candidates
+   there is nothing like that much to truncate. A measured live store (838 rows) broke
+   down as **402 Adzuna rows averaging 497 chars and 361 Reed rows averaging 455** —
+   both APIs truncate their description to a ~500-char teaser — against only ~67 ATS
+   rows carrying a real 3000-char description. That teaser is the *opening blurb*, never
+   the requirements section, and `full_text` (the only other source of real text) is
+   written by Phase 5, which runs **after** gate and rank. So ~91% of candidates were
+   screened and ranked on ~455 chars: an audit of jobs the expensive judge disqualified
+   on an experience bar ("3+ years as a Data Analyst") found the requirement in the
+   snippet for **1 of 24**, and in the scraped `full_text` for 7. The cheap stages
+   weren't miscalibrated — they were starved, and the expensive judge was doing triage
+   work that should have happened three stages earlier. (Those two constants' own
+   comments describe an audit of a real Reed posting whose requirements started at char
+   ~1980 — that was a *scraped* `full_text`, not what a freshly-discovered job supplies.)
+
+   `fetch_reed_details` closes this for Reed: its per-JOB endpoint returns the whole
+   description (measured avg ~3900 chars, ~8.6x the teaser) for one plain HTTP call, no
+   LLM and no browser — a 24-id batch resolved in 1.7s at the same 12-wide pool width
+   `gather_jobs` uses. `_enrich_reed_full_text` runs it over exactly the slice each
+   cluster is about to examine (`queue[:cluster_examine_cap]`, already embed-score
+   ordered), on the main thread before the cluster pool starts, since it commits.
+   Deliberately NOT the whole store: most rows never reach a gate. It fails soft per id
+   (404/410/timeout → that id is simply absent and the candidate keeps its teaser) and,
+   like `_persist_scrape`, only stores text that actually beats the snippet. Two free
+   downstream effects: the text persists on `JobSeen.full_text` for every future run,
+   and `_needs_full_scrape` skips anything carrying it, so **Phase 5 shrinks** by
+   however many were enriched. Independent of the Settings full-scrape toggle, which
+   governs browser page-reading before the *final judge*, not this.
+
+   **Adzuna has no equivalent endpoint** (its `description` is truncated with no
+   per-job detail route), so those rows stay teaser-only until Phase 5 scrapes the
+   finalists. Pre-gate browser-scraping them was considered and rejected: ~4-5s/page
+   would add minutes per run.
+
+   Because of all this, `full_auto._gate_job_id` carries a **two-state text-richness
+   marker** (`:full`). `_gate_cache_key` keys on (gate, profile signature, job id) and
+   *not* on the text that was judged, so without the marker a verdict reached on the
+   455-char teaser would be served forever for a job whose full description has since
+   arrived — silently cancelling the enrichment for exactly the jobs that most needed
+   re-judging. Keep that marker in sync with whatever `_has_full_text` means.
+
+   **Concurrency (what runs at the same time as what).** Three levels, all added
+   because a live 3-cluster run spent `gate=83s`, `scrape=48s`, `final_eval=53s` doing
+   these strictly one after another:
+   - *Within one gate call*, `screen_gate` fans its `_GATE_BATCH`(=20)-sized LLM calls
+     out over a `ThreadPoolExecutor(max_workers=min(3, len(batches)))` — the identical
+     pattern `rank_gate` already used, bounded at 3 for the same reason (a burst risks a
+     short-window rate cap).
+   - *Across clusters at the gate*, `_run_engine_pipeline` submits one
+     `_gate_rank_refill_cluster` per cluster to a thread pool. Safe because both budgets
+     (`cluster_judge_target`, `cluster_examine_cap`) are derived from the active-cluster
+     count *before* any cluster runs, so no cross-cluster fairness decision is left to
+     disturb; results are merged sequentially afterwards, in queue order, so counters and
+     log lines stay deterministic.
+   - *Across clusters at the tail*, each cluster's Phase 5 scrape is `await`ed and then
+     handed straight to its own Phase 6 judge (`_scrape_then_judge`, one `asyncio.gather`
+     over clusters), so one cluster's expensive judge call overlaps the others' page
+     fetching instead of every cluster waiting for a single global scrape phase. The two
+     laps merged into one `scrape+judge` timing, since there's no longer a wall-clock
+     boundary between them.
+
+   Three things make this safe and must stay true if you touch it: (a) worker threads
+   must never touch the request `Session` — `_gate_rank_refill_cluster` takes a
+   `cancel_check` callable (`_make_cancel_check`, which opens its own short-lived
+   session, throttles to one SELECT every 3s and latches once cancelled) instead of the
+   `(db, run)` pair `_check_cancelled` needs, and every DB write (`_persist_scrape`,
+   `_persist_dead_scrapes`, `_persist_verdicts`, scam-verify) happens back on the main
+   thread; (b) the concurrent scrapes share ONE semaphore and ONE alt-source budget via
+   `scrape_full_details`'s optional `sem`/`alt_budget` params, or N clusters would mean N
+   independent `MAX_CONCURRENT` lanes hammering the same sites; (c) `full_auto.get_db()`
+   sets `timeout=30` so the now-concurrent `gate_cache` writers can't collide into
+   "database is locked" and silently lose a batch's cache entries.
 3. Cluster/stream identity is used internally (gate routing, per-cluster LLM calls) but
    is **not** currently exposed as UI grouping — by design, not an oversight; it only
    ever surfaces as an optional "Matched via: X track" clause in `ai_analysis` when more

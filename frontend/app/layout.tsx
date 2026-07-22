@@ -6,7 +6,7 @@ import "./globals.css";
 import { Providers } from "./providers";
 
 export const metadata: Metadata = {
-  title: "Omni Board",
+  title: "Four in a Thousand",
   description: "AI job matching that learns from your feedback",
 };
 

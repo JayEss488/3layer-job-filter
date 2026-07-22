@@ -65,6 +65,12 @@ def update_profile(
         # Free-text feedback on recent search results -- fed to the final judge on
         # the next run (see snapshot.build_snapshot). Empty string clears it.
         profile.search_feedback = body.search_feedback.strip() or None
+    if body.cv_summary is not None:
+        # Manual edit of the evidence brief the gates/judge read (Memory page's
+        # "What the AI reads about you" panel) -- a plain column never touched by
+        # any regenerate path, so no staleness/lock concern here (contrast with
+        # the header PATCH below). Empty string clears it.
+        profile.cv_summary = body.cv_summary.strip() or None
     db.commit()
     db.refresh(profile)
     return profile

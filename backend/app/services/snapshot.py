@@ -19,7 +19,7 @@ from ..config import (
 from ..models import Profile, ProfileAttribute
 from .families import cluster_target_roles, list_families, ordered_for_engine
 from .llm import llm_json
-from .profile_intel import read_cached_intel
+from .profile_intel import candidate_requirements_display, read_cached_intel
 
 _WORK_TYPES = WORK_TYPE_VALUES
 
@@ -405,14 +405,23 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         for label, grp in role_groups
     ]
 
-    # Cached profile-intel artifacts (see profile_intel.py): a header for the final
-    # judge's CV text and a candidate-specific requirements checklist for the cheap
-    # gate's flexible axis. Pure read, no LLM call -- {} until profile_intel has run
-    # at least once for this profile (e.g. before the first search).
+    # Cached profile-intel header (see profile_intel.py) for the final judge's CV
+    # text. Pure read, no LLM call -- {} until profile_intel has run at least once
+    # for this profile (e.g. before the first search).
     intel = read_cached_intel(db, profile_id)
     header = intel.get("header") or ""
-    requirements = intel.get("requirements") or []
-    analytical_brief = intel.get("analytical_brief") or ""
+    # The candidate's own must_have/avoid chips, verbatim -- feeds screen_gate's
+    # soft requirements_ok axis. No LLM re-derivation (see profile_intel.py's
+    # module docstring for why the old TASK 3 was removed).
+    requirements = candidate_requirements_display(db, profile_id)
+    profile = db.get(Profile, profile_id)
+    # Evidence-focused narrative brief -- profile.cv_summary, written by the
+    # formation "understand" call (profile_intel.generate_understanding) in the
+    # same pass as the header. Named projects/tools/outcomes the tier labels
+    # elsewhere in engine_profile can't carry -- and, since skills/qualifications
+    # are no longer extracted as their own chips, this is now the ONLY place that
+    # concrete skill/qualification detail reaches the gates and the final judge.
+    candidate_brief = (profile.cv_summary or "").strip() if profile else ""
 
     engine_profile = {
         # Scopes full_auto's shared rotation cursor (boards_cache.db is one file
@@ -449,11 +458,9 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # weight tiers above so weak/self-directed/AI-assisted skill evidence has
         # some influence at the cheap gate/rank stage, not only at the final judge.
         "skill_evidence_tiers": _evidence_tiers(g.get("skill", [])),
-        # Evidence-focused narrative brief (profile_intel.py's TASK 5) -- named
-        # projects/tools/outcomes the tier labels above can't carry. "" until
-        # profile_intel has run at least once, or when the CV text gave nothing
-        # concrete beyond the typed attribute rows.
-        "candidate_brief": analytical_brief,
+        # "" when the CV gave nothing concrete beyond the typed attribute rows,
+        # or before any CV/text has ever been parsed.
+        "candidate_brief": candidate_brief,
         # Candidate-specific must-have/must-not-have bullets for screen_gate's
         # requirements_ok axis (see full_auto.py::_screen_prompt). [] means none
         # generated yet or none stated.
@@ -481,8 +488,6 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
 
     weighted_text = _weighted_text(g, search_terms)
 
-    profile = db.get(Profile, profile_id)
-
     # Synthetic CV text for the expensive-AI final evaluation (engine reads a file).
     # cv_text_base omits the "Target roles" line -- see cv_text_for_cluster,
     # which appends it scoped to one role cluster at a time, instead of always
@@ -490,23 +495,17 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     # weigh fit against all of them at once).
     #
     # Deliberately de-duplicated rather than concatenating every available
-    # synthesis: the profile_intel `header` ("Looking for X. Must have Y. Must
-    # not have Z.") is an AI paraphrase of the same background this whole
-    # function reads, and profile.intent_text -- the candidate's OWN words,
-    # when they've given any -- is both more authoritative and richer, so
-    # header is only a fallback for profiles with no intent_text yet.
-    # Similarly `analytical_brief` (profile_intel TASK 5) and profile.cv_summary
-    # (parsing.py::summarize_cv_text) are two separately-generated compressions
-    # of the SAME raw CV text for the SAME purpose (evidence detail a typed
-    # attribute list drops) -- analytical_brief supersedes cv_summary once it
-    # exists (named project/tool citations, not just a generic paragraph), so
-    # only one is included, not both. A judge reading a wall of near-duplicate
-    # paragraphs doesn't gain signal, and the genuinely load-bearing detail
-    # (concrete evidence origin -- see EVIDENCE STRENGTH in full_auto.py) risks
-    # getting diluted or, worse, truncated off by _run_final_eval's char budget
-    # if it isn't the LAST thing repeated. So analytical_brief is placed right
-    # after skills (where it's most useful and safest from truncation), not at
-    # the end.
+    # synthesis: the profile_intel `header` ("Looking for...") is an AI
+    # paraphrase of the same background this whole function reads, and
+    # profile.intent_text -- the candidate's OWN words, when they've given any --
+    # is both more authoritative and richer, so header is only a fallback for
+    # profiles with no intent_text yet. candidate_brief (profile.cv_summary,
+    # placed right after skills where it's most useful and safest from
+    # truncation, not at the end) is the one evidence-focused compression of the
+    # raw CV text now -- it used to be duplicated with a second, separately-
+    # generated compression here, which risked diluting the genuinely
+    # load-bearing detail (concrete evidence origin -- see EVIDENCE STRENGTH in
+    # full_auto.py) or losing it to _run_final_eval's char budget.
     if profile and profile.intent_text:
         cv_lines = [
             "What the candidate is looking for (in their own words): " + profile.intent_text.strip()
@@ -523,10 +522,8 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append("Seniority: " + ", ".join(seniorities))
     if skills:
         cv_lines.append("Skills: " + ", ".join(_labeled(g.get("skill", []))))
-    if analytical_brief:
-        cv_lines.append("Skill evidence detail: " + analytical_brief)
-    elif profile and profile.cv_summary:
-        cv_lines.append("Additional background context: " + profile.cv_summary)
+    if candidate_brief:
+        cv_lines.append("Skill evidence detail: " + candidate_brief)
     if sector_targets:
         cv_lines.append("Sector interests: " + "; ".join(sector_targets))
     if location or work_types:

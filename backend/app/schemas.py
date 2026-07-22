@@ -19,6 +19,7 @@ class ProfileUpdate(BaseModel):
     is_active: Optional[bool] = None
     intent_text: Optional[str] = None
     search_feedback: Optional[str] = None
+    cv_summary: Optional[str] = None
 
 
 class ProfileOut(ORMModel):
@@ -120,6 +121,14 @@ class ContextHeaderOut(BaseModel):
     header: str
     requirements: list[str]
     cv_summary: str
+
+
+class ContextHeaderUpdate(BaseModel):
+    """Manual edit of the AI-generated header -- see
+    profile_intel.set_header_locked. cv_summary is edited via
+    ProfileUpdate.cv_summary instead (a plain column, no lock needed)."""
+
+    header: str
 
 
 # ── Roles ───────────────────────────────────────────────────────────────────

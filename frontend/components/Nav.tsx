@@ -51,7 +51,7 @@ export function Nav() {
   return (
     <div className="nav">
       <div className="nav-left">
-        <div className="logo">O</div>
+        <div className="logo">4</div>
         <div className="tabs">
           {TABS.map((t) => (
             <Link

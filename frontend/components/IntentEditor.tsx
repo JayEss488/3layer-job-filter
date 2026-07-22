@@ -54,6 +54,11 @@ export function IntentEditor({ profileId }: { profileId: number }) {
       await qc.invalidateQueries({ queryKey: ["profiles"] });
       await qc.invalidateQueries({ queryKey: ["attributes", profileId] });
       await qc.invalidateQueries({ queryKey: ["confidence", profileId] });
+      // The backend now (re-)groups the fresh roles into existing families as
+      // part of this call -- refresh family cards too so they don't keep
+      // showing stale membership until an unrelated page load happens to
+      // refetch them.
+      await qc.invalidateQueries({ queryKey: ["families", profileId] });
       setSavedText(text);
       setStatus(
         created.length

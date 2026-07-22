@@ -14,6 +14,9 @@ export default function SettingsPage() {
   const [busy, setBusy] = useState(false);
   const [harvestMsg, setHarvestMsg] = useState<string | null>(null);
   const [domainDraft, setDomainDraft] = useState("");
+  const [timingFile, setTimingFile] = useState<File | null>(null);
+  const [timingBusy, setTimingBusy] = useState(false);
+  const [timingErr, setTimingErr] = useState<string | null>(null);
 
   const { data: sources } = useQuery({
     queryKey: ["sources"],
@@ -45,7 +48,31 @@ export default function SettingsPage() {
     queryFn: () => api.snapshot(),
   });
 
+  const { data: timing } = useQuery({
+    queryKey: ["cvParseTiming"],
+    queryFn: () => api.cvParseTiming(),
+  });
+
+  const { data: runTimings } = useQuery({
+    queryKey: ["runTimings"],
+    queryFn: () => api.runTimings(),
+  });
+
   const total = (sources ?? []).reduce((n, s) => n + s.last_count, 0);
+
+  async function runTiming() {
+    if (!timingFile || timingBusy) return;
+    setTimingBusy(true);
+    setTimingErr(null);
+    try {
+      const result = await api.runCvParseTiming(timingFile);
+      qc.setQueryData(["cvParseTiming"], result);
+    } catch (e) {
+      setTimingErr((e as Error).message);
+    } finally {
+      setTimingBusy(false);
+    }
+  }
 
   async function toggleScrape() {
     if (!scrapeSetting || busy) return;
@@ -128,6 +155,254 @@ export default function SettingsPage() {
       <Nav />
       <div className="page-body">
         <div className="page-title">Settings</div>
+
+        <div className="panel">
+          <div className="panel-h">Search run timings</div>
+          <div className="panel-b">
+            <div className="annotation">
+              Where the last finished search spent its time, phase by phase, plus
+              each role track&rsquo;s own funnel through the run. Read-only — these
+              numbers are recorded by every search, so nothing here costs API
+              credits or re-runs anything.
+            </div>
+            {runTimings && runTimings.run_id ? (
+              <div style={{ marginTop: 14 }}>
+                <div className="annotation">
+                  Run #{runTimings.run_id} · total{" "}
+                  <strong>{runTimings.total_seconds.toFixed(1)}s</strong>
+                  {runTimings.finished_at &&
+                    ` · finished ${new Date(runTimings.finished_at).toLocaleString()}`}
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  {runTimings.phases.map((ph) => {
+                    const barPct =
+                      runTimings.total_seconds > 0
+                        ? Math.round((ph.seconds / runTimings.total_seconds) * 100)
+                        : 0;
+                    return (
+                      <div key={ph.name} style={{ marginTop: 10 }}>
+                        <div className="row" style={{ alignItems: "center" }}>
+                          <div style={{ width: 230, flex: "none" }}>{ph.label}</div>
+                          <div
+                            className="field"
+                            style={{ display: "flex", alignItems: "center", gap: 8 }}
+                          >
+                            <div
+                              style={{
+                                flex: 1,
+                                height: 8,
+                                background: "rgba(127,127,127,.15)",
+                                borderRadius: 4,
+                                overflow: "hidden",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  width: `${barPct}%`,
+                                  height: "100%",
+                                  background: "var(--accent)",
+                                }}
+                              />
+                            </div>
+                            <span
+                              style={{
+                                minWidth: 96,
+                                textAlign: "right",
+                                fontVariantNumeric: "tabular-nums",
+                              }}
+                            >
+                              {ph.seconds.toFixed(2)}s ({barPct}%)
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {runTimings.clusters.length > 0 && (
+                  <div style={{ marginTop: 18 }}>
+                    <div className="annotation" style={{ marginBottom: 6 }}>
+                      Per role track — a track that reaches the judge with a healthy
+                      pool and still returns nothing strong is the shape the
+                      run-wide funnel above can&rsquo;t show.
+                    </div>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ borderCollapse: "collapse", fontSize: 13, minWidth: 640 }}>
+                        <thead>
+                          <tr style={{ textAlign: "right" }}>
+                            <th style={{ textAlign: "left", padding: "4px 10px 4px 0" }}>Track</th>
+                            <th style={{ padding: "4px 10px" }}>Queue</th>
+                            <th style={{ padding: "4px 10px" }}>Examined</th>
+                            <th style={{ padding: "4px 10px" }}>Gate</th>
+                            <th style={{ padding: "4px 10px" }}>Judged</th>
+                            <th style={{ padding: "4px 10px" }}>Strong</th>
+                            <th style={{ padding: "4px 10px" }}>Backup</th>
+                            <th style={{ padding: "4px 10px" }}>Shown</th>
+                            <th style={{ textAlign: "left", padding: "4px 0 4px 10px" }}>
+                              Stopped because
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {runTimings.clusters.map((c) => (
+                            <tr
+                              key={c.idx}
+                              style={{
+                                textAlign: "right",
+                                fontVariantNumeric: "tabular-nums",
+                                borderTop: "1px solid rgba(127,127,127,.15)",
+                              }}
+                            >
+                              <td style={{ textAlign: "left", padding: "4px 10px 4px 0" }}>
+                                {c.label || `Cluster ${c.idx}`}
+                              </td>
+                              <td style={{ padding: "4px 10px" }}>{c.queue_len}</td>
+                              <td style={{ padding: "4px 10px" }}>{c.examined}</td>
+                              <td style={{ padding: "4px 10px" }}>{c.gate_survivors}</td>
+                              <td style={{ padding: "4px 10px" }}>{c.judged}</td>
+                              <td style={{ padding: "4px 10px" }}>{c.judge_strong}</td>
+                              <td style={{ padding: "4px 10px" }}>{c.judge_backup}</td>
+                              <td style={{ padding: "4px 10px" }}>{c.picks}</td>
+                              <td
+                                className="annotation"
+                                style={{ textAlign: "left", padding: "4px 0 4px 10px" }}
+                              >
+                                {c.stop_reason.replace(/_/g, " ")}
+                                {c.fallbacks.length > 0 &&
+                                  ` · ${c.fallbacks.join(", ").replace(/_/g, " ")}`}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="annotation" style={{ marginTop: 10 }}>
+                No finished search run yet — run a search and this fills in.
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-h">CV parse timing</div>
+          <div className="panel-b">
+            <div className="annotation">
+              Upload a CV to measure how long each stage of parsing takes: local
+              text extraction, then the AI calls that run <em>in parallel</em> —
+              structured extraction, role families + intent draft, and the summary
+              + &ldquo;looking for&rdquo; header (that last one is skipped for a
+              short CV, whose text is its own summary). It runs the real pipeline
+              against a throwaway profile — your saved profiles are never touched —
+              and <strong>spends API credits</strong> (the same mid-model calls as
+              one real CV upload) each time you press Measure.
+            </div>
+            <div
+              style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}
+            >
+              <input
+                type="file"
+                accept=".pdf,.docx,.txt"
+                disabled={timingBusy}
+                onChange={(e) => setTimingFile(e.target.files?.[0] ?? null)}
+              />
+              <button
+                className="btn btn-secondary"
+                onClick={runTiming}
+                disabled={timingBusy || !timingFile}
+              >
+                {timingBusy ? "Measuring…" : "⏱ Measure parse time"}
+              </button>
+            </div>
+            {timingBusy && (
+              <div className="annotation" style={{ marginTop: 8 }}>
+                Running the full parse — the AI calls go out in parallel.
+              </div>
+            )}
+            {timingErr && (
+              <div className="annotation" style={{ marginTop: 8, color: "#c0392b" }}>
+                {timingErr}
+              </div>
+            )}
+            {timing && timing.measured_at && (
+              <div style={{ marginTop: 14 }}>
+                <div className="annotation">
+                  {timing.filename || "CV"} · {timing.text_words} words · total{" "}
+                  <strong>{timing.total_seconds.toFixed(1)}s</strong> (
+                  {timing.llm_seconds.toFixed(1)}s in AI calls) ·{" "}
+                  {timing.generated_summary
+                    ? "summary generated"
+                    : "short CV — summary skipped"}{" "}
+                  · measured {new Date(timing.measured_at).toLocaleString()}
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  {timing.stages.map((st) => {
+                    const barPct =
+                      timing.total_seconds > 0
+                        ? Math.round((st.seconds / timing.total_seconds) * 100)
+                        : 0;
+                    return (
+                      <div key={st.name} style={{ marginTop: 10 }}>
+                        <div className="row" style={{ alignItems: "center" }}>
+                          <div style={{ width: 230, flex: "none" }}>{st.name}</div>
+                          <div
+                            className="field"
+                            style={{ display: "flex", alignItems: "center", gap: 8 }}
+                          >
+                            <div
+                              style={{
+                                flex: 1,
+                                height: 8,
+                                background: "rgba(127,127,127,.15)",
+                                borderRadius: 4,
+                                overflow: "hidden",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  width: `${barPct}%`,
+                                  height: "100%",
+                                  background: "var(--accent)",
+                                }}
+                              />
+                            </div>
+                            <span
+                              style={{
+                                minWidth: 96,
+                                textAlign: "right",
+                                fontVariantNumeric: "tabular-nums",
+                              }}
+                            >
+                              {st.seconds.toFixed(2)}s ({barPct}%)
+                            </span>
+                          </div>
+                        </div>
+                        {st.llm_calls.map((c, i) => (
+                          <div
+                            key={`${st.name}-${i}`}
+                            className="annotation"
+                            style={{ marginLeft: 12, marginTop: 2 }}
+                          >
+                            ↳ {c.model} · {c.duration_s.toFixed(2)}s
+                            {c.total_tokens != null && ` · ${c.total_tokens} tok`}
+                            {c.prompt_tokens != null &&
+                              c.completion_tokens != null &&
+                              ` (${c.prompt_tokens} in / ${c.completion_tokens} out)`}
+                            {c.attempts > 1 && ` · ${c.attempts} attempts`}
+                            {!c.ok && " · FAILED"}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
 
         <div className="panel">
           <div className="panel-h">Full page scraping</div>

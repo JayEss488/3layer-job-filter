@@ -18,7 +18,7 @@ from .config import FRONTEND_ORIGINS
 from .database import init_db
 from .routers import attributes, families, onboarding, profiles, search, settings
 
-app = FastAPI(title="Omni Board API", version="1.0.0")
+app = FastAPI(title="Four in a Thousand API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,

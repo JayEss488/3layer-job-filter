@@ -9,3 +9,4 @@ raw_api_jobs.json
 .embedding_analysis/
 tests/gate_reports/
 tests/prompt_pipeline_reports/
+tests/profile_formation_reports/

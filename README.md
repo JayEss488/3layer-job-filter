@@ -1,4 +1,4 @@
-# JobMatch
+# Four in a Thousand
 
 AI job-matching that learns from your feedback. Rebuilt per `implementation_notes.md`,
 UI modelled on `wireframes/`.

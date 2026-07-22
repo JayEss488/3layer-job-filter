@@ -56,6 +56,45 @@ export interface RunFunnel {
   shown: number;
 }
 
+export interface RunPhase {
+  name: string;
+  label: string;
+  seconds: number;
+}
+
+/** One role cluster's own funnel through a run — the per-track breakdown the
+ *  run-wide RunFunnel above sums away. Mirrors backend RunClusterOut. */
+export interface RunCluster {
+  idx: number;
+  label: string;
+  queue_len: number;
+  examined: number;
+  gate_survivors: number;
+  hard_dropped: number;
+  off_sector: number;
+  hard_gate_dropped: number;
+  rank_floor_rejected: number;
+  judge_eligible: number;
+  stop_reason: string;
+  judged: number;
+  judge_reused_from_cache: number;
+  judge_strong: number;
+  judge_backup: number;
+  judge_disqualified: number;
+  picks: number;
+  fallbacks: string[];
+}
+
+/** Per-phase wall time for the last finished search run — mirrors backend
+ *  RunTimingsOut. The search-side counterpart to CvParseTiming below. */
+export interface RunTimings {
+  run_id: number | null;
+  finished_at?: string | null;
+  total_seconds: number;
+  phases: RunPhase[];
+  clusters: RunCluster[];
+}
+
 export interface SnapshotJob {
   title: string;
   company: string;
@@ -78,6 +117,35 @@ export interface Snapshot {
 
 export interface Blocklist {
   domains: string[];
+}
+
+export interface LlmCall {
+  model: string;
+  prompt_chars: number;
+  duration_s: number;
+  attempts: number;
+  ok: boolean;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+}
+
+export interface ParseStage {
+  name: string;
+  seconds: number;
+  llm_calls: LlmCall[];
+}
+
+/** Per-stage wall time for a full CV parse — mirrors backend CvParseTimingOut. */
+export interface CvParseTiming {
+  filename: string;
+  measured_at?: string | null;
+  text_chars: number;
+  text_words: number;
+  generated_summary: boolean;
+  total_seconds: number;
+  llm_seconds: number;
+  stages: ParseStage[];
 }
 
 /** How literally a constraint row is applied — mirrors backend config.py. */
@@ -141,7 +209,12 @@ export interface Confidence {
   tip: string;
 }
 
-/** What the AI is told about the candidate — read-only, shown on /memory. */
+/**
+ * What the AI is told about the candidate, shown on /memory. `requirements` is
+ * a read-only mirror of the must_have/avoid chips edited elsewhere; `header`
+ * and `cv_summary` are hand-editable (PATCH /profiles/{id}/context-header and
+ * PATCH /profiles/{id} respectively — see api.ts).
+ */
 export interface ContextHeader {
   header: string;
   requirements: string[];

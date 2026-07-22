@@ -15,6 +15,7 @@ import json
 import random
 import re
 import sys
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +28,7 @@ from sqlalchemy.orm import Session
 from ..config import CATEGORY_EXPAND_ENABLED, DISCOVERY_ATS_CACHE_TTL_HOURS, ROLE_STALE_DAYS
 from ..database import SessionLocal
 from ..models import Role, SearchRun, JobSeen
+from .families import ensure_families
 from .profile_intel import ensure_profile_intel
 from .snapshot import build_snapshot, cv_text_for_cluster
 from .moderation import filter_blocked, get_blocked_domains
@@ -277,12 +279,25 @@ def _verdict_of(entry: dict) -> str | None:
 def _compose_analysis(entry: dict) -> str:
     """The card's analysis text. RoleCard.tsx splits on the §-prefixed markers.
 
-    Always visible (no marker, or the always-rendered `§role-type`): the
-    cluster-label/closest-match notes, the plain-language `summary` headline,
-    and `role_type` classifying the day-to-day work. Behind the "Show more"
+    Always visible (no marker): the cluster-label/closest-match notes, then
+    the headline -- `role_type` (functional classification) and `summary`
+    (this specific role's mission/duties) joined into ONE sentence pair, in
+    that order, per full_auto's step F no-overlap rule (they're written by the
+    model knowing they'll be displayed together, so `summary` adds new
+    information rather than restating `role_type`). Behind the "Show more"
     toggle: `§qualification` (a direct qualified-or-not verdict, then a
     concern count and its bullets) and `§ai-reasoning` (one synthesized
     narrative paragraph).
+
+    `role_type` used to render as its own always-visible `§role-type` block
+    after the `summary` headline -- the two are independently-generated model
+    fields that, despite an existing "distinct from summary" instruction, in
+    practice often restated each other (e.g. "a charity data-and-impact role
+    combining analysis..." next to "...keep records accurate, analyse
+    outcomes..."). Folding them into one headline plus strengthening the
+    prompt's no-overlap rule (FINAL_EVAL_PROMPT_VERSION 13) fixes the visible
+    redundancy without losing the model's two-step reasoning (classify, then
+    describe).
 
     This replaces the old "Matches N/M core requirements" ratio headline,
     which was unreliable -- the judge freely re-enumerates a fresh
@@ -296,12 +311,11 @@ def _compose_analysis(entry: dict) -> str:
     if entry.get("strong_fit") is False:
         parts.append("⚠ Closest available match — no role fully met the bar this run.")
 
-    if entry.get("summary"):
-        parts.append(entry["summary"].strip())
-
-    if entry.get("role_type"):
-        parts.append("§role-type")
-        parts.append(entry["role_type"].strip())
+    headline = " ".join(
+        p.strip() for p in (entry.get("role_type"), entry.get("summary")) if p and p.strip()
+    )
+    if headline:
+        parts.append(headline)
 
     qualification: list[str] = []
     if entry.get("can_do_fit"):
@@ -625,6 +639,69 @@ def _persist_scrape(db: Session, profile_id: int, jobs: list[dict]) -> None:
     for r in rows:
         r.full_text = by_id.get(r.identity_hash)
     db.commit()
+
+
+def _enrich_reed_full_text(engine, db: Session, profile_id: int, jobs: list[dict]) -> int:
+    """Fetch the REAL description for Reed candidates about to be gated, and
+    persist it as their full_text.
+
+    Reed's search API truncates its description to a ~455-char teaser (measured:
+    min 453 / max 500 across a 361-row live sample), and nothing else fills that
+    gap before the cheap stages run -- Phase 5's scrape, the only other source of
+    real text, happens AFTER gate and rank. So screen_gate's seniority axis and
+    rank_gate's DEPTH FIT score were judging a freshly-discovered Reed job on its
+    opening blurb, never its requirements section: an audit of jobs the expensive
+    judge disqualified on an experience bar ("3+ years as a Data Analyst") found
+    the requirement present in the snippet for 1 of 24, and in the scraped
+    full_text for 7. The cheap stages weren't miscalibrated, they were starved.
+
+    Reed's per-job endpoint closes that for one plain HTTP call each (no LLM, no
+    browser) -- see full_auto.fetch_reed_details. Two free downstream effects:
+    _needs_full_scrape skips anything carrying full_text, so Phase 5 shrinks by
+    however many are enriched here, and the text persists for every future run
+    exactly like a scrape would.
+
+    Mutates the passed dicts in place (full_text + _has_full_text, the latter
+    being what _needs_full_scrape and full_auto._gate_job_id's cache-key
+    richness marker both read). Returns how many were enriched."""
+    by_job_id: dict[str, list[dict]] = defaultdict(list)
+    for j in jobs:
+        if j.get("_has_full_text") or canonical_key(j.get("board")) != "reed":
+            continue
+        job_id = engine.reed_job_id(j.get("url") or "")
+        if job_id:
+            by_job_id[job_id].append(j)
+    if not by_job_id:
+        return 0
+
+    texts = engine.fetch_reed_details(list(by_job_id))
+    if not texts:
+        return 0
+
+    # Same shape as _persist_scrape: one indexed SELECT, assign, commit -- and,
+    # like it, deliberately only stores text that actually beats the snippet, so
+    # a degenerate/near-empty detail response can't overwrite a better teaser.
+    by_identity: dict[str, str] = {}
+    enriched = 0
+    for job_id, text in texts.items():
+        for j in by_job_id.get(job_id, []):
+            if len(text) <= len(j.get("snippet") or ""):
+                continue
+            j["full_text"] = text
+            j["_has_full_text"] = True
+            enriched += 1
+            if j.get("_identity"):
+                by_identity[j["_identity"]] = text[:8000]
+    if by_identity:
+        rows = db.execute(
+            select(JobSeen).where(
+                JobSeen.profile_id == profile_id, JobSeen.identity_hash.in_(list(by_identity))
+            )
+        ).scalars().all()
+        for r in rows:
+            r.full_text = by_identity.get(r.identity_hash)
+        db.commit()
+    return enriched
 
 
 def _persist_dead_scrapes(db: Session, profile_id: int, jobs: list[dict]) -> None:
@@ -964,7 +1041,7 @@ def _hard_enforced_axes(engine, cluster_profile: dict) -> tuple[tuple[str, ...],
 
 
 def _gate_rank_refill_cluster(
-    queue: list[dict], cluster_profile: dict, engine, db: Session, run: SearchRun,
+    queue: list[dict], cluster_profile: dict, engine, cancel_check,
     judge_target: int, examine_cap: int,
 ) -> tuple[list[dict], dict]:
     """Iteratively gates then ranks batches of one cluster's embed-score-ordered
@@ -993,7 +1070,12 @@ def _gate_rank_refill_cluster(
     stop_reason), plus "below_rank_floor_jobs" -- the actual rejected candidate
     dicts (not just a count) for the caller's Snapshot-panel sample; `queue[:
     stats['examined']]` recovers exactly the subset of the queue this call
-    looked at."""
+    looked at.
+
+    Runs in a worker thread (one per cluster -- see the call site), so it takes a
+    `cancel_check` callable rather than the pipeline's own (thread-unsafe)
+    Session/SearchRun pair. Makes no DB writes and touches no shared state; every
+    result is merged by the caller, back on the main thread."""
     soft_axes, hard_axes = _hard_enforced_axes(engine, cluster_profile)
     pos = 0
     examined = 0
@@ -1012,7 +1094,7 @@ def _gate_rank_refill_cluster(
         if examined >= examine_cap:
             stop_reason = "absolute_pool_cap"
             break
-        _check_cancelled(db, run)
+        cancel_check()
         batch_size = min(len(queue) - pos, TARGET_POOL, examine_cap - examined)
         batch = queue[pos:pos + batch_size]
         pos += batch_size
@@ -1285,6 +1367,44 @@ def _check_cancelled(db: Session, run: SearchRun) -> None:
     db.refresh(run)
     if run.cancel_requested:
         raise SearchCancelled()
+
+
+def _make_cancel_check(run_id: int, min_interval: float = 3.0):
+    """A thread-safe version of _check_cancelled, for the stages that run one
+    worker thread per role cluster (the gate+rank refill, and the per-cluster
+    scrape+judge). Those threads must not touch the pipeline's own Session --
+    SQLAlchemy sessions aren't thread-safe -- so each probe opens and closes its
+    own short-lived one instead.
+
+    Throttled to one real SELECT every `min_interval` seconds across ALL callers:
+    each cluster calls this per gate batch, so an unthrottled version would turn
+    into a steady trickle of concurrent SQLite reads for a flag that changes at
+    most once per run. Once a cancel is seen it's latched, so every later call
+    raises immediately without another query."""
+    lock = threading.Lock()
+    state = {"next_check": 0.0, "cancelled": False}
+
+    def check() -> None:
+        with lock:
+            if state["cancelled"]:
+                raise SearchCancelled()
+            now = time.monotonic()
+            if now < state["next_check"]:
+                return
+            state["next_check"] = now + min_interval
+        probe = SessionLocal()
+        try:
+            cancelled = bool(probe.execute(
+                select(SearchRun.cancel_requested).where(SearchRun.id == run_id)
+            ).scalar())
+        finally:
+            probe.close()
+        if cancelled:
+            with lock:
+                state["cancelled"] = True
+            raise SearchCancelled()
+
+    return check
 
 
 def _progress(db: Session, run: SearchRun, message: str) -> None:
@@ -1742,18 +1862,56 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     below_rank_floor_all: list[dict] = []
     total_examined = total_gate_survivors = total_judge_eligible = 0
     total_hard_gate_dropped = 0
+    cluster_diagnostics: dict[int, dict] = {}
     num_active_clusters = sum(1 for q in queues.values() if q)
     cluster_judge_target = -(-JUDGE_POOL // num_active_clusters) if num_active_clusters else JUDGE_POOL
     cluster_examine_cap = SINGLE_CLUSTER_EXAMINE_CAP if num_active_clusters <= 1 else MULTI_CLUSTER_EXAMINE_CAP
-    for idx, queue in queues.items():
-        if not queue:
-            continue
-        cluster_profile = dict(eng_profile)
-        cluster_profile["search_terms"] = role_clusters[idx].get("roles") or eng_profile.get("search_terms")
-        cluster_profile["_multi_cluster"] = len(role_clusters) > 1
-        judge_eligible, gate_survivors, stats = _gate_rank_refill_cluster(
-            queue, cluster_profile, engine, db, run, cluster_judge_target, cluster_examine_cap
-        )
+
+    # Give the cheap stages something real to read first. Scoped to exactly the
+    # slice each cluster is about to examine -- the queues are already
+    # embed-score-ordered, so queue[:cluster_examine_cap] IS what the gate will
+    # look at -- rather than the whole store, most of which never reaches a gate.
+    # Runs here, on the main thread, before the cluster pool starts, because it
+    # commits to the request session. See _enrich_reed_full_text.
+    to_enrich = [j for queue in queues.values() for j in queue[:cluster_examine_cap]]
+    n_enriched = _enrich_reed_full_text(engine, db, profile_id, to_enrich)
+    funnel["reed_enriched"] = n_enriched
+    if n_enriched:
+        emit(f"[pipeline] enriched {n_enriched} Reed candidate(s) with their full description "
+             f"before gating (cached for future runs; these now skip phase 5)")
+    t0 = _lap("enrich", t0)
+
+    # Judge every cluster's queue concurrently. Both budgets above
+    # (cluster_judge_target / cluster_examine_cap) are derived from
+    # num_active_clusters BEFORE any cluster runs, and each call's results are
+    # merged afterwards, so -- exactly as with the per-cluster final eval below
+    # -- there is no cross-cluster fairness decision left for concurrency to
+    # disturb. Sequentially, this was the single largest phase of a run (a live
+    # 3-cluster run spent 83s here, ~28s per cluster back-to-back), because
+    # every round is a blocking cheap-model gate call followed by a blocking
+    # mid-model rank call.
+    active_clusters = [(idx, queue) for idx, queue in queues.items() if queue]
+    cancel_check = _make_cancel_check(run.id)
+    gate_results: dict[int, tuple[list[dict], list[dict], dict]] = {}
+    if active_clusters:
+        with ThreadPoolExecutor(max_workers=len(active_clusters)) as pool:
+            futures = {}
+            for idx, queue in active_clusters:
+                cluster_profile = dict(eng_profile)
+                cluster_profile["search_terms"] = (
+                    role_clusters[idx].get("roles") or eng_profile.get("search_terms"))
+                cluster_profile["_multi_cluster"] = len(role_clusters) > 1
+                futures[pool.submit(
+                    _gate_rank_refill_cluster, queue, cluster_profile, engine, cancel_check,
+                    cluster_judge_target, cluster_examine_cap,
+                )] = idx
+            for fut in as_completed(futures):
+                gate_results[futures[fut]] = fut.result()
+
+    # Merge sequentially, in queue order, so the funnel counters, fallback tags
+    # and log lines stay deterministic regardless of which cluster finished first.
+    for idx, queue in active_clusters:
+        judge_eligible, gate_survivors, stats = gate_results[idx]
         rank_by_cluster[idx] = judge_eligible
         examined_ids.update(j["_identity"] for j in queue[:stats["examined"]])
         gate_survivor_ids.update(j["_identity"] for j in gate_survivors)
@@ -1778,6 +1936,19 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
              f"(hard_dropped={stats['hard_dropped']}, off_sector={stats['off_sector']}, "
              f"rank_floor_rejected={stats['rank_floor_rejected']}) "
              f"(stopped: {stats['stop_reason']})")
+        # Per-cluster funnel, for the Settings "Search run timings" panel. The
+        # run-wide funnel_counts can't answer "which track did badly and where" --
+        # it sums every cluster together, so a strong stream and a starving one
+        # average into numbers that look healthy. Judge-side counts are filled in
+        # after Phase 6 below.
+        cluster_diagnostics[idx] = {
+            "idx": idx, "label": _cluster_label(role_clusters[idx]),
+            "queue_len": stats["queue_len"], "examined": stats["examined"],
+            "gate_survivors": stats["gate_survivors"], "hard_dropped": stats["hard_dropped"],
+            "off_sector": stats["off_sector"], "hard_gate_dropped": stats["hard_gate_dropped"],
+            "rank_floor_rejected": stats["rank_floor_rejected"],
+            "judge_eligible": stats["judge_eligible"], "stop_reason": stats["stop_reason"],
+        }
     t0 = _lap("gate", t0)
 
     selected = _fair_allocate(rank_by_cluster, JUDGE_POOL)
@@ -1804,70 +1975,96 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             _compose_fallback_warning(role_clusters, fallback_notes), funnel
     _check_cancelled(db, run)
 
-    # EVALUATE. When full-page scraping is enabled (default), read each selected
-    # job's real page first, so the final LLM judges fit against the actual
-    # posting text (seniority/experience/location) instead of a short snippet
-    # -- but only for jobs whose snippet doesn't already have enough to judge
-    # from (see _needs_full_scrape); skipping the rest is most of the win here,
-    # since it's the largest source of both run time and anti-bot blocking.
-    to_evaluate = selected
-    if get_full_scrape_enabled(db):
-        needs_scrape: list[dict] = []
-        already_ready: list[dict] = []
-        for j in selected:
+    # EVALUATE (phases 5 + 6), PIPELINED PER CLUSTER. When full-page scraping is
+    # enabled (default), each selected job's real page is read first so the final
+    # LLM judges fit against the actual posting text (seniority/experience/
+    # location) instead of a short snippet -- but only for jobs whose snippet
+    # doesn't already have enough to judge from (see _needs_full_scrape); skipping
+    # the rest is most of the win there, since it's the largest source of both run
+    # time and anti-bot blocking.
+    #
+    # These used to be two strictly sequential whole-run phases: scrape ALL 40
+    # selected jobs, then judge, cluster by cluster in a thread pool. Since
+    # _fair_allocate has already fixed each cluster's share by this point, nothing
+    # about a cluster's judging depends on any other cluster's pages -- so each
+    # cluster now scrapes and then judges on its own task, and one cluster's
+    # (expensive, blocking) judge call overlaps the others' page fetching. On a
+    # live 3-cluster run those two phases cost 48s + 53s back-to-back.
+    #
+    # Judging itself is unchanged: still ONE expensive call per cluster (given a
+    # cv_text scoped to just that cluster's roles -- see cv_text_for_cluster) so
+    # the judge weighs fit against ONE coherent role identity, returning both a
+    # strict "strong" list and a lenient disqualifier-only "backup" list. Jobs
+    # already judged under this exact CV are served from their stored verdict.
+    scrape_enabled = get_full_scrape_enabled(db)
+    if not scrape_enabled:
+        emit("[pipeline] full-page scraping disabled in settings; evaluating on snippets")
+    blocked_domains = set(get_blocked_domains(db))
+    scrape_country = eng_profile.get("adzuna_country_code", "gb")
+
+    selected_by_cluster: dict[int, list[dict]] = defaultdict(list)
+    for j in selected:
+        company = (j.get("company") or "").strip().lower()
+        n_titles = len(company_title_counts.get(company, ()))
+        if n_titles >= TEMPLATE_FACTORY_TITLE_THRESHOLD:
+            j["_posting_volume_hint"] = f"{n_titles} differently-titled roles from this source this run"
+        selected_by_cluster[j.get("_cluster", 0)].append(j)
+    cluster_items = list(selected_by_cluster.items())
+
+    # Shared across the concurrent per-cluster scrapes so the crawler still uses
+    # ONE MAX_CONCURRENT-wide lane and ONE alt-source lookup budget for the whole
+    # run -- without these, N clusters would mean N independent lanes/budgets (see
+    # full_auto.scrape_full_details' `sem`/`alt_budget` params).
+    scrape_sem = asyncio.Semaphore(engine.MAX_CONCURRENT)
+    scrape_alt_budget = [engine.ALT_SOURCE_LOOKUP_MAX_PER_RUN]
+    scraped_all: list[dict] = []   # every freshly-fetched job, for the main-thread persist
+    dead_all: list[dict] = []
+    scrape_counts = {"needed": 0, "already_ready": 0}
+
+    async def _scrape_cluster(idx: int, jobs: list[dict], crawler) -> list[dict]:
+        """Phase 5 for ONE cluster. Returns the jobs that should go on to its
+        judge (snippet-sufficient ones plus successfully-scraped live ones);
+        confirmed-dead listings are dropped here and collected for the caller to
+        persist. Runs on the event loop, so appending to the shared lists below
+        needs no lock."""
+        if not scrape_enabled or crawler is None:
+            return jobs
+        needs_scrape, already_ready = [], []
+        for j in jobs:
             if _needs_full_scrape(j):
                 needs_scrape.append(j)
             else:
                 j["full_text"] = j.get("snippet", "")
                 already_ready.append(j)
-        funnel["scrape_needed"] = len(needs_scrape)
-        funnel["scrape_already_ready"] = len(already_ready)
-        emit(f"[pipeline] phase 5: {len(needs_scrape)}/{len(selected)} candidates need a full-page "
-             f"scrape ({len(already_ready)} already have enough detail from their source)")
-        if needs_scrape:
-            _progress(db, run, "Reading full job pages…")
-            browser_config = engine.BrowserConfig(
-                headless=True, verbose=False, viewport_width=1280, viewport_height=800,
-                user_agent_mode="random",
-            )
-            async with engine.AsyncWebCrawler(config=browser_config) as crawler:
-                scraped = await engine.scrape_full_details(
-                    needs_scrape, crawler, blocked_domains=set(get_blocked_domains(db)),
-                    country_code=eng_profile.get("adzuna_country_code", "gb"),
-                )
-            _persist_scrape(db, profile_id, scraped)  # reuse the page next run, no re-scrape
-            scraped_dead = [j for j in scraped if j.get("_dead_reason")]
-            scraped_live = [j for j in scraped if not j.get("_dead_reason")]
-            _persist_dead_scrapes(db, profile_id, scraped_dead)
-            funnel["dead_dropped"] = len(scraped_dead)
-            if scraped_dead:
-                emit(f"[pipeline] phase 5: {len(scraped_dead)} listing(s) confirmed dead/expired "
-                     f"(no alt-source recovery) -- excluded before final judge")
-            to_evaluate = already_ready + scraped_live
-        else:
-            to_evaluate = already_ready
-        t0 = _lap("scrape", t0)
-    else:
-        emit("[pipeline] full-page scraping disabled in settings; evaluating on snippets")
-    _snap("scraped", to_evaluate)
+        scrape_counts["needed"] += len(needs_scrape)
+        scrape_counts["already_ready"] += len(already_ready)
+        emit(f"[pipeline] phase 5 cluster[{idx}]: {len(needs_scrape)}/{len(jobs)} candidates need a "
+             f"full-page scrape ({len(already_ready)} already have enough detail from their source)")
+        if not needs_scrape:
+            return already_ready
+        scraped = await engine.scrape_full_details(
+            needs_scrape, crawler, blocked_domains=blocked_domains,
+            country_code=scrape_country, sem=scrape_sem, alt_budget=scrape_alt_budget,
+        )
+        scraped_all.extend(scraped)
+        dead = [j for j in scraped if j.get("_dead_reason")]
+        dead_all.extend(dead)
+        if dead:
+            emit(f"[pipeline] phase 5 cluster[{idx}]: {len(dead)} listing(s) confirmed dead/expired "
+                 f"(no alt-source recovery) -- excluded before final judge")
+        return already_ready + [j for j in scraped if not j.get("_dead_reason")]
 
-    # Final judgment runs once PER CLUSTER, each given a cv_text scoped to just
-    # that cluster's roles (see cv_text_for_cluster) -- so the judge weighs fit
-    # against ONE coherent role identity instead of every field the candidate
-    # has ever listed. A SINGLE expensive call per cluster returns both a strict
-    # "strong" list and a lenient disqualifier-only "backup" list, so a cluster
-    # with no strong fits no longer costs a second full call. Any job already
-    # judged under this exact CV (unchanged profile) is served from its stored
-    # verdict and never re-sent to the expensive model. If nothing is strong and
-    # there's no backup, a deterministic no-LLM fallback surfaces the top-scoring
-    # candidates rather than silently contributing nothing.
-    to_evaluate_by_cluster: dict[int, list[dict]] = defaultdict(list)
-    for j in to_evaluate:
-        company = (j.get("company") or "").strip().lower()
-        n_titles = len(company_title_counts.get(company, ()))
-        if n_titles >= TEMPLATE_FACTORY_TITLE_THRESHOLD:
-            j["_posting_volume_hint"] = f"{n_titles} differently-titled roles from this source this run"
-        to_evaluate_by_cluster[j.get("_cluster", 0)].append(j)
+    async def _scrape_then_judge(idx: int, jobs: list[dict], crawler) -> dict:
+        ready = await _scrape_cluster(idx, jobs, crawler)
+        # _run_cluster_final_eval is blocking (expensive-model calls) but makes no
+        # DB writes and touches no shared state, so it's safe in a worker thread --
+        # which is what lets the OTHER clusters keep scraping while it runs.
+        result = await asyncio.to_thread(
+            _run_cluster_final_eval, idx, ready, role_clusters, cv_text_base,
+            eng_profile, rank_by_cluster, engine,
+        )
+        result["_evaluated"] = ready
+        return result
 
     final_by_cluster: dict[int, list[dict]] = {}
     final_fresh_judged = final_reused_from_cache = 0
@@ -1875,27 +2072,39 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     final_scam_verified_dropped = 0
     scam_verify_budget = [SCAM_VERIFY_MAX_PER_RUN]
 
-    _progress(db, run, "Final AI review…")
+    _progress(db, run, "Reading job pages & final AI review…")
     _check_cancelled(db, run)
-    # Judge every cluster concurrently -- _fair_allocate has already picked each
-    # cluster's `to_evaluate_by_cluster[idx]` by this point, so unlike the
-    # gate+rank stage there's no cross-cluster fairness left for concurrency to
-    # disturb; running these sequentially (one blocking expensive-model call per
-    # cluster, plus its own backfill/scam-verify) was most of what made "final
-    # matching" feel slow. _run_cluster_final_eval makes no DB writes and touches
-    # no shared state, so persistence, funnel counters, and scam-verify (which
-    # spends a shared per-run budget) all happen below, sequentially, once every
-    # cluster's judging has returned.
-    cluster_items = list(to_evaluate_by_cluster.items())
-    eval_results: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=max(1, len(cluster_items))) as pool:
-        futures = {
-            pool.submit(_run_cluster_final_eval, idx, jobs, role_clusters, cv_text_base,
-                        eng_profile, rank_by_cluster, engine): idx
-            for idx, jobs in cluster_items
-        }
-        for fut in as_completed(futures):
-            eval_results[futures[fut]] = fut.result()
+
+    async def _run_all(crawler) -> list[dict]:
+        return list(await asyncio.gather(
+            *[_scrape_then_judge(idx, jobs, crawler) for idx, jobs in cluster_items]
+        ))
+
+    # Only pay for a browser launch when something actually needs fetching.
+    if scrape_enabled and any(_needs_full_scrape(j) for j in selected):
+        browser_config = engine.BrowserConfig(
+            headless=True, verbose=False, viewport_width=1280, viewport_height=800,
+            user_agent_mode="random",
+        )
+        async with engine.AsyncWebCrawler(config=browser_config) as crawler:
+            results = await _run_all(crawler)
+    else:
+        results = await _run_all(None)
+
+    eval_results: dict[int, dict] = {r["idx"]: r for r in results}
+    to_evaluate = [j for r in results for j in r["_evaluated"]]
+
+    # Scrape persistence stays on the main thread (these touch the request
+    # session): remember the page text so a resurfacing job isn't re-scraped, and
+    # record confirmed-dead listings so no future run considers them at all.
+    if scraped_all:
+        _persist_scrape(db, profile_id, scraped_all)
+        _persist_dead_scrapes(db, profile_id, dead_all)
+    if scrape_enabled:
+        funnel["scrape_needed"] = scrape_counts["needed"]
+        funnel["scrape_already_ready"] = scrape_counts["already_ready"]
+        funnel["dead_dropped"] = len(dead_all)
+    _snap("scraped", to_evaluate)
 
     for idx, jobs in cluster_items:
         r = eval_results[idx]
@@ -1960,6 +2169,21 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                 fallback_notes[idx].add("eval_fallback")
 
         final_by_cluster[idx] = picks
+        # Judge-side half of this cluster's diagnostics row (the gate stage filled
+        # in the other half). A cluster that reaches the judge with a healthy pool
+        # and still returns nothing strong is the shape a run-wide funnel can't
+        # show -- see the Settings "Search run timings" panel.
+        diag = cluster_diagnostics.get(idx)
+        if diag is not None:
+            diag.update({
+                "judged": len(r["fresh"]) + len(r["extras_fresh"]),
+                "judge_reused_from_cache": r["reused_from_cache"] + r["backfill_reused_from_cache"],
+                "judge_strong": len(r["strong"]) + len(r["b_strong"]),
+                "judge_backup": len(r["backup"]) + len(r["b_backup"]),
+                "judge_disqualified": len(r["disqualified"]) + len(r["b_disqualified"]),
+                "picks": len(picks),
+                "fallbacks": sorted(fallback_notes[idx]),
+            })
 
     funnel["final_fresh_judged"] = final_fresh_judged
     funnel["final_reused_from_cache"] = final_reused_from_cache
@@ -1986,9 +2210,18 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     final = _fair_allocate(strong_by_cluster, engine.FINAL_PICKS)
     if len(final) < engine.FINAL_PICKS:
         final += _fair_allocate(backup_by_cluster, engine.FINAL_PICKS - len(final))
-    t0 = _lap("final_eval", t0)
+    # One lap, not the old separate "scrape" + "final_eval": phases 5 and 6 now
+    # overlap per cluster (see _scrape_then_judge), so there is no longer a
+    # wall-clock boundary between them to measure.
+    t0 = _lap("scrape+judge", t0)
     funnel["final_picks"] = len(final)
     _snap("final_picks", final)
+    # Per-cluster funnel, carried out alongside the stage samples (see _snap's
+    # note on `samples` riding inside `funnel`). run_search_task writes it into
+    # SearchRun.snapshot_samples, whose payload is free-form JSON -- the Snapshot
+    # endpoint iterates a fixed stage list and ignores this key, so it needs no
+    # schema change and breaks no existing panel.
+    samples["_clusters"] = [cluster_diagnostics[i] for i in sorted(cluster_diagnostics)]
     _progress(db, run, "Writing up top picks…")
     emit(f"[pipeline] final_evaluation returned {len(final)} picks across "
          f"{sum(1 for v in final_by_cluster.values() if v)} cluster(s)"
@@ -2094,8 +2327,18 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         engine.init_db()  # ensures gate_cache/jobs/profile_cache tables exist
 
         # Cached: only actually calls the LLM when the profile's inputs changed
-        # since the last run (or never ran). See profile_intel.py.
-        ensure_profile_intel(db, profile_id)
+        # since the last run (or never ran). regenerate_roles=False: this
+        # automatic top-up must only ever refresh the header/intent-draft, never
+        # the target_role rows themselves -- letting it also do so used to wipe
+        # every role family's roles (and could reintroduce a just-deleted
+        # cluster) as a side effect of any unrelated signature change, e.g.
+        # deleting one family. See profile_intel.ensure_profile_intel.
+        ensure_profile_intel(db, profile_id, regenerate_roles=False)
+        # Belt-and-braces: slot any genuinely-ungrouped role into an EXISTING
+        # family (a cheap no-op in the normal case now that the call above never
+        # creates ungrouped roles) rather than leaving snapshot._role_groups to
+        # fall back to its own from-scratch, family-unaware clustering.
+        ensure_families(db, profile_id)
 
         snap = build_snapshot(db, profile_id)
 

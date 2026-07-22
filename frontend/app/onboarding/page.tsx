@@ -34,6 +34,10 @@ export default function OnboardingPage() {
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["attributes", activeId] });
     qc.invalidateQueries({ queryKey: ["confidence", activeId] });
+    // A parse also seeds role-family cards (backend now does this synchronously
+    // -- see onboarding.py's parse_cv/parse_text), so a families query left
+    // mounted from an earlier /dashboard visit needs refreshing too.
+    qc.invalidateQueries({ queryKey: ["families", activeId] });
     // A parse can autofill Profile-table fields too (cv_summary, and intent_text
     // when it was empty -- see profile_intel._apply), which IntentEditor reads
     // from the ["profiles"] cache. Without this, a first-time CV upload's
@@ -90,7 +94,7 @@ export default function OnboardingPage() {
   return (
     <div className="app narrow">
       <div className="screen-header">
-        <div className="logo">Omni Board</div>
+        <div className="logo">Four in a Thousand</div>
         <div className="step-indicator">Build your profile</div>
       </div>
 

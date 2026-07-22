@@ -5,12 +5,14 @@ import type {
   Blocklist,
   Confidence,
   ContextHeader,
+  CvParseTiming,
   Enforcement,
   FamilyTier,
   Profile,
   Role,
   RoleFamily,
   RunFunnel,
+  RunTimings,
   ScrapeSetting,
   SearchStart,
   SearchStatus,
@@ -48,7 +50,9 @@ export const api = {
     req<Profile>("/profiles", { method: "POST", body: JSON.stringify({ name }) }),
   updateProfile: (
     id: number,
-    body: Partial<Pick<Profile, "name" | "is_active" | "intent_text" | "search_feedback">>
+    body: Partial<Pick<Profile, "name" | "is_active" | "intent_text" | "search_feedback">> & {
+      cv_summary?: string;
+    }
   ) =>
     req<Profile>(`/profiles/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteProfile: (id: number) =>
@@ -144,6 +148,11 @@ export const api = {
     req<Attribute[]>(`/profiles/${id}/regenerate-target-roles`, { method: "POST" }),
   confidence: (id: number) => req<Confidence>(`/profiles/${id}/confidence`),
   contextHeader: (id: number) => req<ContextHeader>(`/profiles/${id}/context-header`),
+  updateContextHeader: (id: number, header: string) =>
+    req<ContextHeader>(`/profiles/${id}/context-header`, {
+      method: "PATCH",
+      body: JSON.stringify({ header }),
+    }),
 
   // search + roles
   startSearch: (id: number) =>
@@ -172,6 +181,7 @@ export const api = {
   sources: () => req<SourceInfo[]>("/settings/sources"),
   sourceStats: () => req<SourceStat[]>("/settings/source-stats"),
   runFunnel: () => req<RunFunnel>("/settings/run-funnel"),
+  runTimings: () => req<RunTimings>("/settings/run-timings"),
   snapshot: () => req<Snapshot>("/settings/snapshot"),
   setSources: (disabled: string[]) =>
     req<SourceInfo[]>("/settings/sources", {
@@ -190,6 +200,17 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ domains }),
     }),
+  cvParseTiming: () => req<CvParseTiming>("/settings/cv-parse-timing"),
+  runCvParseTiming: async (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/settings/cv-parse-timing`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || "Timing run failed");
+    return (await res.json()) as CvParseTiming;
+  },
 
   // ATS harvesting
   harvestAts: (id: number, force = false) =>

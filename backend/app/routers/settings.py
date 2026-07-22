@@ -1,17 +1,20 @@
 """Settings endpoints. Currently: the per-source visibility toggle (workstream D)
 that lets the user see each discovery source's last-run count and turn sources on
 or off (e.g. disable an ATS vendor that's flooding the pool)."""
+import asyncio
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import SearchRun
+from ..models import SearchRun, Setting
+from ..services.diagnostics import TIMING_RESULT_KEY, time_cv_parse
 from ..services.moderation import get_blocked_domains, set_blocked_domains
+from ..services.parsing import CVParseFailed
 from ..services.sources import (
     get_full_scrape_enabled,
     set_disabled,
@@ -66,6 +69,69 @@ class RunFunnelOut(BaseModel):
     shown: int = 0                       # final_picks
 
 
+class RunPhaseOut(BaseModel):
+    """One timed phase of a search run, as recorded by engine.py's _lap()."""
+    name: str
+    label: str
+    seconds: float
+
+
+class RunClusterOut(BaseModel):
+    """One role cluster's own funnel through a run. Every field is optional
+    because a run can end before the judge stage fills the judge-side half in
+    (an early return, a cancel), and because runs recorded before this panel
+    existed have no cluster data at all."""
+    idx: int = 0
+    label: str = ""
+    queue_len: int = 0
+    examined: int = 0
+    gate_survivors: int = 0
+    hard_dropped: int = 0
+    off_sector: int = 0
+    hard_gate_dropped: int = 0
+    rank_floor_rejected: int = 0
+    judge_eligible: int = 0
+    stop_reason: str = ""
+    judged: int = 0
+    judge_reused_from_cache: int = 0
+    judge_strong: int = 0
+    judge_backup: int = 0
+    judge_disqualified: int = 0
+    picks: int = 0
+    fallbacks: list[str] = []
+
+
+class RunTimingsOut(BaseModel):
+    """Per-phase wall time for the most recent finished search run, plus each
+    role cluster's own funnel. The counterpart to CvParseTimingOut for the search
+    side: SearchRun.phase_timings has been written every run for a long time but
+    was never exposed anywhere, so "where did the run's four minutes go?" could
+    only be answered by watching the backend console live."""
+    run_id: int | None = None
+    finished_at: datetime | None = None
+    total_seconds: float = 0.0
+    phases: list[RunPhaseOut] = []
+    clusters: list[RunClusterOut] = []
+
+
+# Human labels for engine.py's _lap() phase keys, in pipeline order. An unknown
+# key (a phase added later, or an old run's retired one -- e.g. the separate
+# "scrape"/"final_eval" laps that became one overlapped "scrape+judge") still
+# renders, just under its raw name.
+_RUN_PHASE_LABELS = [
+    ("discovery", "Discovery (job board + ATS queries)"),
+    ("category_expand", "Category-page expansion"),
+    ("embed", "Embedding new listings"),
+    ("score", "Cosine scoring against clusters"),
+    ("enrich", "Fetching full descriptions (Reed)"),
+    ("gate", "Cheap screen + rank gate (per cluster)"),
+    ("rank", "Fair-allocate to the judge pool"),
+    ("scrape", "Full-page scraping"),
+    ("final_eval", "Final AI judge"),
+    ("scrape+judge", "Full-page scrape + final AI judge (overlapped)"),
+]
+
+
 class SnapshotJobOut(BaseModel):
     title: str = ""
     company: str = ""
@@ -118,6 +184,37 @@ class BlocklistIn(BaseModel):
     domains: list[str]
 
 
+class LlmCallOut(BaseModel):
+    """One underlying model call captured during a timed parse stage."""
+    model: str
+    prompt_chars: int
+    duration_s: float
+    attempts: int
+    ok: bool
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+class ParseStageOut(BaseModel):
+    name: str
+    seconds: float
+    llm_calls: list[LlmCallOut] = []
+
+
+class CvParseTimingOut(BaseModel):
+    """Per-stage wall time for a full CV parse (see services/diagnostics.py).
+    Empty (measured_at=None) until Measure has been pressed at least once."""
+    filename: str = ""
+    measured_at: str | None = None
+    text_chars: int = 0
+    text_words: int = 0
+    generated_summary: bool = False
+    total_seconds: float = 0.0
+    llm_seconds: float = 0.0
+    stages: list[ParseStageOut] = []
+
+
 @router.get("/settings/sources", response_model=list[SourceOut])
 def list_sources(db: Session = Depends(get_db)):
     return sources_overview(db)
@@ -166,6 +263,49 @@ def get_run_funnel(db: Session = Depends(get_db)):
         ),
         judge_pool_size=counts.get("judge_pool_size", 0),
         shown=counts.get("final_picks", 0),
+    )
+
+
+@router.get("/settings/run-timings", response_model=RunTimingsOut)
+def get_run_timings(db: Session = Depends(get_db)):
+    """Per-phase wall time + per-cluster funnel for the most recently finished
+    search run, across any profile -- same "last finished run" selection as
+    get_run_funnel above. Pure read of what the run already recorded: no LLM
+    cost, nothing re-computed."""
+    run = db.execute(
+        select(SearchRun)
+        .where(SearchRun.status == "done", SearchRun.phase_timings.isnot(None))
+        .order_by(SearchRun.finished_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if not run:
+        return RunTimingsOut()
+    try:
+        timings = json.loads(run.phase_timings or "{}")
+    except (ValueError, TypeError):
+        timings = {}
+    try:
+        samples = json.loads(run.snapshot_samples or "{}")
+    except (ValueError, TypeError):
+        samples = {}
+
+    known = [(key, label) for key, label in _RUN_PHASE_LABELS if key in timings]
+    labelled = {key for key, _ in known}
+    phases = [RunPhaseOut(name=key, label=label, seconds=float(timings.get(key) or 0.0))
+              for key, label in known]
+    # Anything _lap() recorded that this module doesn't have a label for yet --
+    # shown under its raw key rather than silently dropped from the total.
+    phases += [RunPhaseOut(name=key, label=key, seconds=float(value or 0.0))
+               for key, value in timings.items() if key not in labelled]
+
+    clusters = [RunClusterOut(**{k: v for k, v in c.items() if k in RunClusterOut.model_fields})
+                for c in (samples.get("_clusters") or []) if isinstance(c, dict)]
+    return RunTimingsOut(
+        run_id=run.id,
+        finished_at=run.finished_at,
+        total_seconds=round(sum(p.seconds for p in phases), 2),
+        phases=phases,
+        clusters=clusters,
     )
 
 
@@ -220,3 +360,46 @@ def get_blocklist(db: Session = Depends(get_db)):
 @router.put("/settings/blocklist", response_model=BlocklistOut)
 def update_blocklist(body: BlocklistIn, db: Session = Depends(get_db)):
     return {"domains": set_blocked_domains(db, body.domains)}
+
+
+def _timing_setting_row(db: Session) -> Setting | None:
+    return db.execute(
+        select(Setting).where(Setting.profile_id.is_(None), Setting.key == TIMING_RESULT_KEY)
+    ).scalar_one_or_none()
+
+
+@router.get("/settings/cv-parse-timing", response_model=CvParseTimingOut)
+def get_cv_parse_timing(db: Session = Depends(get_db)):
+    """The most recent CV-parse timing measurement (global, single-user). Empty
+    until Measure has run once -- pure read, no LLM cost."""
+    row = _timing_setting_row(db)
+    if not row or not row.value:
+        return CvParseTimingOut()
+    try:
+        return CvParseTimingOut(**json.loads(row.value))
+    except (ValueError, TypeError):
+        return CvParseTimingOut()
+
+
+@router.post("/settings/cv-parse-timing", response_model=CvParseTimingOut)
+async def run_cv_parse_timing(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Measure a full CV parse stage by stage against a throwaway profile.
+    Spends the same three STRONG-model calls a real upload does -- user-triggered
+    only (see services/diagnostics.py). The result is stored as the global
+    'last measured' so the panel shows it again on reload."""
+    raw = await file.read()
+    try:
+        result = await asyncio.to_thread(time_cv_parse, db, file.filename or "", raw)
+    except CVParseFailed as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    row = _timing_setting_row(db)
+    payload = json.dumps(result)
+    if row is not None:
+        row.value = payload
+    else:
+        db.add(Setting(profile_id=None, key=TIMING_RESULT_KEY, value=payload))
+    db.commit()
+    return CvParseTimingOut(**result)

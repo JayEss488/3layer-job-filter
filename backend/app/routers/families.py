@@ -2,7 +2,7 @@
 
 Thin, like the other routers -- the seeding/ordering logic lives in
 services/families.py."""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -11,7 +11,12 @@ from ..database import get_db
 from ..deps import current_user_id, get_profile_or_404
 from ..models import Profile, ProfileAttribute, RoleFamily
 from ..schemas import AttributeOut, FamilyCreate, FamilyOut, FamilyUpdate
-from ..services.families import ensure_families, list_families, regenerate_family
+from ..services.families import (
+    ensure_families,
+    list_families,
+    reconcile_summary_after_family_change_bg,
+    regenerate_family,
+)
 
 router = APIRouter(tags=["families"])
 
@@ -70,12 +75,20 @@ def add_family(
 
 
 @router.patch("/families/{family_id}", response_model=FamilyOut)
-def update_family(family_id: int, body: FamilyUpdate, db: Session = Depends(get_db)):
+def update_family(
+    family_id: int,
+    body: FamilyUpdate,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     family = _get_family_or_404(db, family_id)
+    old_name = family.name
+    renamed = False
     if body.name is not None:
         name = body.name.strip()
         if not name:
             raise HTTPException(status_code=422, detail="Family name cannot be empty")
+        renamed = name != old_name
         family.name = name
     if body.tier is not None:
         if body.tier not in FAMILY_TIER_CHOICES:
@@ -83,8 +96,17 @@ def update_family(family_id: int, body: FamilyUpdate, db: Session = Depends(get_
         family.tier = body.tier
     if body.position is not None:
         family.position = body.position
+    profile_id, new_name = family.profile_id, family.name
     db.commit()
     db.refresh(family)
+    if renamed:
+        # Cheap-model patch so a stale reference to the old family name/theme
+        # doesn't linger in the evidence brief the final judge reads -- runs
+        # off-request so the rename returns instantly (see
+        # services/families.reconcile_summary_after_family_change_bg).
+        background.add_task(
+            reconcile_summary_after_family_change_bg, profile_id, old_name, new_name
+        )
     return family
 
 
@@ -99,7 +121,9 @@ def regenerate_family_roles(family_id: int, db: Session = Depends(get_db)):
 
 
 @router.delete("/families/{family_id}", status_code=204)
-def delete_family(family_id: int, db: Session = Depends(get_db)):
+def delete_family(
+    family_id: int, background: BackgroundTasks, db: Session = Depends(get_db)
+):
     """Removes the family AND its target roles.
 
     Orphaning them instead (family_id -> NULL) reads as the safer option but
@@ -107,8 +131,13 @@ def delete_family(family_id: int, db: Session = Depends(get_db)):
     would be invisible while still driving discovery, and the next
     ensure_families call would re-seed it into a brand-new card -- i.e. deleting
     a card would make its roles silently come back. The card's ✕ means "stop
-    searching for this stream"; each role keeps its own ✕ for narrower edits."""
+    searching for this stream"; each role keeps its own ✕ for narrower edits.
+
+    The delete itself commits and returns immediately; the cv_summary
+    reconciliation runs off-request so the card disappears without waiting on an
+    LLM round-trip (this was the reported "delete isn't instant" lag)."""
     family = _get_family_or_404(db, family_id)
+    profile_id, old_name = family.profile_id, family.name
     members = db.execute(
         select(ProfileAttribute).where(ProfileAttribute.family_id == family.id)
     ).scalars().all()
@@ -116,3 +145,7 @@ def delete_family(family_id: int, db: Session = Depends(get_db)):
         db.delete(attr)
     db.delete(family)
     db.commit()
+    # See update_family above -- same reconciliation, deletion instead of rename.
+    background.add_task(
+        reconcile_summary_after_family_change_bg, profile_id, old_name, None
+    )

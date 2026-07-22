@@ -88,7 +88,8 @@ export default function SearchPage() {
           <div className="warning-banner warning-banner-row">
             <span>
               <span className="spinner">◴</span> {status?.message || "Building your matches…"} This
-              can take a couple of minutes (fetching, ranking, and reading full role pages).
+              takes about 3½ minutes (fetching, ranking, and reading full role pages) — feel free to
+              explore other tabs while you wait, we'll have your results when you get back.
             </span>
             <button
               className="btn btn-ghost sm"

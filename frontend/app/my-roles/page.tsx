@@ -82,6 +82,7 @@ export default function MyRolesPage() {
             <RoleCard
               key={role.id}
               role={role}
+              showAnalysis
               actions={
                 <>
                   <button className="btn btn-primary sm" onClick={() => apply.mutate(role.id)}>
@@ -120,6 +121,7 @@ export default function MyRolesPage() {
               key={role.id}
               role={role}
               variant="ignored"
+              showAnalysis
               actions={
                 <button className="btn btn-secondary sm" onClick={() => save.mutate(role.id)}>
                   ✓ Restore to Saved
@@ -136,6 +138,7 @@ export default function MyRolesPage() {
                 key={role.id}
                 role={role}
                 variant={s === "rejected" ? "dim" : ""}
+                showAnalysis
                 meta={role.applied_at ? `Applied ${fmtDate(role.applied_at)}` : undefined}
                 actions={(["pending", "interview", "rejected"] as ApplicationStatus[]).map(
                   (opt) => (

@@ -96,6 +96,28 @@ EVIDENCE_ORIGIN_CHOICES = ["Commercial", "Self-directed", "Academic", "AI-assist
 # this set -- keep it in sync with LocationPicker.tsx's WORK_TYPES.
 WORK_TYPE_VALUES = {"remote", "hybrid", "on-site", "onsite"}
 
+# ── CV summary length handling ──────────────────────────────────────────────
+# Below this many words, a candidate's raw CV/notes text is already about as
+# short as a compressed brief would be -- asking the model to compress it
+# further risks losing real, concrete detail (paid work experience, named
+# projects, societies, honesty caveats like "AI-assisted") for no space saved,
+# and a compressed reply that runs long risks being hard-truncated mid-word by
+# CV_SUMMARY_MAX_CHARS below. So parsing.py stores the raw text as cv_summary
+# verbatim instead of asking the model to write one, and profile_intel.py skips
+# generating a separate "Looking for" header for the same reason -- the raw
+# text already speaks for itself. Shared by both modules so the two decisions
+# never disagree about what counts as "short".
+CV_SHORT_WORD_THRESHOLD = 750
+
+# Storage caps for profile.cv_summary (a Text column -- these are app-level
+# sanity bounds, not DB limits). CV_SUMMARY_RAW_MAX_CHARS guards the verbatim
+# short-CV path above against a pathological document with almost no
+# whitespace; CV_SUMMARY_MAX_CHARS guards the long-CV, AI-compressed path,
+# raised from an old 1200 (which used to cut a reply off mid-word) to comfortably
+# fit the fuller ~400-word descriptive overview parsing.py now asks for.
+CV_SUMMARY_RAW_MAX_CHARS = 6000
+CV_SUMMARY_MAX_CHARS = 3000
+
 # ── Hard/soft enforcement ───────────────────────────────────────────────────
 # How literally a constraint row is applied. "hard" = an unconditional drop the
 # moment the listing CLEARLY violates it (screen_gate drops it outright; the
@@ -225,13 +247,17 @@ WEIGHT_MIN, WEIGHT_MAX = 0.1, 2.0
 DEFAULT_WEIGHT = 1.0
 
 # ── Confidence indicator weights (section 6) ────────────────────────────────
+# `skill` was dropped here when it stopped being auto-extracted (see the
+# formation rewrite / parsing.py): a profile that never fills skills as chips
+# shouldn't sit permanently at 75% confidence nagging "add skills". Its weight
+# was redistributed across the types that ARE still populated automatically, so a
+# freshly-parsed profile reads as ready.
 CONFIDENCE_REQUIRED = {
-    "target_role": 0.30,
-    "skill": 0.25,
-    "seniority": 0.15,
-    "location": 0.15,
+    "target_role": 0.35,
+    "seniority": 0.20,
+    "location": 0.20,
     "salary": 0.10,
-    "past_role": 0.05,
+    "past_role": 0.15,
 }
 
 # Human labels for the "missing" tip builder.

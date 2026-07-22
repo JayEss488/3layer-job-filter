@@ -227,8 +227,9 @@ def _annotate_profile_formation(eng_profile, role_clusters):
 
 
 def _decode_reason(packed_reason):
-    # 8 codes since screen_v9 (sector_code appended last -- see full_auto.screen_gate's
-    # docstring); older-shaped strings still decode fine, sector just reads as "ok".
+    # 8 codes since screen_v9, unchanged by screen_v10 (sector_code appended last --
+    # see full_auto.screen_gate's docstring); older-shaped strings still decode fine,
+    # sector just reads as "ok".
     parts = (list((packed_reason or "").split("|")) + ["ok"] * 8)[:8]
     (seniority_code, req_code, skills_code, salary_code, arr_code, hard_code, listing_code,
      sector_code) = parts
@@ -376,6 +377,11 @@ def _finalize_job_record(d, cluster_labels):
         "axes": axes,
         "gate_reason_raw": reason_raw,
         "gate_reason_decoded": _decode_reason(reason_raw) if reason_raw else None,
+        # Model-cited evidence for a seniority_ok=false verdict (screen_v10) -- only
+        # present on a fresh judgment, never a cache hit (see screen_gate's docstring).
+        # Lets a reviewer check the code direction (high/low) against what it's
+        # actually anchored on, instead of taking the packed code on faith.
+        "seniority_signal": d.get("_seniority_signal"),
         "key_requirements": d.get("_key_requirements") or [],
         "bucket": d.get("_bucket"),
         "round_index": d.get("_round_index"),
@@ -601,6 +607,7 @@ function jobDetailHtml(j) {
     '<div style="margin-top:4px"><b>URL:</b> <a href="' + escapeHtml(j.url) + '" target="_blank" rel="noopener">' + escapeHtml(j.url) + '</a></div>' +
     '<div style="margin-top:4px"><b>Key requirements:</b> ' + escapeHtml(JSON.stringify(j.key_requirements)) + '</div>' +
     '<div style="margin-top:4px"><b>Decoded reason:</b> ' + escapeHtml(JSON.stringify(j.gate_reason_decoded)) + '</div>' +
+    (j.seniority_signal ? '<div style="margin-top:4px"><b>Seniority signal (model-cited anchor):</b> ' + escapeHtml(j.seniority_signal) + '</div>' : '') +
     '<div style="margin-top:4px"><b>Soft-fail count this round:</b> ' + (j.soft_fail_count === null || j.soft_fail_count === undefined ? 'n/a (dropped before soft-axis scoring)' : j.soft_fail_count) + '</div>' +
     '<div style="margin-top:4px"><b>Prior final-judge verdict (if any):</b> ' + escapeHtml(j.prior_eval_verdict || 'none on record') + '</div>';
 }

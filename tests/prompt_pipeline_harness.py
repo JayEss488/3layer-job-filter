@@ -14,7 +14,7 @@ possible understanding of the candidate and the role.
 Historical prompt/response logs for these stages are not persisted anywhere (gate
 decisions are cached as booleans/reason-codes, not raw prompt text; final-judge
 verdicts are cached as parsed JSON, not the raw call) and prompts have since changed
-version (FINAL_EVAL_PROMPT_VERSION, screen_v9, rank_v5) -- so old runs cannot be
+version (FINAL_EVAL_PROMPT_VERSION, screen_v10, rank_v5) -- so old runs cannot be
 replayed byte-for-byte. This makes fresh, live calls against the CURRENT prompts
 instead.
 
@@ -118,7 +118,6 @@ _JUDGE_ONLY_FIELD_DRIVES = {
                    "never reaches the weak gate or medium scorer",
     "search_feedback": "STRONG JUDGE ONLY, via cv_text_base's 'Candidate's feedback on recent search "
                        "results' line -- a steer for this run, not enforced like a hard filter",
-    "cv_summary": "STRONG JUDGE ONLY, via cv_text_base's 'Additional background context' line",
 }
 
 
@@ -163,8 +162,9 @@ def _resolve_profile(db, models, profile_id):
 
 
 def _decode_reason(packed_reason):
-    # 8 codes since screen_v9 (sector_code appended last -- see full_auto.screen_gate's
-    # docstring); older-shaped strings still decode fine, sector just reads as "ok".
+    # 8 codes since screen_v9, unchanged by screen_v10 (sector_code appended last --
+    # see full_auto.screen_gate's docstring); older-shaped strings still decode fine,
+    # sector just reads as "ok".
     parts = (list((packed_reason or "").split("|")) + ["ok"] * 8)[:8]
     (seniority_code, req_code, skills_code, salary_code, arr_code, hard_code, listing_code,
      sector_code) = parts

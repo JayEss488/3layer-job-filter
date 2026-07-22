@@ -12,20 +12,23 @@ from ..schemas import (
     AttributeOut,
     ConfidenceOut,
     ContextHeaderOut,
+    ContextHeaderUpdate,
     ParseTextIn,
     SuggestIn,
     SuggestOut,
 )
+from ..services import formation
 from ..services.confidence import confidence
+from ..services.families import ensure_families
 from ..services.harvest import harvest_for_profile
 from ..services.llm import llm_json
-from ..services.parsing import (
-    CVParseFailed,
-    extract_text_from_upload,
-    parse_text_to_attributes,
-    summarize_cv_text,
+from ..services.parsing import CVParseFailed, extract_text_from_upload
+from ..services.profile_intel import (
+    candidate_requirements_display,
+    ensure_profile_intel,
+    read_cached_intel,
+    set_header_locked,
 )
-from ..services.profile_intel import ensure_profile_intel, read_cached_intel
 
 router = APIRouter(tags=["onboarding"])
 
@@ -45,7 +48,27 @@ def get_context_header(
     intel = read_cached_intel(db, profile.id)
     return ContextHeaderOut(
         header=intel.get("header") or "",
-        requirements=intel.get("requirements") or [],
+        requirements=candidate_requirements_display(db, profile.id),
+        cv_summary=profile.cv_summary or "",
+    )
+
+
+@router.patch("/profiles/{profile_id}/context-header", response_model=ContextHeaderOut)
+def update_context_header(
+    body: ContextHeaderUpdate,
+    profile: Profile = Depends(get_profile_or_404),
+    db: Session = Depends(get_db),
+):
+    """Manual edit of the AI-generated header from the Memory page. Locks it
+    (see profile_intel.set_header_locked) so the next search or profile edit
+    doesn't silently regenerate over it -- cv_summary is edited via the plain
+    PATCH /profiles/{id} (ProfileUpdate.cv_summary) instead, since that field
+    is never touched by any regenerate path."""
+    set_header_locked(db, profile.id, body.header)
+    intel = read_cached_intel(db, profile.id)
+    return ContextHeaderOut(
+        header=intel.get("header") or "",
+        requirements=candidate_requirements_display(db, profile.id),
         cv_summary=profile.cv_summary or "",
     )
 
@@ -61,25 +84,7 @@ async def parse_cv(
     text = extract_text_from_upload(file.filename or "", raw)
     if not text.strip():
         raise HTTPException(status_code=422, detail="Could not read any text from that file")
-    profile.cv_text = text[:40000]
-    # summarize_cv_text and parse_text_to_attributes each only need the raw text,
-    # not each other's output, so run their (both STRONG_MODEL) LLM calls
-    # concurrently instead of back-to-back -- cuts one of the three sequential
-    # calls off the upload wait without changing either prompt/model.
-    try:
-        summary, created = await asyncio.gather(
-            asyncio.to_thread(summarize_cv_text, text),
-            asyncio.to_thread(parse_text_to_attributes, db, profile.id, text, source="cv_parsed"),
-        )
-    except CVParseFailed as e:
-        raise HTTPException(status_code=502, detail=f"Couldn't parse that CV automatically: {e}") from e
-    profile.cv_summary = summary
-    db.commit()
-    created += ensure_profile_intel(db, profile.id)
-    # Grow the ATS company set for this profile's sectors, off-request. Skips its
-    # own SerpAPI spend when the derived keywords are unchanged (see harvest.py).
-    background.add_task(harvest_for_profile, profile.id)
-    return created
+    return await _run_formation(background, profile, db, text, "cv_parsed", "CV")
 
 
 @router.post("/profiles/{profile_id}/parse-text", response_model=list[AttributeOut])
@@ -89,17 +94,42 @@ async def parse_text(
     profile: Profile = Depends(get_profile_or_404),
     db: Session = Depends(get_db),
 ):
-    profile.cv_text = body.text[:40000]
+    if not body.text.strip():
+        raise HTTPException(status_code=422, detail="No text to parse")
+    return await _run_formation(background, profile, db, body.text, "text_parsed", "text")
+
+
+async def _run_formation(
+    background: BackgroundTasks,
+    profile: Profile,
+    db: Session,
+    text: str,
+    source: str,
+    noun: str,
+):
+    """Shared CV-upload / text-paste body: run the two formation LLM calls in
+    parallel (services/formation.py), then persist everything -- structured
+    attributes, cv_summary, the seeded role families (+ their target roles), a
+    drafted intent, and the profile-intel cache -- in one commit. Families are
+    seeded here (before the response returns) rather than lazily on a later GET
+    /families, so the attribute rows the frontend refetches already carry their
+    family_id and the cards render with their role chips immediately.
+
+    intent_text is read (and cv_text staged) before the LLM calls; the calls are
+    DB-free, so nothing flushes until persist_formation runs its single commit."""
+    intent_text = profile.intent_text
+    profile.cv_text = text[:40000]
+    extract_data, understand_data = await formation.run_formation_calls(text, intent_text)
     try:
-        summary, created = await asyncio.gather(
-            asyncio.to_thread(summarize_cv_text, body.text),
-            asyncio.to_thread(parse_text_to_attributes, db, profile.id, body.text, source="text_parsed"),
+        created = await asyncio.to_thread(
+            formation.persist_formation, db, profile.id, text, source, extract_data, understand_data
         )
     except CVParseFailed as e:
-        raise HTTPException(status_code=502, detail=f"Couldn't parse that text automatically: {e}") from e
-    profile.cv_summary = summary
-    db.commit()
-    created += ensure_profile_intel(db, profile.id)
+        raise HTTPException(
+            status_code=502, detail=f"Couldn't parse that {noun} automatically: {e}"
+        ) from e
+    # Grow the ATS company set for this profile's sectors, off-request. Skips its
+    # own SerpAPI spend when the derived keywords are unchanged (see harvest.py).
     background.add_task(harvest_for_profile, profile.id)
     return created
 
@@ -124,9 +154,18 @@ def regenerate_target_roles(
 ):
     """Manual "regenerate now" override -- forces profile_intel to re-run even if
     its cached signature is unchanged. Refreshes target roles, the final-judge
-    header, the cheap-gate requirements checklist, and (only if empty) a draft
-    intent_text, all together."""
-    return ensure_profile_intel(db, profile.id, force=True)
+    header, and (only if empty) a draft intent_text, all together.
+
+    The fresh target_role rows profile_intel creates start with no family_id
+    (it has no notion of family boundaries) -- ensure_families must run
+    synchronously right here, same as parse_cv/parse_text do, so the roles are
+    correctly (re-)grouped into the profile's EXISTING family/families before
+    the response returns, rather than sitting ungrouped until some later GET
+    happens to trigger it (which used to risk a stale/ungrouped read from a
+    search kicked off in between, and could reseed a surprise extra family)."""
+    new_attrs = ensure_profile_intel(db, profile.id, force=True)
+    ensure_families(db, profile.id)
+    return new_attrs
 
 
 @router.post("/profiles/{profile_id}/suggest", response_model=SuggestOut)

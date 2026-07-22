@@ -23,7 +23,8 @@ from ..database import SessionLocal
 from ..models import ProfileAttribute, Setting
 from .llm import llm_json
 
-HARVEST_KEYWORD_HASH = "harvest_keyword_hash"
+HARVEST_KEYWORD_HASH = "harvest_keyword_hash"   # post-call: gates the SerpAPI spend
+HARVEST_SIGNAL_HASH = "harvest_signal_hash"     # pre-call: gates the LLM call itself
 
 
 def _signals(db: Session, profile_id: int) -> dict[str, list[str]]:
@@ -36,11 +37,20 @@ def _signals(db: Session, profile_id: int) -> dict[str, list[str]]:
     return by_type
 
 
-def derive_keywords(db: Session, profile_id: int) -> list[str]:
+def _signal_digest(sig: dict[str, list[str]]) -> str:
+    roles = sig.get("target_role", []) + sig.get("past_role", [])
+    skills = sig.get("skill", [])
+    basis = json.dumps({
+        "roles": sorted(r.strip().lower() for r in roles),
+        "skills": sorted(s.strip().lower() for s in skills),
+    }, sort_keys=True)
+    return hashlib.sha256(basis.encode()).hexdigest()
+
+
+def derive_keywords(sig: dict[str, list[str]]) -> list[str]:
     """LLM -> search keyword / sector phrases grounded in the profile. Kept to
     phrases (not company names) so the downstream `site:` search stays the thing
     that decides which real companies exist."""
-    sig = _signals(db, profile_id)
     roles = sig.get("target_role", []) + sig.get("past_role", [])
     skills = sig.get("skill", [])
     if not roles and not skills:
@@ -65,37 +75,65 @@ Return ONLY JSON: {{"keywords": ["...", ...]}} with 8-16 concise phrases."""
     return out[:16]
 
 
-def _marker(db: Session, profile_id: int) -> Setting | None:
+def _marker(db: Session, profile_id: int, key: str) -> Setting | None:
     return db.execute(
-        select(Setting).where(
-            Setting.profile_id == profile_id, Setting.key == HARVEST_KEYWORD_HASH
-        )
+        select(Setting).where(Setting.profile_id == profile_id, Setting.key == key)
     ).scalar_one_or_none()
 
 
+def _upsert(db: Session, profile_id: int, key: str, value: str) -> None:
+    row = _marker(db, profile_id, key)
+    if row is not None:
+        row.value = value
+    else:
+        db.add(Setting(profile_id=profile_id, key=key, value=value))
+
+
 def harvest_for_profile(profile_id: int, force: bool = False) -> dict:
-    """Own-session entry point, safe to run in a FastAPI BackgroundTask. Skips
-    the SerpAPI spend when the derived keyword set hasn't changed (unless forced,
-    e.g. a periodic top-up or a feedback-driven re-harvest)."""
+    """Own-session entry point, safe to run in a FastAPI BackgroundTask.
+
+    Two cache gates, checked in order (unless forced, e.g. a periodic top-up or
+    a feedback-driven re-harvest):
+    1. pre-call -- skip deriving keywords at all (the LLM call itself) when the
+       profile's target_role/past_role/skill signal hasn't changed since the
+       last harvest.
+    2. post-call -- skip the SerpAPI spend when the derived keyword set is
+       unchanged even though the signal did (an LLM re-deriving the same
+       keywords from a slightly different input is plausible and shouldn't
+       still cost a web search)."""
     import full_auto as engine  # lazy, mirrors engine.run_search_task
 
     db = SessionLocal()
     try:
-        keywords = derive_keywords(db, profile_id)
+        sig = _signals(db, profile_id)
+        roles = sig.get("target_role", []) + sig.get("past_role", [])
+        skills = sig.get("skill", [])
+        if not roles and not skills:
+            return {"harvested": 0, "skipped": "no-signals", "keywords": []}
+
+        signal_digest = _signal_digest(sig)
+        signal_marker = _marker(db, profile_id, HARVEST_SIGNAL_HASH)
+        if not force and signal_marker is not None and signal_marker.value == signal_digest:
+            return {"harvested": 0, "skipped": "unchanged-signal", "keywords": []}
+
+        keywords = derive_keywords(sig)
         if not keywords:
             return {"harvested": 0, "skipped": "no-signals", "keywords": []}
 
         digest = hashlib.sha256(json.dumps(sorted(keywords)).encode()).hexdigest()
-        marker = _marker(db, profile_id)
+        marker = _marker(db, profile_id, HARVEST_KEYWORD_HASH)
         if not force and marker is not None and marker.value == digest:
+            # Signal changed but derived the same keywords -- still advance the
+            # signal marker so an unchanged repeat short-circuits pre-call next
+            # time, but skip the SerpAPI spend as before.
+            _upsert(db, profile_id, HARVEST_SIGNAL_HASH, signal_digest)
+            db.commit()
             return {"harvested": 0, "skipped": "unchanged", "keywords": keywords}
 
         rows = engine.harvest_ats_tokens(keywords)  # writes to the shared company_ats
 
-        if marker is not None:
-            marker.value = digest
-        else:
-            db.add(Setting(profile_id=profile_id, key=HARVEST_KEYWORD_HASH, value=digest))
+        _upsert(db, profile_id, HARVEST_KEYWORD_HASH, digest)
+        _upsert(db, profile_id, HARVEST_SIGNAL_HASH, signal_digest)
         db.commit()
         return {"harvested": len(rows), "keywords": keywords}
     finally:

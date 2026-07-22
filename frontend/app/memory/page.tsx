@@ -1,7 +1,7 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { AttributeRow } from "@/components/AttributeRow";
 import { ConfidenceBar } from "@/components/ConfidenceBar";
@@ -38,6 +38,59 @@ export default function MemoryPage() {
   const { data: conf } = useConfidence(activeId);
   const fileRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
+
+  // Editable "What the AI reads about you" fields -- header is cache-derived
+  // (PATCH /context-header, locks it against the next auto-regenerate) and
+  // cv_summary is a plain profile column (PATCH /profiles/{id}), same
+  // dirty-tracking/save-on-blur pattern as IntentEditor.tsx.
+  const [headerText, setHeaderText] = useState(ctx?.header ?? "");
+  const [headerSaved, setHeaderSaved] = useState(ctx?.header ?? "");
+  const [headerBusy, setHeaderBusy] = useState(false);
+  const [headerStatus, setHeaderStatus] = useState("");
+  const [summaryText, setSummaryText] = useState(ctx?.cv_summary ?? "");
+  const [summarySaved, setSummarySaved] = useState(ctx?.cv_summary ?? "");
+  const [summaryBusy, setSummaryBusy] = useState(false);
+  const [summaryStatus, setSummaryStatus] = useState("");
+
+  useEffect(() => {
+    setHeaderText(ctx?.header ?? "");
+    setHeaderSaved(ctx?.header ?? "");
+  }, [ctx?.header]);
+
+  useEffect(() => {
+    setSummaryText(ctx?.cv_summary ?? "");
+    setSummarySaved(ctx?.cv_summary ?? "");
+  }, [ctx?.cv_summary]);
+
+  async function saveHeader() {
+    if (headerText.trim() === (headerSaved ?? "").trim()) return;
+    setHeaderBusy(true);
+    try {
+      await api.updateContextHeader(activeId!, headerText);
+      await qc.invalidateQueries({ queryKey: ["contextHeader", activeId] });
+      setHeaderSaved(headerText);
+      setHeaderStatus("Saved.");
+    } catch (e) {
+      setHeaderStatus((e as Error).message);
+    } finally {
+      setHeaderBusy(false);
+    }
+  }
+
+  async function saveSummary() {
+    if (summaryText.trim() === (summarySaved ?? "").trim()) return;
+    setSummaryBusy(true);
+    try {
+      await api.updateProfile(activeId!, { cv_summary: summaryText });
+      await qc.invalidateQueries({ queryKey: ["contextHeader", activeId] });
+      setSummarySaved(summaryText);
+      setSummaryStatus("Saved.");
+    } catch (e) {
+      setSummaryStatus((e as Error).message);
+    } finally {
+      setSummaryBusy(false);
+    }
+  }
 
   if (!activeId) {
     return (
@@ -150,11 +203,30 @@ export default function MemoryPage() {
             <div className="annotation" style={{ padding: "10px 0 4px" }}>
               Generated from the background above — this is the summary given to the AI that
               judges each role. It refreshes when your memory changes, or when you run a
-              search.
+              search. Edit either box directly if the AI got something wrong — an edited
+              header is locked in and won&apos;t be silently regenerated.
             </div>
             {ctx?.header ? (
-              <div className="ctx-block">{ctx.header}</div>
-            ) : (
+              <div className="row" style={{ flexDirection: "column", alignItems: "stretch", gap: 4 }}>
+                <textarea
+                  className="textarea-input"
+                  value={headerText}
+                  onChange={(e) => setHeaderText(e.target.value)}
+                  onBlur={saveHeader}
+                />
+                <span style={{ fontSize: 12, opacity: 0.7 }}>
+                  {headerBusy
+                    ? "Saving…"
+                    : headerText.trim() !== (headerSaved ?? "").trim()
+                      ? "Unsaved — click away to save."
+                      : headerStatus}
+                </span>
+              </div>
+            ) : ctx?.cv_summary ? null : (
+              // No header AND no CV summary means profile_intel genuinely hasn't run
+              // yet. A short CV/notes document intentionally gets no separate header
+              // (the CV summary below is the raw text already) -- that's not "nothing
+              // generated", so the banner only shows when both are actually empty.
               <div className="info-banner">
                 Nothing generated yet — it&apos;s written the first time a search runs, or
                 right after you upload a CV.
@@ -173,7 +245,22 @@ export default function MemoryPage() {
             {ctx?.cv_summary && (
               <>
                 <div className="subhead">CV summary</div>
-                <div className="ctx-block">{ctx.cv_summary}</div>
+                <div className="row" style={{ flexDirection: "column", alignItems: "stretch", gap: 4 }}>
+                  <textarea
+                    className="textarea-input"
+                    style={{ minHeight: 180 }}
+                    value={summaryText}
+                    onChange={(e) => setSummaryText(e.target.value)}
+                    onBlur={saveSummary}
+                  />
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>
+                    {summaryBusy
+                      ? "Saving…"
+                      : summaryText.trim() !== (summarySaved ?? "").trim()
+                        ? "Unsaved — click away to save."
+                        : summaryStatus}
+                  </span>
+                </div>
               </>
             )}
           </div>

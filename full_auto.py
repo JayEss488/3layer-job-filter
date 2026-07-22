@@ -96,6 +96,19 @@ ATS_HARVEST_MAX_QUERIES = int(os.getenv("ATS_HARVEST_MAX_QUERIES", "30"))
 # organic-search call per attempt, so capped per run like the ATS harvest above.
 ALT_SOURCE_LOOKUP_MAX_PER_RUN = int(os.getenv("ALT_SOURCE_LOOKUP_MAX_PER_RUN", "15"))
 
+# Reed full-description enrichment (see fetch_reed_details). Reed's SEARCH endpoint
+# truncates jobDescription to ~455 chars -- a measured 361-row sample of one live
+# profile's store had min 453 / max 500 -- which is the opening blurb and never the
+# requirements section. That teaser is all screen_gate and rank_gate ever see for a
+# freshly-discovered Reed job (full_text is only written by Phase 5, which runs
+# AFTER both), so their GATE_LISTING_TEXT_CHARS/RANK_LISTING_TEXT_CHARS budgets
+# were ceilings with nothing to fill them. Reed's per-JOB endpoint returns the
+# whole description (measured avg ~3900 chars, 8.6x the teaser) for one cheap HTTP
+# call -- no LLM, no browser. Capped per run because engine.py only enriches the
+# candidates a run is actually about to examine, not the whole store.
+REED_DETAIL_ENRICH_ENABLED = os.getenv("REED_DETAIL_ENRICH_ENABLED", "true").lower() == "true"
+REED_DETAIL_MAX_PER_RUN = int(os.getenv("REED_DETAIL_MAX_PER_RUN", "150"))
+
 DEBUG_SAVE_RAW = True
 
 # ── Dynamic Path Configuration ──────────────────────────────────────────────────
@@ -433,6 +446,50 @@ def fetch_reed(query: str, location: str = "United Kingdom", country_code: str =
         if len(results) < page_size:  # last page reached
             break
     return jobs
+
+
+# Reed's jobUrl always ends in the numeric jobId
+# (https://www.reed.co.uk/jobs/data-scientist/57069135). Parsing it back out here
+# avoids widening fetch_reed's return shape and the jobs_seen schema just to carry
+# an id the URL already encodes.
+_REED_JOB_ID_RE = re.compile(r"reed\.co\.uk/jobs/[^/]+/(\d+)", re.I)
+
+
+def reed_job_id(url: str) -> str | None:
+    m = _REED_JOB_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def fetch_reed_details(job_ids: List[str]) -> Dict[str, str]:
+    """jobId -> full plain-text job description, for the ids that resolved.
+
+    Reed's search response truncates jobDescription to a ~455-char teaser; this
+    per-job endpoint returns the whole thing (see REED_DETAIL_ENRICH_ENABLED for
+    why that matters). One cheap HTTP call each, fanned out over the same
+    12-wide pool gather_jobs uses -- a measured 24-id batch resolved in 1.7s.
+
+    Fails SOFT and per-id: a 404/410 (listing pulled), a timeout, or an empty
+    description simply doesn't appear in the returned dict, and the caller keeps
+    whatever text it already had. Enrichment that can't be done is never a reason
+    to lose a candidate."""
+    ids = [j for j in dict.fromkeys(job_ids) if j][:REED_DETAIL_MAX_PER_RUN]
+    if not ids or not REED_API_KEY or not REED_DETAIL_ENRICH_ENABLED:
+        return {}
+
+    def _one(job_id: str) -> tuple[str, str]:
+        try:
+            r = requests.get(f"https://www.reed.co.uk/api/1.0/jobs/{job_id}",
+                             auth=HTTPBasicAuth(REED_API_KEY, ""), timeout=12)
+            if r.status_code != 200:
+                return job_id, ""
+            return job_id, _strip_html(r.json().get("jobDescription") or "")
+        except Exception:
+            return job_id, ""
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        out = {job_id: text for job_id, text in ex.map(_one, ids) if text}
+    emit(f"   [reed] full descriptions fetched for {len(out)}/{len(ids)} listing(s)")
+    return out
 
 
 # Country-level location strings that Adzuna's `where` geocoder rejects (the cc
@@ -1364,7 +1421,14 @@ def gather_jobs(profile: Dict) -> List[Dict]:
 # ── Database Lifecycle ──────────────────────────────────────────────────────────
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # timeout=30 (default 5): the gate_cache writers (_gate_cache_store) now run
+    # from several threads at once -- screen_gate and rank_gate each fan their
+    # batches out over a pool, and engine.py runs a whole gate round per cluster
+    # concurrently. Each caller opens and closes its own connection, so reads are
+    # fine, but two concurrent commits can collide; without a generous busy
+    # timeout that surfaces as an outright "database is locked" and loses a
+    # batch's cache entries (re-paying for them next run).
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -1819,8 +1883,18 @@ def _profile_signature(profile: dict) -> str:
 
 
 def _gate_job_id(job: dict) -> str:
-    """Stable per-job key. Prefer the backend's cross-source identity when present."""
-    return job.get("_identity") or make_job_id(job.get("board", ""), job.get("url", ""))
+    """Stable per-job key. Prefer the backend's cross-source identity when present.
+
+    Carries a two-state TEXT-RICHNESS marker, because _gate_cache_key below keys on
+    (gate, profile signature, this) and NOT on the text that was actually judged.
+    The same job can reach a gate with wildly different amounts of text: a ~455-char
+    Reed/Adzuna search teaser when it's brand new, or its full description once
+    fetch_reed_details or a Phase 5 scrape has supplied one (see engine.py's
+    _has_full_text). Without the marker, a verdict reached on the teaser would be
+    served forever for a job we can now actually read -- silently cancelling the
+    enrichment for exactly the jobs that most needed re-judging."""
+    ident = job.get("_identity") or make_job_id(job.get("board", ""), job.get("url", ""))
+    return f"{ident}:full" if job.get("_has_full_text") else ident
 
 
 def _gate_cache_key(gate: str, sig: str, job_id: str) -> str:
@@ -1996,11 +2070,11 @@ def _annotate_with_weight_tiers(
 
 
 def _candidate_background_block(profile: dict) -> str:
-    """Evidence-focused narrative brief (profile_intel.py's analytical_brief,
+    """Evidence-focused narrative brief (parsing.py's cv_summary schema key,
     see snapshot.py's candidate_brief), when available -- named projects/tools/
     outcomes the coarse tier labels above can't carry. "" (whole block omitted)
-    until profile_intel has run, or when the CV gave nothing concrete beyond
-    the typed attribute rows."""
+    when the CV gave nothing concrete beyond the typed attribute rows, or
+    before any CV/text has ever been parsed."""
     brief = (profile.get("candidate_brief") or "").strip()
     if not brief:
         return ""
@@ -2044,13 +2118,20 @@ ROLE FUNCTION FIT
 Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms') or [], profile.get('target_role_weight_tiers'))}
 - sector_confidence="match" if the listing is CLEARLY the same underlying job function as one of these
   target roles, or a closely adjacent one (e.g. a different seniority phrasing of the same function, or
-  a near-identical role at a different type of employer).
+  a near-identical role at a different type of employer). A listing whose TITLE matches one of the
+  target roles above word-for-word is presumptively sector_confidence="match" -- only override this if
+  the listing's actual described duties clearly diverge from that function despite the title (e.g. a
+  titled "Research Analyst" role whose duties are entirely sales or admin).
 - sector_confidence="mismatch" if it is CLEARLY a different job function -- e.g. the candidate targets
-  Data Analyst/Insights roles and the listing is a Product Manager, Communications Officer, or Research
-  Assistant role: even in a related or adjacent industry, a different underlying job function is not
-  a match. Judge on FUNCTION, not industry -- a role in a totally different industry doing the same
-  job the candidate wants is sector_confidence="match"; a role in the candidate's own industry doing a
-  different job is sector_confidence="mismatch".
+  Data Analyst/Insights roles and the listing is a Product Manager, Communications Officer, or Intelligence/
+  Security Analyst role: even in a related or adjacent industry, or with a shared word like "Analyst" in
+  the title, a different underlying job function is not a match. Judge on FUNCTION, not industry or
+  job-tooling -- a role in a totally different industry doing the same job the candidate wants is
+  sector_confidence="match"; a role in the candidate's own industry (or one that uses the candidate's own
+  tools) doing a different job is sector_confidence="mismatch". Do NOT judge this axis using the
+  candidate's skills list below -- a listing that reads as technical/data-flavored because it happens to
+  mention the candidate's own tools is not thereby a function match, and skills inform CORE SKILLS
+  OVERLAP only.
 - sector_confidence="ambiguous" when you genuinely cannot tell either way -- e.g. a vague or generic
   title, a thin description that could plausibly be either the candidate's target function or a
   different one, or a title used inconsistently across employers. This is NOT a mismatch: the listing
@@ -2090,11 +2171,19 @@ a little more favorably toward it. One tagged "deprioritize"/"lower priority" re
 "one-time evidence only", "self-directed evidence only", "academic evidence only", or "ai-assisted evidence
 only" means the candidate's evidence for it is shallow and/or not from paid/commercial work -- don't let it
 alone satisfy a requirement that clearly expects professional/production-level competency.)
-{_candidate_background_block(profile)}- seniority_ok=false if the listing clearly implies a seniority level well ABOVE or well
-  BELOW the candidate (e.g. Director/VP/Head/Principal for a mid-level candidate, or
-  Intern/Graduate/Entry for a senior candidate), OR if it states a minimum years-of-experience
-  requirement (e.g. "3+ years") that the candidate's stated background clearly doesn't meet, OR
-  if it states more than {MAX_MUST_HAVE_GAPS} hard must-have requirements the candidate clearly lacks.
+{_candidate_background_block(profile)}- seniority_ok=false, reason="seniority_high", if the listing clearly implies a level well ABOVE
+  the candidate -- e.g. Director/VP/Head/Principal/Lead in the title, or duties like "lead the
+  elicitation of requirements" / "facilitate workshops" / manage a team -- or it states a minimum
+  years-of-experience requirement (e.g. "3+ years") the candidate clearly doesn't meet, or more
+  than {MAX_MUST_HAVE_GAPS} hard must-have requirements the candidate clearly lacks.
+- seniority_ok=false, reason="seniority_low", if the listing clearly implies a level well BELOW the
+  candidate's stated seniority (e.g. Intern/Work-experience for a Mid/Senior candidate), or the role
+  is a production-level professional role in a field the candidate has only shallow/non-commercial
+  evidence for (e.g. "Data Scientist" expecting production ML/DS work from a candidate whose only DS
+  evidence is academic-tagged).
+  (These two directions are opposite failures -- "_high" always means the ROLE outranks the
+  CANDIDATE, "_low" always means the CANDIDATE outranks the role's real level or lacks the
+  professional depth it expects. Do not mix them up.)
 - A stated salary/pay figure is also a real signal of the listing's TRUE seniority band, often
   more reliable than the title -- a title can be inflated or watered down, a number the employer
   is actually paying usually can't. If the listing states a salary, weigh it alongside the title
@@ -2103,11 +2192,15 @@ alone satisfy a requirement that clearly expects professional/production-level c
   points to a more senior role even under a modest-sounding title. Use ordinary judgement for the
   sector/region/currency shown -- there is no fixed number, it varies by country and field. Don't
   invent a mismatch from salary alone when the figure is genuinely ambiguous or absent.
-- Before setting seniority_ok=false, be able to point to ONE of the concrete signals above (an
+- Before setting seniority_ok=false, you MUST identify which ONE concrete signal it rests on -- an
   explicit seniority word in the TITLE, an explicit years-of-experience or degree-level bar in the
-  text, or a stated salary that clearly reads as the wrong band) -- a plain "Officer"/"Assistant"/
-  "Coordinator"/"Executive"-style title with no such signal, or a general impression that the role
-  "sounds senior" without one, is NOT enough on its own.
+  text, a stated salary that clearly reads as the wrong band, or (for seniority_low only) a named
+  professional-level skill the candidate's evidence for is shallow/non-commercial. Record that
+  signal in "seniority_signal" (a short quote or phrase, e.g. "\"Lead the elicitation...\" implies
+  team/process ownership beyond junior scope"). A plain "Officer"/"Assistant"/"Coordinator"/
+  "Executive"-style title with no such signal, or a general impression that the role "sounds senior"
+  or "sounds junior" without one, is NOT enough -- in that case seniority_ok=true and omit
+  "seniority_signal".
 - otherwise seniority_ok=true. When unsure or genuinely ambiguous, seniority_ok=true.{_strict("_seniority_ok")}
 
 CANDIDATE-SPECIFIC REQUIREMENTS
@@ -2162,7 +2255,7 @@ Omit the list entirely if the listing states no concrete requirements worth flag
 reason: short code for the MOST significant failure (or "ok" if all pass) -- "ok" |
 "seniority_high" | "seniority_low" | "too_many_gaps" | "requirement_gap" | "skills_gap" |
 "salary_mismatch" | "arrangement_mismatch" | "off_sector" | "hard_filter" | "not_a_real_listing".
-Output ONLY JSON: {{"decisions":[{{"n":1,"sector_confidence":"match","hard_gate_ok":true,"listing_ok":true,"seniority_ok":true,"requirements_ok":true,"skills_ok":true,"salary_ok":true,"work_arrangement_ok":true,"reason":"ok","key_requirements":[{{"item":"SQL","necessity":"required","professional_level_expected":true}}]}}]}}
+Output ONLY JSON: {{"decisions":[{{"n":1,"sector_confidence":"match","hard_gate_ok":true,"listing_ok":true,"seniority_ok":true,"seniority_signal":null,"requirements_ok":true,"skills_ok":true,"salary_ok":true,"work_arrangement_ok":true,"reason":"ok","key_requirements":[{{"item":"SQL","necessity":"required","professional_level_expected":true}}]}}]}}
 Include one object per listing, numbered exactly as shown.
 
 Listings:
@@ -2272,7 +2365,27 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     enough to skip rank_gate/the judge.
 
     Cached per (profile signature, job id) in the shared gate_cache under
-    gate="screen_v9" (bumped from "screen_v8": sector_ok's flat boolean became a
+    gate="screen_v10" (bumped from "screen_v9": a live audit found the sector axis
+    anchoring on the candidate's skills list instead of the target-role list -- a
+    listing titled exactly "Research Analyst" (one of the candidate's own named
+    target roles) was wrongly called sector_confidence="mismatch" because its
+    description read as too technical/data-tooling-flavored -- so the prompt now
+    presumes a word-for-word title match is sector_confidence="match" and
+    explicitly bars using the skills list to judge this axis. Separately, the
+    seniority axis's "seniority_high"/"seniority_low" reason codes were being
+    picked essentially at random by the model despite the docstring/enum implying
+    a clear ABOVE/BELOW split -- live output showed both a too-senior TQR listing
+    ("lead the elicitation...facilitate workshops") and a too-senior Data
+    Scientist listing coded "seniority_low", which is backwards. The prompt now
+    spells out which direction maps to which code plus a worked example each, and
+    requires the model to name the concrete anchor it's relying on in a new
+    "seniority_signal" field before setting seniority_ok=false (not persisted to
+    the cache -- see the fresh-judge loop below -- purely to keep the model
+    honest about having a real anchor rather than a vibe, closing the same class
+    of gap tightened for the final judge's "weakest_link"). A previously-cached
+    v9 verdict was reached under the old, direction-confused seniority guidance
+    and a skills-anchored sector read, and must not be reused as if it still
+    means the same thing. "screen_v9" was bumped from "screen_v8": sector_ok's flat boolean became a
     3-way sector_confidence match/ambiguous/mismatch judgment, and
     GATE_LISTING_TEXT_CHARS was raised 900 -> 2000 -- see its own comment for the
     live Reed.co.uk audit that motivated both; a previously-cached verdict was
@@ -2300,11 +2413,13 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    # screen_v9 (from screen_v8): sector_ok became a 3-way sector_confidence
-    # judgment (match/ambiguous/mismatch) and the per-listing text budget grew --
-    # old v8 rows were judged under a coarser signal and a smaller text window,
-    # and must not be reused as if they still mean the same thing.
-    keys = [_gate_cache_key("screen_v9", sig, _gate_job_id(c)) for c in candidates]
+    # screen_v10 (from screen_v9): sector axis no longer anchors on the skills
+    # list and presumes a verbatim target-role title match; seniority_high/
+    # seniority_low direction guidance fixed and now requires a named
+    # seniority_signal anchor -- old v9 rows were judged under the confused
+    # direction guidance and the skills-anchored sector read, and must not be
+    # reused as if they still mean the same thing.
+    keys = [_gate_cache_key("screen_v10", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -2316,6 +2431,10 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             c["_sector_ok"] = sector_ok
             c["_sector_ambiguous"] = sector_code == _SECTOR_AMBIGUOUS_CODE
             c["_seniority_ok"] = seniority_code not in _SENIORITY_BAD_CODES
+            # seniority_signal is prompt-forcing only (see the fresh-judge loop
+            # below) and isn't persisted to gate_cache, so a cache-hit row never
+            # has one to restore.
+            c["_seniority_signal"] = None
             c["_requirements_ok"] = (req_code or "ok") != _REQUIREMENTS_BAD_CODE
             c["_skills_ok"] = (skills_code or "ok") != _SKILLS_BAD_CODE
             c["_salary_ok"] = (salary_code or "ok") != _SALARY_BAD_CODE
@@ -2331,9 +2450,15 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             to_judge.append((c, key))
 
     n_cached = len(candidates) - len(to_judge)
-    new_entries: list[tuple[str, bool, str, str | None]] = []
-    for start in range(0, len(to_judge), _GATE_BATCH):
-        batch = to_judge[start:start + _GATE_BATCH]
+
+    def _screen_one_batch(
+        batch: list[tuple[dict, str]]
+    ) -> list[tuple[str, bool, str, str | None]]:
+        """One _GATE_BATCH-sized LLM call. Annotates its own batch's candidate
+        dicts in place and RETURNS its cache entries rather than appending to a
+        shared list, so several of these can run concurrently (see the pool
+        below) without two threads touching the same object."""
+        new_entries: list[tuple[str, bool, str, str | None]] = []
         listing_block = "\n".join(
             f"{i+1}. {c['title']} @ {c.get('company','')} | "
             f"{(c.get('location') or 'location unknown')}"
@@ -2342,7 +2467,7 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             for i, (c, _k) in enumerate(batch)
         )
         prompt = _screen_prompt(profile, listing_block)
-        decisions: dict[int, tuple[str, bool, bool, bool, bool, bool, bool, bool, str]] = {}
+        decisions: dict[int, tuple[str, bool, bool, bool, str | None, bool, bool, bool, bool, str]] = {}
         key_reqs_by_n: dict[int, list[dict]] = {}
         try:
             raw = llm(prompt, require_json=True, temperature=0,
@@ -2356,10 +2481,12 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
                     sector_confidence = str(d.get("sector_confidence", "match")).strip().lower()
                     if sector_confidence not in ("match", "ambiguous", "mismatch"):
                         sector_confidence = "match"
+                    seniority_signal = d.get("seniority_signal")
                     decisions[n] = (sector_confidence,
                                     bool(d.get("hard_gate_ok", True)),
                                     bool(d.get("listing_ok", True)),
                                     bool(d.get("seniority_ok", True)),
+                                    str(seniority_signal) if seniority_signal else None,
                                     bool(d.get("requirements_ok", True)),
                                     bool(d.get("skills_ok", True)),
                                     bool(d.get("salary_ok", True)),
@@ -2368,13 +2495,13 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
                     key_reqs_by_n[n] = _sanitize_key_requirements(d.get("key_requirements"))
         except Exception as e:
             emit(f"[gate:screen] batch parse failed ({e}); keeping batch (fail-open).")
-            decisions = {i + 1: ("match", True, True, True, True, True, True, True, "gate_error")
+            decisions = {i + 1: ("match", True, True, True, None, True, True, True, True, "gate_error")
                          for i in range(len(batch))}
 
         for i, (c, key) in enumerate(batch):
-            (sector_confidence, hard_gate_ok, listing_ok, seniority_ok, requirements_ok, skills_ok,
-             salary_ok, work_arrangement_ok, reason) = decisions.get(
-                i + 1, ("match", True, True, True, True, True, True, True, "missing_decision")
+            (sector_confidence, hard_gate_ok, listing_ok, seniority_ok, seniority_signal,
+             requirements_ok, skills_ok, salary_ok, work_arrangement_ok, reason) = decisions.get(
+                i + 1, ("match", True, True, True, None, True, True, True, True, "missing_decision")
             )
             sector_ok = sector_confidence != "mismatch"
             c["_sector_ok"] = sector_ok
@@ -2382,6 +2509,7 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             c["_hard_gate_ok"] = hard_gate_ok
             c["_listing_ok"] = listing_ok
             c["_seniority_ok"] = seniority_ok
+            c["_seniority_signal"] = seniority_signal if not seniority_ok else None
             c["_requirements_ok"] = requirements_ok
             c["_skills_ok"] = skills_ok
             c["_salary_ok"] = salary_ok
@@ -2411,6 +2539,23 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             key_reqs = key_reqs_by_n.get(i + 1, [])
             c["_key_requirements"] = key_reqs
             new_entries.append((key, sector_ok, packed_reason, json.dumps(key_reqs) if key_reqs else None))
+        return new_entries
+
+    batches = [to_judge[start:start + _GATE_BATCH]
+               for start in range(0, len(to_judge), _GATE_BATCH)]
+    new_entries: list[tuple[str, bool, str, str | None]] = []
+    if batches:
+        # Capped concurrency, mirroring rank_gate's identical batch pool below --
+        # and bounded for the same reason. Serial batches were most of this
+        # stage's wall-clock time (each one a blocking LLM call, and a full gate
+        # round routinely runs several per cluster), but firing every batch at
+        # once risks tripping a short-window rate cap on the screening model.
+        # Safe to parallelize: each call only writes to its own batch's candidate
+        # dicts, and every cache write is collected here and stored once, below,
+        # on this thread.
+        with ThreadPoolExecutor(max_workers=min(3, len(batches))) as pool:
+            for entries in pool.map(_screen_one_batch, batches):
+                new_entries.extend(entries)
 
     _gate_cache_store(new_entries)
     in_sector = sum(1 for c in candidates if c.get("_sector_ok"))
@@ -2422,9 +2567,15 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     all_soft_ok = sum(1 for n in soft_fail_counts if n == 0)
     threshold = dynamic_hard_drop_threshold(soft_fail_counts)
     hard_dropped = sum(1 for n in soft_fail_counts if n >= threshold)
+    # Visibility for the seniority_high/seniority_low direction fix (screen_v10):
+    # a batch that's still suspiciously lopsided toward one code is worth a
+    # second look at the prompt rather than assuming the model is just always
+    # finding one direction of mismatch.
+    seniority_high = sum(1 for c in candidates if (c.get("_gate_reason") or "").split("|")[0] == "seniority_high")
+    seniority_low = sum(1 for c in candidates if (c.get("_gate_reason") or "").split("|")[0] == "seniority_low")
     emit(f"[gate:screen] {len(candidates)} in -> {in_sector} in-sector ({ambiguous_sector} ambiguous), "
          f"{all_soft_ok} pass all soft axes, {hard_dropped} hard-dropped ({threshold}+ soft-axis "
-         f"failures) ({n_cached} from cache)")
+         f"failures), seniority drops: {seniority_high} high / {seniority_low} low ({n_cached} from cache)")
     return candidates
 
 
@@ -2909,6 +3060,7 @@ def verify_not_duplicated(job: dict, country_code: str = "gb") -> str | None:
 async def scrape_full_details(
     jobs: list[dict], crawler: AsyncWebCrawler, blocked_domains: frozenset[str] | set[str] = frozenset(),
     total_budget_seconds: float = 60.0, country_code: str = "gb",
+    sem: "asyncio.Semaphore | None" = None, alt_budget: list[int] | None = None,
 ) -> list[dict]:
     """Fetches each job's real page, capped concurrency, with retries. Every
     source shares one concurrency lane (Adzuna used to be forced single-lane
@@ -2923,14 +3075,23 @@ async def scrape_full_details(
     A job that exhausts its own retries tries _find_alternate_posting once
     before falling back to the snippet, spending from the shared
     ALT_SOURCE_LOOKUP_MAX_PER_RUN budget -- not applied to blocklist skips,
-    which are a deliberate user opt-out, not a failure worth searching around."""
+    which are a deliberate user opt-out, not a failure worth searching around.
+
+    `sem` and `alt_budget` let a caller that invokes this SEVERAL TIMES
+    CONCURRENTLY (engine.py scrapes each role cluster on its own task now, so
+    each cluster's judge can start as soon as its own pages are ready) share one
+    concurrency lane and one alt-source lookup budget across those calls. Left at
+    None -- the standalone path and any single-call caller -- each call gets its
+    own, exactly as before."""
     emit(f"\n[phase 5] Fetching full pages for {len(jobs)} jobs...")
 
-    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
     blocked_hit = 0
     alt_found = 0
     dead_confirmed = 0
-    alt_budget = [ALT_SOURCE_LOOKUP_MAX_PER_RUN]
+    if alt_budget is None:
+        alt_budget = [ALT_SOURCE_LOOKUP_MAX_PER_RUN]
 
     async def fetch_one(job: dict) -> dict:
         nonlocal blocked_hit, alt_found, dead_confirmed
@@ -3130,7 +3291,7 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
-FINAL_EVAL_PROMPT_VERSION = 12
+FINAL_EVAL_PROMPT_VERSION = 13
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -3256,11 +3417,14 @@ initiative"), and never state the bare title with no object at all. If the profi
 name to attach, leave the title out entirely rather than stating it bare - never phrase any of this so it
 could read as company-founding or executive experience.
 
-PLAIN LANGUAGE: "summary" and "role_type" are read by the candidate before anything else on the result
-card, so write them the way you'd explain the role to a friend outside the field - concrete, everyday
-words for what the person actually spends their day doing. Avoid listing-style marketing language
+PLAIN LANGUAGE: "role_type" and "summary" are read by the candidate before anything else on the result
+card, displayed as ONE continuous sentence pair (role_type immediately followed by summary, with
+nothing in between) - so write them the way you'd explain the role to a friend outside the field,
+concrete everyday words for what the person actually spends their day doing, and write them as two
+halves of one thought rather than two independent descriptions. Avoid listing-style marketing language
 ("drive synergies", "stakeholder engagement", "dynamic self-starter") even when the JD itself uses it;
-translate it into what that actually means in practice.
+translate it into what that actually means in practice. Do not let "summary" restate "role_type" in
+different words - see reasoning step F for the no-overlap rule between them.
 
 NO LOCATION COMMENTARY: never mention location, remote/hybrid/on-site arrangement, relocation, or visa
 status in "summary", "role_type", "can_do_fit", "concerns", or "top_match_reason" - that's already shown
@@ -3369,8 +3533,16 @@ E. Write "top_match_reason" as a short (2-4 sentence), first-person narrative in
    want, but ..." -- so that trade-off is visible rather than silent.
 F. Classify the FUNCTIONAL NATURE of the day-to-day work in "role_type" -- one short sentence naming the
    kind of role this is (e.g. "This is a programme delivery role featuring admin and facilitation tasks",
-   "This is a technical individual-contributor engineering role", "This is a client-facing sales role"),
-   distinct from "summary" (which describes what this SPECIFIC role/project/mission is for).
+   "This is a technical individual-contributor engineering role", "This is a client-facing sales role").
+   "role_type" and "summary" are displayed to the candidate as ONE continuous sentence pair, "role_type"
+   immediately followed by "summary" - so they must be NON-OVERLAPPING: "role_type" stays at the
+   functional-category level only, and "summary" (which describes what this SPECIFIC role/project/mission
+   is for) must add NEW information the candidate doesn't already have from "role_type", never restate the
+   same category in different words. For example, if "role_type" is "This is a charity data-and-impact role",
+   "summary" must NOT also independently describe the work as "combining analysis, data-quality work, and
+   support for colleagues" (that's the same functional-category information "role_type" already gave) -
+   it should instead name the concrete duties/mission, e.g. "You would keep service records accurate,
+   analyse outcomes, and turn evidence into reports for funders and partners."
 G. SECTOR MATCH (a ranking signal, never a disqualifier -- see rule 5 above): for every role you include
    in "strong" or "backup", set "sector_match" true if its core domain/employer sits within one of the
    candidate's stated sector interests or causes (their sector_target values and their own words), false
@@ -3384,9 +3556,9 @@ optional list, using this item shape for "strong"/"backup":
 {"strong": [
   {
     "job_number": 1, "title": "...", "company": "...", "url": "...",
-    "summary": "1 concise, PLAIN-LANGUAGE sentence on what this specific role/project/mission actually involves (not why it fits the candidate) -- see PLAIN LANGUAGE and NO LOCATION COMMENTARY above.",
+    "role_type": "1 short sentence classifying the FUNCTIONAL NATURE of the day-to-day work -- see reasoning step F. Written FIRST, since it's shown immediately before \\"summary\\" as one continuous sentence pair.",
+    "summary": "1 concise, PLAIN-LANGUAGE sentence on what this specific role/project/mission actually involves (not why it fits the candidate) -- see PLAIN LANGUAGE and NO LOCATION COMMENTARY above. Must add information NOT already given by \\"role_type\\" -- never restate its functional-category classification (see reasoning step F's no-overlap rule).",
     "fit_level": "very_strong" | "strong" | "ok" | "stretch",
-    "role_type": "1 short sentence classifying the FUNCTIONAL NATURE of the day-to-day work -- see reasoning step F.",
     "sector_match": true,
     "can_do_fit": "a direct, second-person qualification verdict -- see reasoning step B.",
     "top_match_reason": "a short first-person narrative synthesizing why this role earned its verdict -- see reasoning step E.",
@@ -3636,12 +3808,19 @@ def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None 
     caller can tell that apart from a real judgment that rejected everyone.
 
     A cluster within FINAL_EVAL_MAX_JOBS_PER_CALL is still exactly ONE call, same as
-    before. A larger cluster is split into concurrent chunk calls instead of one giant
-    prompt risking the client's 90s read timeout -- each chunk is judged independently
-    (no cross-chunk comparison), then chunk results are merged and FINAL_PICKS/backup
-    caps re-applied across the merged cluster-level lists. A chunk that fails simply
-    contributes nothing (its jobs get no verdict this run, retried next run) rather than
-    failing the whole cluster, as long as at least one other chunk succeeded."""
+    before -- the model's own "best first" ordering (see the prompt above) is trusted
+    as-is and nothing here re-sorts it. A larger cluster is split into concurrent chunk
+    calls instead of one giant prompt risking the client's 90s read timeout -- each
+    chunk is judged independently (no cross-chunk comparison), then chunk results are
+    merged and FINAL_PICKS/backup caps re-applied across the merged cluster-level
+    lists. Plain concatenation would only guarantee best-first WITHIN each chunk, not
+    across the whole cluster (chunk order, not fit, would decide who ranks above whom)
+    -- so the merged lists are re-sorted by `_rank_score`, the one comparable numeric
+    signal every candidate already carries from the cheap rank_gate stage that ran
+    before any chunking happened, giving the cluster a single true best-first order
+    end to end. A chunk that fails simply contributes nothing (its jobs get no verdict
+    this run, retried next run) rather than failing the whole cluster, as long as at
+    least one other chunk succeeded."""
     if len(jobs) <= FINAL_EVAL_MAX_JOBS_PER_CALL:
         return _run_final_eval(jobs, cv_text)
 
@@ -3666,6 +3845,8 @@ def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None 
 
     if not any_succeeded:
         return None, None, None
+    strong.sort(key=lambda j: j.get("_rank_score", 0.0), reverse=True)
+    backup.sort(key=lambda j: j.get("_rank_score", 0.0), reverse=True)
     return strong[:FINAL_PICKS], backup[:min(3, len(jobs))], disqualified
 
 
