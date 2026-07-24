@@ -10,18 +10,21 @@ This module is the ONLY place that imports it. It:
 full_auto is imported lazily so the API (and its lightweight LLM features) boot
 even without crawl4ai/playwright present, and only a real search pays that cost."""
 import asyncio
+import base64
 import hashlib
 import json
+import queue
 import random
 import re
 import sys
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
+import numpy as np
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
@@ -54,6 +57,15 @@ from .sources import (
 # fair-scoring candidates on the table every run. Survivors -> expensive
 # full-text judge -> engine.FINAL_PICKS capped final results.
 TARGET_POOL       = 90     # gate-survivor checkpoint per cluster per refill round
+# Examine-round sizing inside _gate_rank_refill_cluster. A round gates then ranks
+# one batch and only THEN reports its judge-eligible snapshot for provisional
+# "Verifying…" cards, so the size of the FIRST round is what gates time-to-first-
+# card. A small first round (20) paints cards ~4x sooner than the old effectively-
+# single round of examine_cap (80); later rounds are larger (40) to keep the total
+# round count -- and thus the per-round screen_gate/rank_gate orchestration
+# overhead -- low. (These cap the round; TARGET_POOL still bounds it from above.)
+GATE_FIRST_ROUND  = 20     # small first examine round -> earliest provisional cards
+GATE_ROUND_SIZE   = 40     # subsequent examine rounds
 MIN_RESULTS       = 3      # below this many strong matches, broaden the threshold
 # Below this many characters, a job's discovery-time snippet is assumed too
 # thin (e.g. a short Google-organic blurb) to judge fit against without
@@ -88,11 +100,44 @@ RELEVANCE_PRIMARY = 0.39   # strict strong-fit threshold
 RELEVANCE_FLOOR    = 0.39  # never include anything weaker than this
 BACKLOG_TOPUP     = 40     # enriched rows pulled in when fresh discovery is thin
 STORE_SCORE_CAP   = 6000   # max 'new' rows relevance-scored per run (whole store)
+# Fresh-row embedding fetch (_ensure_embeddings): texts are capped at ~2000
+# chars (~500 tokens) each, so 250/chunk is ~125k tokens/request -- well
+# inside OpenAI's per-request limits -- while cutting round trips for a large
+# new-row batch (e.g. a measured 651-new-row run went from 7 chunks/2
+# sequential rounds at chunk=100 to 3 chunks/1 round at chunk=250). Worker
+# count raised from 4: the embeddings endpoint's rate limits run well above
+# the chat-completion endpoints gate/rank's "cap at 3-4" was calibrated
+# against; kept at 6 rather than higher since a burst still risks a
+# short-window rate cap.
+EMBED_CHUNK_SIZE  = 250
+EMBED_MAX_WORKERS = 6
 # Cheap numeric-ranking stage (rank_gate), between the sector/seniority gate and
 # the expensive full-text judge: an extra cheap-model pass that scores gate
 # survivors 0-100 on fit instead of a boolean pass/fail, so the expensive judge
 # only ever sees a curated top slice instead of every gate survivor.
 JUDGE_POOL = 40               # top-ranked candidates sent on to scrape + judge
+# Symmetric FLOOR to the JUDGE_POOL ceiling: an absolute rank cutoff
+# (RANK_REJECT_SCORE_FLOOR) plus per-cluster examine caps can leave the judge with
+# far fewer than JUDGE_POOL candidates even when dozens of gate survivors exist
+# (a live run sent only 20). Rather than pay the cheap rank stage to silently kill
+# borderline roles the expensive judge never gets to weigh in on, backfill the
+# judge pool up to this many by running one bounded EXTRA gate+rank round per
+# still-open cluster over its next unexamined candidates (best-effort -- only
+# clusters whose first round stopped on a cap, not a genuinely exhausted queue,
+# have anything fresh to examine; see the call site in _run_engine_pipeline).
+JUDGE_POOL_FLOOR = 25
+# Per-cluster examine cap for that extra round -- deliberately small (one
+# GATE_FIRST_ROUND-sized batch) so a shortfall costs at most one more cheap
+# gate+rank call per needy cluster rather than re-running a full
+# MULTI_CLUSTER_EXAMINE_CAP-sized pass.
+JUDGE_POOL_FLOOR_EXTRA_CAP = 20
+# How many of the judge pool's top-ranked candidates are persisted as
+# provisional "being verified..." Role rows the moment gate+rank finishes --
+# roughly halfway through a run, before the ~90s scrape+judge tail -- so the
+# user sees real cards (with the cheap 0-100 fit estimate) while the expensive
+# judge works. Matches full_auto.FINAL_PICKS so the end-of-run upgrade swaps
+# card content in place rather than visually collapsing a longer list.
+PROVISIONAL_MAX = 12
 # Per-cluster ceiling on how many candidates screen_gate/rank_gate examine in one
 # run (see _gate_rank_refill_cluster's judge_target/examine_cap params below).
 # Replaces a flat cap applied per cluster regardless of cluster
@@ -440,6 +485,57 @@ def _find_soft_duplicate(job: dict, candidates: list["JobSeen"]) -> "JobSeen | N
                 and job_tokens & _location_tokens(cand.location or ""):
             return cand
     return None
+
+
+# Judge-pool near-duplicate suppression (see _suppress_judge_duplicates).
+# _find_soft_duplicate above deliberately requires a shared location token, so a
+# recruiter template posted verbatim across several cities (same company, same
+# title, identical description text) stays N separate JobSeen rows -- correct
+# for the discovery store, but wasteful at the judge: a live run sent two
+# word-for-word identical "Hypercreate Ltd / Data Analyst" teasers (different
+# city each) to the expensive judge as two full slots. The text-prefix
+# requirement is what keeps this narrower than title+company alone: two
+# genuinely distinct openings with the same title at the same company will have
+# differently-worded descriptions and both proceed.
+_DUP_TEXT_PREFIX_CHARS = 400   # normalized chars that must match to call it the same vacancy text
+_DUP_TEXT_MIN_CHARS = 120      # below this there's no real evidence either way -- never collapse
+
+
+def _judge_dup_key(j: dict) -> tuple | None:
+    company = _norm_company(j.get("company", ""))
+    title = _norm(j.get("title", ""))
+    if not company or not title:
+        return None
+    text = re.sub(r"\s+", " ", (j.get("full_text") or j.get("snippet") or "").lower()).strip()
+    if len(text) < _DUP_TEXT_MIN_CHARS:
+        return None
+    return (company, title, text[:_DUP_TEXT_PREFIX_CHARS])
+
+
+def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
+    """Drops near-duplicate postings from the per-cluster judge-eligible lists
+    in place, keeping only the highest-rank_gate-scored copy of each (the lists
+    arrive _rank_score-sorted descending, so the first copy seen is the best).
+    Runs BEFORE _fair_allocate, so a freed slot goes to the next-ranked real
+    candidate instead of just shrinking the judge pool. Suppression is
+    judge-pool-only: the dropped copy stays a gate survivor, keeps its cached
+    rank score, and gets no persisted verdict -- if the kept copy disappears at
+    source, the duplicate can still surface on a future run. Returns how many
+    were suppressed."""
+    seen: set[tuple] = set()
+    suppressed = 0
+    for idx, jobs in rank_by_cluster.items():
+        kept = []
+        for j in jobs:
+            key = _judge_dup_key(j)
+            if key is not None and key in seen:
+                suppressed += 1
+                continue
+            if key is not None:
+                seen.add(key)
+            kept.append(j)
+        rank_by_cluster[idx] = kept
+    return suppressed
 
 
 def _parse_iso(s: str):
@@ -812,14 +908,30 @@ def _persist_scam_override(db: Session, profile_id: int, identity: str, reason: 
     """Overrides an already-persisted strong/backup verdict to a reject, after
     verify_not_duplicated corroborates a judge-flagged scam_suspect pick with
     real cross-site evidence post-hoc. Never resurfaces under this eval_sig,
-    same as any other reject."""
+    same as any other reject.
+
+    Preserves the judge's original eval_analysis (summary/concerns/top_match_reason/
+    etc.) rather than replacing it outright -- an earlier version overwrote the
+    whole blob with just the corroboration reason, which silently destroyed the
+    judge's original "why this was strong" reasoning for every overridden pick,
+    making it impossible to later audit whether the override itself was
+    reasonable (see the investigation that found several overrides were likely
+    false positives off a generic job-aggregator mirror site)."""
     row = db.execute(
         select(JobSeen).where(JobSeen.profile_id == profile_id, JobSeen.identity_hash == identity)
     ).scalar_one_or_none()
     if row is None:
         return
+    try:
+        analysis = json.loads(row.eval_analysis or "{}")
+        if not isinstance(analysis, dict):
+            analysis = {}
+    except (TypeError, ValueError):
+        analysis = {}
+    analysis["concerns"] = [reason] + [c for c in (analysis.get("concerns") or []) if c != reason]
+    analysis["scam_verified_override"] = True
     row.eval_verdict = "reject"
-    row.eval_analysis = json.dumps({"summary": "", "concerns": [reason]})
+    row.eval_analysis = json.dumps(analysis)
     row.eval_signature = eval_sig
     row.evaluated_at = datetime.utcnow()
     db.commit()
@@ -875,37 +987,89 @@ def _ensure_embeddings(engine, db: Session, rows: list[JobSeen]) -> int:
     if not missing:
         return 0
     texts = [f"{r.title} {r.company or ''} {(r.snippet or '')[:2000]}" for r in missing]
-    embeddings = []
-    for i in range(0, len(texts), 100):
-        embeddings.extend(engine.get_embeddings_batch(texts[i:i+100]))
+    chunks = [texts[i:i+EMBED_CHUNK_SIZE] for i in range(0, len(texts), EMBED_CHUNK_SIZE)]
+    if len(chunks) == 1:
+        embeddings = engine.get_embeddings_batch(chunks[0])
+    else:
+        # A first run embeds several hundred fresh rows (measured: 651 -> 7
+        # sequential OpenAI calls, ~15s of the run). The chunks are independent,
+        # so overlap them -- bounded at EMBED_MAX_WORKERS workers for the same
+        # rate-limit-burst reason the gate/rank pools cap at 3. ex.map preserves
+        # input order, which the zip below depends on. get_embeddings_batch only
+        # touches the module-level OpenAI client (thread-safe, no DB); the row
+        # writes + commit stay on this thread.
+        embeddings = []
+        with ThreadPoolExecutor(max_workers=min(EMBED_MAX_WORKERS, len(chunks))) as ex:
+            for chunk_result in ex.map(engine.get_embeddings_batch, chunks):
+                embeddings.extend(chunk_result)
     for r, emb in zip(missing, embeddings):
-        r.embedding = json.dumps(emb)
+        r.embedding = _encode_embedding(emb)
     db.commit()
     return len(missing)
 
 
-def _score_rows(engine, rows: list[JobSeen], cluster_embeddings: list[list[float]]) -> list[dict]:
+def _encode_embedding(vec) -> str:
+    """Compact on-disk encoding for an embedding vector: base64 of raw float32
+    bytes rather than a JSON list. Measured on this store's real 1536-dim
+    OpenAI vectors: ~31,000 JSON chars vs ~8,200 base64 chars per row (~74%
+    smaller), and decoding is a zero-copy np.frombuffer reinterpret instead of
+    character-by-character JSON number parsing -- the JSON text was the
+    dominant cost of the cosine-scoring stage, which re-reads every candidate
+    row's embedding on every run. float32 (~7 significant digits) is far more
+    precision than this pipeline's ~0.35-0.45 relevance cutoffs use."""
+    return base64.b64encode(np.asarray(vec, dtype=np.float32).tobytes()).decode("ascii")
+
+
+def _decode_embedding(raw: str | None) -> np.ndarray | None:
+    """Inverse of _encode_embedding, auto-detecting format so rows still
+    holding the old JSON-list encoding (anything not yet touched by
+    _ensure_embeddings since the format switch, or not yet migrated by
+    migrate_embedding_format.py) keep working. A JSON list always starts with
+    '['; the new format never does."""
+    if not raw:
+        return None
+    try:
+        if raw[0] == "[":
+            return np.asarray(json.loads(raw), dtype=np.float32)
+        return np.frombuffer(base64.b64decode(raw), dtype=np.float32)
+    except (ValueError, TypeError):
+        return None
+
+
+def _score_rows(rows: list[JobSeen], cluster_embeddings: list[list[float]]) -> list[dict]:
     """Cosine each row's cached embedding against EVERY role-cluster embedding
     (free, local) and keep the best. A job is assigned to whichever cluster it
     matches best (_cluster, an index into cluster_embeddings) so pooling/
     gating/final-eval downstream can treat each role interest independently
     instead of judging every job against one blended average of all of them.
     Returns engine-shaped dicts sorted by score desc with embed_score,
-    _cluster, and _identity."""
-    scored: list[tuple[float, int, JobSeen]] = []
-    for r in rows:
-        try:
-            emb = json.loads(r.embedding) if r.embedding else None
-        except (ValueError, TypeError):
-            emb = None
-        if emb:
-            per_cluster = [engine.cosine_similarity(ce, emb) for ce in cluster_embeddings]
-            best_idx = max(range(len(per_cluster)), key=lambda i: per_cluster[i])
-            best_score = per_cluster[best_idx]
-        else:
-            best_idx, best_score = 0, 0.0
-        scored.append((best_score, best_idx, r))
-    scored.sort(key=lambda t: t[0], reverse=True)
+    _cluster, and _identity.
+
+    Vectorized: decodes every row's embedding into one N-D matrix and the
+    cluster embeddings into one M-D matrix, then scores the whole set with a
+    single normalized matrix multiply instead of a Python loop calling
+    cosine_similarity() once per (row, cluster) pair -- same cosine formula,
+    just batched, so scores are unchanged (within float32 rounding)."""
+    decoded = [_decode_embedding(r.embedding) for r in rows]
+    valid_idx = [i for i, v in enumerate(decoded) if v is not None and v.size]
+
+    best_idx_arr = [0] * len(rows)
+    best_score_arr = [0.0] * len(rows)
+    if valid_idx and cluster_embeddings:
+        mat = np.stack([decoded[i] for i in valid_idx]).astype(np.float32)
+        cmat = np.asarray(cluster_embeddings, dtype=np.float32)
+        mat_norm = mat / np.clip(np.linalg.norm(mat, axis=1, keepdims=True), 1e-12, None)
+        cmat_norm = cmat / np.clip(np.linalg.norm(cmat, axis=1, keepdims=True), 1e-12, None)
+        sims = mat_norm @ cmat_norm.T  # (len(valid_idx), M)
+        row_best_idx = sims.argmax(axis=1)
+        row_best_score = sims[np.arange(sims.shape[0]), row_best_idx]
+        for pos, i in enumerate(valid_idx):
+            best_idx_arr[i] = int(row_best_idx[pos])
+            best_score_arr[i] = float(row_best_score[pos])
+
+    scored = sorted(
+        zip(best_score_arr, best_idx_arr, rows), key=lambda t: t[0], reverse=True
+    )
     out = []
     for score, cluster_idx, r in scored:
         d = _rows_to_dicts([r])[0]
@@ -1040,9 +1204,22 @@ def _hard_enforced_axes(engine, cluster_profile: dict) -> tuple[tuple[str, ...],
     return soft, hard
 
 
+def _make_progress_reporter(progress_q: "queue.Queue", idx: int):
+    """Binds a cluster index to the shared progress queue so
+    _gate_rank_refill_cluster can report a snapshot of its own judge_eligible
+    list without knowing anything about queues or which cluster it is --
+    mirrors _make_cancel_check's callable-injection pattern, just flowing the
+    opposite direction (worker thread -> main thread instead of main thread ->
+    worker thread). Thread-safe: queue.Queue.put is safe to call from any
+    thread with no external locking."""
+    def report(snapshot: list[dict]) -> None:
+        progress_q.put((idx, snapshot))
+    return report
+
+
 def _gate_rank_refill_cluster(
     queue: list[dict], cluster_profile: dict, engine, cancel_check,
-    judge_target: int, examine_cap: int,
+    judge_target: int, examine_cap: int, report=None,
 ) -> tuple[list[dict], dict]:
     """Iteratively gates then ranks batches of one cluster's embed-score-ordered
     candidate queue (already restricted to >= RELEVANCE_FLOOR, or the small
@@ -1075,7 +1252,13 @@ def _gate_rank_refill_cluster(
     Runs in a worker thread (one per cluster -- see the call site), so it takes a
     `cancel_check` callable rather than the pipeline's own (thread-unsafe)
     Session/SearchRun pair. Makes no DB writes and touches no shared state; every
-    result is merged by the caller, back on the main thread."""
+    result is merged by the caller, back on the main thread. `report`, if given,
+    is called with a full snapshot of `judge_eligible` (a thread-safe one-way
+    channel -- see _make_progress_reporter) every time that list grows, so the
+    caller can persist provisional rows for early display well before this
+    whole cluster's queue is exhausted, instead of only once this function
+    returns."""
+    report = report or (lambda _: None)
     soft_axes, hard_axes = _hard_enforced_axes(engine, cluster_profile)
     pos = 0
     examined = 0
@@ -1095,7 +1278,13 @@ def _gate_rank_refill_cluster(
             stop_reason = "absolute_pool_cap"
             break
         cancel_check()
-        batch_size = min(len(queue) - pos, TARGET_POOL, examine_cap - examined)
+        # Small first round -> earliest possible provisional cards (report() below
+        # fires per round), larger rounds after to bound orchestration overhead.
+        # dynamic_hard_drop_threshold (below) is now computed per smaller round --
+        # more responsive, slightly noisier -- which is fine: it already defaulted
+        # to "unsure -> keep" on any axis it isn't confident about.
+        round_cap = GATE_FIRST_ROUND if examined == 0 else GATE_ROUND_SIZE
+        batch_size = min(len(queue) - pos, round_cap, TARGET_POOL, examine_cap - examined)
         batch = queue[pos:pos + batch_size]
         pos += batch_size
         examined += len(batch)
@@ -1160,6 +1349,8 @@ def _gate_rank_refill_cluster(
                     judge_eligible.append(j)
                 else:
                     below_rank_floor.append(j)
+            if judge_eligible:
+                report(list(judge_eligible))
 
     # Gate-side floor backfill: never let a cluster reach rank with fewer than
     # MIN_RESULTS in-sector candidates, mirroring the pre-refill design (a
@@ -1177,6 +1368,8 @@ def _gate_rank_refill_cluster(
                     judge_eligible.append(j)
                 else:
                     below_rank_floor.append(j)
+            if judge_eligible:
+                report(list(judge_eligible))
 
     rank_floor_rejected = len(below_rank_floor)
 
@@ -1193,6 +1386,8 @@ def _gate_rank_refill_cluster(
         judge_eligible.extend(promoted)
         below_rank_floor = [j for j in below_rank_floor if j not in promoted]
         rank_floor_rejected -= len(promoted)
+        if promoted:
+            report(list(judge_eligible))
 
     judge_eligible.sort(key=lambda j: j.get("_rank_score", 50.0), reverse=True)
     stats = {
@@ -1775,7 +1970,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     if n_embedded:
         emit(f"[pipeline] embedded {n_embedded} new rows (cached for future runs)")
     t0 = _lap("embed", t0)
-    scored = _score_rows(engine, rows, cluster_embeddings)
+    scored = _score_rows(rows, cluster_embeddings)
     t0 = _lap("score", t0)
 
     # Re-apply the country filter to the *candidate* set, not just this run's fresh
@@ -1893,27 +2088,65 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     active_clusters = [(idx, queue) for idx, queue in queues.items() if queue]
     cancel_check = _make_cancel_check(run.id)
     gate_results: dict[int, tuple[list[dict], list[dict], dict]] = {}
+    # Progress reports flow worker-thread -> main-thread over a queue.Queue
+    # (the one-way counterpart to `cancel_check`, which flows the other way) so
+    # each cluster's judge-eligible candidates can be persisted as provisional
+    # "being verified..." rows the moment the very first gate+rank round
+    # returns, not just once an entire cluster (or every cluster) finishes --
+    # see _gate_rank_refill_cluster's `report` param and _upsert_provisional_rows.
+    progress_q: "queue.Queue" = queue.Queue()
+    cluster_accum: dict[int, list[dict]] = {idx: [] for idx, _ in active_clusters}
+    # Stashed so a JUDGE_POOL_FLOOR shortfall can re-enter the SAME cluster's
+    # queue with the same profile/context later, instead of only being able to
+    # recycle already-rank-rejected candidates -- see the call site below.
+    cluster_profiles: dict[int, dict] = {}
     if active_clusters:
         with ThreadPoolExecutor(max_workers=len(active_clusters)) as pool:
             futures = {}
-            for idx, queue in active_clusters:
+            for idx, cluster_queue in active_clusters:
                 cluster_profile = dict(eng_profile)
                 cluster_profile["search_terms"] = (
                     role_clusters[idx].get("roles") or eng_profile.get("search_terms"))
                 cluster_profile["_multi_cluster"] = len(role_clusters) > 1
+                cluster_profiles[idx] = cluster_profile
                 futures[pool.submit(
-                    _gate_rank_refill_cluster, queue, cluster_profile, engine, cancel_check,
-                    cluster_judge_target, cluster_examine_cap,
+                    _gate_rank_refill_cluster, cluster_queue, cluster_profile, engine, cancel_check,
+                    cluster_judge_target, cluster_examine_cap, _make_progress_reporter(progress_q, idx),
                 )] = idx
-            for fut in as_completed(futures):
-                gate_results[futures[fut]] = fut.result()
+
+            pending = set(futures)
+            while pending:
+                try:
+                    p_idx, snapshot = progress_q.get(timeout=0.2)
+                    cluster_accum[p_idx] = snapshot  # replace: snapshot is that cluster's full state so far
+                    _check_cancelled(db, run)         # DB-aware check; main thread owns `db`
+                    _upsert_provisional_rows(
+                        db, profile_id, run, _top_n_across_clusters(cluster_accum, PROVISIONAL_MAX), engine)
+                except queue.Empty:
+                    pass
+                done_now = {f for f in pending if f.done()}
+                for f in done_now:
+                    gate_results[futures[f]] = f.result()
+                pending -= done_now
+            # report() always completes before _gate_rank_refill_cluster returns, so
+            # nothing further will arrive after every future is done -- but the queue
+            # may still hold buffered items the loop above hasn't drained yet.
+            while True:
+                try:
+                    p_idx, snapshot = progress_q.get_nowait()
+                    cluster_accum[p_idx] = snapshot
+                except queue.Empty:
+                    break
+            if cluster_accum:
+                _upsert_provisional_rows(
+                    db, profile_id, run, _top_n_across_clusters(cluster_accum, PROVISIONAL_MAX), engine)
 
     # Merge sequentially, in queue order, so the funnel counters, fallback tags
     # and log lines stay deterministic regardless of which cluster finished first.
-    for idx, queue in active_clusters:
+    for idx, cluster_queue in active_clusters:
         judge_eligible, gate_survivors, stats = gate_results[idx]
         rank_by_cluster[idx] = judge_eligible
-        examined_ids.update(j["_identity"] for j in queue[:stats["examined"]])
+        examined_ids.update(j["_identity"] for j in cluster_queue[:stats["examined"]])
         gate_survivor_ids.update(j["_identity"] for j in gate_survivors)
         below_rank_floor_all.extend(stats["below_rank_floor_jobs"])
         total_examined += stats["examined"]
@@ -1951,6 +2184,71 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         }
     t0 = _lap("gate", t0)
 
+    # Judge-pool FLOOR (symmetric to the JUDGE_POOL ceiling): if the gate+rank
+    # funnel left fewer than JUDGE_POOL_FLOOR candidates eligible for the expensive
+    # judge, run one bounded EXTRA gate+rank round per still-open cluster over its
+    # next unexamined candidates, rather than recycling already-rank-rejected jobs
+    # (which, by construction, already scored < RANK_REJECT_SCORE_FLOOR and have no
+    # better shot at the judge than they already had). Only clusters whose first
+    # round stopped on a CAP (target_reached / absolute_pool_cap) -- not a
+    # genuinely exhausted queue -- have anything fresh left; a cluster that already
+    # burned through its whole queue is simply left short, no reject fallback (a
+    # prior version promoted below-floor rejects here instead -- dropped after an
+    # investigation found the judge's own scam-suspicion signals, and a downstream
+    # scam-verify check, were producing false positives on legitimate high-volume
+    # agency listings, making "borderline reject" a much weaker signal of genuine
+    # unfitness than assumed). Runs BEFORE dup-suppression/fair-allocate so those
+    # stages treat any extra-round survivors uniformly with the rest.
+    judge_floor_extra_examined = 0
+    if total_judge_eligible < JUDGE_POOL_FLOOR:
+        need = JUDGE_POOL_FLOOR - total_judge_eligible
+        reopenable = [
+            (idx, cluster_queue) for idx, cluster_queue in active_clusters
+            if cluster_diagnostics[idx]["stop_reason"] != "pool_exhausted"
+            and cluster_diagnostics[idx]["examined"] < len(cluster_queue)
+        ]
+        if reopenable:
+            # Split the shortfall evenly across clusters that can actually supply
+            # more candidates -- same fairness principle as cluster_judge_target.
+            per_cluster_target = -(-need // len(reopenable))
+            with ThreadPoolExecutor(max_workers=len(reopenable)) as pool:
+                extra_futures = {
+                    pool.submit(
+                        _gate_rank_refill_cluster,
+                        cluster_queue[cluster_diagnostics[idx]["examined"]:],
+                        cluster_profiles[idx], engine, cancel_check,
+                        per_cluster_target, JUDGE_POOL_FLOOR_EXTRA_CAP,
+                    ): idx
+                    for idx, cluster_queue in reopenable
+                }
+                for f in extra_futures:
+                    idx = extra_futures[f]
+                    extra_eligible, _extra_survivors, extra_stats = f.result()
+                    rank_by_cluster.setdefault(idx, []).extend(extra_eligible)
+                    rank_by_cluster[idx].sort(key=lambda x: x.get("_rank_score", 50.0), reverse=True)
+                    below_rank_floor_all.extend(extra_stats["below_rank_floor_jobs"])
+                    judge_floor_extra_examined += extra_stats["examined"]
+                    total_judge_eligible += extra_stats["judge_eligible"]
+                    total_examined += extra_stats["examined"]
+                    total_gate_survivors += extra_stats["gate_survivors"]
+                    emit(f"[pipeline] judge-pool floor: cluster[{idx}] extra round examined "
+                         f"{extra_stats['examined']} more candidate(s) -> "
+                         f"{extra_stats['judge_eligible']} newly judge-eligible "
+                         f"(total now {total_judge_eligible}, floor={JUDGE_POOL_FLOOR})")
+        if total_judge_eligible < JUDGE_POOL_FLOOR:
+            emit(f"[pipeline] judge-pool floor: still {total_judge_eligible} judge-eligible after the "
+                 f"extra round (floor={JUDGE_POOL_FLOOR}) -- no reject fallback, accepting the shortfall")
+    funnel["judge_floor_extra_examined"] = judge_floor_extra_examined
+
+    # Near-duplicate suppression before the expensive judge: same company, same
+    # title, near-identical text (a recruiter template re-posted per city) keeps
+    # only its top-ranked copy -- see _suppress_judge_duplicates.
+    n_dupes = _suppress_judge_duplicates(rank_by_cluster)
+    funnel["judge_dupes_suppressed"] = n_dupes
+    if n_dupes:
+        emit(f"[pipeline] suppressed {n_dupes} near-duplicate posting(s) before the judge pool "
+             f"(same company+title+text; top-ranked copy retained)")
+
     selected = _fair_allocate(rank_by_cluster, JUDGE_POOL)
     t0 = _lap("rank", t0)
     funnel["gate_survivors_total"] = total_gate_survivors
@@ -1974,6 +2272,23 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         return [], True, ([j["_identity"] for j in scored], []), timings, \
             _compose_fallback_warning(role_clusters, fallback_notes), funnel
     _check_cancelled(db, run)
+
+    # Reconcile this run's provisional "being verified..." rows against the
+    # real, fair-allocated judge pool -- interim rows may already exist from
+    # gate+rank rounds finishing earlier (see the progress_q loop above), so
+    # this upserts/reaps rather than blind-inserting. The scrape+judge tail
+    # below is still the run's longest phase (~90s live); this just fixes the
+    # display's fit_rank/membership up to the true fair-allocated state before
+    # that tail starts.
+    matched, inserted, removed = _reconcile_provisional_roles(db, profile_id, run, selected, engine)
+    funnel["provisional_persisted"] = matched + inserted
+    funnel["provisional_reconcile_matched"] = matched
+    funnel["provisional_reconcile_inserted"] = inserted
+    funnel["provisional_reconcile_removed"] = removed
+    emit(f"[pipeline] provisional reconcile: {matched} interim row(s) matched, {inserted} newly "
+         f"persisted, {removed} resolved away (deduped/dropped by fair-allocate) -> "
+         f"{matched + inserted} provisional role(s) live for early display "
+         f"(upgraded/removed at finalization)")
 
     # EVALUATE (phases 5 + 6), PIPELINED PER CLUSTER. When full-page scraping is
     # enabled (default), each selected job's real page is read first so the final
@@ -2270,6 +2585,10 @@ def reap_stale_search_runs(db: Session) -> int:
         run.message = "Search was interrupted by a server restart. Please run a new search."
         run.finished_at = now
     db.commit()
+    # A run killed after its gate+rank phase left provisional Role rows behind
+    # -- nothing else will ever revisit them, so resolve them here too.
+    for run in stale:
+        _cleanup_provisional_roles(db, run.id)
     return len(stale)
 
 
@@ -2298,6 +2617,204 @@ def _expire_stale_roles(db: Session, profile_id: int) -> None:
         Role.profile_id == profile_id, Role.status == "new", Role.created_at < cutoff,
     ).update({Role.status: "ignored"}, synchronize_session=False)
     db.commit()
+
+
+def _already_decided_ids(db: Session, profile_id: int, identities: list[str]) -> set[str]:
+    """External ids among `identities` that already have a saved/applied Role for
+    this profile from an earlier run. A Keep/Save is a completed decision (see
+    the Role lifecycle notes in CLAUDE.md) -- these must never get a second,
+    duplicate 'new' Role persisted alongside the existing one just because the
+    same job resurfaced in a later run's candidate pool."""
+    identities = [i for i in identities if i]
+    if not identities:
+        return set()
+    return {
+        row[0] for row in db.execute(
+            select(Role.external_id).where(
+                Role.profile_id == profile_id,
+                Role.external_id.in_(identities),
+                Role.status.in_(("saved", "applied")),
+            )
+        ).all()
+    }
+
+
+def _top_n_across_clusters(cluster_accum: dict[int, list[dict]], n: int) -> list[dict]:
+    """Flattens every cluster's currently-known judge_eligible snapshot and
+    returns the top `n` by _rank_score. A simple global sort, NOT fairness-
+    balanced across clusters the way _fair_allocate is -- that's only possible
+    once every cluster's gate+rank has finished. A cluster with generally
+    higher-scoring candidates can dominate this interim view early in a run;
+    accepted tradeoff for responsiveness, corrected once _reconcile_provisional_roles
+    runs on the real fair-allocated pool."""
+    everything = [j for jl in cluster_accum.values() for j in jl]
+    everything.sort(key=lambda j: j.get("_rank_score", 50.0), reverse=True)
+    return everything[:n]
+
+
+def _upsert_provisional_rows(db: Session, profile_id: int, run: SearchRun,
+                              top: list[dict], engine) -> tuple[int, int]:
+    """Insert-or-update this run's provisional Role rows to mirror `top`
+    (already sorted/capped by the caller) -- never deletes. Interim calls
+    during gate+rank only ever add or refresh rows so a row's fit_rank can
+    shift as better candidates arrive; only _reconcile_provisional_roles,
+    once the real fair-allocated pool is known, resolves genuinely-gone
+    leftovers. Safe to call repeatedly with a growing/reshuffling `top`
+    across the run -- see the call sites in _run_engine_pipeline."""
+    decided = _already_decided_ids(db, profile_id, [j.get("_identity") for j in top])
+    top = [j for j in top if j.get("_identity") not in decided]
+    existing = {
+        r.external_id: r
+        for r in db.query(Role).filter(Role.search_run_id == run.id, Role.provisional.is_(True))
+        if r.external_id
+    }
+    matched = inserted = 0
+    for pos, j in enumerate(top, start=1):
+        ident = j.get("_identity") or _external_id(engine, j)
+        fields = dict(
+            title=j.get("title", "Untitled role"),
+            company=j.get("company"),
+            location=j.get("location"),
+            url=j.get("url"),
+            salary_text=_salary_text(j),
+            source=j.get("board"),
+            fit_rank=pos,
+            rank_score=int(round(j.get("_rank_score", 50.0))),
+        )
+        row = existing.get(ident)
+        if row is not None:
+            for k, v in fields.items():
+                setattr(row, k, v)   # upgrade in place: same row id, status untouched
+            matched += 1
+        else:
+            db.add(Role(profile_id=profile_id, search_run_id=run.id, external_id=ident,
+                        provisional=True, status="new", **fields))
+            inserted += 1
+    db.commit()
+    return matched, inserted
+
+
+def _reconcile_provisional_roles(db: Session, profile_id: int, run: SearchRun,
+                                  selected: list[dict], engine) -> tuple[int, int, int]:
+    """Final provisional reconcile, once every cluster's gate+rank has
+    finished and _fair_allocate has produced the real, fair, cross-cluster
+    `selected` pool (~JUDGE_POOL candidates). Some/all of this run's
+    provisional rows may already exist -- interim _upsert_provisional_rows
+    calls fired as each gate/rank round returned (see _run_engine_pipeline) --
+    so this upserts/reaps rather than blind-inserting.
+
+    `selected` is the full judge pool; `top` here is only the top
+    PROVISIONAL_MAX of it for *display* -- the rest are still headed to
+    scrape+judge this run. A row a user Kept mid-run that's ranked outside
+    the top-PROVISIONAL_MAX but still in `selected` must be left
+    provisional=True and untouched: resolving it here would permanently file
+    it before the judge ever actually saw it, and finalization's own later
+    pass (which only looks at provisional=True rows) would never find it
+    again to upgrade it with the real verdict. Only a row whose job has
+    genuinely fallen out of `selected` entirely -- deduped by
+    _suppress_judge_duplicates, or cut by _fair_allocate's cross-cluster
+    budget -- gets resolved (retained-if-kept-or-applied / removed) here."""
+    selected_ids = {j.get("_identity") for j in selected}
+    top = sorted(selected, key=lambda j: j.get("_rank_score", 50.0), reverse=True)[:PROVISIONAL_MAX]
+    matched, inserted = _upsert_provisional_rows(db, profile_id, run, top, engine)
+
+    still_provisional = {
+        r.external_id: r
+        for r in db.query(Role).filter(Role.search_run_id == run.id, Role.provisional.is_(True))
+        if r.external_id
+    }
+    top_ids = {j.get("_identity") for j in top}
+    removed = 0
+    for ident, row in still_provisional.items():
+        if ident in top_ids:
+            continue
+        if ident not in selected_ids:
+            _resolve_leftover_provisional(db, row)
+            removed += 1
+    db.commit()
+    return matched, inserted, removed
+
+
+# Honest markers for a provisional row the user chose to Keep but that the
+# final judge didn't put in this run's picks. Rendered by RoleCard's notes
+# bucket (a leading ⚠ line before any headline). Keyed by the job's stored
+# JobSeen.eval_verdict at finalization time. Worded for a role that may now
+# be back in the Inbox (see _resolve_leftover_provisional's routing below),
+# not just a still-"saved" one.
+_RETAINED_MARKER_BY_VERDICT = {
+    "reject": "⚠ You kept this during review, but the full AI review later rated it below the bar — take another look.",
+    "strong": "⚠ Verified as a reasonable match, but it didn't make this run's final cut.",
+    "backup": "⚠ Verified as a reasonable match, but it didn't make this run's final cut.",
+}
+_RETAINED_MARKER_UNJUDGED = (
+    "⚠ You kept this during review, but the AI couldn't complete its full review of this role.")
+_RETAINED_MARKER_INTERRUPTED = (
+    "⚠ You kept this during review, but the search ended before the AI finished verifying this role.")
+
+
+def _resolve_leftover_provisional(db: Session, row: Role, marker: str | None = None) -> None:
+    """Apply the leftover rules to ONE provisional row that did NOT land in the
+    final picks (or whose run ended early). Never-acted 'new' rows are
+    hard-deleted (no FeedbackLog referent exists); crossed/deleted rows
+    soft-delete so their feedback audit rows keep a valid referent (same
+    posture as routers/search.delete_role).
+
+    'applied' rows are retained as applied unconditionally -- a real action
+    already taken, never reverted by a later AI opinion. 'saved' (Keep during
+    verification) rows are retained too, but a Keep is a tentative preference,
+    not a firm decision the way an ordinary Save is -- if the full judge
+    rated it strong/backup (a reasonable match, just short of this run's
+    numeric FINAL_PICKS cut), that's the judge agreeing, so it stays saved;
+    otherwise (rejected outright, never got a verdict at all, or the run was
+    interrupted before judging) it goes back to the Inbox (status="new") for
+    a real decision, with the ⚠ marker carried over so the context isn't
+    lost. Caller commits."""
+    if row.status in ("saved", "applied"):
+        job = db.execute(
+            select(JobSeen).where(
+                JobSeen.profile_id == row.profile_id,
+                JobSeen.identity_hash == (row.external_id or ""),
+            )
+        ).scalar_one_or_none()
+        verdict = job.eval_verdict if job else None
+        interrupted = marker is not None  # caller forced a marker: cancel/failure/restart path
+        if marker is None:
+            marker = _RETAINED_MARKER_BY_VERDICT.get(verdict or "", _RETAINED_MARKER_UNJUDGED)
+        # Only `final` entries get JobSeen.state bumped to "shown" (see
+        # run_search_task) -- a provisional row the judge never picked otherwise
+        # stays "enriched", which _backlog_rows treats as fair game to resurface
+        # on a later run. A kept/applied row is a permanent decision, same as a
+        # Role saved from `final`, so it needs the same protection regardless of
+        # which status it ends up with below, or a later run can persist a
+        # second, duplicate Role for the exact job already handled here (see
+        # _already_decided_ids for the belt-and-braces guard at the two
+        # Role-creation sites).
+        if job is not None and job.state != "shown":
+            job.state = "shown"
+        row.provisional = False
+        row.ai_analysis = marker if not row.ai_analysis else f"{marker}\n{row.ai_analysis}"
+        if row.status == "saved" and (interrupted or verdict not in ("strong", "backup")):
+            row.status = "new"
+        row.fit_rank = None  # sorts after the ranked picks (NULLS LAST); no rank context applies here
+    elif row.status == "new":
+        db.delete(row)
+    else:  # crossed (possibly already flipped to deleted by _prune_previous_roles)
+        row.status = "deleted"
+        row.provisional = False
+
+
+def _cleanup_provisional_roles(db: Session, run_id: int) -> None:
+    """Remove/retain the provisional rows of a run that ended without
+    finalizing (cancel, failure, server restart) -- preserves the invariant
+    that a cancelled/failed run leaves nothing user-visible behind, except
+    rows the user explicitly kept."""
+    rows = db.query(Role).filter(
+        Role.search_run_id == run_id, Role.provisional.is_(True)
+    ).all()
+    for row in rows:
+        _resolve_leftover_provisional(db, row, marker=_RETAINED_MARKER_INTERRUPTED)
+    if rows:
+        db.commit()
 
 
 def _safe_print(msg: str) -> None:
@@ -2361,20 +2878,43 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         # expects to see.
         db.refresh(run)
         if run.cancel_requested:
+            _cleanup_provisional_roles(db, run_id)
             _safe_print(f"[pipeline] ── search run {run_id} cancelled (caught before persisting results) ──\n")
             return
 
         # Prune only after the pipeline has succeeded, so a failed run leaves the
         # previous "crossed" roles intact instead of wiping them with nothing
-        # to replace them.
+        # to replace them. (Prune may flip a mid-run-crossed provisional row to
+        # 'deleted' -- fine: it lands in the leftover bucket below either way.)
         _prune_previous_roles(db, profile_id)
         _expire_stale_roles(db, profile_id)
 
+        # This run's provisional rows (persisted after gate+rank for early
+        # display): each is upgraded in place by the matching final pick, or
+        # resolved by the leftover rules (retain if the user kept it, else
+        # remove). Matching by external_id, scoped to this run.
+        provisional_by_id = {
+            r.external_id: r
+            for r in db.query(Role).filter(
+                Role.search_run_id == run.id, Role.provisional.is_(True)
+            )
+            if r.external_id
+        }
+
+        # A job the candidate already saved/applied to in an earlier run can
+        # still legitimately reach `final` again (e.g. a backlog-resurfaced or
+        # requeued JobSeen row the judge re-confirms) -- see _already_decided_ids.
+        # Belt-and-braces alongside the JobSeen "shown" fix in
+        # _resolve_leftover_provisional: don't persist a second, duplicate 'new'
+        # Role for it.
+        decided_ids = _already_decided_ids(
+            db, profile_id,
+            [entry.get("_identity") or _external_id(engine, entry) for entry in final],
+        )
+
         for rank, entry in enumerate(final, start=1):
-            db.add(Role(
-                profile_id=profile_id,
-                search_run_id=run.id,
-                external_id=entry.get("_identity") or _external_id(engine, entry),
+            ident = entry.get("_identity") or _external_id(engine, entry)
+            fields = dict(
                 title=entry.get("title", "Untitled role"),
                 company=entry.get("company"),
                 location=entry.get("location"),
@@ -2391,8 +2931,30 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 work_style=(entry.get("work_style") or "").strip() or None,
                 seniority_level=(entry.get("role_seniority") or "").strip() or None,
                 deadline_text=(entry.get("deadline") or "").strip() or None,
-                status="new",
-            ))
+            )
+            row = provisional_by_id.pop(ident, None)
+            if row is not None:
+                # Upgrade in place: same row id, so the frontend card swaps
+                # content rather than remounting. Deliberately does NOT touch
+                # `status` -- a mid-run save/cross must survive the upgrade.
+                for k, v in fields.items():
+                    setattr(row, k, v)
+                row.provisional = False
+            elif ident not in decided_ids:
+                db.add(Role(
+                    profile_id=profile_id,
+                    search_run_id=run.id,
+                    external_id=ident,
+                    status="new",
+                    **fields,
+                ))
+            # else: already saved/applied from an earlier run -- see decided_ids.
+
+        # Provisional rows the judge did NOT pick: retain the user-kept ones
+        # (with an honest marker), remove the rest. Rides the same commit as
+        # the picks above, so upgrade+removal is atomic with status="done".
+        for row in provisional_by_id.values():
+            _resolve_leftover_provisional(db, row)
 
         if marks:
             processed_ids, shown_ids = marks
@@ -2420,11 +2982,13 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         # The cancel endpoint already set status="cancelled"/finished_at/message
         # on its own session -- don't touch `run` here, just stop cleanly.
         db.rollback()
+        _cleanup_provisional_roles(db, run_id)
         _safe_print(f"[pipeline] ── search run {run_id} cancelled mid-run ──\n")
     except Exception as e:  # never let the worker thread die silently
         import traceback
         traceback.print_exc()  # full stack trace to the backend console
         db.rollback()
+        _cleanup_provisional_roles(db, run_id)
         if run:
             run.status = "error"
             run.message = f"Search failed: {e!r}" if str(e) else f"Search failed: {type(e).__name__} (see backend console for traceback)"

@@ -79,9 +79,9 @@ class RoleFamily(Base):
         Integer, ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name = Column(Text, nullable=False)
-    # core|secondary -- the candidate's declared priority for this stream. Feeds
-    # an emphasis multiplier in snapshot._weighted_text (config.FAMILY_TIER_MULT)
-    # and orders which families survive the MAX_ROLE_CLUSTERS cap.
+    # active|inactive -- whether this stream runs in the pipeline at all. An
+    # inactive family gets no cluster (see snapshot._role_groups): no
+    # discovery, embedding, gate, rank, or judge calls for it, full stop.
     tier = Column(Text, nullable=False, default=FAMILY_TIER_DEFAULT)
     position = Column(Integer, nullable=False, default=0)  # display order
     created_at = Column(DateTime, default=_now)
@@ -163,6 +163,15 @@ class Role(Base):
     salary_text = Column(Text)
     source = Column(Text)  # board this role was discovered on (see JobSeen.source)
     fit_rank = Column(Integer)  # 1..N within a search batch
+    # The cheap rank_gate's 0-100 fit estimate, written when this row is first
+    # persisted provisionally (mid-run, before the expensive judge). Kept after
+    # finalization but only rendered while `provisional` is true.
+    rank_score = Column(Integer)
+    # True only in the window between the gate+rank phase persisting this row
+    # and the run finishing: the row is a "being verified" placeholder that the
+    # final judge either upgrades in place or removes. Every non-/search
+    # consumer filters these out (see routers/search.py::list_roles).
+    provisional = Column(Boolean, nullable=False, default=False)
     ai_analysis = Column(Text)  # the expensive-AI justification
     # very_strong|strong|ok|stretch -- the final judge's own verdict, a finer
     # grade than the strong/backup list it landed in (see full_auto's

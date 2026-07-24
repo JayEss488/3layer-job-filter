@@ -554,11 +554,15 @@ Output ONLY JSON: {{"target_roles": ["..."]}}""",
 
 
 def ordered_for_engine(families: list[RoleFamily]) -> list[RoleFamily]:
-    """Families in the order the engine should spend its per-cluster budget:
-    core streams first, then display order within a tier.
+    """Active families only, in the order the engine should spend its
+    per-cluster budget: display order. Inactive families are dropped here --
+    the engine creates no cluster/discovery stream for them at all (see
+    snapshot._role_groups).
 
-    Only matters when a profile has more families than MAX_ROLE_CLUSTERS -- see
-    snapshot.build_snapshot, which merges the overflow into the last cluster.
-    Ordering core-first means a secondary stream is what gets merged away, not
-    whichever family happened to be created last."""
-    return sorted(families, key=lambda f: (0 if f.tier == "core" else 1, f.position, f.id))
+    The MAX_ROLE_CLUSTERS overflow-merge only matters when a profile has more
+    ACTIVE families than the cap -- see snapshot.build_snapshot, which merges
+    the overflow into the last cluster in this order."""
+    return sorted(
+        (f for f in families if f.tier != "inactive"),
+        key=lambda f: (f.position, f.id),
+    )

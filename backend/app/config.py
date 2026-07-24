@@ -163,20 +163,28 @@ def enforcement_for(attr_type: str, value: str | None) -> str:
 # independently (see CLAUDE.md's search-pipeline section). They replace the
 # per-run LLM clustering call, which now only ever runs once to SEED families
 # from a freshly parsed CV (see services/families.py).
-FAMILY_TIER_CHOICES = ["core", "secondary"]
-FAMILY_TIER_DEFAULT = "core"
+#
+# active|inactive -- a strict on/off switch, not a priority scale. An inactive
+# family gets no cluster at all (see snapshot._role_groups/families.
+# ordered_for_engine): no discovery, no embedding, no gate/rank/judge calls --
+# the algorithm ignores it completely, same as if its target roles didn't
+# exist. There used to be a third "secondary" tier that stayed fully in the
+# pipeline but at a damped 0.6x embedding weight (FAMILY_TIER_MULT); dropped
+# because a family that still runs its own full discovery/gate/judge lifecycle
+# barely reads as deprioritized in practice -- if a stream isn't wanted, it
+# should cost nothing, not just rank lower.
+FAMILY_TIER_CHOICES = ["active", "inactive"]
+FAMILY_TIER_DEFAULT = "active"
 
-# Emphasis multipliers applied in snapshot._weighted_text, alongside (not
-# instead of) the learned feedback weight -- tier and pin are the candidate's
-# declared priority, weight is what their tick/cross history revealed, and the
-# two are deliberately orthogonal signals that multiply together.
-FAMILY_TIER_MULT = {"core": 1.0, "secondary": 0.6}
+# Emphasis multiplier applied in snapshot._weighted_text for a pinned role
+# within its (active) family.
 PINNED_ROLE_MULT = 1.4
 
 # Same cap the LLM clustering path has always enforced: discovery volume is
 # fixed per run, not scaled by cluster count, so more clusters only thins each
-# one's candidate pool. Families past this cap are merged into the last one
-# (core families first -- see families.ordered_for_engine).
+# one's candidate pool. Active families past this cap are merged into the last
+# one, in display order (see families.ordered_for_engine); inactive families
+# never count against the cap at all.
 MAX_ROLE_CLUSTERS = 3
 
 # How many family CARDS the candidate can manually create, enforced in

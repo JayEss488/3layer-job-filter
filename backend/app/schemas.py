@@ -145,6 +145,8 @@ class RoleOut(ORMModel):
     salary_text: Optional[str] = None
     source: Optional[str] = None
     fit_rank: Optional[int] = None
+    rank_score: Optional[int] = None
+    provisional: bool = False
     ai_analysis: Optional[str] = None
     verdict: Optional[str] = None
     work_style: Optional[str] = None

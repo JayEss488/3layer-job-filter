@@ -66,6 +66,7 @@ class RunFunnelOut(BaseModel):
     final_judge: int = 0                 # final_strong + final_backup
     final_judge_rejected: int = 0        # final_fresh_judged - final_strong - final_backup
     judge_pool_size: int = 0             # initial judge pool, capped at JUDGE_POOL (engine.py)
+    judge_dupes_suppressed: int = 0      # near-duplicate postings dropped pre-judge (engine.py::_suppress_judge_duplicates)
     shown: int = 0                       # final_picks
 
 
@@ -262,6 +263,7 @@ def get_run_funnel(db: Session = Depends(get_db)):
             - counts.get("final_backup", 0)
         ),
         judge_pool_size=counts.get("judge_pool_size", 0),
+        judge_dupes_suppressed=counts.get("judge_dupes_suppressed", 0),
         shown=counts.get("final_picks", 0),
     )
 

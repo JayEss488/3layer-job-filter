@@ -84,8 +84,15 @@ def time_cv_parse(db: Session, filename: str, raw: bytes) -> dict:
     db.flush()  # need probe.id below
     pid = probe.id
 
+    # Short CVs skip the summary/"understand" call entirely (see
+    # formation.run_formation_calls) -- only extraction + families actually run.
+    # The stage label below reflects that instead of always naming the call
+    # that, for a short CV, never happens.
+    words = len(text.split())
+    short_cv = words < CV_SHORT_WORD_THRESHOLD
+
     try:
-        # The two formation calls run concurrently in production; measure the
+        # The formation calls run concurrently in production; measure the
         # parallel block's real wall time, with each call's own duration/tokens
         # captured underneath (both worker threads append to the same trace list).
         with capture_llm_calls() as calls:
@@ -93,7 +100,10 @@ def time_cv_parse(db: Session, filename: str, raw: bytes) -> dict:
             extract_data, understand_data = asyncio.run(formation.run_formation_calls(text, ""))
             block_seconds = perf_counter() - start
         stages.append({
-            "name": "Understand + extract (parallel AI calls)",
+            "name": (
+                "Extract + families (parallel AI calls) -- short CV, summary skipped"
+                if short_cv else "Understand + extract (parallel AI calls)"
+            ),
             "seconds": round(block_seconds, 3),
             "llm_calls": list(calls),
         })
@@ -113,13 +123,12 @@ def time_cv_parse(db: Session, filename: str, raw: bytes) -> dict:
         db.delete(probe)
         db.commit()
 
-    words = len(text.split())
     return {
         "filename": filename or "",
         "measured_at": datetime.utcnow().isoformat() + "Z",
         "text_chars": len(text),
         "text_words": words,
-        "generated_summary": words >= CV_SHORT_WORD_THRESHOLD,
+        "generated_summary": not short_cv,
         "total_seconds": round(sum(s["seconds"] for s in stages), 3),
         "llm_seconds": round(sum(c["duration_s"] for s in stages for c in s["llm_calls"]), 3),
         "stages": stages,

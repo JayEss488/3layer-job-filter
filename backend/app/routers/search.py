@@ -123,10 +123,17 @@ def cancel_search(
 @router.get("/profiles/{profile_id}/roles", response_model=list[RoleOut])
 def list_roles(
     status: str | None = None,
+    include_provisional: bool = False,
     profile: Profile = Depends(get_profile_or_404),
     db: Session = Depends(get_db),
 ):
     q = db.query(Role).filter(Role.profile_id == profile.id)
+    if not include_provisional:
+        # Mid-run "being verified..." placeholder rows (see
+        # engine._upsert_provisional_rows). Only the /search page opts in;
+        # every other consumer (/my-roles Inbox, stats) must never see them.
+        # isnot(True) rather than == False so pre-migration NULLs pass too.
+        q = q.filter(Role.provisional.isnot(True))
     if status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
         q = q.filter(Role.status.in_(statuses))

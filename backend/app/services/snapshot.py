@@ -10,7 +10,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import (
-    FAMILY_TIER_MULT,
     MAX_ROLE_CLUSTERS,
     PINNED_ROLE_MULT,
     WORK_TYPE_VALUES,
@@ -158,24 +157,24 @@ Location: {location or 'United Kingdom'}"""
 _BASE_EMPHASIS = 3  # times a target_role repeats per unit of weight
 
 
-def _declared_priority_multiplier(
-    attr: ProfileAttribute, tier_by_family: dict[int, str],
-) -> float:
-    """The candidate's DECLARED priority for a target role: its family's
-    core/secondary tier, times a bonus if they pinned it within that family.
+def _declared_priority_multiplier(attr: ProfileAttribute) -> float:
+    """The candidate's DECLARED priority for a target role: a bonus if they
+    pinned it within its family. (A family's active/inactive tier used to feed
+    a second multiplier here too -- dropped because inactive families are now
+    excluded from clustering entirely, see _role_groups, so by the time a
+    target role reaches this function its family is active by definition.)
 
     Deliberately a separate multiplier from `weight` (which is what tick/cross
     feedback LEARNED) rather than something that writes into it: the two answer
-    different questions and multiply together, so declaring a family secondary
-    damps it without erasing the fact that its roles have been ticked, and
-    crossing a pinned role still suppresses it."""
-    mult = FAMILY_TIER_MULT.get(tier_by_family.get(attr.family_id or -1, "core"), 1.0)
-    return mult * (PINNED_ROLE_MULT if attr.pinned else 1.0)
+    different questions and multiply together, so pinning a role weights it up
+    without erasing the fact that it's been crossed, and crossing a pinned role
+    still suppresses it."""
+    return PINNED_ROLE_MULT if attr.pinned else 1.0
 
 
 def _weighted_text(
     g: dict[str, list[ProfileAttribute]], search_terms: list[str],
-    role_filter: set[str] | None = None, tier_by_family: dict[int, str] | None = None,
+    role_filter: set[str] | None = None,
 ) -> str:
     """Weighted emphasis text driving the embedding pre-filter: repeat each
     target_role value roughly in proportion to its learned weight so feedback
@@ -192,17 +191,14 @@ def _weighted_text(
     push it up. When role_filter is given, only target_roles in that set are
     included -- this is what lets each role cluster get its own scoped
     embedding text instead of one blend of every target role the candidate has.
-    tier_by_family maps family id -> core/secondary so a target role also carries
-    its family's declared priority (see _declared_priority_multiplier).
 
     target_role ONLY -- see the comment above _BASE_EMPHASIS for why
     sector_target/sectors/seniority were dropped from here."""
     emphasis: list[str] = []
-    tiers = tier_by_family or {}
     for a in g.get("target_role", []):
         if role_filter is not None and a.value.strip() not in role_filter:
             continue
-        mult = _declared_priority_multiplier(a, tiers)
+        mult = _declared_priority_multiplier(a)
         count = max(0, round(_BASE_EMPHASIS * a.weight * mult))
         emphasis.extend([a.value] * count)
     return " ".join(emphasis) or " ".join(search_terms)
@@ -219,9 +215,12 @@ def cv_text_for_cluster(cv_text_base: str, cluster_roles: list[str]) -> str:
 
 def _role_groups(
     db: Session, profile_id: int, g: dict[str, list[ProfileAttribute]],
-) -> tuple[list[tuple[str, list[str]]], dict[int, str]]:
-    """The profile's target roles as (label, roles) clusters, plus family id ->
-    tier for the emphasis multiplier.
+) -> list[tuple[str, list[str]]]:
+    """The profile's target roles as (label, roles) clusters -- one per ACTIVE
+    family. An inactive family's target roles are dropped here, not just
+    de-weighted: they never become a cluster, so the engine runs no discovery/
+    gate/rank/judge for them at all (see families.ordered_for_engine and
+    config.py's role-families section).
 
     Families ARE the clusters (see services/families.py). Two fallbacks keep a
     run from ever failing for want of family rows: a target_role with no family
@@ -229,25 +228,27 @@ def _role_groups(
     seeding clusterer in memory, without persisting; a profile with no target
     roles at all yields no clusters, exactly as before."""
     families = list_families(db, profile_id)
-    tier_by_family = {f.id: f.tier for f in families}
+    family_ids = {f.id for f in families}
     by_family: dict[int, list[str]] = defaultdict(list)
     ungrouped: list[str] = []
     for a in g.get("target_role", []):
-        if a.family_id in tier_by_family:
+        if a.family_id in family_ids:
             by_family[a.family_id].append(a.value)
         else:
             ungrouped.append(a.value)
 
+    # ordered_for_engine already filters out inactive families.
     groups = [(f.name, by_family[f.id]) for f in ordered_for_engine(families) if by_family[f.id]]
     groups.extend(cluster_target_roles(ungrouped))
 
     # Same cap the LLM path has always enforced -- discovery volume is fixed per
-    # run, so more clusters only thins each one's pool. ordered_for_engine puts
-    # core families first, so it's a secondary stream that gets merged away.
+    # run, so more active clusters only thins each one's pool. ordered_for_engine
+    # returns active families in display order, so whichever active family is
+    # least-preferred gets merged away.
     if len(groups) > MAX_ROLE_CLUSTERS:
         overflow = [r for _, roles in groups[MAX_ROLE_CLUSTERS - 1:] for r in roles]
         groups = groups[:MAX_ROLE_CLUSTERS - 1] + [(groups[MAX_ROLE_CLUSTERS - 1][0], overflow)]
-    return groups, tier_by_family
+    return groups
 
 
 def _resolve_enforcement(attr: ProfileAttribute) -> str:
@@ -390,18 +391,18 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     # 0 (the slider's default min) means "no floor" -> the filter is a no-op.
     salary_floor = _parse_salary_floor(_values(g.get("salary", [])))
 
-    # Role clusters: one per role family the candidate defined (usually one, but
-    # a candidate targeting genuinely different fields gets several -- see
-    # services/families.py). The engine scores, gates, and evaluates each
-    # independently. Each cluster carries its own weighted_text (scoped to just
-    # that cluster's roles) so its embedding isn't diluted by the candidate's
-    # other, unrelated target roles, and `label` so logs and the "Matched via"
-    # note name the family the candidate named rather than a role inside it.
-    role_groups, tier_by_family = _role_groups(db, profile_id, g)
+    # Role clusters: one per ACTIVE role family the candidate defined (usually
+    # one, but a candidate targeting genuinely different fields gets several --
+    # see services/families.py); inactive families contribute no cluster at all
+    # (see _role_groups). The engine scores, gates, and evaluates each cluster
+    # independently. Each carries its own weighted_text (scoped to just that
+    # cluster's roles) so its embedding isn't diluted by the candidate's other,
+    # unrelated target roles, and `label` so logs and the "Matched via" note
+    # name the family the candidate named rather than a role inside it.
+    role_groups = _role_groups(db, profile_id, g)
     role_clusters = [
         {"label": label, "roles": grp,
-         "weighted_text": _weighted_text(g, search_terms,
-                                          role_filter=set(grp), tier_by_family=tier_by_family)}
+         "weighted_text": _weighted_text(g, search_terms, role_filter=set(grp))}
         for label, grp in role_groups
     ]
 
