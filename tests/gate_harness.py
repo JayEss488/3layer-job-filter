@@ -161,7 +161,7 @@ def _score_sampled_rows(engine_svc, engine, rows, cluster_embeddings):
     rows actually had an embedding first, then null out the fallback ones after,
     so the report doesn't misrepresent a missing embedding as a real low score."""
     had_embedding = {r.identity_hash: bool(r.embedding) for r in rows}
-    scored = engine_svc._score_rows(engine, rows, cluster_embeddings)
+    scored = engine_svc._score_rows(rows, cluster_embeddings)
     for d in scored:
         if had_embedding.get(d.get("_identity"), False):
             d["_embed_fallback"] = False

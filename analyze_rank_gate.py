@@ -118,7 +118,7 @@ def main():
         all_rows = db.query(models.JobSeen).filter(models.JobSeen.profile_id == profile_id).all()
         rows_with_embedding = [r for r in all_rows if r.embedding]
         print(f"[analyze] {len(rows_with_embedding)}/{len(all_rows)} jobs_seen rows have a cached embedding")
-        scored = engine_svc._score_rows(engine, rows_with_embedding, cluster_embeddings)
+        scored = engine_svc._score_rows(rows_with_embedding, cluster_embeddings)
 
         # ── Final picks from the cross-referenced run, for guaranteed inclusion ─
         roles = (

@@ -211,7 +211,7 @@ def main():
 
     cluster_texts = [c["weighted_text"] for c in snap["role_clusters"]]
     cluster_embeddings = engine.get_embeddings_batch(cluster_texts)
-    scored_all = engine_svc._score_rows(engine, jobseen_rows, cluster_embeddings)
+    scored_all = engine_svc._score_rows(jobseen_rows, cluster_embeddings)
     scored_by_identity = {d["_identity"]: d for d in scored_all}
 
     role_clusters = snap["role_clusters"]

@@ -103,7 +103,7 @@ def main():
             raise SystemExit("no cached job embeddings for this profile -- run a real search at least once first")
 
         # ── Re-score (free, local) and re-derive the heuristic verdict ─────────
-        scored = engine_svc._score_rows(engine, rows_with_embedding, cluster_embeddings)
+        scored = engine_svc._score_rows(rows_with_embedding, cluster_embeddings)
         by_identity = {r.identity_hash: r for r in rows_with_embedding}
 
         junior_band, senior_band = engine_svc._JUNIOR_BAND, engine_svc._SENIOR_BAND

@@ -109,6 +109,16 @@ ALT_SOURCE_LOOKUP_MAX_PER_RUN = int(os.getenv("ALT_SOURCE_LOOKUP_MAX_PER_RUN", "
 REED_DETAIL_ENRICH_ENABLED = os.getenv("REED_DETAIL_ENRICH_ENABLED", "true").lower() == "true"
 REED_DETAIL_MAX_PER_RUN = int(os.getenv("REED_DETAIL_MAX_PER_RUN", "150"))
 
+# Pages fetched per (source, term) by gather_jobs' per-run discovery, cut from
+# the fetchers' own pages=3 default (which the legacy standalone path keeps).
+# One page still returns up to 100 (Reed) / 50 (Adzuna) results per term, and a
+# measured live run discovered 7,800 raw listings of which only ~100 were ever
+# examined past the embedding stage -- pages 2-3 were pure fetch latency. The
+# fetchers emit a "page cap hit" note whenever the last page came back full, so
+# the coverage trade-off stays visible per term.
+REED_PAGES_PER_TERM = int(os.getenv("REED_PAGES_PER_TERM", "1"))
+ADZUNA_PAGES_PER_TERM = int(os.getenv("ADZUNA_PAGES_PER_TERM", "1"))
+
 DEBUG_SAVE_RAW = True
 
 # ── Dynamic Path Configuration ──────────────────────────────────────────────────
@@ -210,6 +220,16 @@ GATE_LISTING_TEXT_CHARS = 2000
 # that with headroom while staying well short of the judge's full 8000-char
 # budget.
 RANK_LISTING_TEXT_CHARS = 3000
+
+# Below this many available chars (and with no enriched/scraped full_text), a
+# listing reaching rank_gate is tagged as a truncated source teaser in the
+# prompt (see _score_rank_batch). Mirrors engine.py's SNIPPET_SUFFICIENT_CHARS
+# reasoning: the Reed/Adzuna search APIs truncate descriptions at ~455-500
+# chars, which is the opening blurb only -- the requirements section is simply
+# not visible. The tag tells the rank model that explicitly, so its HARD
+# DOWNGRADES (which require CLEAR visible evidence) don't fire on absence and
+# its score leans on what actually IS visible instead of guessing at the rest.
+RANK_TEASER_MARKER_CHARS = 600
 
 # Category-page expansion (see expand_category_pages): Google-organic discovery
 # has no caching, so this cost repeats every run that surfaces category hits,
@@ -421,6 +441,7 @@ def fetch_reed(query: str, location: str = "United Kingdom", country_code: str =
     url = "https://www.reed.co.uk/api/1.0/search"
     page_size = 100  # Reed's max resultsToTake
     jobs: List[Dict] = []
+    last_page_full = False
     for page in range(pages):
         params = {"keywords": query,
                   "resultsToTake": page_size, "resultsToSkip": page * page_size}
@@ -431,6 +452,7 @@ def fetch_reed(query: str, location: str = "United Kingdom", country_code: str =
             results = r.json().get("results", [])
         except Exception as e:
             emit(f"   [!] Reed API Error: {e}")
+            last_page_full = False
             break
         for job in results:
             jobs.append({
@@ -443,8 +465,11 @@ def fetch_reed(query: str, location: str = "United Kingdom", country_code: str =
                 "salary_max": job.get("maximumSalary"),
                 "snippet": job.get("jobDescription", "")
             })
+        last_page_full = len(results) >= page_size
         if len(results) < page_size:  # last page reached
             break
+    if last_page_full:
+        emit(f"   [reed] '{query}': page cap ({pages}) hit with a full page -- more results likely available")
     return jobs
 
 
@@ -545,6 +570,7 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
         base_params["where"] = location.split(",")[0].strip()
 
     jobs: List[Dict] = []
+    last_page_full = False
     for page in range(1, pages + 1):
         url = f"https://api.adzuna.com/v1/api/jobs/{cc}/search/{page}"
         try:
@@ -553,6 +579,7 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
             results = body.get("results", [])
         except Exception as e:
             emit(f"   [!] Adzuna ({cc}) API Error: {e}")
+            last_page_full = False
             break
         for job in results:
             jobs.append({
@@ -568,8 +595,11 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
         if page == 1 and not results:
             emit(f"   [!] Adzuna ({cc}) returned 0 results for '{query}' "
                  f"(where={base_params.get('where', '<none>')}): {body.get('exception') or body.get('error') or 'no error field'}")
+        last_page_full = len(results) >= 50
         if len(results) < 50:  # last page reached
             break
+    if last_page_full:
+        emit(f"   [adzuna] '{query}': page cap ({pages}) hit with a full page -- more results likely available")
     return jobs
 
 
@@ -1010,54 +1040,70 @@ def _google_location(profile: Dict) -> str:
     return _CC_DISPLAY.get(cc, "United Kingdom")
 
 
+# Each source's fetch() is a plain sequential loop over fetch_term(), so the
+# JobSource protocol (and the legacy standalone path that calls fetch())
+# behaves exactly as before -- but gather_jobs fans the per-term calls out as
+# individual pool tasks instead (see its task construction), which is what
+# turned e.g. Reed's 6-terms-x-3-pages = 18 sequential HTTP calls in a single
+# pool slot into 6 concurrent one-page calls. Reed/Adzuna pass the
+# *_PAGES_PER_TERM caps explicitly; the fetchers' own pages=3 defaults are the
+# legacy path's behavior and stay untouched.
 class ReedSource:
     name, tier = "reed", "fast"
+    def fetch_term(self, profile, term):
+        return fetch_reed(term, _geo_scoped_location(profile),
+                          profile.get("adzuna_country_code", "gb"),
+                          pages=REED_PAGES_PER_TERM)
     def fetch(self, profile, since=None):
         out: List[Dict] = []
-        country_code = profile.get("adzuna_country_code", "gb")
-        location = _geo_scoped_location(profile)
         for term in _terms(profile):
-            out.extend(fetch_reed(term, location, country_code))
+            out.extend(self.fetch_term(profile, term))
         return out
 
 
 class AdzunaSource:
     name, tier = "adzuna", "fast"
+    def fetch_term(self, profile, term):
+        return fetch_adzuna(term, _geo_scoped_location(profile),
+                            profile.get("adzuna_country_code", "gb"),
+                            pages=ADZUNA_PAGES_PER_TERM)
     def fetch(self, profile, since=None):
         out: List[Dict] = []
-        location = _geo_scoped_location(profile)
         for term in _terms(profile):
-            out.extend(fetch_adzuna(term, location,
-                                    profile.get("adzuna_country_code", "gb")))
+            out.extend(self.fetch_term(profile, term))
         return out
 
 
 class GoogleJobsSource:
     name, tier = "google_jobs", "broad"   # organic discovery via serper.dev/SerpAPI
+    def fetch_term(self, profile, term):
+        return fetch_google_jobs(term, _google_location(profile))
     def fetch(self, profile, since=None):
         out: List[Dict] = []
-        location = _google_location(profile)
         for term in _terms(profile):
-            out.extend(fetch_google_jobs(term, location))
+            out.extend(self.fetch_term(profile, term))
         return out
 
 
 class JSearchSource:
     name, tier = "jsearch", "broad"
+    def fetch_term(self, profile, term):
+        return fetch_jsearch(term, _google_location(profile))
     def fetch(self, profile, since=None):
         out: List[Dict] = []
-        location = _google_location(profile)
         for term in _terms(profile):
-            out.extend(fetch_jsearch(term, location))
+            out.extend(self.fetch_term(profile, term))
         return out
 
 
 class RemotiveSource:
     name, tier = "remotive", "broad"
+    def fetch_term(self, profile, term):
+        return fetch_remotive(term)
     def fetch(self, profile, since=None):
         out: List[Dict] = []
         for term in _terms(profile):
-            out.extend(fetch_remotive(term))
+            out.extend(self.fetch_term(profile, term))
         return out
 
 
@@ -1369,8 +1415,21 @@ def gather_jobs(profile: Dict) -> List[Dict]:
     # keys (API source names like "adzuna"/"google_jobs" and ATS vendor names like
     # "greenhouse"/"lever"). Anything in it is skipped for this run.
     disabled = set(profile.get("disabled_sources") or [])
-    tasks: List[tuple] = [("src", s) for s in select_sources_for_run(profile)
-                          if s.name not in disabled]
+    # select_sources_for_run must run before _terms(): it fills
+    # profile["search_terms_batch"] as a side effect (which engine.py also
+    # reads back after this returns).
+    sources = [s for s in select_sources_for_run(profile) if s.name not in disabled]
+    terms = _terms(profile)
+    # One pool task per (source, term) rather than one per source: a source's
+    # old whole-run task was up to TERMS_PER_RUN sequential per-term calls
+    # occupying a single pool slot (Reed at 3 pages/term was 18 sequential
+    # HTTP calls -- the measured long pole of a 55s discovery phase).
+    tasks: List[tuple] = []
+    for s in sources:
+        if hasattr(s, "fetch_term") and terms:
+            tasks += [("term", (s, t)) for t in terms]
+        else:
+            tasks.append(("src", s))
     tasks += [("ats", (vendor, token))
               for (_company, vendor, token) in select_ats_batch_for_run(profile)
               if vendor not in disabled]
@@ -1386,30 +1445,49 @@ def gather_jobs(profile: Dict) -> List[Dict]:
 
     def run_task(t):
         kind, payload = t
+        started = time.monotonic()
         if kind == "src":
             result = payload.fetch(profile, since=profile.get("since")) or []
-            emit(f"   [source] {payload.name}: {len(result)} jobs")
-            return None, result
+            elapsed = time.monotonic() - started
+            emit(f"   [source] {payload.name}: {len(result)} jobs in {elapsed:.1f}s")
+            return kind, payload.name, result, elapsed
+        if kind == "term":
+            src, term = payload
+            result = src.fetch_term(profile, term) or []
+            elapsed = time.monotonic() - started
+            emit(f"   [source] {src.name} ('{term}'): {len(result)} jobs in {elapsed:.1f}s")
+            return kind, src.name, result, elapsed
         vendor, token = payload
-        return vendor, (fetch_ats(vendor, token) or [])
+        return kind, vendor, (fetch_ats(vendor, token) or []), time.monotonic() - started
 
     all_jobs: List[Dict] = []
+    term_counts: Counter = Counter()
     ats_counts: Counter = Counter()
+    slowest: Dict[str, float] = {}
     with ThreadPoolExecutor(max_workers=12) as ex:
         for fut in as_completed([ex.submit(run_task, t) for t in tasks]):
             try:
-                vendor, result = fut.result()
+                kind, name, result, elapsed = fut.result()
                 all_jobs.extend(result)
-                if vendor is not None:
-                    ats_counts[vendor] += len(result)
+                key = f"ats:{name}" if kind == "ats" else name
+                slowest[key] = max(slowest.get(key, 0.0), elapsed)
+                if kind == "ats":
+                    ats_counts[name] += len(result)
+                elif kind == "term":
+                    term_counts[name] += len(result)
             except Exception as e:
                 emit(f"   [!] discovery task failed: {e}")
 
+    # Aggregated per-source totals (the per-term lines above are the detail).
+    # "slowest term" is the source's latency floor at full parallelism -- the
+    # number to look at when discovery is slow.
+    for name, count in sorted(term_counts.items()):
+        emit(f"   [source] {name}: {count} jobs total (slowest term {slowest.get(name, 0.0):.1f}s)")
     # One aggregated per-vendor count, comparable to the [source] lines above --
     # without this, ATS source performance was only inferable indirectly from the
     # post-filter board breakdown further down the pipeline.
     for vendor, count in sorted(ats_counts.items()):
-        emit(f"   [source] ats:{vendor}: {count} jobs")
+        emit(f"   [source] ats:{vendor}: {count} jobs (slowest board {slowest.get(f'ats:{vendor}', 0.0):.1f}s)")
 
     if DEBUG_SAVE_RAW:
         with open(os.path.join(BASE_DIR, "raw_api_jobs.json"), "w") as f:
@@ -2595,6 +2673,7 @@ def _rank_prompt(profile: dict, listing_block: str) -> str:
         "don't penalize a listing for not matching an unrelated interest of theirs.\n"
         if profile.get("_multi_cluster") else ""
     )
+    salary_floor = profile.get("salary_floor") or 0
     return f"""You are estimating how well each job listing fits ONE candidate, as a rough numeric score.
 This score gates which listings proceed to detailed review -- a wrong score buries a job silently, so
 when genuinely unsure between two scores, prefer the higher one.
@@ -2602,8 +2681,41 @@ when genuinely unsure between two scores, prefer the higher one.
 Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms') or [], profile.get('target_role_weight_tiers'))}
 Candidate seniority: {profile.get('seniority', 'mid-level')}
 Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'), profile.get('skill_evidence_tiers'))}
+Candidate location: {profile.get('location') or 'none stated'}
+Candidate work-type preference: {', '.join(profile.get('work_types') or []) or 'none stated'}
+Candidate stated salary floor: {salary_floor if salary_floor else 'none stated'}
 {_candidate_background_block(profile)}{multi_note}
-SCORING -- two components, in this order:
+Some listing text is scraped from a web page and may include unrelated boilerplate around the actual job:
+site navigation, a page footer, a "Similar jobs" list or a salary histogram carrying OTHER roles' figures.
+Judge only the posting itself -- never treat a salary, requirement or location from such a footer as this
+role's (it would misfire the SALARY/LOCATION downgrades below).
+
+HARD DOWNGRADES -- check these FIRST. If a listing's visible text CLEARLY shows any of the following,
+that listing scores 15 or below no matter how well the function matches, and its note must name which
+one fired. Each needs CLEAR, explicit evidence in the text shown -- some listings below are tagged as
+truncated source teasers; silence, ambiguity, or truncation NEVER triggers a downgrade, and a listing
+is never downgraded for merely failing to confirm something.
+a. EXPERIENCE BAR: the listing states a minimum professional-experience requirement (e.g. "2+ years
+   as a data analyst", "proven commercial experience in X") that the candidate's evidence above
+   clearly does not meet. Evidence tagged "self-directed", "academic", "ai-assisted", "one-time", or
+   "familiar evidence only" -- or a background of degree/personal projects with no paid role in the
+   function -- is NOT professional experience here: matching the listed tools does not clear a stated
+   experience bar. Wording like "internships count" only helps if the candidate actually evidences one.
+b. REQUIRED CREDENTIAL OR TOOL: the listing names a specific certification, qualification level, or
+   tool as REQUIRED (not nice-to-have) and nothing in the candidate's skills/background above
+   evidences it or plainly covers it.
+c. CLOSED LISTING: the text says the vacancy is closed -- e.g. "the application deadline has now
+   passed", "no longer accepting applications".
+d. LOCATION / WORK ARRANGEMENT: first classify the LISTING's own arrangement -- explicit remote/
+   distributed/work-from-home wording means remote; explicit hybrid wording means hybrid; a stated
+   city/office with no remote/hybrid mention means ON-SITE there (never remote-by-default). Downgrade
+   only if that classified arrangement clearly cannot work given the candidate's stated location and
+   work-type preference above (e.g. on-site or hybrid in another country), or the listing requires an
+   already-held work permit / right-to-work in a country that clearly isn't the candidate's.
+e. SALARY: the listing states a salary clearly below the candidate's stated floor (never a downgrade
+   when either is unstated or the ranges could plausibly overlap).
+
+SCORING -- two components, in this order (for listings with no hard downgrade):
 1. FUNCTION MATCH (the primary driver of the score): does the role's actual day-to-day work match the
    target roles above -- a same-function role in a different industry is a good match; a different-
    function role in the candidate's own industry is not. Within "analyst"-type titles specifically,
@@ -2627,8 +2739,10 @@ the whole batch -- spread scores out rather than clustering everything near one 
 
 Output ONLY JSON: {{"scores":[{{"n":1,"fit_score":72,"note":"..."}},{{"n":2,"fit_score":40,"note":"..."}}]}}
 "note": one short phrase (under 12 words) naming the main driver of the score -- e.g. "strong function +
-title match" or "operational role, weak function match despite title". For audit purposes only, never
-shown to the candidate. Include one object per listing, numbered exactly as shown.
+title match" or "operational role, weak function match despite title". For a hard-downgraded listing,
+the note MUST name the downgrade, e.g. "hard: 3+ years paid experience bar" or "hard: on-site Cyprus,
+candidate UK". For audit purposes only, never shown to the candidate. Include one object per listing,
+numbered exactly as shown.
 
 Listings:
 {listing_block}"""
@@ -2644,9 +2758,20 @@ def _score_rank_batch(
     short audit phrase per listing (see _rank_prompt's "note" field) -- for a
     borderline drop, this is the only record of WHY it scored low enough to be cut
     before the expensive judge ever saw it (see engine.py's Snapshot panel)."""
+    def _teaser_tag(c: dict) -> str:
+        # See RANK_TEASER_MARKER_CHARS: a job with only its source API's ~500-char
+        # teaser gets tagged so the model knows the requirements section isn't
+        # visible (vs. a short posting that genuinely says this little).
+        text = c.get("full_text") or c.get("snippet") or ""
+        if not c.get("_has_full_text") and len(text) < RANK_TEASER_MARKER_CHARS:
+            return ("[truncated source teaser -- only the posting's opening is visible; "
+                    "its requirements section is likely cut off] ")
+        return ""
+
     listing_block = "\n".join(
         f"{i+1}. {c['title']} @ {c.get('company','')} | "
-        f"{(c.get('location') or 'location unknown')} | "
+        f"{(c.get('location') or 'location unknown')}{_listing_salary_suffix(c)} | "
+        f"{_teaser_tag(c)}"
         f"{'[gate note: role-function fit vs target roles was ambiguous, not a confirmed match] ' if c.get('_sector_ambiguous') else ''}"
         f"{(c.get('full_text') or c.get('snippet') or '')[:RANK_LISTING_TEXT_CHARS]}"
         for i, (c, _k) in enumerate(batch)
@@ -2742,8 +2867,24 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     with `_rank_score` (0-100, higher is better) and `_rank_note` (short audit
     phrase, "" if none) in place and returns the full list unfiltered -- the
     caller applies its own cutoff (e.g. drop the bottom fraction, cap at N).
-    Cached per (profile signature, job id) in gate_cache under gate="rank_v5"
-    (bumped from "rank_v4": the prompt gained a paragraph on how to weigh a
+    Cached per (profile signature, job id) in gate_cache under gate="rank_v7"
+    (bumped from "rank_v6": the prompt gained a boilerplate-scope guard telling the
+    model to ignore a scraped page's nav/footer/"Similar jobs"/salary-histogram
+    sections so a neighbouring role's salary can't misfire the SALARY/LOCATION
+    downgrades -- a score computed without that guard, against text that may carry
+    such a footer, isn't comparable and must not be served stale. "rank_v6" was
+    bumped from "rank_v5": the prompt gained the candidate's location/work-type
+    preference/salary floor -- previously never in this prompt at all, so an
+    on-site-abroad listing could score 84 with no way to know it was even a
+    candidate for rejection -- plus a HARD DOWNGRADES section (a clearly-stated
+    experience bar the candidate's evidence doesn't meet, a required named
+    credential/tool with no evidence, a closed/expired listing, a clear
+    location/arrangement conflict, or salary clearly under the stated floor now
+    cap the score at 15, mirroring the final judge's DISQUALIFIER rules that a
+    live mismatch audit showed this stage scoring 80+ against), a truncated-
+    teaser tag on listings that only carry their source API's ~500-char opening
+    blurb, and the structured salary line in the listing block. "rank_v5" was
+    bumped from "rank_v4": the prompt gained a paragraph on how to weigh a
     "[gate note: ... ambiguous ...]" tag (see screen_gate's sector_confidence and
     _score_rank_batch's listing_block), and the per-listing text budget grew from
     GATE_LISTING_TEXT_CHARS to the new, larger RANK_LISTING_TEXT_CHARS -- a score
@@ -2765,12 +2906,12 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    # "rank_v5" (not "rank_v4"): the gate name doubles as part of the cache key, and
+    # "rank_v7" (not "rank_v6"): the gate name doubles as part of the cache key, and
     # _gate_cache_key has no model field -- bumping it forces every previously
-    # scored job to be re-ranked under the reworded prompt/larger excerpt instead
-    # of serving a stale score forever. Bump again if the rank model/prompt changes
-    # again.
-    keys = [_gate_cache_key("rank_v5", sig, _gate_job_id(c)) for c in candidates]
+    # scored job to be re-ranked under the reworded prompt (now with the boilerplate-
+    # scope guard, see the docstring) instead of serving a stale score forever. Bump
+    # again if the rank model/prompt changes again.
+    keys = [_gate_cache_key("rank_v7", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -2958,19 +3099,58 @@ def _scrape_succeeded(result, markdown: str) -> bool:
 # into the text than GATE_LISTING_TEXT_CHARS's truncation window expected, and the
 # weak gate's listing_ok check misread the truncated nav-heavy excerpt as board
 # boilerplate/a category page rather than a real single posting.
+# Aggregator/job-board pages append a footer that is NOT part of the posting: a
+# salary histogram ("Stats for this job" / "The number of jobs in each salary
+# range"), a "Similar jobs" list carrying OTHER roles' salaries, and email-alert
+# chrome. crawl4ai's density-based PruningContentFilter does not reliably drop it
+# (real headings + real figures survive), so it can land in full_text and mislead
+# the final judge -- e.g. reading a neighbouring job's "£50,000 - £55,000" as THIS
+# role's salary. Cut everything from the earliest high-confidence footer marker
+# that appears as its own line; these strings essentially never occur inside a real
+# JD body, and line-anchoring (tolerating markdown heading/emphasis punctuation)
+# avoids mid-sentence false hits.
+_FOOTER_MARKERS = [
+    "stats for this job",
+    "receive similar jobs by email",
+    "the number of jobs in each salary range",
+    "similar jobs",
+    "create alert",
+]
+_FOOTER_MARKER_RE = re.compile(
+    r"(?im)^[\s#>*_+.\-]*(?:" + "|".join(re.escape(m) for m in _FOOTER_MARKERS) + r")[\s:*_.\-]*$"
+)
+
+
+def _strip_boilerplate_footer(md: str) -> str:
+    """Trim an aggregator's non-posting footer (salary histogram / "Similar jobs" /
+    alert chrome) from scraped markdown -- see _FOOTER_MARKERS. No-op when no marker
+    is found, or when trimming would leave almost nothing (the marker probably
+    matched real content, or the page wasn't a real posting to begin with)."""
+    if not md:
+        return md
+    m = _FOOTER_MARKER_RE.search(md)
+    if not m:
+        return md
+    trimmed = md[:m.start()].rstrip()
+    if len(trimmed) < 200:
+        return md
+    return trimmed
+
+
 def _best_markdown(result) -> str:
     """Prefers crawl4ai's content-filtered `fit_markdown` (main content only) over
     the raw page markdown, falling back to raw when fit_markdown is missing or
     implausibly short (a handful of words) -- an unusual page layout the pruning
     heuristic mishandles should still yield *something* to judge against rather
-    than an empty/near-empty string."""
+    than an empty/near-empty string. Either way, a known aggregator footer is
+    stripped (see _strip_boilerplate_footer)."""
     md = result.markdown
     if md is None:
         return ""
     fit = getattr(md, "fit_markdown", None)
     if fit and len(fit.strip()) >= 200:
-        return fit.strip()
-    return str(md).strip()
+        return _strip_boilerplate_footer(fit.strip())
+    return _strip_boilerplate_footer(str(md).strip())
 
 
 async def _find_alternate_posting(
@@ -3029,15 +3209,40 @@ def _distinctive_sentence(text: str) -> str | None:
     return None
 
 
+# Generic job-board/aggregator sites (careerjet, bebee, opcionempleo, indeed, etc.)
+# mirror real postings verbatim as their normal SEO/aggregation business model --
+# scraping ATS pages, other boards, and Google Jobs. Finding a listing's own text
+# duplicated on one of these is expected of ANY real posting (the more widely a
+# genuine role is distributed, the MORE likely this is, not less) and is not
+# evidence of a lead-gen/CV-farming scam, so a hit on one of these must not count
+# as corroboration. Matched as a substring of the host so one fragment (e.g.
+# "careerjet") covers every country-code TLD variant (careerjet.com.qa,
+# careerjet.co.uk, careerjet.fr, ...) without listing each one. Also includes
+# reed/adzuna since this pipeline already treats those as legitimate primary
+# sources in their own right -- a cross-post there is a positive signal, if anything.
+_KNOWN_JOB_AGGREGATOR_FRAGMENTS = (
+    "careerjet", "bebee", "opcionempleo", "indeed", "glassdoor", "ziprecruiter",
+    "jooble", "trovit", "jobrapido", "whatjobs", "simplyhired", "linkedin",
+    "monster", "talent.com", "jobisjob", "jobted", "mitula", "neuvoo",
+    "learn4good", "adzuna", "reed.co.uk", "jora.com", "receptix",
+)
+
+
+def _is_known_job_aggregator(host: str) -> bool:
+    host = (host or "").lower()
+    return any(frag in host for frag in _KNOWN_JOB_AGGREGATOR_FRAGMENTS)
+
+
 def verify_not_duplicated(job: dict, country_code: str = "gb") -> str | None:
     """Cross-site corroboration for a judge-flagged `scam_suspect` pick: search a
     distinctive sentence from the listing's own scraped text in quotes, and check
-    whether it verbatim-appears on an unrelated, differently-hosted site --
-    genuine single-employer postings essentially never propagate word-for-word
-    across independent boards. The caller (engine.py) gates this to only the rare
-    already-suspicious pick, bounded by SCAM_VERIFY_MAX_PER_RUN, since it spends a
-    real search call. Fails open: any search/parse issue, or no distinctive
-    sentence available, returns None -- never itself a disqualifier."""
+    whether it verbatim-appears on an unrelated, differently-hosted site that ISN'T
+    a known job-board/aggregator (see _is_known_job_aggregator -- those mirror real
+    postings verbatim as routine SEO/aggregation, so a hit there proves nothing).
+    The caller (engine.py) gates this to only the rare already-suspicious pick,
+    bounded by SCAM_VERIFY_MAX_PER_RUN, since it spends a real search call. Fails
+    open: any search/parse issue, or no distinctive sentence available, returns
+    None -- never itself a disqualifier."""
     sentence = _distinctive_sentence(job.get("full_text", ""))
     if not sentence:
         return None
@@ -3049,7 +3254,7 @@ def verify_not_duplicated(job: dict, country_code: str = "gb") -> str | None:
     needle = sentence.lower()
     for r in results:
         host = _scrape_host(r.get("link", ""))
-        if not host or host == orig_host:
+        if not host or host == orig_host or _is_known_job_aggregator(host):
             continue
         haystack = f"{r.get('title','')} {r.get('snippet','')}".lower()
         if needle in haystack or needle[:40] in haystack:
@@ -3291,7 +3496,7 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
-FINAL_EVAL_PROMPT_VERSION = 13
+FINAL_EVAL_PROMPT_VERSION = 15
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -3364,6 +3569,17 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    These softer signals are ADDITIVE, not independently sufficient - set "scam_suspect": true (see
    schema below) whenever exactly ONE is present so it can be corroborated before the listing reaches
    the candidate, and only move straight to "disqualified" when two or more coincide.
+   IMPORTANT EXCEPTION for recruitment/staffing agencies: if the listing block carries a
+   "[source: ...]" note identifying it as sourced via a registered ATS/careers-page account (Workable,
+   Greenhouse, Lever, Ashby, Recruitee, Personio), that confirms a real, currently-operating company or
+   agency account sits behind it - it is not a scraped or self-submitted page. For these, an anonymized
+   "one of our clients is hiring" framing and a high same-run posting-volume note are BOTH normal,
+   expected traits of a legitimate recruitment/staffing agency operating that account (agencies routinely
+   advertise many similar roles for undisclosed end-clients) - do not count either one toward the
+   two-signal threshold on its own for a listing carrying that source note. Only disqualify such a
+   listing under this rule if an independently-sufficient hard signal below is also present, or if the
+   content-free "About Us" signal describes the AGENCY itself with no concrete detail about what it
+   recruits for or which sector it operates in.
    The following are independently sufficient - either ALONE disqualifies immediately, no combination
    needed: payment, purchase, bank/financial, or sensitive-ID (passport, National Insurance/SSN) requests
    as a condition of applying or being hired; contact/apply only via a personal Gmail/Yahoo/Outlook
@@ -3564,7 +3780,7 @@ optional list, using this item shape for "strong"/"backup":
     "top_match_reason": "a short first-person narrative synthesizing why this role earned its verdict -- see reasoning step E.",
     "requirements": [{"text": "a JD requirement, short and concrete", "category": "core" | "secondary", "met": true}],
     "concerns": ["each notable gap, one per item, most sink-worthy first -- see reasoning step C; [] if none"],
-    "role_salary": "the salary or range the LISTING states, verbatim and short (e.g. \\"GBP 35,000-42,000\\"); null if it states none",
+    "role_salary": "the salary or range THIS posting's own description states, verbatim and short (e.g. \\"GBP 35,000-42,000\\"); null if this posting states none -- even when other salary figures appear elsewhere in the supplied text (a \\"Similar jobs\\" list or salary histogram, see SCOPE OF EACH POSTING'S TEXT)",
     "work_style": "Remote" | "Hybrid" | "On-site" | null,
     "role_seniority": "the role's REAL seniority bar from axis A (e.g. \\"Graduate\\", \\"Junior\\", \\"Mid\\", \\"Senior\\"); null if you genuinely can't tell",
     "deadline": "the application deadline the listing states, short (e.g. \\"15 August\\", \\"rolling\\"); null if it states none",
@@ -3596,9 +3812,10 @@ concerns) or "strong" (genuinely strong, one real but surmountable concern); ite
 "backup" are "ok" (a plausible fit with real gaps) or "stretch" (they'd be reaching for it).
 Grade honestly -- "very_strong" should be rare.
 
-"role_salary"/"work_style"/"role_seniority"/"deadline" are FACTS READ OFF THE LISTING, not
-judgements about the candidate. Report only what the listing actually says: use null when it is
-silent, and never infer or estimate. For "work_style" apply the same classification as the
+"role_salary"/"work_style"/"role_seniority"/"deadline" are FACTS READ OFF THIS POSTING, not
+judgements about the candidate. Report only what this posting's own description actually says: use null
+when it is silent, and never infer, estimate, or borrow a figure from another posting's text in the
+payload (see SCOPE OF EACH POSTING'S TEXT). For "work_style" apply the same classification as the
 LOCATION/VISA/RELOCATION rule -- a stated office location with no remote/hybrid/work-from-home
 wording anywhere is "On-site", not null and not "Remote".
 
@@ -3611,6 +3828,14 @@ language text a candidate can understand without the rest of the analysis."""
 # carries all the rules; the per-call user prompt is just the CV + the jobs payload.
 _FINAL_EVAL_SYSTEM = f"""You are an elite talent placement advisor matching a candidate to open job vacancies.
 You are given a candidate profile and a set of job postings, and must return TWO lists: "strong" and "backup".
+
+SCOPE OF EACH POSTING'S TEXT -- read first. Each posting's text is scraped from a web page and may contain
+unrelated boilerplate wrapped around the actual job description: site navigation, page footers, a "Similar jobs"
+list, a "Stats for this job" salary histogram, "Receive similar jobs by email"/"Create alert" chrome, and
+salaries, titles or locations belonging to OTHER postings. Judge ONLY the single posting named at the top of each
+job block (its title/company/URL). Ignore anything that clearly belongs to a different job or to the site's own
+chrome. In particular, never attribute a salary, deadline, location or requirement to this role unless it appears
+in THIS posting's own description -- a figure from a "Similar jobs"/histogram footer is not this role's salary.
 
 DISQUALIFIERS -- apply to EVERY role, for BOTH lists, first:
 {_FINAL_EVAL_QUOTE_PROTOCOL}
@@ -3658,6 +3883,15 @@ def _final_eval_job_block(i: int, j: dict) -> str:
     reason = j.get("_gate_reason") or ""
     parts = [p for p in reason.split("|") if p and p not in ("ok", "gate_error", "missing_decision")]
     hint = f"[screen note: {', '.join(parts)}]\n" if parts else ""
+    # ATS-vendor board tags are "{vendor}:{token}" (see harvest_ats_tokens/company_ats
+    # ingestion); API-sourced boards are flat names ("reed", "adzuna", "google_jobs",
+    # ...) with no colon. Surfaced so the SCAM/CV-FARMING disqualifier (rule 4 above)
+    # can tell a registered agency/employer ATS account apart from a scraped or
+    # self-submitted listing -- see that rule's staffing-agency exception.
+    board = j.get("board") or ""
+    if ":" in board:
+        vendor = board.split(":", 1)[0]
+        hint += f"[source: sourced via a registered {vendor} ATS/careers-page account]\n"
     volume_hint = j.get("_posting_volume_hint")
     hint += f"[posting-volume note: {volume_hint}]\n" if volume_hint else ""
     key_reqs = j.get("_key_requirements") or []

@@ -842,7 +842,7 @@ def main():
             raise SystemExit("no cached, embedded jobs_seen rows for this profile -- run a real search "
                               "at least once first so there's something real to sample.")
 
-        scored = engine_svc._score_rows(engine, rows_with_embedding, cluster_embeddings)
+        scored = engine_svc._score_rows(rows_with_embedding, cluster_embeddings)
         by_cluster = defaultdict(list)
         for d in scored:
             by_cluster[d["_cluster"]].append(d)
