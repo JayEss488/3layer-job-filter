@@ -172,7 +172,7 @@ function ProfileBody({ profileId }: { profileId: number }) {
                 ? `Limit reached (${MAX_ROLE_FAMILIES} max)`
                 : undefined
             }
-            onClick={() => fam.add.mutate({ name: "New role family", tier: "secondary" })}
+            onClick={() => fam.add.mutate({ name: "New role family" })}
           >
             ＋ add role family
           </button>

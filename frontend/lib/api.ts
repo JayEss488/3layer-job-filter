@@ -161,8 +161,13 @@ export const api = {
     req<SearchStatus>(`/profiles/${id}/search/cancel`, { method: "POST" }),
   searchStatus: (id: number) =>
     req<SearchStatus | null>(`/profiles/${id}/search/status`),
-  roles: (id: number, status?: string) =>
-    req<Role[]>(`/profiles/${id}/roles${status ? `?status=${status}` : ""}`),
+  roles: (id: number, status?: string, includeProvisional?: boolean) => {
+    const params = new URLSearchParams();
+    if (status) params.set("status", status);
+    if (includeProvisional) params.set("include_provisional", "true");
+    const qs = params.toString();
+    return req<Role[]>(`/profiles/${id}/roles${qs ? `?${qs}` : ""}`);
+  },
   tick: (roleId: number) => req<Role>(`/roles/${roleId}/tick`, { method: "POST" }),
   cross: (roleId: number) => req<Role>(`/roles/${roleId}/cross`, { method: "POST" }),
   save: (roleId: number) => req<Role>(`/roles/${roleId}/save`, { method: "POST" }),

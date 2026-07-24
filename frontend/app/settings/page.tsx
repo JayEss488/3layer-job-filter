@@ -636,6 +636,13 @@ export default function SettingsPage() {
                           </>
                         )}
                         .
+                        {runFunnel.judge_dupes_suppressed > 0 && (
+                          <>
+                            {" "}{runFunnel.judge_dupes_suppressed} near-duplicate posting
+                            {runFunnel.judge_dupes_suppressed === 1 ? "" : "s"} suppressed before
+                            the judge (same employer, title &amp; text).
+                          </>
+                        )}
                       </>
                     );
                   })()}

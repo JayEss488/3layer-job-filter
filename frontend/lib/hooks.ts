@@ -46,11 +46,16 @@ export function useStats(profileId: number | null) {
   });
 }
 
-export function useRoles(profileId: number | null, status?: string) {
+export function useRoles(
+  profileId: number | null,
+  status?: string,
+  opts?: { includeProvisional?: boolean; refetchInterval?: number | false },
+) {
   return useQuery({
-    queryKey: ["roles", profileId, status ?? "all"],
-    queryFn: () => api.roles(profileId!, status),
+    queryKey: ["roles", profileId, status ?? "all", opts?.includeProvisional ?? false],
+    queryFn: () => api.roles(profileId!, status, opts?.includeProvisional),
     enabled: !!profileId,
+    refetchInterval: opts?.refetchInterval ?? false,
   });
 }
 

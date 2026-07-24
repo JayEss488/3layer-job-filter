@@ -107,6 +107,9 @@ export default function MyRolesPage() {
                   <button className="btn btn-secondary sm" onClick={() => save.mutate(role.id)}>
                     ✓ Save
                   </button>
+                  <button className="btn btn-primary sm" onClick={() => apply.mutate(role.id)}>
+                    Mark as applied
+                  </button>
                   <button className="btn btn-ghost sm" onClick={() => del.mutate(role.id)}>
                     ✕ Delete
                   </button>

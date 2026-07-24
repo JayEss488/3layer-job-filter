@@ -88,8 +88,11 @@ function parseAnalysis(text: string): Analysis {
 
 function factChips(role: Role): string[] {
   // Only what the AI actually read off the listing — a null means the listing
-  // was silent, and no chip is better than a guessed one.
+  // was silent, and no chip is better than a guessed one. While provisional,
+  // the cheap rank stage's estimate is the only fit signal there is — surface
+  // it honestly as an estimate (it disappears when the real verdict lands).
   return [
+    role.provisional && role.rank_score != null ? `Fit estimate ${role.rank_score}/100` : null,
     role.salary_text,
     role.work_style,
     role.seniority_level,
@@ -134,8 +137,13 @@ export function RoleCard({
           )}
         </div>
         <div className="card-corner">
-          {verdict && VERDICT_LABEL[verdict] && (
-            <span className={`verdict v-${verdict}`}>{VERDICT_LABEL[verdict]}</span>
+          {role.provisional ? (
+            <span className="verdict v-verifying">Verifying…</span>
+          ) : (
+            verdict &&
+            VERDICT_LABEL[verdict] && (
+              <span className={`verdict v-${verdict}`}>{VERDICT_LABEL[verdict]}</span>
+            )
           )}
           {meta && <div className="applied-meta">{meta}</div>}
         </div>

@@ -351,6 +351,8 @@ a { color: inherit; }
 .verdict.v-strong { background: var(--accent-tint); color: #8a4023; border-color: var(--accent-ghost-bd); }
 .verdict.v-ok { background: var(--surface-3); color: var(--ink-2); border-color: var(--line-input); }
 .verdict.v-stretch { background: none; color: var(--muted); border-color: var(--line-input); }
+/* Mid-run provisional card: the expensive judge hasn't graded it yet. */
+.verdict.v-verifying { background: none; color: var(--muted); border-color: var(--line-input); border-style: dashed; }
 
 /* The judge's one-line description of the role. Above the analysis box and
    larger than it: it's the first thing worth reading, and it was previously

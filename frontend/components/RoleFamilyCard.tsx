@@ -14,11 +14,14 @@ const REGENERATE_TITLE =
  * card is therefore not just a grouping widget: what you put in it decides how
  * the engine splits its budget.
  *
- * Core/Secondary and the per-role pin both feed an emphasis multiplier on the
- * embedding pre-filter (backend config.FAMILY_TIER_MULT / PINNED_ROLE_MULT).
- * The pin also sets `confirmed`, which is what protects a role from being
- * dropped when target roles regenerate — one control, one meaning ("this one
- * matters"), rather than two near-identical pins the user has to tell apart.
+ * Active/Inactive is a strict on/off switch, not a priority scale: an inactive
+ * family gets no cluster at all — no discovery, no searching, no gate/rank/
+ * judge calls, nothing (see CLAUDE.md's search-pipeline section). The per-role
+ * pin is a separate, milder signal that only matters within an active family:
+ * it feeds an emphasis multiplier on the embedding pre-filter (backend
+ * config.PINNED_ROLE_MULT) and sets `confirmed`, which protects a role from
+ * being dropped when target roles regenerate — one control, one meaning
+ * ("this one matters"), rather than two near-identical pins to tell apart.
  */
 export function RoleFamilyCard({
   profileId,
@@ -74,18 +77,18 @@ export function RoleFamilyCard({
         />
         <div className="fam-head-right">
           <div className="choice-row">
-            {(["core", "secondary"] as const).map((tier) => (
+            {(["active", "inactive"] as const).map((tier) => (
               <button
                 key={tier}
                 className={`toggle sm ${family.tier === tier ? "on" : "off"}`}
                 onClick={() => fam.update.mutate({ id: family.id, tier })}
                 title={
-                  tier === "core"
-                    ? "A main search stream — full weight in results."
-                    : "A side interest — searched, but weighted lower than your core streams."
+                  tier === "active"
+                    ? "Searched every run — has its own discovery, gate, and AI review."
+                    : "Not searched at all — the algorithm ignores this stream completely until you switch it back on."
                 }
               >
-                {tier === "core" ? "Core" : "Secondary"}
+                {tier === "active" ? "Active" : "Inactive"}
               </button>
             ))}
           </div>

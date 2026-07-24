@@ -27,7 +27,13 @@ export default function SearchPage() {
   const { activeId } = useProfiles();
   const qc = useQueryClient();
   const { data: status } = useSearchStatus(activeId);
-  const { data: roles } = useRoles(activeId ?? null, "new,saved,crossed");
+  const running = status?.status === "running";
+  // includeProvisional + a poll while running: mid-run "being verified" rows
+  // land as soon as the engine's gate+rank phase persists them (~halfway).
+  const { data: roles } = useRoles(activeId ?? null, "new,saved,crossed", {
+    includeProvisional: true,
+    refetchInterval: running ? 2500 : false,
+  });
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["roles", activeId] });
@@ -35,6 +41,7 @@ export default function SearchPage() {
   };
   const tick = useMutation({ mutationFn: api.tick, onSuccess: invalidate });
   const cross = useMutation({ mutationFn: api.cross, onSuccess: invalidate });
+  const applyRole = useMutation({ mutationFn: api.apply, onSuccess: invalidate });
   const cancelSearch = useMutation({
     mutationFn: (id: number) => api.cancelSearch(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["searchStatus", activeId] }),
@@ -55,9 +62,17 @@ export default function SearchPage() {
     return <div className="app"><Nav /><div className="center-pad">Loading…</div></div>;
   }
 
-  const running = status?.status === "running";
-  const active = (roles ?? []).filter((r) => r.status !== "crossed");
-  const crossed = (roles ?? []).filter((r) => r.status === "crossed");
+  // !r.provisional: once the run leaves "running", any provisional row still
+  // in the payload is a leftover the engine's cleanup hasn't committed yet
+  // (e.g. the gap right after a cancel) — never render it as a real result.
+  const active = (roles ?? []).filter((r) => r.status !== "crossed" && !r.provisional);
+  const crossed = (roles ?? []).filter((r) => r.status === "crossed" && !r.provisional);
+  // Mid-run "being verified" cards for the current run only.
+  const verifying = running
+    ? (roles ?? []).filter(
+        (r) => r.provisional && r.search_run_id === status?.id && r.status !== "crossed",
+      )
+    : [];
 
   // Second-search semantics: an unreviewed ('new') role left over from an
   // earlier run shouldn't interleave with this run's fresh picks by fit_rank
@@ -71,11 +86,16 @@ export default function SearchPage() {
     null
   );
   const current = active.filter(
-    (r) => r.status !== "new" || r.search_run_id == null || r.search_run_id === latestRunId
+    (r) => r.status === "new" && (r.search_run_id == null || r.search_run_id === latestRunId)
   );
   const previous = active.filter(
     (r) => r.status === "new" && r.search_run_id != null && r.search_run_id !== latestRunId
   );
+  // Saved roles are a completed decision from any run -- shown in their own
+  // section below, never mixed into the ranked `current`/`previous` lists
+  // (their fit_rank is only unique within whichever run produced it, so
+  // mixing them in caused duplicate rank badges alongside this run's picks).
+  const savedRoles = active.filter((r) => r.status === "saved");
 
   return (
     <div className="app">
@@ -88,8 +108,8 @@ export default function SearchPage() {
           <div className="warning-banner warning-banner-row">
             <span>
               <span className="spinner">◴</span> {status?.message || "Building your matches…"} This
-              takes about 3½ minutes (fetching, ranking, and reading full role pages) — feel free to
-              explore other tabs while you wait, we'll have your results when you get back.
+              takes a couple of minutes — top candidates appear below as soon as they're ranked,
+              then get upgraded once the full AI review finishes.
             </span>
             <button
               className="btn btn-ghost sm"
@@ -123,6 +143,46 @@ export default function SearchPage() {
           </div>
         )}
 
+        {running && verifying.length > 0 && (
+          <>
+            <div className="crossed-section-label">
+              Top candidates so far — verifying with the full AI review…
+            </div>
+            <div className="annotation" style={{ padding: "0 0 8px" }}>
+              These are provisional. Anything you don&apos;t Keep will disappear once the
+              full review finishes if it doesn&apos;t make the final cut.
+            </div>
+            {verifying.map((role) => {
+              const kept = role.status === "saved";
+              return (
+                <RoleCard
+                  key={role.id}
+                  role={role}
+                  showRank
+                  indentActions
+                  actions={
+                    <>
+                      <button
+                        className={`btn ${kept ? "btn-primary" : "btn-secondary"}`}
+                        onClick={() => (kept ? cross.mutate(role.id) : tick.mutate(role.id))}
+                        title={kept ? "Click to un-keep (pass)" : "Keep this role even if the AI review later rates it lower"}
+                      >
+                        {kept ? "✓ Kept" : "✓ Keep"}
+                      </button>
+                      <button className="btn btn-secondary" onClick={() => applyRole.mutate(role.id)}>
+                        Mark as applied
+                      </button>
+                      <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
+                        ✗ Pass
+                      </button>
+                    </>
+                  }
+                />
+              );
+            })}
+          </>
+        )}
+
         {!running && current.map((role: Role) => {
           const saved = role.status === "saved";
           return (
@@ -136,10 +196,13 @@ export default function SearchPage() {
                 <>
                   <button
                     className={`btn ${saved ? "btn-primary" : "btn-secondary"}`}
-                    onClick={() => tick.mutate(role.id)}
-                    disabled={saved}
+                    onClick={() => (saved ? cross.mutate(role.id) : tick.mutate(role.id))}
+                    title={saved ? "Click to unsave" : undefined}
                   >
                     {saved ? "✓ Saved" : "✓ Save"}
+                  </button>
+                  <button className="btn btn-secondary" onClick={() => applyRole.mutate(role.id)}>
+                    Mark as applied
                   </button>
                   <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
                     ✗ Pass
@@ -166,10 +229,13 @@ export default function SearchPage() {
                     <>
                       <button
                         className={`btn ${saved ? "btn-primary" : "btn-secondary"}`}
-                        onClick={() => tick.mutate(role.id)}
-                        disabled={saved}
+                        onClick={() => (saved ? cross.mutate(role.id) : tick.mutate(role.id))}
+                        title={saved ? "Click to unsave" : undefined}
                       >
                         {saved ? "✓ Saved" : "✓ Save"}
+                      </button>
+                      <button className="btn btn-secondary" onClick={() => applyRole.mutate(role.id)}>
+                        Mark as applied
                       </button>
                       <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
                         ✗ Pass
@@ -179,6 +245,36 @@ export default function SearchPage() {
                 />
               );
             })}
+          </>
+        )}
+
+        {!running && savedRoles.length > 0 && (
+          <>
+            <div className="crossed-section-label">already saved</div>
+            {savedRoles.map((role) => (
+              <RoleCard
+                key={role.id}
+                role={role}
+                showAnalysis
+                actions={
+                  <>
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => cross.mutate(role.id)}
+                      title="Click to unsave"
+                    >
+                      ✓ Saved
+                    </button>
+                    <button className="btn btn-secondary" onClick={() => applyRole.mutate(role.id)}>
+                      Mark as applied
+                    </button>
+                    <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
+                      ✗ Pass
+                    </button>
+                  </>
+                }
+              />
+            ))}
           </>
         )}
 

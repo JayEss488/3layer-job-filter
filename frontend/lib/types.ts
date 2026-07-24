@@ -53,6 +53,7 @@ export interface RunFunnel {
   final_judge: number;
   final_judge_rejected: number;
   judge_pool_size: number;
+  judge_dupes_suppressed: number;
   shown: number;
 }
 
@@ -172,7 +173,7 @@ export function enforcementOf(attr: Attribute): Enforcement {
   return ENFORCEMENT_DEFAULT[attr.type] ?? "soft";
 }
 
-export type FamilyTier = "core" | "secondary";
+export type FamilyTier = "active" | "inactive";
 
 export interface RoleFamily {
   id: number;
@@ -260,6 +261,10 @@ export interface Role {
   salary_text?: string | null;
   source?: string | null;
   fit_rank?: number | null;
+  /** The cheap rank stage's 0-100 fit estimate; shown only while provisional. */
+  rank_score?: number | null;
+  /** Mid-run "being verified" placeholder — upgraded/removed when the run finishes. */
+  provisional?: boolean;
   ai_analysis?: string | null;
   /** The final judge's grade. Null on rows judged before it existed. */
   verdict?: RoleVerdict | null;
