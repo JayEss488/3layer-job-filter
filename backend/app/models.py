@@ -26,6 +26,23 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
+class User(Base):
+    """A login account. Added for the closed beta: credentials are hand-assigned
+    (see scripts/gen_beta_users.py), not self-service. `User.id` IS the `user_id`
+    every other table already carries, so authenticating simply makes
+    deps.current_user_id() return this id instead of the old hardcoded constant --
+    no other table changed. Passwords are stored as a pbkdf2-sha256 hash + per-user
+    salt (see services/auth.py); the plaintext is never persisted."""
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(Text, nullable=False, unique=True, index=True)
+    password_hash = Column(Text, nullable=False)  # pbkdf2_hmac(sha256) hex digest
+    salt = Column(Text, nullable=False)            # per-user hex salt
+    created_at = Column(DateTime, default=_now)
+
+
 class Profile(Base):
     __tablename__ = "profiles"
 
@@ -172,6 +189,19 @@ class Role(Base):
     # final judge either upgrades in place or removes. Every non-/search
     # consumer filters these out (see routers/search.py::list_roles).
     provisional = Column(Boolean, nullable=False, default=False)
+    # Which pipeline stage a still-provisional row was painted by, so /search can
+    # bucket the three progressive-paint sections. "embed" = surfaced straight off
+    # the cosine pre-filter, before any LLM has looked at it (no rank_score, no
+    # analysis); "rank" = survived the cheap gate and carries rank_gate's 0-100
+    # estimate. A row is only ever promoted embed -> rank -> final IN PLACE
+    # (matched by external_id within the run), which is what stops the same job
+    # appearing in two sections at once.
+    # Survives finalization in ONE case: `provisional_stage="rank"` together with
+    # `provisional=False` means a row the cheap stages scored but the expensive
+    # judge never got to, retained on screen under its own heading rather than
+    # deleted (engine._retain_unreviewed_provisional). A genuine judged pick has
+    # provisional False and this NULL.
+    provisional_stage = Column(Text)
     ai_analysis = Column(Text)  # the expensive-AI justification
     # very_strong|strong|ok|stretch -- the final judge's own verdict, a finer
     # grade than the strong/backup list it landed in (see full_auto's
@@ -209,6 +239,25 @@ class FeedbackLog(Base):
     role_id = Column(Integer, ForeignKey("roles.id"), nullable=True)
     action = Column(Text, nullable=False)  # tick|cross|ignore|apply
     created_at = Column(DateTime, default=_now)
+
+
+class EventLog(Base):
+    """Append-only usage-analytics stream for the beta (see services/analytics.py).
+
+    Carries user_id directly (FeedbackLog/SearchRun only have profile_id) so
+    per-user activity rolls up without a join. `event_type` is a short slug
+    (login|search_started|role_tick|role_cross|role_ignore|role_apply|
+    profile_created|...); `payload` is optional free-form JSON for extra context.
+    Read only by the owner-only GET /admin/analytics endpoint."""
+
+    __tablename__ = "event_log"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    profile_id = Column(Integer, nullable=True, index=True)
+    event_type = Column(Text, nullable=False, index=True)
+    payload = Column(Text, nullable=True)  # JSON-encoded when present
+    created_at = Column(DateTime, default=_now, index=True)
 
 
 class JobSeen(Base):
@@ -254,6 +303,31 @@ class JobSeen(Base):
     __table_args__ = (
         UniqueConstraint("profile_id", "identity_hash", name="uq_jobseen_profile_identity"),
     )
+
+
+class JobEmbedding(Base):
+    """Global, content-addressed cache of job embedding vectors.
+
+    Deliberately NOT scoped by user_id/profile_id, unlike every other table
+    here: a job's embedding text is purely `title + company + snippet[:2000]`
+    (see engine._embed_text) -- zero profile data -- so the same job yields an
+    identical vector for every candidate. Caching it per-profile on JobSeen.embedding
+    meant every new profile that discovered the same job re-embedded it from
+    scratch (a ~90s tax on a first international run, paid again per user). This
+    store lets any profile reuse a vector computed once, ever.
+
+    Keyed by sha1(EMBED_MODEL + "\\n" + embed_text): folding the model name into
+    the hash means a future embedding-model switch transparently recomputes
+    under fresh keys instead of serving stale vectors. `embedding` is the same
+    base64-float32 encoding JobSeen.embedding uses (engine._encode_embedding),
+    so a cache hit is copied straight across with no re-encode."""
+
+    __tablename__ = "job_embeddings"
+
+    text_hash = Column(Text, primary_key=True)
+    embedding = Column(Text, nullable=False)  # base64 float32, see engine._encode_embedding
+    model = Column(Text)                      # EMBED_MODEL at compute time (informational)
+    created_at = Column(DateTime, default=_now)
 
 
 class CompanyATS(Base):

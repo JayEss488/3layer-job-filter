@@ -61,7 +61,12 @@ async def run_formation_calls(
     short_cv = _is_short_cv(text)
     calls = [
         asyncio.to_thread(extract_attributes, text),
-        asyncio.to_thread(generate_families, text, intent_text),
+        # No auto-drafted intent statement off a short document -- see
+        # generate_families' docstring. The onboarding/profile box stays empty and
+        # optional instead, and is used verbatim if the candidate does fill it.
+        asyncio.to_thread(
+            generate_families, text, intent_text, want_intent_draft=not short_cv
+        ),
     ]
     if not short_cv:
         # A short document reads as its own summary (persist_formation stores the

@@ -4,15 +4,14 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 
-import { AttributeRow } from "@/components/AttributeRow";
-import { ConfidenceBar } from "@/components/ConfidenceBar";
 import { IntentEditor } from "@/components/IntentEditor";
 import { LocationPicker } from "@/components/LocationPicker";
+import { RequirementRows } from "@/components/RequirementRows";
+import { RoleFamilyCard } from "@/components/RoleFamilyCard";
 import { SalarySlider } from "@/components/SalarySlider";
 import { SeniorityPicker } from "@/components/SeniorityPicker";
-import { TargetRoleChips } from "@/components/TargetRoleChips";
 import { api } from "@/lib/api";
-import { useAttributes, useConfidence } from "@/lib/hooks";
+import { useAttributes, useFamilies } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
 
 export default function OnboardingPage() {
@@ -20,7 +19,7 @@ export default function OnboardingPage() {
   const qc = useQueryClient();
   const { activeId } = useProfiles();
   const { data: attrs } = useAttributes(activeId);
-  const { data: confidence } = useConfidence(activeId);
+  const { data: families } = useFamilies(activeId);
   const fileRef = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -33,7 +32,6 @@ export default function OnboardingPage() {
   const g = attrs?.by_type;
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["attributes", activeId] });
-    qc.invalidateQueries({ queryKey: ["confidence", activeId] });
     // A parse also seeds role-family cards (backend now does this synchronously
     // -- see onboarding.py's parse_cv/parse_text), so a families query left
     // mounted from an earlier /dashboard visit needs refreshing too.
@@ -165,49 +163,57 @@ export default function OnboardingPage() {
           </div>
         </div>
 
-        {/* Step 2 — review + complete */}
+        {/* Step 2 — review + complete. Deliberately the same three blocks, in the
+            same order, as /dashboard's profile editor (role families → extra
+            requirements → preferences): onboarding used to show a different set
+            of controls in a different layout, so the profile a user built here
+            didn't look like the profile they came back to edit. Past roles and
+            qualifications are no longer shown at all -- they're background, not
+            things the search targets, and having them first invited people to
+            fill in a CV they had already uploaded. Both attribute types still
+            exist and still feed the engine; they're just edited on /memory. */}
         <div className="step-block">
           <div className="step-heading">Step 2 — Review and complete your profile</div>
           <div className="profile-box">
             <div className="profile-header">Your profile</div>
             <div className="panel-b">
-              <div className="profile-section-label">
-                Your background — what you have done
+              <div className="profile-section-label">Role types</div>
+              <div className="fam-list">
+                {(families ?? []).map((f) => (
+                  <RoleFamilyCard
+                    key={f.id}
+                    profileId={activeId}
+                    family={f}
+                    roles={(g?.target_role ?? []).filter((r) => r.family_id === f.id)}
+                  />
+                ))}
+                {families?.length === 0 && (
+                  <div className="info-banner">
+                    {busy
+                      ? "Reading your CV — your role families will appear here."
+                      : "No role families yet — upload a CV or paste your experience above and they'll be built for you."}
+                  </div>
+                )}
               </div>
-              <AttributeRow label="Past roles" profileId={activeId} type="past_role" attributes={g?.past_role ?? []} />
-              <AttributeRow
-                label="Qualifications"
+              <div className="annotation">
+                Each family is searched as its own stream, so unrelated interests are judged on
+                their own merits rather than blended together.
+              </div>
+
+              <div className="profile-section-label">Extra requirements</div>
+              <RequirementRows
                 profileId={activeId}
-                type="qualification"
-                attributes={g?.qualification ?? []}
-                placeholder="e.g. First Class Honours BSc Physics, Durham"
+                mustHave={g?.must_have ?? []}
+                avoid={g?.avoid ?? []}
               />
+
+              <div className="profile-section-label">Preferences</div>
               <div className="row pref">
                 <div className="label">Seniority</div>
                 <div className="field">
                   <SeniorityPicker profileId={activeId} attributes={g?.seniority ?? []} />
                 </div>
               </div>
-
-              <div className="profile-section-label">
-                What you&apos;re looking for — your next role
-              </div>
-              <IntentEditor profileId={activeId} />
-              <TargetRoleChips profileId={activeId} attributes={g?.target_role ?? []} />
-              <AttributeRow
-                label="Must have"
-                profileId={activeId}
-                type="must_have"
-                attributes={g?.must_have ?? []}
-                placeholder="e.g. Visa sponsorship"
-              />
-              <AttributeRow
-                label="Avoid"
-                profileId={activeId}
-                type="avoid"
-                attributes={g?.avoid ?? []}
-                placeholder="e.g. No cold-calling"
-              />
               <div className="row pref">
                 <div className="label">Salary range</div>
                 <div className="field">
@@ -225,6 +231,8 @@ export default function OnboardingPage() {
                   />
                 </div>
               </div>
+
+              <IntentEditor profileId={activeId} />
             </div>
           </div>
         </div>
@@ -233,7 +241,6 @@ export default function OnboardingPage() {
         <div className="step-block">
           <div className="step-heading">Step 3 — Run your first search</div>
           <div className="launch-box">
-            <ConfidenceBar confidence={confidence} />
             <button
               className="btn btn-primary"
               style={{ padding: "10px 24px", fontSize: 13 }}

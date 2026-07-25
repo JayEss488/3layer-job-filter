@@ -3,6 +3,11 @@
 import { useEffect, useState } from "react";
 
 import { api } from "@/lib/api";
+// COUNTRY_CHOICES (full worldwide dropdown) and COUNTRY_TOKENS (name/alias + a
+// few major cities, for auto-highlighting the inferred country) are generated
+// alongside the engine's country tokens and the backend list by
+// scripts/gen_countries.py, so all three stay in sync. Regenerate to refresh.
+import { COUNTRY_CHOICES, COUNTRY_TOKENS } from "@/lib/countries.gen";
 import { useAttributeMutations } from "@/lib/hooks";
 import type { Attribute } from "@/lib/types";
 
@@ -27,51 +32,6 @@ const SCOPE_CHOICES: { value: string; label: string }[] = [
   { value: "international", label: "International" },
 ];
 const SCOPE_ORDER = SCOPE_CHOICES.map((s) => s.value);
-
-const COUNTRY_CHOICES: { code: string; label: string }[] = [
-  { code: "global", label: "Global (no filter)" },
-  { code: "gb", label: "United Kingdom" },
-  { code: "us", label: "United States" },
-  { code: "ca", label: "Canada" },
-  { code: "au", label: "Australia" },
-  { code: "de", label: "Germany" },
-  { code: "fr", label: "France" },
-  { code: "in", label: "India" },
-  { code: "it", label: "Italy" },
-  { code: "nl", label: "Netherlands" },
-  { code: "at", label: "Austria" },
-  { code: "pl", label: "Poland" },
-  { code: "sg", label: "Singapore" },
-  { code: "za", label: "South Africa" },
-];
-
-// Mirrors full_auto.py _COUNTRY_TOKENS (high-signal tokens only) so the picker
-// can auto-detect the country from a typed city/region and highlight it — which
-// matches the backend's fail-closed default (no explicit country chip -> filter
-// by the country inferred from the location).
-const COUNTRY_TOKENS: Record<string, string[]> = {
-  gb: ["united kingdom", "uk", "u.k.", "great britain", "england", "scotland", "wales",
-       "northern ireland", "london", "manchester", "birmingham", "leeds", "glasgow",
-       "edinburgh", "bristol", "liverpool", "sheffield", "newcastle", "nottingham",
-       "leicester", "coventry", "cardiff", "belfast", "cambridge", "oxford", "reading",
-       "brighton", "aberdeen", "dundee", "southampton", "portsmouth", "essex", "kent",
-       "surrey", "sussex", "hampshire", "yorkshire", "lancashire", "cheshire", "devon",
-       "cornwall", "southend"],
-  us: ["united states", "usa", "u.s.", "america", "new york", "san francisco",
-       "los angeles", "chicago", "seattle", "austin", "boston", "texas", "california",
-       "florida", "washington", "denver", "atlanta", "dallas", "houston", "philadelphia"],
-  ca: ["canada", "toronto", "vancouver", "montreal", "ottawa", "calgary"],
-  au: ["australia", "sydney", "melbourne", "brisbane", "perth"],
-  de: ["germany", "deutschland", "berlin", "munich", "hamburg", "frankfurt"],
-  fr: ["france", "paris", "lyon", "marseille"],
-  in: ["india", "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "pune"],
-  it: ["italy", "italia", "rome", "milan", "turin"],
-  nl: ["netherlands", "holland", "amsterdam", "rotterdam", "the hague"],
-  at: ["austria", "vienna"],
-  pl: ["poland", "warsaw", "krakow", "wroclaw"],
-  sg: ["singapore"],
-  za: ["south africa", "johannesburg", "cape town", "pretoria"],
-};
 
 function detectCountry(text: string): string | null {
   const loc = (text || "").trim().toLowerCase();
@@ -178,18 +138,34 @@ export function LocationPicker({
         </div>
       </div>
       {showCountryChips && (
-        <div className="choice-row" style={{ flexWrap: "wrap" }}>
-          {COUNTRY_CHOICES.map((c) => (
+        <div className="choice-row" style={{ flexWrap: "wrap", gap: 6 }}>
+          {/* Selected countries as removable chips (the list is worldwide now, so
+              the picker is a searchable dropdown rather than 250 chips). */}
+          {COUNTRY_CHOICES.filter((c) => selectedCountries.has(c.code)).map((c) => (
             <button
               key={c.code}
-              className={`country${selectedCountries.has(c.code) ? " on" : ""}${
-                noneSelected && c.code === detected ? " detected" : ""
-              }`}
+              className="country on"
               onClick={() => toggleCountry(c.code)}
+              title="Remove"
             >
-              {c.label}
+              {c.label} ✕
             </button>
           ))}
+          <select
+            className="input"
+            style={{ width: 200 }}
+            value=""
+            onChange={(e) => {
+              if (e.target.value) toggleCountry(e.target.value);
+            }}
+          >
+            <option value="">+ Add country…</option>
+            {COUNTRY_CHOICES.filter((c) => !selectedCountries.has(c.code)).map((c) => (
+              <option key={c.code} value={c.code}>
+                {c.label}
+              </option>
+            ))}
+          </select>
         </div>
       )}
       {showCountryChips && noneSelected && detected && (

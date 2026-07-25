@@ -204,12 +204,6 @@ export interface AttributesResponse {
   items: Attribute[];
 }
 
-export interface Confidence {
-  score: number;
-  missing: string[];
-  tip: string;
-}
-
 /**
  * What the AI is told about the candidate, shown on /memory. `requirements` is
  * a read-only mirror of the must_have/avoid chips edited elsewhere; `header`
@@ -265,6 +259,16 @@ export interface Role {
   rank_score?: number | null;
   /** Mid-run "being verified" placeholder — upgraded/removed when the run finishes. */
   provisional?: boolean;
+  /**
+   * Which progressive-paint stage this row belongs to (see backend models.Role):
+   * "embed" — straight off the cosine pre-filter, no AI has looked at it;
+   * "rank"  — cheap gate + 0-100 estimate, no full review yet;
+   * null    — a real judged pick.
+   * `provisional_stage === "rank"` with `provisional === false` is the one
+   * combination that outlives a run: a role the quick scorer rated but the full
+   * review never reached, kept on screen under its own heading.
+   */
+  provisional_stage?: "embed" | "rank" | null;
   ai_analysis?: string | null;
   /** The final judge's grade. Null on rows judged before it existed. */
   verdict?: RoleVerdict | null;

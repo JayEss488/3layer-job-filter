@@ -4,12 +4,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 
 import { AttributeRow } from "@/components/AttributeRow";
-import { ConfidenceBar } from "@/components/ConfidenceBar";
 import { Nav } from "@/components/Nav";
 import { ProfileTabs } from "@/components/ProfileTabs";
 import { SalarySlider } from "@/components/SalarySlider";
 import { api } from "@/lib/api";
-import { useAttributes, useConfidence, useContextHeader } from "@/lib/hooks";
+import { useAttributes, useContextHeader } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
 
 /**
@@ -23,19 +22,17 @@ import { useProfiles } from "@/lib/ProfileContext";
  * loop: it's generated from exactly these rows, so it's how you check an edit
  * actually landed.
  *
- * Salary and "extra preferences" (the custom attribute type) are the one
- * deliberate exception to that split: both count toward the confidence meter
- * shown on THIS page, so both need an editor here too, not only on /dashboard
- * — otherwise the meter's "add salary" tip is a dead end. Salary is still also
- * editable (with its Hard/Soft toggle) on the Profile tab; this is the same
- * attribute row, not a second copy.
+ * Salary and "extra preferences" (the custom attribute type) are edited here as
+ * well as on /dashboard: both are "who you are / what you'll accept" background
+ * the judge reads, so they belong alongside the other memory rows. Salary is
+ * still also editable (with its Hard/Soft toggle) on the Profile tab; this is
+ * the same attribute row, not a second copy.
  */
 export default function MemoryPage() {
   const qc = useQueryClient();
   const { activeId } = useProfiles();
   const { data: attrs } = useAttributes(activeId);
   const { data: ctx } = useContextHeader(activeId);
-  const { data: conf } = useConfidence(activeId);
   const fileRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
 
@@ -111,7 +108,6 @@ export default function MemoryPage() {
       await api.parseCv(activeId!, file);
       qc.invalidateQueries({ queryKey: ["attributes", activeId] });
       qc.invalidateQueries({ queryKey: ["families", activeId] });
-      qc.invalidateQueries({ queryKey: ["confidence", activeId] });
       qc.invalidateQueries({ queryKey: ["contextHeader", activeId] });
       // Profile-table fields (cv_summary, and intent_text when it was empty --
       // see profile_intel._apply) can change too; see onboarding/page.tsx's
@@ -136,8 +132,6 @@ export default function MemoryPage() {
           </div>
         </div>
 
-        <ConfidenceBar confidence={conf} />
-
         <div className="panel">
           <div className="panel-h">Background</div>
           <div className="panel-b">
@@ -161,8 +155,7 @@ export default function MemoryPage() {
                 page is that place: a skill and its evidence tier are squarely "who
                 you are". sector_target stays hidden, deliberately: that's a want,
                 not background — see snapshot._BASE_EMPHASIS for how it still feeds
-                the engine. custom is surfaced below instead, since it counts toward
-                confidence. */}
+                the engine. custom is surfaced below instead, under Preferences. */}
             <AttributeRow
               label="Skills"
               profileId={activeId}
@@ -178,8 +171,8 @@ export default function MemoryPage() {
           <div className="panel-h">Preferences</div>
           <div className="panel-b">
             <div className="annotation" style={{ padding: "10px 0 4px" }}>
-              These count toward the confidence score above — fill them in here so the tip
-              isn&apos;t a dead end. Fine-tune enforcement (hard/soft) on the Profile tab.
+              Extra background the AI weighs when judging roles. Fine-tune enforcement
+              (hard/soft) on the Profile tab.
             </div>
             <div className="row pref">
               <div className="label">Salary</div>

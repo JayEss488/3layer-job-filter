@@ -8,18 +8,24 @@ from ..database import get_db
 from ..deps import current_user_id, get_profile_or_404
 from ..models import Profile, Role
 from ..schemas import AttributeOut, ProfileCreate, ProfileOut, ProfileUpdate, StatsOut
+from ..services.analytics import log_event
 from ..services.feedback_intel import interpret_search_feedback
 
 router = APIRouter(prefix="/profiles", tags=["profiles"])
 
 
 def _ensure_default(db: Session) -> None:
+    uid = current_user_id()
     exists = db.execute(
-        select(Profile.id).where(Profile.user_id == current_user_id())
+        select(Profile.id).where(Profile.user_id == uid)
     ).first()
     if not exists:
-        db.add(Profile(user_id=current_user_id(), name="Profile 1", is_active=True))
+        profile = Profile(user_id=uid, name="Profile 1", is_active=True)
+        db.add(profile)
         db.commit()
+        db.refresh(profile)
+        # First profile for this user == effectively their first session.
+        log_event(db, uid, profile.id, "profile_created", {"auto": True})
 
 
 @router.get("", response_model=list[ProfileOut])
@@ -39,11 +45,13 @@ def create_profile(body: ProfileCreate, db: Session = Depends(get_db)):
             select(Profile.id).where(Profile.user_id == current_user_id())
         ).all()
     )
+    uid = current_user_id()
     name = (body.name or f"Profile {count + 1}").strip()
-    profile = Profile(user_id=current_user_id(), name=name, is_active=True)
+    profile = Profile(user_id=uid, name=name, is_active=True)
     db.add(profile)
     db.commit()
     db.refresh(profile)
+    log_event(db, uid, profile.id, "profile_created", {"auto": False})
     return profile
 
 

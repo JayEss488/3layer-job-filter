@@ -1,5 +1,4 @@
-"""Onboarding/parsing: CV upload + free text -> attributes, AI suggestions,
-and the confidence indicator."""
+"""Onboarding/parsing: CV upload + free text -> attributes and AI suggestions."""
 import asyncio
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
@@ -10,7 +9,6 @@ from ..deps import get_profile_or_404
 from ..models import Profile
 from ..schemas import (
     AttributeOut,
-    ConfidenceOut,
     ContextHeaderOut,
     ContextHeaderUpdate,
     ParseTextIn,
@@ -18,7 +16,6 @@ from ..schemas import (
     SuggestOut,
 )
 from ..services import formation
-from ..services.confidence import confidence
 from ..services.families import ensure_families
 from ..services.harvest import harvest_for_profile
 from ..services.llm import llm_json
@@ -203,10 +200,3 @@ Return ONLY JSON: {{"suggestions": ["...", "..."]}}. Keep each value short (a ti
         if s and s.lower() not in existing_lower
     ]
     return SuggestOut(suggestions=cleaned[:6])
-
-
-@router.get("/profiles/{profile_id}/confidence", response_model=ConfidenceOut)
-def get_confidence(
-    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
-):
-    return confidence(db, profile.id)

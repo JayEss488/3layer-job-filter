@@ -6,6 +6,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { api } from "@/lib/api";
+import { clearAuth, getUsername } from "@/lib/auth";
 import { useSearchStatus } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
 
@@ -48,6 +49,14 @@ export function Nav() {
     }
   }
 
+  function logout() {
+    clearAuth();
+    qc.clear();
+    router.replace("/login");
+  }
+
+  const username = getUsername();
+
   return (
     <div className="nav">
       <div className="nav-left">
@@ -64,9 +73,17 @@ export function Nav() {
           ))}
         </div>
       </div>
-      <button className="btn btn-primary" onClick={runSearch} disabled={running || !activeId}>
-        {starting ? "Starting…" : searchInFlight ? "Search running…" : "▶ Run New Search"}
-      </button>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <button className="btn btn-primary" onClick={runSearch} disabled={running || !activeId}>
+          {starting ? "Starting…" : searchInFlight ? "Search running…" : "▶ Run New Search"}
+        </button>
+        {username && (
+          <span style={{ fontSize: 12, color: "var(--muted, #888)" }}>{username}</span>
+        )}
+        <button className="btn btn-secondary" onClick={logout} title="Log out">
+          Log out
+        </button>
+      </div>
     </div>
   );
 }

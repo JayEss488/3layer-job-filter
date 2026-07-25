@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 
 import { HardSoftToggle } from "@/components/HardSoftToggle";
+import { IntentEditor } from "@/components/IntentEditor";
 import { LocationPicker, WORK_SET } from "@/components/LocationPicker";
 import { Nav } from "@/components/Nav";
 import { ProfileTabs } from "@/components/ProfileTabs";
@@ -112,7 +113,6 @@ function ProfileBody({ profileId }: { profileId: number }) {
       // A parse adds ungrouped target roles; refetching families is what seeds
       // them into cards (see routers/families.py's GET).
       qc.invalidateQueries({ queryKey: ["families", profileId] });
-      qc.invalidateQueries({ queryKey: ["confidence", profileId] });
       // Profile-table fields (cv_summary, and intent_text when it was empty --
       // see profile_intel._apply) can change too; see onboarding/page.tsx's
       // invalidate() for the bug this avoids.
@@ -223,6 +223,13 @@ function ProfileBody({ profileId }: { profileId: number }) {
           mustHave={g?.must_have ?? []}
           avoid={g?.avoid ?? []}
         />
+
+        {/* profile.intent_text used to be editable ONLY during onboarding, even
+            though it outranks every other want-signal at the final judge (see
+            snapshot.build_snapshot) -- so a candidate who left it blank there,
+            or whose priorities changed, had no way to set it. Same component,
+            same three-block order as /onboarding. */}
+        <IntentEditor profileId={profileId} />
 
         {/* ── Preferences ── */}
         <div className="subhead">Preferences</div>

@@ -2,7 +2,9 @@
 __pycache__/
 *.pyc
 *.db
-inactive components/key_openai
+*.db-shm
+*.db-wal
+*.bak
 venv/
 raw_api_jobs.json
 .offline_test/
@@ -10,3 +12,31 @@ raw_api_jobs.json
 tests/gate_reports/
 tests/prompt_pipeline_reports/
 tests/profile_formation_reports/
+tests/medium_vs_strong_reports/
+
+# Archived data snapshots (see scripts/reset_user_data.py)
+memory_archive/
+
+# Beta credentials handed out manually -- never commit plaintext
+beta_credentials.txt
+
+# Untracked-but-kept-local dev/archive material (removed from the repo for the
+# beta; delete locally if you don't want them)
+/inactive components/
+/legacy/
+/wireframes/
+/Functional wireframe design upgrade/
+/Interface redesign with role cards/
+/claude/
+/txt non code/
+/JobMatch_Roadmap_and_Assessment.docx
+/launch_content_review.docx
+/profile7_raw_sample.xlsx
+/exp.txt
+/results.md
+/how to run webapp.txt
+/analyze_embedding_gate.py
+/analyze_medium_vs_strong.py
+/analyze_rank_gate.py
+/migrate_embedding_format.py
+/test_pipeline_offline.py

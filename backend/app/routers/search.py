@@ -16,6 +16,7 @@ from ..schemas import (
     SearchStartOut,
     SearchStatusOut,
 )
+from ..services.analytics import log_event
 from ..services.engine import run_search_task
 from ..services.feedback import apply_feedback
 
@@ -23,13 +24,18 @@ router = APIRouter(tags=["search"])
 
 _VALID_APP_STATUS = {"pending", "interview", "rejected"}
 
+# Which usage event a role lifecycle action logs (see services/analytics.py).
+_FEEDBACK_EVENT = {"tick": "role_tick", "cross": "role_cross", "ignore": "role_ignore"}
 
-def _searches_today(db: Session) -> int:
-    """Global count across all profiles -- the daily cap is shared, not per-profile."""
+
+def _searches_today(db: Session, user_id: int) -> int:
+    """Count of this USER's searches today. The daily cap is now per-user (a beta
+    has ~50 users; a single global cap would let one exhaust everyone's quota)."""
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     return (
         db.query(func.count(SearchRun.id))
-        .filter(SearchRun.started_at >= start)
+        .join(Profile, SearchRun.profile_id == Profile.id)
+        .filter(Profile.user_id == user_id, SearchRun.started_at >= start)
         .scalar()
         or 0
     )
@@ -52,7 +58,7 @@ def start_search(
             detail="A search is already running for this profile.",
         )
 
-    used = _searches_today(db)
+    used = _searches_today(db, profile.user_id)
     if used >= MAX_SEARCHES_PER_DAY:
         raise HTTPException(
             status_code=429,
@@ -73,6 +79,7 @@ def start_search(
     db.add(run)
     db.commit()
     db.refresh(run)
+    log_event(db, profile.user_id, profile.id, "search_started", {"run_id": run.id})
 
     background.add_task(run_search_task, profile.id, run.id)
     return SearchStartOut(
@@ -149,6 +156,9 @@ def _act(db: Session, role: Role, status: str, feedback: str | None):
         apply_feedback(db, role.profile_id, role, feedback)
     db.commit()
     db.refresh(role)
+    event = _FEEDBACK_EVENT.get(feedback or "")
+    if event and role.profile:
+        log_event(db, role.profile.user_id, role.profile_id, event, {"role_id": role.id})
     return role
 
 
@@ -181,6 +191,8 @@ def apply_role(role: Role = Depends(get_role_or_404), db: Session = Depends(get_
     apply_feedback(db, role.profile_id, role, "apply")  # logged; strong positive
     db.commit()
     db.refresh(role)
+    if role.profile:
+        log_event(db, role.profile.user_id, role.profile_id, "role_apply", {"role_id": role.id})
     return role
 
 

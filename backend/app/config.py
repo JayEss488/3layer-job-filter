@@ -20,8 +20,26 @@ if str(ROOT_DIR) not in sys.path:
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(BACKEND_DIR / ".env", override=False)
 
-# Hardcoded single user. Swap for the authenticated user id when auth arrives.
+# Fallback user_id used ONLY as a column default (models.py) and by the
+# throwaway diagnostics probe profile. The real, per-request user now comes from
+# the authenticated login token -- see services/auth.py and deps.current_user_id().
 CURRENT_USER_ID = 1
+
+# ── Auth (closed beta) ───────────────────────────────────────────────────────
+# AUTH_SECRET signs login tokens. MUST be set to a stable, random value in
+# production: if it's the dev default, tokens are both forgeable and reset on
+# every process restart. Generate one with e.g. `python -c "import secrets;
+# print(secrets.token_urlsafe(48))"` and set it in the host's env.
+AUTH_SECRET = os.getenv("AUTH_SECRET", "dev-insecure-secret-change-me")
+if AUTH_SECRET == "dev-insecure-secret-change-me":
+    print("[config] WARNING: AUTH_SECRET is the insecure dev default -- set it in the environment before any real deployment.")
+
+# How long a login token stays valid before the user must sign in again.
+TOKEN_MAX_AGE_SECONDS = int(os.getenv("TOKEN_MAX_AGE_SECONDS", str(60 * 60 * 24 * 30)))
+
+# Shared secret guarding the owner-only analytics endpoint (GET /admin/analytics,
+# sent as the `X-Admin-Token` header). Empty string = endpoint disabled/locked.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 # SQLite by default; flip DATABASE_URL to a postgres:// URL to migrate later.
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'jobmatch.db'}")
@@ -231,50 +249,12 @@ LOCATION_SCOPE_CHOICES = [
 ]
 
 # Selectable countries for the hard location filter (code -> Adzuna cc / label).
-# "global" is a sentinel meaning "no country filter".
-COUNTRY_CHOICES = [
-    ("global", "Global (no filter)"),
-    ("gb", "United Kingdom"),
-    ("us", "United States"),
-    ("ca", "Canada"),
-    ("au", "Australia"),
-    ("de", "Germany"),
-    ("fr", "France"),
-    ("in", "India"),
-    ("it", "Italy"),
-    ("nl", "Netherlands"),
-    ("at", "Austria"),
-    ("pl", "Poland"),
-    ("sg", "Singapore"),
-    ("za", "South Africa"),
-]
+# "global" is a sentinel meaning "no country filter". The worldwide list is
+# generated from scripts/gen_countries.py alongside the engine's country tokens
+# and the frontend picker, so all three stay in sync (regenerate to refresh).
+from .countries_gen import COUNTRY_CHOICES  # noqa: E402
 
 # ── Feedback weight system (see implementation notes section 3) ──────────────
 DELTAS = {"tick": 0.10, "cross": -0.15, "ignore": -0.02}
 WEIGHT_MIN, WEIGHT_MAX = 0.1, 2.0
 DEFAULT_WEIGHT = 1.0
-
-# ── Confidence indicator weights (section 6) ────────────────────────────────
-# `skill` was dropped here when it stopped being auto-extracted (see the
-# formation rewrite / parsing.py): a profile that never fills skills as chips
-# shouldn't sit permanently at 75% confidence nagging "add skills". Its weight
-# was redistributed across the types that ARE still populated automatically, so a
-# freshly-parsed profile reads as ready.
-CONFIDENCE_REQUIRED = {
-    "target_role": 0.35,
-    "seniority": 0.20,
-    "location": 0.20,
-    "salary": 0.10,
-    "past_role": 0.15,
-}
-
-# Human labels for the "missing" tip builder.
-TYPE_LABELS = {
-    "target_role": "target roles",
-    "skill": "skills",
-    "seniority": "seniority",
-    "location": "location",
-    "salary": "salary range",
-    "past_role": "past roles",
-    "custom": "extra preferences",
-}

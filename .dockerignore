@@ -1,0 +1,32 @@
+# Keep the backend image lean. The frontend is deployed separately (Vercel).
+.git
+.gitignore
+venv/
+**/__pycache__/
+*.pyc
+
+# Frontend (deployed to Vercel, not needed in the backend image)
+frontend/
+
+# Local data / archives / secrets
+*.db
+*.db-shm
+*.db-wal
+*.bak
+memory_archive/
+beta_credentials.txt
+.env
+
+# Dev/archive material (already untracked; belt-and-braces so it never bloats the image)
+inactive components/
+legacy/
+wireframes/
+Functional wireframe design upgrade/
+Interface redesign with role cards/
+txt non code/
+tests/
+*.docx
+*.xlsx
+raw_api_jobs.json
+.offline_test/
+.embedding_analysis/

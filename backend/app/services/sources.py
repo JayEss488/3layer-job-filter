@@ -24,6 +24,7 @@ SOURCES: list[dict] = [
     {"key": "adzuna",      "label": "Adzuna",           "kind": "api", "board_prefix": "adzuna"},
     {"key": "google_jobs", "label": "Google Jobs",      "kind": "api", "board_prefix": "google_jobs"},
     {"key": "jsearch",     "label": "JSearch",          "kind": "api", "board_prefix": "jsearch"},
+    {"key": "careerjet",   "label": "Careerjet",        "kind": "api", "board_prefix": "careerjet"},
     {"key": "remotive",    "label": "Remotive",         "kind": "api", "board_prefix": "remotive"},
     {"key": "greenhouse",  "label": "Greenhouse (ATS)", "kind": "ats", "board_prefix": "gh"},
     {"key": "lever",       "label": "Lever (ATS)",      "kind": "ats", "board_prefix": "lever"},

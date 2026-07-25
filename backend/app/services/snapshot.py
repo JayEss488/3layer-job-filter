@@ -125,7 +125,7 @@ def _infer_region(skills: list[str], roles: list[str], location: str) -> dict:
     data = llm_json(
         f"""Given this candidate, return JSON:
 {{"sectors": ["2-4 industry domains e.g. software, fintech, marketing"],
-  "adzuna_country_code": "2-letter lowercase code: gb,us,ca,za,au,de,fr,in,it,nl,at,pl,sg"}}
+  "adzuna_country_code": "the ISO 3166-1 alpha-2 country code (lowercase) for the candidate's country -- ANY country worldwide, e.g. gb, us, ca, au, de, fr, ae, sa, qa, ng, ke, ie, es, jp, br, in; pick the closest match to the Location field, default gb only if truly unknown"}}
 Skills: {', '.join(skills) or 'n/a'}
 Roles: {', '.join(roles) or 'n/a'}
 Location: {location or 'United Kingdom'}"""
@@ -462,6 +462,23 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # "" when the CV gave nothing concrete beyond the typed attribute rows,
         # or before any CV/text has ever been parsed.
         "candidate_brief": candidate_brief,
+        # The candidate's OWN words about what they're looking for (profile.
+        # intent_text -- the optional free-text box on /onboarding and
+        # /dashboard). Read by full_auto._rank_prompt only. It reached the final
+        # judge from the very start (via cv_text below, where it outranks every
+        # other want-signal) but was invisible to the mid tier, so rank_gate
+        # scored function fit against a bare list of target-role TITLES with no
+        # access to the one place the candidate says what they actually mean by
+        # them -- which is precisely the signal needed to tell an ambiguous
+        # title's two professions apart. Deliberately NOT given to screen_gate:
+        # its sector axis is scoped to job FUNCTION on purpose (see
+        # _screen_prompt's ROLE FUNCTION FIT and CLAUDE.md's note on the
+        # `sectors` guess that was removed from it), and feeding free-text
+        # aspiration into that axis is the same drift that change fixed.
+        # "" when the candidate hasn't written one -- which is now the default
+        # after a short CV, since nothing is auto-drafted (see
+        # profile_intel.generate_families).
+        "intent_text": ((profile.intent_text or "").strip() if profile else ""),
         # Candidate-specific must-have/must-not-have bullets for screen_gate's
         # requirements_ok axis (see full_auto.py::_screen_prompt). [] means none
         # generated yet or none stated.

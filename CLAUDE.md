@@ -107,11 +107,89 @@ than expecting structured logs.
   The `/search` page uses it to bucket a still-`new` role left over from an earlier run
   into its own "from earlier searches" section below the current run's picks, instead of
   interleaving every past run's unreviewed roles by `fit_rank` (each run numbers its own
-  1..N, so ranks collide across runs). `saved` roles stay in the main section regardless
-  of which run surfaced them — they're a completed decision, not pending review. The
-  `/my-roles` "Inbox" tab (every `status=new` role, any run) is deliberately unaffected —
-  this is `/search`-page-only display grouping of the same underlying rows, not a new
-  status or a data change.
+  1..N, so ranks collide across runs). `saved` roles (any run) get their own "already
+  saved" section, unranked (no `showRank`) — they used to sit inside the same ranked
+  `current` list as this run's fresh picks, which caused literal duplicate rank badges
+  (a saved role's stale fit_rank from its own original run colliding on-screen with an
+  unrelated fit_rank=N from the new run). The `/my-roles` "Inbox" tab (every
+  `status=new` role, any run) is deliberately unaffected — this is `/search`-page-only
+  display grouping of the same underlying rows, not a new status or a data change.
+  **Progressive paint — the /search page is written three times per run**
+  (`provisional`/`provisional_stage`/`rank_score` columns). Each paint is the same
+  `engine._upsert_provisional_rows` call with a different `stage`, and a job that
+  reaches a later stage is the **same Role row updated in place** (matched by
+  `external_id` within the run) — which is where the de-duplication between the three
+  on-screen sections comes from, rather than any dedupe pass. A row is only ever
+  promoted forwards (`embed → rank → final`); re-running the embed paint never demotes
+  one back. Consequence worth expecting: the embedding section shrinks as a run
+  progresses, so an 8-card "early matches" block routinely ends up as 3–4.
+  1. **`stage="embed"`, `EMBED_PAINT_MAX`=8** — painted straight off the cosine
+     pre-filter the moment `_cluster_candidate_queues` returns (seconds in; the embed +
+     score phases measured 6.8s and 0.4s live, against ~90s for the first gate+rank
+     round). Ordered by `embed_score`, **not** `_selection_score` — nothing has a rank
+     score yet, so the default key would collapse to a flat 50.0 whose only remaining
+     variation is the rich-text bonus, i.e. it would order the first cards the user ever
+     sees by snippet length. No `rank_score` is written (a `50/100` chip on a card no
+     model has read would be fabricated) and the card's corner reads "Not yet reviewed",
+     not "Verifying…" — nothing is verifying it and it may never be examined at all.
+     These are the least-informed cards the app shows: cosine similarity and nothing
+     else.
+  2. **`stage="rank"`, `PROVISIONAL_MAX`=12** — the pre-existing mid-run paint, below.
+  3. **final** — `provisional=False`, `provisional_stage=None`.
+
+  After the run, rank-stage leftovers do **not** all disappear: the top
+  `UNREVIEWED_RETAIN_MAX`(8) by `rank_score` are retained
+  (`engine._retain_unreviewed_provisional`) as `provisional=False` +
+  `provisional_stage="rank"` — the one combination that outlives a run — and render in a
+  trailing "quick-scored only" section with `fit_rank=None` (NULLS LAST). **Anything the
+  judge actually rejected is excluded** from that retention: "a job with a stored
+  `reject` verdict under the current signature is never resurfaced" is enforced
+  everywhere else in the pipeline, and a rejected role coming back labelled "not
+  reviewed" would also simply be false. So that section only ever means *not reached*,
+  never *reviewed and failed*. Embedding-stage leftovers are resolved normally at
+  finalization (deleted if never acted on). `_reconcile_provisional_roles` deliberately
+  skips embed-stage rows — it runs at the end of gate+rank, exactly when the embedding
+  section is supposed to still be on screen underneath the rank results.
+
+  Provisional-row mechanics: rather than waiting for
+  every cluster's gate+rank to finish, each gate/rank round (one screen_gate + one
+  rank_gate call, examining up to `TARGET_POOL` candidates) reports its growing
+  judge-eligible snapshot back to the main thread over a `queue.Queue` (worker threads
+  still never touch the DB session — see `_gate_rank_refill_cluster`'s `report` param /
+  `_make_progress_reporter`), which upserts the global top-`engine.PROVISIONAL_MAX`
+  scorers seen *so far* across all clusters as `provisional=True` rows
+  (`engine._upsert_provisional_rows`) — so the very first rank_gate call to return,
+  across any cluster, can put "Verifying…" cards on screen, with later rounds adding to
+  them. This interim view is a simple global top-N by score, not fairness-balanced
+  across clusters the way the eventual judge pool is, and can transiently show *more*
+  than `PROVISIONAL_MAX` cards (interim upserts only ever add/update, never delete, to
+  avoid ever risking silently dropping a mid-run Keep) until gate+rank fully finishes and
+  `engine._reconcile_provisional_roles` runs against the real `_fair_allocate`d pool,
+  trimming it back to the true top-N in fair order. At finalization each surviving row is
+  upgraded **in place** (matched by `external_id` scoped to the run — same row id, so the
+  card swaps content, and `status` is never touched so a mid-run save/cross survives) or
+  resolved by the leftover rules (`engine._resolve_leftover_provisional`): `applied` →
+  always retained with a ⚠ marker prepended to `ai_analysis` and `fit_rank=None` (a real
+  action already taken, never reverted); `saved` (i.e. Keep, a *tentative* preference,
+  unlike an ordinary Save) → retained the same way if the judge rated it strong/backup
+  (agreement, just short of this run's numeric cut), but flipped back to `status="new"`
+  (returned to the Inbox for a real decision) if the judge rejected it outright, never
+  got to judge it at all, or the run was interrupted before finishing; untouched `new` →
+  retained as "quick-scored only" if it qualifies (rank stage, top
+  `UNREVIEWED_RETAIN_MAX`, not judge-rejected — see the progressive-paint note above),
+  otherwise hard-deleted; crossed → soft-deleted (keeps the FeedbackLog referent).
+  A user action always wins: `saved`/`applied` take the rules above, never the
+  quick-scored retention. Cancel/failure/
+  restart all run `engine._cleanup_provisional_roles` (four call sites incl.
+  `reap_stale_search_runs`), preserving the "an unfinished run leaves nothing
+  user-visible" invariant (a Kept row in an interrupted run always returns to the Inbox,
+  same as a rejected verdict, never silently stays Saved). `GET .../roles` **filters
+  provisional rows out unless `include_provisional=true`** — only the /search page opts
+  in; /my-roles and stats never see them. The /search page's `!r.provisional` guard also
+  hides leftovers during the short gap between a cancel and the background thread's
+  cleanup commit. `/search` and the `/my-roles` "Inbox" tab both also expose a "Mark as
+  applied" action directly on each role card (`POST /roles/{id}/apply`, pre-existing
+  endpoint) — no need to Save first or navigate to `/my-roles`' Saved tab.
 - **`JobSeen`**: the *persistent discovery store* — every listing ever seen for a
   profile, separate from `Role` (which is just what got shown). Discovery upserts here
   (deduped by `identity_hash`); scoring/backlog top-up reads from here across runs so a
@@ -174,7 +252,17 @@ never share a session — writes happen back on the request thread in one commit
    writes.
 2. **Families** (`profile_intel.generate_families`) → the candidate's **role families**
    (`[{label, roles[]}]`, 1–3, generated *with their titles in one pass*) and a
-   first-person `intent_draft` (only used if `intent_text` is empty).
+   first-person `intent_draft` (only used if `intent_text` is empty). For a short CV
+   (`< CV_SHORT_WORD_THRESHOLD`) the intent task and its field are **dropped from the
+   prompt entirely** (`want_intent_draft=False`; the regenerate path's `_prompt` skips
+   it on the same flag). A short document gives the model too little to paraphrase, and
+   the draft then reaches every downstream stage as `intent_text` — which
+   `snapshot.build_snapshot` ranks *above* every other want-signal, i.e. as the
+   candidate's own words. A live run drafted "…with openness to roles involving
+   automation" off a data/software CV, which is part of what let an industrial-controls
+   "Automation Engineer" through as a top pick. The box is now empty and framed as
+   optional on both `/onboarding` and `/dashboard` (`IntentEditor`), and is used
+   verbatim whenever the candidate does fill it.
 3. **Summary** (`profile_intel.generate_summary`) → the `cv_summary` (the evidence brief
    the judge/gates read) and the "Looking for…" `header` (told explicitly NOT to restate
    the summary — they used to overlap). For a short CV (`< CV_SHORT_WORD_THRESHOLD`)
@@ -237,8 +325,32 @@ of what the last finished run already recorded — see the search-pipeline secti
    discovery (`full_auto.gather_jobs` — Reed/Adzuna/Google-Jobs-via-serper.dev/JSearch/
    Remotive + the ATS vendor batch; search terms sent to the board APIs are the
    profile's `target_role`s only — `past_role`s used to be appended too, which pulled in
-   results matching what the candidate has *done* rather than what they want next) →
-   blocklist/training/country filters → dedupe-upsert into `jobs_seen` → embed &
+   results matching what the candidate has *done* rather than what they want next.
+   `gather_jobs` submits **one pool task per (source, term)** — each Source class has a
+   `fetch_term` the pool calls directly; `fetch` is kept as a sequential loop over it for
+   the legacy standalone path — because one whole-source task used to hold up to
+   TERMS_PER_RUN sequential per-term calls in a single 12-wide-pool slot (Reed at 3
+   pages/term = 18 sequential HTTP calls, the measured long pole of a 55s discovery
+   phase). Reed/Adzuna page depth is capped by `REED_PAGES_PER_TERM`/
+   `ADZUNA_PAGES_PER_TERM` (env, default 1 — still 100/50 results per term; the
+   fetchers' own `pages=3` defaults are the legacy path's behavior): a measured live run
+   discovered 7,800 raw listings of which only ~100 were ever examined past the
+   embedding stage, so pages 2–3 were pure latency. The fetchers emit a
+   "page cap hit … more results likely available" note whenever the last page came back
+   full, and every discovery task emits its elapsed time plus a per-source
+   "slowest term" aggregate, so both the coverage trade-off and any slow source stay
+   visible in the console) →
+   blocklist/training/country filters → dedupe-upsert into `jobs_seen` → embed
+   (`engine._ensure_embeddings` — cached forever per job, and cached GLOBALLY across
+   profiles: a vector is looked up in the `job_embeddings` store (a content-addressed
+   table keyed by `sha1(EMBED_MODEL + embed_text)`, no user/profile scope — the embed
+   text is pure job content, so the same job yields the same vector for everyone) and only
+   text not already there hits OpenAI, which also collapses within-run duplicate texts
+   (aggregator reposts) to one call each. Seed the store from existing `jobs_seen` vectors
+   with `scripts/backfill_job_embeddings.py`. `jobs_seen.embedding` is still populated for
+   the fast cosine path; the shared table is a compute cache in front of it. Fresh rows are
+   embedded in `EMBED_CHUNK_SIZE` chunks fanned over an `EMBED_MAX_WORKERS`-worker pool,
+   order-preserving via `ex.map`, DB writes staying on the calling thread) &
    cosine-score every candidate against **every** cluster embedding, assigning each job
    to its single best-scoring cluster → free heuristic prescreen (`_heuristic_prescreen`:
    title-regex drops obvious seniority mismatches — Director/VP for a junior, Intern for
@@ -286,11 +398,17 @@ of what the last finished run already recorded — see the search-pipeline secti
    and `engine.py`'s actual decision so the two can't disagree): normally 2+ failures
    (two independent clear-mismatch signals agreeing is confident enough to skip paying
    for `rank_gate`/the expensive judge on it, without the risk either signal carries
-   alone), but if **over half** of a round's in-sector candidates pass every soft axis
+   alone), but if more than `_GATE_CLEAN_ROUND_FRACTION` (**0.35**) of a round's
+   in-sector candidates pass every soft axis
    clean, that's a sign the round is thin on genuine mismatches rather than that
    everyone really fits, so the threshold tightens to 1+ for that round. Added after a
    live run showed `86 in-sector, 72 pass all soft axes, 1 hard-dropped` — a fixed 2+
-   floor was barely discriminating on a round that clean. The soft-fail check itself
+   floor was barely discriminating on a round that clean. The fraction was loosened
+   from 0.5 to 0.35 (i.e. the gate tightens **sooner**) when `RANK_EXAMINE_BUDGET` went
+   to 240: the gate's job is to stop the mid tier paying to rank hopeless candidates, so
+   tripling the intake both makes that saving worth more and removes the reason to be
+   lenient — a wrongly-dropped borderline job used to cost a scarce slot out of ~40
+   examined, where now there are 200 more candidates behind it. The soft-fail check itself
    only marks an axis false on a *clear* mismatch, defaulting true when unsure, so even
    the tightened 1+ threshold needs one real, confident signal, not a coin-flip. The
    work-arrangement axis specifically first classifies the *listing's own* arrangement —
@@ -315,13 +433,77 @@ of what the last finished run already recorded — see the search-pipeline secti
    (`RANK_REJECT_SCORE_FLOOR`, replacing an older relative bottom-20%-of-batch trim) —
    anything below the floor is dropped **per cluster, before** fair-allocating to
    `JUDGE_POOL` (40), so a cluster that happens to score lower can't lose more than its
-   own share before fair-allocate ever runs. Raised 40 → 55 after a live run showed
-   `85 gate survivors -> 85 judge-eligible` — literally nothing scored below the old
-   floor, making it a no-op; `rank_gate`'s own log line now also reports the batch's
-   min/max/avg score so a floor that's silently toothless again is visible without a
-   gate_cache query. The rank-side `MIN_RESULTS` floor backfill (below) still guarantees
-   a cluster with any gate survivors reaches the judge, so raising the cutoff can't
-   starve a cluster to zero, only make it lean harder on that backfill → optional
+   own share before fair-allocate ever runs. **The mid tier is deliberately run wider
+   than the judge**: it accumulates toward `RANK_TARGET_POOL` (80) judge-eligible
+   approvals out of a run-wide `RANK_EXAMINE_BUDGET` (240) examined, and the judge then
+   takes the best `JUDGE_POOL` (40) of those. Before this the accumulation target *was*
+   `JUDGE_POOL`, which made the judge's input "whatever survived" rather than a curated
+   best-of — a live run reached it with 35 candidates, 5 of them in one cluster, so the
+   judge could only pick the least-bad of five and did. Both budgets are run-wide totals
+   split evenly across active clusters (so a 3-family profile costs the same as a
+   1-family one, with thinner shares), replacing the old per-cluster
+   `SINGLE_CLUSTER_EXAMINE_CAP`(80)/`MULTI_CLUSTER_EXAMINE_CAP`(40) pair.
+   `RANK_REJECT_SCORE_FLOOR` moved 40 → 55 → **50** across that change: at 40 it was a
+   no-op (a live run showed `85 gate survivors -> 85 judge-eligible`); 55 made it a
+   *selection* mechanism, which is the wrong instrument — a cutoff set high enough to
+   select is also high enough to starve a thin cluster. At 50 it is back to being a
+   "not clearly a no" bar, and selection is done by the wide-pool-plus-top-N cut, which
+   cannot starve. `rank_gate`'s own log line reports the batch's min/max/avg score so a
+   floor that's silently toothless again is visible without a gate_cache query. The
+   rank-side `MIN_RESULTS` floor backfill (below) still guarantees
+   a cluster with any gate survivors reaches the judge.
+   Ordering into the judge pool is `engine._selection_score`, **not** `_rank_score`:
+   the model's score plus `RICH_TEXT_SELECTION_BONUS` (3.0) for a candidate that
+   doesn't need a phase-5 page fetch (`_needs_full_scrape` false — ATS text, a
+   Reed-enriched or previously-persisted `full_text`, or a long-enough snippet). Purely
+   a tie-break, so among candidates the mid tier rated equally the judge pool fills with
+   the ones it can actually read — which shortens phase 5 (the run's longest tail and
+   its main anti-bot exposure) and gives the judge better text. Kept separate from
+   `_rank_score` on purpose: the card's "Fit estimate N/100" chip and
+   `RANK_REJECT_SCORE_FLOOR` both still use the unmodified model score, so rich text can
+   never lift a genuinely poor job over the floor, and gate_cache still stores the
+   model's own number so the bonus can be retuned without invalidating a single score.
+   `rank_gate`'s
+   prompt (`_rank_prompt`, cache gate "rank_v9.{intent hash}") carries **the candidate's
+   own `intent_text`** — which used to reach only the final judge, leaving this stage
+   scoring function fit against bare role TITLES with no access to what the candidate
+   meant by them, precisely the signal needed to tell an ambiguous title's two
+   professions apart. The intent hash rides in the *gate name* rather than in
+   `_profile_signature` (shared with `screen_gate`) so editing that box re-scores
+   without also re-running every cheap screen call for a guaranteed identical answer.
+   `screen_gate` is deliberately still **not** shown intent: its sector axis is scoped
+   to job FUNCTION on purpose, and feeding free-text aspiration into it is the same
+   drift that removing the `sectors` guess fixed. The prompt also carries the candidate's location/
+   work-type preference/salary floor (previously never in this prompt at all — an
+   on-site-Cyprus listing scored 84 for a UK-remote candidate with no way to know it
+   was even rejectable) and a **HARD DOWNGRADES** section mirroring the final judge's
+   DISQUALIFIER rules at the cheap tier: a clearly-stated experience bar the
+   candidate's evidence doesn't meet (evidence tagged self-directed/academic/
+   ai-assisted doesn't count as paid experience — the judge's evidence-strength rule,
+   which this stage used to lack entirely), a required named credential/tool with no
+   evidence, a closed/expired listing, a clear location/arrangement conflict (same
+   on-site-unless-stated-otherwise classification as the gate axis and judge rule), or
+   a salary clearly under the stated floor — each caps the score at 15, added after a
+   26-mismatch audit showed this stage scoring 80+ on listings the judge then
+   hard-rejected on exactly these grounds. All downgrade rules require CLEAR visible
+   evidence: listings carrying only their source API's ~500-char teaser are tagged
+   `[truncated source teaser ...]` in the listing block (`RANK_TEASER_MARKER_CHARS`)
+   so truncation is never read as absence — Adzuna has no fuller pre-scrape text to
+   give it (see the text-supply note below). Between rank and fair-allocate,
+   **near-duplicate suppression** (`engine._suppress_judge_duplicates`): same
+   normalized company + title + near-identical text prefix (a recruiter template
+   re-posted per city — `_find_soft_duplicate` deliberately keeps those as separate
+   store rows because their locations differ) keeps only the top-ranked copy in the
+   judge pool, so the freed slots go to real candidates; the dropped copy keeps its
+   cached rank score and no verdict, so it can resurface if the kept copy dies.
+   Count lands in `funnel_counts.judge_dupes_suppressed` (rendered on the Settings
+   run-funnel panel) → **provisional
+   early display reconcile**: by this point in the pipeline, provisional Role rows
+   already exist for the /search page's "Verifying…" cards — interim rows have been
+   upserted incrementally as each gate/rank round finished, not just here (see the
+   `Role` data-model bullet for the full lifecycle) — so this step reconciles them
+   against the now-final, fair-allocated judge pool: fixing fit_rank/membership up to
+   the true top-N before the tail phases run → optional
    Phase 5 full-page scrape, **run per cluster and pipelined straight into that
    cluster's Phase 6 judge** (skipped
    for ATS-sourced jobs, for any snippet already long enough to judge —
@@ -347,8 +529,63 @@ of what the last finished run already recorded — see the search-pipeline secti
    identically to a fresh one), and are rendered by `engine._compose_analysis`. There is
    still no separate JD-summarisation pass — the three-axis read happens inside this same
    call, on the `full_text` it already receives, deliberately avoiding an extra paid call
-   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 7)
-   or every already-persisted verdict is served stale forever. The
+   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 16)
+   or every already-persisted verdict is served stale forever.
+   **`fit_level` is derived mechanically from the model's own step-D requirements
+   checklist and `concerns`, not from an overall impression, and is decoupled from which
+   list the pick landed in** (v16). A live run graded 9 of 11 picks `strong` and 2
+   `very_strong`, with zero `ok`/`stretch` — no discrimination at all — because nothing
+   in the prompt tied the grade to anything: the model listed a decisive concern ("no
+   hands-on exposure to PLCs, industrial control systems, robotics") and still returned
+   `strong`. Two rules fix it. The **rubric** (in `_FINAL_EVAL_SCHEMA`) sets `very_strong`
+   = all core requirements met + `sector_match` + no concern touching a core requirement,
+   `strong` = all core met + at most one such concern, `ok` = one unmet core or 2+ such
+   concerns, `stretch` = 2+ unmet core; a `strong`-list pick may legitimately grade `ok`,
+   so the strong/backup split (a disqualifier + worth-showing decision) no longer forces
+   the badge. The **checklist discipline** (step D) is the other half, and the more
+   load-bearing one: the same run's checklists were being drafted at whatever level of
+   abstraction made every item "met" — the industrial role's three core items were
+   "graduate-level technical foundation", "ability to learn automation work" and
+   "programming and analytical problem-solving" (unfailable by construction), with
+   *industrial automation/control systems/robotics* filed as **secondary**. Step D now
+   forbids capacity/attitude phrasings outright, requires the JD's own specificity
+   ("Computer Science degree", not "a related technical degree"), and states that the
+   domain-defining asks are core by definition and cannot be demoted to secondary
+   because the candidate lacks them. Since the rubric reads off the checklist, a padded
+   checklist is the way an unearned grade gets produced — fix that before touching the
+   rubric thresholds.
+   **Tier hand-off — what the cheap/mid stages pass forward so the judge re-derives
+   less** (`full_auto._final_eval_job_block`, all as bracketed notes in each job block;
+   the judge's system prompt has a `WHAT THE BRACKETED HINTS IN A JOB BLOCK ARE`
+   paragraph telling it these came from passes that saw LESS text, so they say where to
+   look and never what to conclude): `[screen note: ...]` = every non-`ok` axis code
+   from `screen_gate`'s packed `_gate_reason`; `[key requirements: ...]` =
+   `screen_gate`'s extracted JD asks with their required/nice-to-have tag;
+   `[earlier screening pass thought: ...]` = `rank_gate`'s own one-line `_rank_note`,
+   which was previously computed and then thrown away. The rank SCORE is deliberately
+   **not** passed — a number anchors a grade, a phrase points at something checkable.
+   The `[key requirements]` hand-off is the load-bearing one and doubles as a
+   calibration fix: reasoning step D now tells the judge to START from those items
+   (carrying their required/nice-to-have tag as the core/secondary split) and only then
+   add what the fuller text reveals, because they were extracted by a pass that had
+   **never seen the candidate** and therefore cannot have been bent to fit them — which
+   is exactly the failure the step-D rules above exist to prevent. Note what is
+   deliberately NOT delegated: `fit_level`, the met/unmet judgement, and the
+   listing FACTS (`work_style`/`role_seniority`/`role_salary`/`deadline`). The facts
+   look delegable but aren't — the judge reads phase-5-scraped full text while
+   `rank_gate` often saw only a ~455-char teaser, so a handed-down fact would be
+   strictly worse than the one it can read itself.
+   Disqualifier rule 5 (SECTOR/DOMAIN FIT) also carries a **shared/ambiguous job title**
+   carve-out: some titles name two different professions and are told apart only by the
+   duties ("Automation Engineer" = software/RPA vs industrial PLC/robotics; "Analyst" =
+   data vs financial/intelligence; "Engineer" = software vs mechanical/electrical). For
+   those, a word-for-word match against a target role is explicitly *not* evidence of a
+   field match — see the matching carve-outs in `_screen_prompt`'s ROLE FUNCTION FIT
+   (which had the inverse rule: a verbatim title match was *presumptively* a match) and
+   `_rank_prompt`'s FUNCTION MATCH. All three were changed together and all three cache
+   versions bumped (`screen_v11`, `rank_v8`, eval 16); leaving any one behind reinstates
+   the hole at that stage.
+   The
    LOCATION/VISA/RELOCATION disqualifier rule
    applies the same on-site-unless-stated-otherwise classification as the gate's
    work-arrangement axis above before judging eligibility, rather than treating an
@@ -374,7 +611,14 @@ of what the last finished run already recorded — see the search-pipeline secti
    succeeded and genuinely rejected everyone (or rejected everyone in the retry too),
    which correctly contributes zero picks for that cluster rather than padding a
    wrong-function role into the results → fair-allocate the combined per-cluster picks
-   to a final cap (`FINAL_PICKS` = 12) → persisted as `Role` rows.
+   to a final cap (`FINAL_PICKS` = 12) → persisted as `Role` rows. That last
+   fair-allocate runs **once per `_VERDICT_GRADES` tier** (very_strong → strong → ok
+   → stretch → ungraded), not once over a strong/backup split: `fit_rank` is assigned
+   purely by position in the final list and nothing downstream re-sorts, so tiering on
+   the `strong_fit` boolean alone left the judge's finer `fit_level` — the grade the
+   card's badge actually shows — doing nothing, and a live run ranked four "Strong fit"
+   picks above two "Very strong fit" ones purely on cluster iteration order. Each
+   grade's own pass still spreads that grade's slots across clusters fairly.
    Historical note: the gate stage has gone through three designs. Originally two
    separate gates (sector per-cluster, seniority once globally) with a
    strict-then-relaxed two-call final eval — the global seniority gate over-pruned and
@@ -494,16 +738,33 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   primary) after a live `tests/gate_harness.py` run confirmed jobs scoring below ~0.39
   were reliably screened out later anyway — admitting them at all just burned gate/rank
   calls on jobs with no realistic path to a final pick.
-- `JUDGE_POOL` (default 40, `engine.py`) / `RANK_REJECT_SCORE_FLOOR` (default 55,
-  `engine.py`) — the cheap rank stage's cap and absolute per-job score cutoff, see
-  pipeline step 2. `full_auto.rank_gate`'s fail-open path (its `llm()` call erroring,
+- `RANK_EXAMINE_BUDGET` (240) / `RANK_TARGET_POOL` (80) / `JUDGE_POOL` (40) /
+  `RANK_REJECT_SCORE_FLOOR` (50), all `engine.py` — the four numbers that set what the
+  cheap+mid stages cost and what the judge gets to choose from, see pipeline step 2.
+  `RANK_EXAMINE_BUDGET` is the honest cost dial: it is roughly a 3x increase on what the
+  old per-cluster caps summed to, and screen (CHEAP) + rank (MID) calls scale directly
+  with it. `full_auto.rank_gate`'s fail-open path (its `llm()` call erroring,
   e.g. an intermittent permission/rate error on `MID_MODEL`) retries once on the same
   model after a short backoff, then falls back to `CHEAP_MODEL`, before giving up; a
   job that still has no real score after all of that is tagged `_rank_gate_failed` and
   bypasses `RANK_REJECT_SCORE_FLOOR` entirely in `engine._gate_rank_refill_cluster`
-  rather than being compared against it — the fallback neutral score (50) sits below
-  the floor (55), so without this bypass "fail-open" was silently rejecting almost
-  everything in an affected batch instead of letting it through.
+  rather than being compared against it — the fallback neutral score (50) is now exactly
+  AT the floor rather than below it, but the bypass stays: it must not depend on those
+  two numbers happening to coincide.
+- `GATE_FIRST_ROUND` (20) / `GATE_ROUND_SIZE` (80) / `full_auto._GATE_MAX_WORKERS` (4) —
+  the latency side of that budget. Round COUNT, not batch size, is what costs wall time:
+  a round is a blocking `screen_gate` call then a blocking `rank_gate` call, each of
+  which fans its own `_GATE_BATCH`(20)-sized sub-calls over a `_GATE_MAX_WORKERS` pool.
+  At 80/round an 80-candidate round is exactly 4 sub-calls in ONE wave, so tripling the
+  intake costs roughly one extra round rather than three. **`GATE_FIRST_ROUND` stays
+  small on purpose and should not be raised**: `report()` only fires once a whole round
+  has gated *and* ranked, so that first round alone sets time-to-first-"Verifying…"-card.
+  For the same reason `REED_ENRICH_PRE_GATE_CAP` (100, run-wide) caps the pre-gate Reed
+  enrichment rather than letting it follow the examine budget out to 240 — it is
+  blocking main-thread HTTP sitting directly in front of first paint (a live run
+  enriched 45 in 4.1s), so it is sized to cover roughly the first two rounds and the
+  deep tail rides its teaser. `_GATE_MAX_WORKERS` is the knob to turn back down if
+  429s/401s appear.
 - `CATEGORY_EXPAND_ENABLED` (default false) — see the category-page-expansion note
   above; off by default since it currently recovers ~0 jobs on JS-hydrated category
   pages while still paying full crawl cost.
@@ -581,6 +842,26 @@ stale "global" country row left over from an earlier national selection doesn't 
 waive the country filter for `local` scope, which always narrows by country+city
 regardless of any country chip (the UI hides country chips entirely once scope leaves
 "national").
+
+The country filter itself (`engine._filter_by_country`) is **no longer positively-must-
+match**: it was hard-dropping ~97% of genuinely-UK listings because the worldwide
+`countries_data.py` token set carries only ~20 UK cities, so most postings (which name only
+a town like Slough/Watford/Derby) resolved to `None` via `country_of` and were dropped — a
+live UK run collapsed `country filter ['gb']: 2502 -> 63`. It now keeps a job **unless it
+positively resolves to a *different* country**, with two escape hatches: (1) country-scoped
+boards (`_COUNTRY_SCOPED_BOARDS` = reed [UK-only] / adzuna [always queried on the profile's
+own country endpoint]) are trusted unconditionally, and (2) an unrecognised/blank/descriptor
+location is kept, not dropped. The positive in-country check uses `full_auto.country_matches`
+(tests the *allowed* codes directly) instead of `country_of`, which sidesteps `country_of`'s
+alphabetical first-match misroute (e.g. "Newcastle" → `au` because Australia sorts before
+`gb`, even though gb also carries the token). The cheap gate's work-arrangement axis and the
+final judge's LOCATION disqualifier remain the real location enforcers for anything kept.
+Relatedly, `select_sources_for_run` only adds the `CareerjetSource` aggregator to the
+always-on tier when the profile's country is **not** Adzuna-supported (`cc not in
+_ADZUNA_SUPPORTED`) — it's the essential coverage backstop for UAE/etc. (Adzuna serves
+neither, Reed is UK-only) but redundant blank-company repost noise for UK, where it was
+crowding out the clean Adzuna/Reed feeds (worsened by `fetch_adzuna` silently dropping a
+whole term on any API error, now retried once).
 
 The candidate's own Remote/Hybrid/On-site preference(s) are captured as `location`
 attribute rows too (same attribute type as the free-text city — `LocationPicker.tsx`'s

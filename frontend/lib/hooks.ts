@@ -22,14 +22,6 @@ export function useFamilies(profileId: number | null) {
   });
 }
 
-export function useConfidence(profileId: number | null) {
-  return useQuery({
-    queryKey: ["confidence", profileId],
-    queryFn: () => api.confidence(profileId!),
-    enabled: !!profileId,
-  });
-}
-
 export function useContextHeader(profileId: number | null) {
   return useQuery({
     queryKey: ["contextHeader", profileId],
@@ -75,7 +67,6 @@ export function useAttributeMutations(profileId: number) {
   const qc = useQueryClient();
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["attributes", profileId] });
-    qc.invalidateQueries({ queryKey: ["confidence", profileId] });
   };
 
   const add = useMutation({
@@ -123,7 +114,6 @@ export function useFamilyMutations(profileId: number) {
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["families", profileId] });
     qc.invalidateQueries({ queryKey: ["attributes", profileId] });
-    qc.invalidateQueries({ queryKey: ["confidence", profileId] });
   };
 
   const add = useMutation({

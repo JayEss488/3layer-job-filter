@@ -3,16 +3,14 @@
   "configurations": [
     {
       "name": "backend",
-      "runtimeExecutable": "../venv/Scripts/python",
-      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--port", "8000"],
-      "cwd": "backend",
+      "runtimeExecutable": "venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--port", "8000", "--app-dir", "backend"],
       "port": 8000
     },
     {
       "name": "frontend",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
-      "cwd": "frontend",
+      "runtimeArgs": ["run", "dev", "--prefix", "frontend"],
       "port": 3000
     }
   ]

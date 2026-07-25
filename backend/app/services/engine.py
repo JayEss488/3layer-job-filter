@@ -26,11 +26,12 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import numpy as np
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import CATEGORY_EXPAND_ENABLED, DISCOVERY_ATS_CACHE_TTL_HOURS, ROLE_STALE_DAYS
 from ..database import SessionLocal
-from ..models import Role, SearchRun, JobSeen
+from ..models import Role, SearchRun, JobSeen, JobEmbedding
 from .families import ensure_families
 from .profile_intel import ensure_profile_intel
 from .snapshot import build_snapshot, cv_text_for_cluster
@@ -51,7 +52,7 @@ from .sources import (
 # gate+rank (see _gate_rank_refill_cluster) until that cluster's fair share of
 # JUDGE_POOL rank-floor survivors accumulate, or the cluster's candidate queue
 # is exhausted, or its fair share of the examine budget (see
-# SINGLE_CLUSTER_EXAMINE_CAP/MULTI_CLUSTER_EXAMINE_CAP below) has been examined
+# RANK_EXAMINE_BUDGET below) has been examined
 # -- unlike a one-shot capped batch, this keeps pulling from the idle
 # above-RELEVANCE_FLOOR pool instead of leaving hundreds of unexamined,
 # fair-scoring candidates on the table every run. Survivors -> expensive
@@ -65,7 +66,16 @@ TARGET_POOL       = 90     # gate-survivor checkpoint per cluster per refill rou
 # round count -- and thus the per-round screen_gate/rank_gate orchestration
 # overhead -- low. (These cap the round; TARGET_POOL still bounds it from above.)
 GATE_FIRST_ROUND  = 20     # small first examine round -> earliest provisional cards
-GATE_ROUND_SIZE   = 40     # subsequent examine rounds
+# Later rounds raised 40 -> 80 alongside the RANK_EXAMINE_BUDGET increase below.
+# Round count, not batch size, is what costs wall time here: a round is a blocking
+# screen_gate call followed by a blocking rank_gate call, and each of those already
+# fans its own _GATE_BATCH(=20)-sized sub-calls out over a 3-worker pool -- so an
+# 80-candidate round is 4 sub-calls across 3 workers (~2 waves) rather than 4
+# sequential round-trips. At the old 40, a 240-candidate budget would have meant
+# ~7 sequential rounds per cluster; at 80 it is 4 (20 + 80 + 80 + 60). The FIRST
+# round is deliberately left at 20: it alone sets time-to-first-provisional-card,
+# since report() only fires once a whole round has gated AND ranked.
+GATE_ROUND_SIZE   = 80     # subsequent examine rounds
 MIN_RESULTS       = 3      # below this many strong matches, broaden the threshold
 # Below this many characters, a job's discovery-time snippet is assumed too
 # thin (e.g. a short Google-organic blurb) to judge fit against without
@@ -116,6 +126,24 @@ EMBED_MAX_WORKERS = 6
 # survivors 0-100 on fit instead of a boolean pass/fail, so the expensive judge
 # only ever sees a curated top slice instead of every gate survivor.
 JUDGE_POOL = 40               # top-ranked candidates sent on to scrape + judge
+# The mid tier is deliberately run WIDER than the judge is: it accumulates up to
+# RANK_TARGET_POOL approvals and the judge then takes the best JUDGE_POOL of them,
+# so the expensive stage chooses from a curated best-of rather than from whatever
+# happened to survive. Before this, the accumulation target WAS JUDGE_POOL, which
+# made the judge's input "everything that got through" -- a live run reached it
+# with 35 candidates, 5 of them in one cluster, and the judge could only pick the
+# least-bad of five. Widening the mid tier is cheap relative to the judge (CHEAP
+# screen + MID rank vs. a STRONG full-text call on a scraped page), which is the
+# whole reason the ratio is worth paying for.
+RANK_TARGET_POOL = 80         # run-wide judge-eligible target for the gate+rank stage
+# Run-wide ceiling on how many candidates the cheap+mid stages examine, split
+# evenly across active clusters at the call site. Replaces the old per-cluster
+# SINGLE_CLUSTER_EXAMINE_CAP(80)/MULTI_CLUSTER_EXAMINE_CAP(40) pair, whose total
+# depended on cluster count in the wrong direction: a 2-cluster profile examined
+# 80 in total while a 1-cluster profile examined 80 as well, and a live 2-cluster
+# run left queues of 329 and 194 with only 40 examined each. A single run-wide
+# number is both the honest cost dial and the thing worth tuning.
+RANK_EXAMINE_BUDGET = 240
 # Symmetric FLOOR to the JUDGE_POOL ceiling: an absolute rank cutoff
 # (RANK_REJECT_SCORE_FLOOR) plus per-cluster examine caps can leave the judge with
 # far fewer than JUDGE_POOL candidates even when dozens of gate survivors exist
@@ -129,7 +157,9 @@ JUDGE_POOL_FLOOR = 25
 # Per-cluster examine cap for that extra round -- deliberately small (one
 # GATE_FIRST_ROUND-sized batch) so a shortfall costs at most one more cheap
 # gate+rank call per needy cluster rather than re-running a full
-# MULTI_CLUSTER_EXAMINE_CAP-sized pass.
+# per-cluster share of RANK_EXAMINE_BUDGET. Rarely fires now that the main
+# budget is 240 rather than 40-80, but kept as the safety net for a profile
+# whose queues are genuinely thin.
 JUDGE_POOL_FLOOR_EXTRA_CAP = 20
 # How many of the judge pool's top-ranked candidates are persisted as
 # provisional "being verified..." Role rows the moment gate+rank finishes --
@@ -138,18 +168,44 @@ JUDGE_POOL_FLOOR_EXTRA_CAP = 20
 # judge works. Matches full_auto.FINAL_PICKS so the end-of-run upgrade swaps
 # card content in place rather than visually collapsing a longer list.
 PROVISIONAL_MAX = 12
-# Per-cluster ceiling on how many candidates screen_gate/rank_gate examine in one
-# run (see _gate_rank_refill_cluster's judge_target/examine_cap params below).
-# Replaces a flat cap applied per cluster regardless of cluster
-# count, which let every cluster in a multi-stream profile independently grind
-# toward the FULL JUDGE_POOL target each -- a live 2-cluster run produced
-# "450 examined -> 282 gate survivors -> 203 judge-eligible -> top-40 sent to
-# full evaluation" this way, since only JUDGE_POOL=40 total is ever used by the
-# final cross-cluster fair-allocate regardless of how many more each cluster
-# found. Smaller when there's more than one cluster, since each only needs its
-# fair share (JUDGE_POOL / active cluster count) rather than the full 40.
-SINGLE_CLUSTER_EXAMINE_CAP = 80
-MULTI_CLUSTER_EXAMINE_CAP = 40
+# Progressive paint: how many candidates are shown straight off the embedding
+# pre-filter, before any LLM has looked at them. These land seconds into a run
+# (the embed+score phases measured 6.8s and 0.4s live) instead of the ~90s the
+# first gate+rank round takes, but they are also the least-informed cards the app
+# ever shows -- cosine similarity against a cluster embedding, nothing more. Kept
+# deliberately small for that reason: it is a "we're working, here's the shape of
+# it" signal, not a result set. Most of these get replaced by the rank-stage paint
+# (in place -- see _upsert_provisional_rows), so a run typically ends with fewer
+# than this many still sitting in the embedding section.
+EMBED_PAINT_MAX = 8
+# Stage values for Role.provisional_stage, in pipeline order. A row is only ever
+# promoted forwards along this chain.
+PROVISIONAL_STAGE_EMBED = "embed"
+PROVISIONAL_STAGE_RANK = "rank"
+_PROVISIONAL_STAGES_AFTER_EMBED = (PROVISIONAL_STAGE_RANK,)
+# A candidate whose text is already rich enough to judge (ATS description, a
+# Reed full description fetched by _enrich_reed_full_text, a persisted full_text
+# from an earlier run, or a long-enough snippet -- i.e. _needs_full_scrape is
+# False) gets this added to its ORDERING score when the judge pool is filled.
+# Not to its rank score, and not to the floor test: a bad job stays rejected
+# (see _selection_score). Purely a tie-break, so among candidates the mid tier
+# rated the same, the judge pool fills with the ones it can actually read --
+# which both shortens phase 5 (fewer pages to fetch, the run's longest tail and
+# its main anti-bot exposure) and gives the judge better text on the roles it
+# does see. Small on purpose: 3 points on a 0-100 scale breaks a near-tie and
+# nothing more, so this can never promote a 60 over a 75.
+RICH_TEXT_SELECTION_BONUS = 3.0
+# Run-wide cap on how many about-to-be-gated candidates _enrich_reed_full_text is
+# offered before the cluster pool starts. This step is pure blocking HTTP on the
+# main thread (it commits), so it sits directly in front of time-to-first-card:
+# ~12 ids resolve per wave, and a live run enriched 45 in 4.1s. Handing it the
+# whole RANK_EXAMINE_BUDGET slice would have made that ~12s of dead air before
+# the first "Verifying…" card could possibly appear. Sized instead to cover
+# roughly the first two examine rounds (GATE_FIRST_ROUND + GATE_ROUND_SIZE), so
+# the candidates the gate reaches SOONEST get real text and the deep tail --
+# lower embed-score by construction, and re-scraped by phase 5 anyway if it
+# survives to the judge -- rides its teaser.
+REED_ENRICH_PRE_GATE_CAP = 100
 # Absolute cutoff on rank_gate's 0-100 fit score, replacing the old relative
 # bottom-20%-of-whatever-batch trim (RANK_AUTOREJECT_FRACTION). MID_MODEL is a
 # materially stronger model now (see full_auto.py's model tier comments), so
@@ -167,7 +223,15 @@ MULTI_CLUSTER_EXAMINE_CAP = 40
 # the judge with at least MIN_RESULTS candidates, so raising this can't
 # starve a cluster to zero -- it can only promote the harsher floor's
 # rejects back in when a cluster is otherwise thin.
-RANK_REJECT_SCORE_FLOOR = 55
+# Lowered again 55 -> 50 as the other half of the RANK_TARGET_POOL widening:
+# this floor is now a "not clearly a no" bar rather than a selection mechanism.
+# Selection is done by taking the best JUDGE_POOL of up to RANK_TARGET_POOL
+# approvals, which is a strictly better instrument -- an absolute cutoff set
+# high enough to select is also high enough to starve a cluster (which is what
+# 55 did to a 5-candidate cluster), whereas a low floor plus a wide pool plus a
+# top-N cut cannot. Anything at or above the midpoint of the mid tier's own
+# 0-100 scale proceeds; ordering after that is _selection_score's job.
+RANK_REJECT_SCORE_FLOOR = 50
 # Same-source posting-volume signal (scam/CV-farming detection, see
 # _company_title_counts): a company posting at least this many DIFFERENT
 # titles in one run's discovery is surfaced to the final judge as a hint --
@@ -208,6 +272,22 @@ def _needs_full_scrape(job: dict) -> bool:
     if _KNOWN_DEAD_END_URL_RE.search(job.get("url") or ""):
         return False  # known-dead redirect stub -- skip straight to snippet fallback
     return len((job.get("snippet") or "").strip()) < SNIPPET_SUFFICIENT_CHARS
+
+
+def _selection_score(j: dict) -> float:
+    """Ordering key for filling the judge pool: the mid tier's own 0-100 fit
+    score, plus RICH_TEXT_SELECTION_BONUS for a candidate whose text is already
+    good enough to judge without a phase-5 page fetch.
+
+    Deliberately SEPARATE from `_rank_score`, which stays exactly what the model
+    said. Three things depend on that separation: the card's "Fit estimate N/100"
+    chip shows an unmodified model score; RANK_REJECT_SCORE_FLOOR is tested
+    against the unmodified score, so already-scraped text can never lift a
+    genuinely poor job over the floor; and gate_cache still stores the model's
+    own number, so the bonus can be retuned without invalidating a single cached
+    score. Only ORDER changes -- which of two acceptable candidates gets the
+    judge slot."""
+    return j.get("_rank_score", 50.0) + (0.0 if _needs_full_scrape(j) else RICH_TEXT_SELECTION_BONUS)
 
 
 # Free, high-confidence seniority pre-reject: a junior/graduate candidate will never
@@ -501,15 +581,28 @@ _DUP_TEXT_PREFIX_CHARS = 400   # normalized chars that must match to call it the
 _DUP_TEXT_MIN_CHARS = 120      # below this there's no real evidence either way -- never collapse
 
 
-def _judge_dup_key(j: dict) -> tuple | None:
-    company = _norm_company(j.get("company", ""))
+def _dup_key(j: dict) -> tuple | None:
     title = _norm(j.get("title", ""))
-    if not company or not title:
+    if not title:
         return None
     text = re.sub(r"\s+", " ", (j.get("full_text") or j.get("snippet") or "").lower()).strip()
     if len(text) < _DUP_TEXT_MIN_CHARS:
-        return None
-    return (company, title, text[:_DUP_TEXT_PREFIX_CHARS])
+        return None   # no text evidence either way -- never collapse
+    company = _norm_company(j.get("company", ""))
+    if company:
+        return (company, title, text[:_DUP_TEXT_PREFIX_CHARS])
+    # Aggregator listings (careerjet/jobviewtrack and similar) arrive with a
+    # BLANK company and a unique per-listing redirect URL, so neither the
+    # company-keyed path here nor discovery's URL-canonical identity_hash ever
+    # collapses their verbatim reposts -- a live UAE run surfaced four identical
+    # "Marketing Assistant / Dubai" cards straight into the provisional view.
+    # With no company to key on, fall back to title + location + text prefix.
+    # Location is included (not just title+text) so a genuinely different-city
+    # repost of the same template stays a separate posting, and the text-prefix
+    # requirement (already enforced above) keeps two thin, evidence-free generic
+    # titles from ever being merged.
+    loc = "|".join(sorted(_location_tokens(j.get("location", ""))))
+    return ("", title, loc, text[:_DUP_TEXT_PREFIX_CHARS])
 
 
 def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
@@ -527,7 +620,7 @@ def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
     for idx, jobs in rank_by_cluster.items():
         kept = []
         for j in jobs:
-            key = _judge_dup_key(j)
+            key = _dup_key(j)
             if key is not None and key in seen:
                 suppressed += 1
                 continue
@@ -979,33 +1072,86 @@ def _company_title_counts(jobs: list[dict]) -> dict[str, set[str]]:
 
 # ── Adaptive enrichment funnel ───────────────────────────────────────────────
 
-def _ensure_embeddings(engine, db: Session, rows: list[JobSeen]) -> int:
-    """Compute and cache an embedding for any row missing one. Each job is
-    embedded exactly once ever; later runs only pay for newly-discovered rows.
-    Returns how many were embedded this call (for logging)."""
+def _embed_text(r: JobSeen) -> str:
+    """The exact string embedded for a job. Purely job content (title/company/
+    snippet) -- no profile data -- which is what makes the resulting vector
+    reusable across every profile via the JobEmbedding cache."""
+    return f"{r.title} {r.company or ''} {(r.snippet or '')[:2000]}"
+
+
+def _embed_text_hash(engine, text: str) -> str:
+    """Content-address key for JobEmbedding. Folds the embedding model name in
+    so switching models transparently recomputes under fresh keys rather than
+    serving a stale vector from a different model."""
+    return hashlib.sha1(f"{engine.EMBED_MODEL}\n{text}".encode()).hexdigest()
+
+
+def _ensure_embeddings(engine, db: Session, rows: list[JobSeen]) -> tuple[int, int]:
+    """Assign an embedding to any row missing one, computing via OpenAI only for
+    text not already in the global JobEmbedding cache. Each distinct job TEXT is
+    embedded exactly once ever, across all profiles -- see the JobEmbedding
+    model. Returns (reused, computed) for logging."""
     missing = [r for r in rows if not r.embedding]
     if not missing:
-        return 0
-    texts = [f"{r.title} {r.company or ''} {(r.snippet or '')[:2000]}" for r in missing]
-    chunks = [texts[i:i+EMBED_CHUNK_SIZE] for i in range(0, len(texts), EMBED_CHUNK_SIZE)]
-    if len(chunks) == 1:
-        embeddings = engine.get_embeddings_batch(chunks[0])
-    else:
-        # A first run embeds several hundred fresh rows (measured: 651 -> 7
-        # sequential OpenAI calls, ~15s of the run). The chunks are independent,
-        # so overlap them -- bounded at EMBED_MAX_WORKERS workers for the same
-        # rate-limit-burst reason the gate/rank pools cap at 3. ex.map preserves
-        # input order, which the zip below depends on. get_embeddings_batch only
-        # touches the module-level OpenAI client (thread-safe, no DB); the row
-        # writes + commit stay on this thread.
-        embeddings = []
-        with ThreadPoolExecutor(max_workers=min(EMBED_MAX_WORKERS, len(chunks))) as ex:
-            for chunk_result in ex.map(engine.get_embeddings_batch, chunks):
-                embeddings.extend(chunk_result)
-    for r, emb in zip(missing, embeddings):
-        r.embedding = _encode_embedding(emb)
+        return 0, 0
+    texts = [_embed_text(r) for r in missing]
+    hashes = [_embed_text_hash(engine, t) for t in texts]
+
+    # 1. Pull whatever the shared cache already has for this batch's hashes.
+    want = set(hashes)
+    cache: dict[str, str] = {
+        row.text_hash: row.embedding
+        for row in db.query(JobEmbedding).filter(JobEmbedding.text_hash.in_(want))
+    }
+
+    # 2. Which hashes still need an API call -- unique only, so two rows with the
+    # same text (e.g. aggregator reposts) cost one call, not two.
+    to_compute: dict[str, str] = {}   # hash -> text
+    for h, t in zip(hashes, texts):
+        if h not in cache and h not in to_compute:
+            to_compute[h] = t
+
+    computed: dict[str, str] = {}     # hash -> base64 embedding
+    if to_compute:
+        c_hashes = list(to_compute)
+        c_texts = [to_compute[h] for h in c_hashes]
+        chunks = [c_texts[i:i+EMBED_CHUNK_SIZE] for i in range(0, len(c_texts), EMBED_CHUNK_SIZE)]
+        if len(chunks) == 1:
+            vectors = engine.get_embeddings_batch(chunks[0])
+        else:
+            # A first run embeds several hundred fresh rows (measured: 651 -> 7
+            # sequential OpenAI calls, ~15s of the run). The chunks are independent,
+            # so overlap them -- bounded at EMBED_MAX_WORKERS workers for the same
+            # rate-limit-burst reason the gate/rank pools cap at 3. ex.map preserves
+            # input order, which the zip below depends on. get_embeddings_batch only
+            # touches the module-level OpenAI client (thread-safe, no DB); the row
+            # writes + commit stay on this thread.
+            vectors = []
+            with ThreadPoolExecutor(max_workers=min(EMBED_MAX_WORKERS, len(chunks))) as ex:
+                for chunk_result in ex.map(engine.get_embeddings_batch, chunks):
+                    vectors.extend(chunk_result)
+        computed = {h: _encode_embedding(v) for h, v in zip(c_hashes, vectors)}
+        # Persist the fresh vectors into the shared cache. Guard the PK against a
+        # concurrent search thread having inserted the same hash meanwhile: add
+        # each in its own nested transaction so one collision doesn't poison the
+        # batch, and fall back to the just-committed value on conflict.
+        for h, enc in computed.items():
+            try:
+                with db.begin_nested():
+                    db.add(JobEmbedding(text_hash=h, embedding=enc, model=engine.EMBED_MODEL))
+            except IntegrityError:
+                existing = db.get(JobEmbedding, h)
+                if existing is not None:
+                    computed[h] = existing.embedding
+
+    # 3. Assign every missing row its vector (cache hit or freshly computed).
+    resolved = {**cache, **computed}
+    for r, h in zip(missing, hashes):
+        enc = resolved.get(h)
+        if enc is not None:
+            r.embedding = enc
     db.commit()
-    return len(missing)
+    return len(missing) - len(to_compute), len(to_compute)
 
 
 def _encode_embedding(vec) -> str:
@@ -1380,7 +1526,7 @@ def _gate_rank_refill_cluster(
     floor_target = min(MIN_RESULTS, len(gate_survivors))
     if len(judge_eligible) < floor_target:
         need = floor_target - len(judge_eligible)
-        promoted = sorted(below_rank_floor, key=lambda x: x.get("_rank_score", 0), reverse=True)[:need]
+        promoted = sorted(below_rank_floor, key=_selection_score, reverse=True)[:need]
         if promoted:
             backfilled = True
         judge_eligible.extend(promoted)
@@ -1389,7 +1535,7 @@ def _gate_rank_refill_cluster(
         if promoted:
             report(list(judge_eligible))
 
-    judge_eligible.sort(key=lambda j: j.get("_rank_score", 50.0), reverse=True)
+    judge_eligible.sort(key=_selection_score, reverse=True)
     stats = {
         "examined": examined, "queue_len": len(queue),
         "gate_survivors": len(gate_survivors), "hard_dropped": len(hard_dropped),
@@ -1457,29 +1603,69 @@ def _is_location_scope_descriptor(location: str) -> bool:
     return (location or "").strip().lower() in _LOCATION_SCOPE_DESCRIPTORS
 
 
+# Boards that are inherently scoped to the profile's own country at query time,
+# so a listing they return is guaranteed in-country regardless of whether our
+# token set can recognise the town it names: Reed is UK-only, and Adzuna is only
+# ever queried on the profile's own country endpoint (fetch_adzuna returns [] for
+# an unsupported country). Aggregators (careerjet), organic (google_jobs), broad
+# APIs (jsearch/remotive) and company ATS boards can all carry cross-border rows,
+# so they still get the location check below.
+_COUNTRY_SCOPED_BOARDS = {"reed", "adzuna"}
+
+
 def _filter_by_country(engine, jobs: list[dict], country_codes: list[str]) -> list[dict]:
-    """Hard-drop jobs whose location isn't the selected country. A job is only
-    kept if it positively matches an allowed country. The snippet is only
-    consulted when location is inconclusive -- either genuinely blank, or a
-    bare work-arrangement descriptor ("Hybrid"/"Distributed"/"In-Office") that
-    carries no place information at all. A known-but-unrecognised REAL place
-    name (e.g. "Riga, Latvia" when our token list doesn't cover Latvia) must
-    NOT fall back to scanning the description, since a global company's
-    boilerplate ("headquartered in London...") will false-positive-match the
-    HQ's country for a role based somewhere else entirely. country_codes == []
-    means "Global" -- no filtering. Anything we can't positively confirm is
-    dropped: that's the point of a hard filter, not a reason to wave it through."""
+    """Keep a job UNLESS it positively resolves to a country OTHER than an allowed
+    one. Two escape hatches stop this starving a country whose town names the
+    worldwide token set can't recognise:
+
+      * Country-scoped boards (_COUNTRY_SCOPED_BOARDS) are kept unconditionally --
+        they're guaranteed in-country by construction, so a town the gb token set
+        can't name must not drop a Reed/Adzuna row.
+      * A location that doesn't positively resolve to ANY country (an unrecognised
+        town, a bare work-arrangement descriptor, or blank) is KEPT; only a location
+        that resolves to a *different*, non-allowed country is dropped.
+
+    This deliberately loosens the old positively-must-match-or-drop posture, which
+    was hard-dropping ~97% of genuinely-UK listings (most UK postings name only a
+    town the ~20-city gb token set doesn't carry -> country_of returned None -> the
+    row was dropped). The cheap gate's work-arrangement axis and the final judge's
+    LOCATION disqualifier remain the real location enforcers for anything kept here.
+
+    The positive check uses engine.country_matches (which tests the allowed codes
+    directly) rather than engine.country_of, so an ambiguous city that IS a valid
+    allowed-country place -- e.g. "Newcastle", which country_of misroutes to `au`
+    because Australia sorts first -- is still recognised as in-country. The blank/
+    descriptor -> snippet fallback is preserved. country_codes == [] means Global
+    (International scope) -- no filtering."""
     if not country_codes:
         return jobs
     allowed = set(country_codes)
-    kept = []
+    kept: list[dict] = []
+    trusted = matched = unknown = foreign = 0
     for j in jobs:
-        location = j.get("location", "") or ""
-        cc = engine.country_of(location)
-        if cc is None and (not location.strip() or _is_location_scope_descriptor(location)):
-            cc = engine.country_of(j.get("snippet", "") or "")
-        if cc in allowed:
+        board = (j.get("board") or "").split(":")[0].strip().lower()
+        if board in _COUNTRY_SCOPED_BOARDS:
             kept.append(j)
+            trusted += 1
+            continue
+        location = j.get("location", "") or ""
+        text = location
+        if not location.strip() or _is_location_scope_descriptor(location):
+            text = j.get("snippet", "") or ""
+        if engine.country_matches(text, allowed):
+            kept.append(j)
+            matched += 1
+            continue
+        cc = engine.country_of(text)
+        if cc is None or cc in allowed:
+            kept.append(j)          # unrecognised location -> keep (see docstring)
+            unknown += 1
+        else:
+            foreign += 1            # positively a different country -> drop
+    engine.emit(
+        f"[pipeline] country filter {sorted(allowed)} kept {len(kept)}/{len(jobs)} "
+        f"(scoped-source {trusted}, matched {matched}, unknown-kept {unknown}; "
+        f"dropped {foreign} confirmed-foreign)")
     return kept
 
 
@@ -1965,10 +2151,11 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # FILTER: embed (cached) + cosine-score the whole set against every role
     # cluster, take a fair adaptive pool per cluster.
     _progress(db, run, f"Found {len(rows)} jobs, scoring…")
-    n_embedded = _ensure_embeddings(engine, db, rows)
+    n_reused, n_embedded = _ensure_embeddings(engine, db, rows)
     funnel["embedded_new"] = n_embedded
-    if n_embedded:
-        emit(f"[pipeline] embedded {n_embedded} new rows (cached for future runs)")
+    if n_embedded or n_reused:
+        emit(f"[pipeline] embedded {n_embedded} new rows "
+             f"({n_reused} reused from shared cache; all cached for future runs)")
     t0 = _lap("embed", t0)
     scored = _score_rows(rows, cluster_embeddings)
     t0 = _lap("score", t0)
@@ -2023,6 +2210,27 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     total_queued = sum(len(q) for q in queues.values())
     funnel["candidate_queue_size"] = total_queued
     funnel["pool_harsh"] = harsh
+
+    # PAINT 1 of 3 (embedding stage). The queues are embed-score-ordered and have
+    # already been through the country filter, the free heuristic prescreen and
+    # RELEVANCE_FLOOR, so their heads are the best thing known this early -- and
+    # this early is seconds in, against ~90s for the first gate+rank round. Pure
+    # DB write over dicts already in memory: no LLM, no fetch, nothing added to
+    # the critical path. _top_n_across_clusters reuses the same global sort +
+    # _dup_key collapse the rank-stage paint uses, so aggregator reposts don't
+    # show up as several identical cards here either. Rows land provisional=True,
+    # so every existing safety net already covers them -- /my-roles and stats
+    # never see them (include_provisional), and a cancelled or failed run reaps
+    # them (_cleanup_provisional_roles), preserving "an unfinished run leaves
+    # nothing user-visible".
+    _upsert_provisional_rows(
+        db, profile_id, run,
+        _top_n_across_clusters(
+            {i: q[:EMBED_PAINT_MAX] for i, q in queues.items()}, EMBED_PAINT_MAX,
+            key=lambda j: j.get("embed_score", 0.0),
+        ),
+        engine, stage=PROVISIONAL_STAGE_EMBED,
+    )
     emit(f"[pipeline] candidate queues: {total_queued} total across {len(queues)} cluster(s) "
          f"available to gate (>= RELEVANCE_FLOOR) (harsh/broadened={harsh}) "
          f"fallbacks={dict(pool_fallbacks)}")
@@ -2033,17 +2241,13 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # GATE + RANK, combined per cluster with refill: each cluster's own
     # embed-score-ordered queue is fed through screen_gate then rank_gate in
     # batches (see _gate_rank_refill_cluster) until that cluster's fair share
-    # of JUDGE_POOL rank-floor survivors accumulate, the queue is exhausted, or
-    # its fair share of the examine budget has been examined -- unlike the old
-    # one-shot TARGET_POOL-capped gate call, this keeps pulling from the idle
-    # above-floor pool instead of accepting a thin result when a harsher gate
-    # or the rank floor (RANK_REJECT_SCORE_FLOOR) leaves a cluster short.
-    # Each cluster targets JUDGE_POOL / active-cluster-count rather than the
-    # full JUDGE_POOL, and is capped at SINGLE_CLUSTER_EXAMINE_CAP (1 cluster)
-    # or MULTI_CLUSTER_EXAMINE_CAP (2+) total examined -- otherwise every
-    # cluster in a multi-stream profile independently grinds toward the full
-    # JUDGE_POOL target each, producing far more judge-eligible candidates than
-    # the final cross-cluster fair-allocate below will ever use. sector_ok
+    # of RANK_TARGET_POOL rank-floor survivors accumulate, the queue is
+    # exhausted, or its fair share of RANK_EXAMINE_BUDGET has been examined --
+    # unlike the old one-shot TARGET_POOL-capped gate call, this keeps pulling
+    # from the idle above-floor pool instead of accepting a thin result when a
+    # harsher gate or the rank floor (RANK_REJECT_SCORE_FLOOR) leaves a cluster
+    # short. Both budgets are run-wide and split evenly across active clusters,
+    # so a multi-stream profile costs the same as a single-stream one. sector_ok
     # stays the one unconditional hard drop within screen_gate; 2+ of the 5
     # soft axes failing (seniority/requirements/skills/salary/work-arrangement)
     # is now ALSO a hard drop (see full_auto.screen_gate/SOFT_GATE_AXES), with
@@ -2059,16 +2263,26 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     total_hard_gate_dropped = 0
     cluster_diagnostics: dict[int, dict] = {}
     num_active_clusters = sum(1 for q in queues.values() if q)
-    cluster_judge_target = -(-JUDGE_POOL // num_active_clusters) if num_active_clusters else JUDGE_POOL
-    cluster_examine_cap = SINGLE_CLUSTER_EXAMINE_CAP if num_active_clusters <= 1 else MULTI_CLUSTER_EXAMINE_CAP
+    # Both budgets are run-wide totals split evenly, so the run's cost is the
+    # same whether the candidate has one role family or three -- the shares just
+    # get thinner. cluster_judge_target aims at RANK_TARGET_POOL (80), NOT at
+    # JUDGE_POOL (40): the mid tier deliberately approves about twice what the
+    # judge will use so the expensive stage picks the best of a real pool rather
+    # than judging whatever survived. See RANK_TARGET_POOL / RANK_EXAMINE_BUDGET.
+    _n = num_active_clusters or 1
+    cluster_judge_target = -(-RANK_TARGET_POOL // _n)
+    cluster_examine_cap = -(-RANK_EXAMINE_BUDGET // _n)
 
-    # Give the cheap stages something real to read first. Scoped to exactly the
-    # slice each cluster is about to examine -- the queues are already
-    # embed-score-ordered, so queue[:cluster_examine_cap] IS what the gate will
-    # look at -- rather than the whole store, most of which never reaches a gate.
-    # Runs here, on the main thread, before the cluster pool starts, because it
-    # commits to the request session. See _enrich_reed_full_text.
-    to_enrich = [j for queue in queues.values() for j in queue[:cluster_examine_cap]]
+    # Give the cheap stages something real to read first. Scoped to the head of
+    # each cluster's queue -- already embed-score-ordered, so this is the slice
+    # the gate reaches first -- rather than the whole store, most of which never
+    # reaches a gate. Runs here, on the main thread, before the cluster pool
+    # starts, because it commits to the request session; that also puts it
+    # squarely in front of time-to-first-card, which is why it's capped at
+    # REED_ENRICH_PRE_GATE_CAP rather than following cluster_examine_cap all the
+    # way out to RANK_EXAMINE_BUDGET. See _enrich_reed_full_text.
+    enrich_slice = min(cluster_examine_cap, -(-REED_ENRICH_PRE_GATE_CAP // _n))
+    to_enrich = [j for queue in queues.values() for j in queue[:enrich_slice]]
     n_enriched = _enrich_reed_full_text(engine, db, profile_id, to_enrich)
     funnel["reed_enriched"] = n_enriched
     if n_enriched:
@@ -2225,7 +2439,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                     idx = extra_futures[f]
                     extra_eligible, _extra_survivors, extra_stats = f.result()
                     rank_by_cluster.setdefault(idx, []).extend(extra_eligible)
-                    rank_by_cluster[idx].sort(key=lambda x: x.get("_rank_score", 50.0), reverse=True)
+                    rank_by_cluster[idx].sort(key=_selection_score, reverse=True)
                     below_rank_floor_all.extend(extra_stats["below_rank_floor_jobs"])
                     judge_floor_extra_examined += extra_stats["examined"]
                     total_judge_eligible += extra_stats["judge_eligible"]
@@ -2509,22 +2723,39 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
 
     # Same fair-allocation logic as pooling/top-N: total output stays capped at
     # FINAL_PICKS, redistributed across clusters rather than added per cluster.
-    # Allocated in two tiers (strong_fit, already set on every pick above) rather
-    # than one pass over each cluster's already tier-ordered list -- a single pass
-    # takes each cluster's WHOLE share in cluster order, so a cluster with zero
-    # strong picks could contribute its backup-tier filler ahead of a later
-    # cluster's genuine strong picks. fit_rank (below) is assigned purely by
-    # position in `final`, and nothing downstream re-sorts by verdict, so that
-    # ordering bug rode all the way to the UI. Splitting by tier first guarantees
-    # every strong pick outranks every backup pick globally, while each tier's own
-    # fair-allocate pass still distributes slots across clusters fairly.
-    strong_by_cluster = {idx: [p for p in picks if p.get("strong_fit")]
-                          for idx, picks in final_by_cluster.items()}
-    backup_by_cluster = {idx: [p for p in picks if not p.get("strong_fit")]
-                          for idx, picks in final_by_cluster.items()}
-    final = _fair_allocate(strong_by_cluster, engine.FINAL_PICKS)
-    if len(final) < engine.FINAL_PICKS:
-        final += _fair_allocate(backup_by_cluster, engine.FINAL_PICKS - len(final))
+    # Allocated one VERDICT GRADE at a time rather than one pass over each
+    # cluster's already tier-ordered list -- a single pass takes each cluster's
+    # WHOLE share in cluster order, so a cluster with zero strong picks could
+    # contribute its backup-tier filler ahead of a later cluster's genuine strong
+    # picks. fit_rank (below) is assigned purely by position in `final`, and
+    # nothing downstream re-sorts by verdict, so any ordering slip here rides all
+    # the way to the UI.
+    #
+    # This used to split on the `strong_fit` BOOLEAN only (which list the judge
+    # put the pick in), which guaranteed strong-before-backup but left the finer
+    # fit_level grade -- the very thing the card's badge shows -- doing nothing at
+    # all: a live run ranked four "Strong fit" picks above two "Very strong fit"
+    # ones purely because they came from the cluster that happened to be first in
+    # `final_by_cluster`. Splitting per _VERDICT_GRADES instead makes the badge
+    # order and the rank order agree (every Very strong fit above every Strong
+    # fit, and so on down), while each grade's own fair-allocate pass still
+    # distributes that grade's slots across clusters fairly. Within one cluster's
+    # grade bucket the judge's own ordering is preserved.
+    graded_by_cluster: dict[str, dict[int, list[dict]]] = {
+        grade: {idx: [p for p in picks if _verdict_of(p) == grade]
+                for idx, picks in final_by_cluster.items()}
+        for grade in _VERDICT_GRADES
+    }
+    # A pick the judge graded with something we don't recognise (or didn't grade
+    # at all -- e.g. an inconclusive-call fallback) still has to land somewhere:
+    # keep it behind every graded pick rather than dropping it.
+    ungraded_by_cluster = {idx: [p for p in picks if _verdict_of(p) not in _VERDICT_GRADES]
+                           for idx, picks in final_by_cluster.items()}
+    final: list[dict] = []
+    for by_cluster in (*(graded_by_cluster[g] for g in _VERDICT_GRADES), ungraded_by_cluster):
+        if len(final) >= engine.FINAL_PICKS:
+            break
+        final += _fair_allocate(by_cluster, engine.FINAL_PICKS - len(final))
     # One lap, not the old separate "scrape" + "final_eval": phases 5 and 6 now
     # overlap per cluster (see _scrape_then_judge), so there is no longer a
     # wall-clock boundary between them to measure.
@@ -2639,35 +2870,76 @@ def _already_decided_ids(db: Session, profile_id: int, identities: list[str]) ->
     }
 
 
-def _top_n_across_clusters(cluster_accum: dict[int, list[dict]], n: int) -> list[dict]:
-    """Flattens every cluster's currently-known judge_eligible snapshot and
-    returns the top `n` by _rank_score. A simple global sort, NOT fairness-
+def _top_n_across_clusters(cluster_accum: dict[int, list[dict]], n: int, key=None) -> list[dict]:
+    """Flattens every cluster's currently-known snapshot and returns the top `n`
+    by `key` (default _selection_score). A simple global sort, NOT fairness-
     balanced across clusters the way _fair_allocate is -- that's only possible
     once every cluster's gate+rank has finished. A cluster with generally
     higher-scoring candidates can dominate this interim view early in a run;
     accepted tradeoff for responsiveness, corrected once _reconcile_provisional_roles
-    runs on the real fair-allocated pool."""
+    runs on the real fair-allocated pool.
+
+    The embedding-stage paint passes an embed_score key: nothing has a rank score
+    that early, and the default would fall back to a flat 50.0 whose only
+    remaining variation is _selection_score's rich-text bonus -- i.e. it would
+    order the very first cards the user sees by which ones happen to carry a long
+    snippet, not by how well they match."""
     everything = [j for jl in cluster_accum.values() for j in jl]
-    everything.sort(key=lambda j: j.get("_rank_score", 50.0), reverse=True)
-    return everything[:n]
+    everything.sort(key=key or _selection_score, reverse=True)
+    # Dedup the interim view with the same key the judge pool uses
+    # (_suppress_judge_duplicates), keeping the highest-ranked copy -- otherwise
+    # aggregator reposts (blank-company careerjet/jobviewtrack listings) show as
+    # several identical "Verifying..." cards until finalization finally collapses
+    # them. Keep the top-ranked copy of each; a job with no reliable key
+    # (key is None) is always kept.
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for j in everything:
+        key = _dup_key(j)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(j)
+        if len(out) >= n:
+            break
+    return out
 
 
 def _upsert_provisional_rows(db: Session, profile_id: int, run: SearchRun,
-                              top: list[dict], engine) -> tuple[int, int]:
+                              top: list[dict], engine, *, stage: str = "rank") -> tuple[int, int]:
     """Insert-or-update this run's provisional Role rows to mirror `top`
     (already sorted/capped by the caller) -- never deletes. Interim calls
     during gate+rank only ever add or refresh rows so a row's fit_rank can
     shift as better candidates arrive; only _reconcile_provisional_roles,
     once the real fair-allocated pool is known, resolves genuinely-gone
     leftovers. Safe to call repeatedly with a growing/reshuffling `top`
-    across the run -- see the call sites in _run_engine_pipeline."""
-    decided = _already_decided_ids(db, profile_id, [j.get("_identity") for j in top])
-    top = [j for j in top if j.get("_identity") not in decided]
+    across the run -- see the call sites in _run_engine_pipeline.
+
+    `stage` ("embed" | "rank") records which progressive-paint section the row
+    belongs to. A row already at a LATER stage is never demoted back: the
+    embed-stage paint runs once, up front, over candidates that mostly go on to
+    be examined, so re-writing stage="embed" onto a row the gate has since
+    promoted would bounce it back up the page. Promotion embed -> rank happens
+    here, in place (same row id, status untouched), which is what makes a job
+    move between sections instead of appearing in both -- the de-duplication the
+    three-stage view depends on falls out of the upsert rather than needing its
+    own pass."""
     existing = {
         r.external_id: r
         for r in db.query(Role).filter(Role.search_run_id == run.id, Role.provisional.is_(True))
         if r.external_id
     }
+    # _already_decided_ids exists to stop a SECOND, duplicate Role being created
+    # for a job the candidate already saved/applied. It must not also block
+    # UPDATES to a row this run already owns: its query isn't scoped to earlier
+    # runs, so a card the user Kept mid-run matches it too, and skipping that row
+    # froze it at whatever stage/rank it was first painted at. Latent before the
+    # three-stage paint (a stale fit_rank), load-bearing now -- a Kept
+    # embedding-stage card would never be promoted out of the "not yet reviewed"
+    # section even once the gate and rank stage had cleared it.
+    decided = _already_decided_ids(db, profile_id, [j.get("_identity") for j in top])
+    top = [j for j in top if j.get("_identity") in existing or j.get("_identity") not in decided]
     matched = inserted = 0
     for pos, j in enumerate(top, start=1):
         ident = j.get("_identity") or _external_id(engine, j)
@@ -2679,10 +2951,17 @@ def _upsert_provisional_rows(db: Session, profile_id: int, run: SearchRun,
             salary_text=_salary_text(j),
             source=j.get("board"),
             fit_rank=pos,
-            rank_score=int(round(j.get("_rank_score", 50.0))),
+            provisional_stage=stage,
         )
+        # No rank_score at the embedding stage -- nothing has scored this job yet,
+        # and writing the 50.0 default would render a fabricated "Fit estimate
+        # 50/100" chip on a card whose whole point is that no AI has seen it.
+        if stage != "embed":
+            fields["rank_score"] = int(round(j.get("_rank_score", 50.0)))
         row = existing.get(ident)
         if row is not None:
+            if stage == "embed" and row.provisional_stage in _PROVISIONAL_STAGES_AFTER_EMBED:
+                continue
             for k, v in fields.items():
                 setattr(row, k, v)   # upgrade in place: same row id, status untouched
             matched += 1
@@ -2715,7 +2994,7 @@ def _reconcile_provisional_roles(db: Session, profile_id: int, run: SearchRun,
     _suppress_judge_duplicates, or cut by _fair_allocate's cross-cluster
     budget -- gets resolved (retained-if-kept-or-applied / removed) here."""
     selected_ids = {j.get("_identity") for j in selected}
-    top = sorted(selected, key=lambda j: j.get("_rank_score", 50.0), reverse=True)[:PROVISIONAL_MAX]
+    top = sorted(selected, key=_selection_score, reverse=True)[:PROVISIONAL_MAX]
     matched, inserted = _upsert_provisional_rows(db, profile_id, run, top, engine)
 
     still_provisional = {
@@ -2727,6 +3006,13 @@ def _reconcile_provisional_roles(db: Session, profile_id: int, run: SearchRun,
     removed = 0
     for ident, row in still_provisional.items():
         if ident in top_ids:
+            continue
+        # Embedding-stage rows are NOT reaped here. This runs at the end of
+        # gate+rank, which is exactly the point where the embedding section is
+        # supposed to still be on screen underneath the rank-stage results (paint
+        # 2 of 3) -- resolving them would blank the bottom of the page mid-run.
+        # They are resolved at finalization like any other leftover.
+        if row.provisional_stage == PROVISIONAL_STAGE_EMBED:
             continue
         if ident not in selected_ids:
             _resolve_leftover_provisional(db, row)
@@ -2750,6 +3036,30 @@ _RETAINED_MARKER_UNJUDGED = (
     "⚠ You kept this during review, but the AI couldn't complete its full review of this role.")
 _RETAINED_MARKER_INTERRUPTED = (
     "⚠ You kept this during review, but the search ended before the AI finished verifying this role.")
+
+
+# How many rank-stage leftovers stay on screen after the run finishes, under
+# their own "quick-scored only" heading (paint 3 of 3). Ranked by the cheap
+# stage's own estimate, so these are the best of what the expensive judge ran out
+# of budget to look at.
+UNREVIEWED_RETAIN_MAX = 8
+_UNREVIEWED_MARKER = (
+    "⚠ Only quick-scored — the full AI review ran out of room before reaching this one, "
+    "so there's no detailed verdict here yet.")
+
+
+def _retain_unreviewed_provisional(db: Session, row: Role) -> None:
+    """Keep a rank-stage leftover on screen after the run, as an honestly-labelled
+    "we didn't get to this" card rather than deleting it.
+
+    Stays `provisional_stage="rank"` while `provisional` goes False: that pair is
+    what /search buckets on to render the trailing section, and it keeps the
+    persisted rank_score renderable. fit_rank is cleared so the row sorts after
+    every real pick (NULLS LAST), same as a retained Keep. Caller commits."""
+    row.provisional = False
+    row.fit_rank = None
+    row.ai_analysis = (_UNREVIEWED_MARKER if not row.ai_analysis
+                       else f"{_UNREVIEWED_MARKER}\n{row.ai_analysis}")
 
 
 def _resolve_leftover_provisional(db: Session, row: Role, marker: str | None = None) -> None:
@@ -2792,6 +3102,10 @@ def _resolve_leftover_provisional(db: Session, row: Role, marker: str | None = N
         if job is not None and job.state != "shown":
             job.state = "shown"
         row.provisional = False
+        # A retained Keep/Applied carries its own ⚠ marker and is a user decision,
+        # not an interim display bucket -- clear the stage so /search renders it as
+        # an ordinary row rather than filing it under "quick-scored only".
+        row.provisional_stage = None
         row.ai_analysis = marker if not row.ai_analysis else f"{marker}\n{row.ai_analysis}"
         if row.status == "saved" and (interrupted or verdict not in ("strong", "backup")):
             row.status = "new"
@@ -2801,6 +3115,7 @@ def _resolve_leftover_provisional(db: Session, row: Role, marker: str | None = N
     else:  # crossed (possibly already flipped to deleted by _prune_previous_roles)
         row.status = "deleted"
         row.provisional = False
+        row.provisional_stage = None
 
 
 def _cleanup_provisional_roles(db: Session, run_id: int) -> None:
@@ -2940,6 +3255,11 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 for k, v in fields.items():
                     setattr(row, k, v)
                 row.provisional = False
+                # A real judged pick belongs to no interim stage. Must be cleared
+                # explicitly: the row may have been painted at the embedding or
+                # rank stage, and a stale value here would file a genuine pick
+                # into the trailing "quick-scored only" section on /search.
+                row.provisional_stage = None
             elif ident not in decided_ids:
                 db.add(Role(
                     profile_id=profile_id,
@@ -2950,11 +3270,50 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 ))
             # else: already saved/applied from an earlier run -- see decided_ids.
 
-        # Provisional rows the judge did NOT pick: retain the user-kept ones
-        # (with an honest marker), remove the rest. Rides the same commit as
-        # the picks above, so upgrade+removal is atomic with status="done".
-        for row in provisional_by_id.values():
-            _resolve_leftover_provisional(db, row)
+        # Provisional rows the judge did NOT pick. Three outcomes, in priority
+        # order, all riding the same commit as the picks above so the whole
+        # transition is atomic with status="done":
+        #
+        #  1. saved/applied  -> _resolve_leftover_provisional (unchanged). A real
+        #     user action always outranks the display rules below.
+        #  2. rank-stage, top UNREVIEWED_RETAIN_MAX by rank_score, and NOT
+        #     explicitly rejected by the judge -> retained on screen under the
+        #     "quick-scored only" heading (paint 3 of 3).
+        #  3. everything else (embedding-stage leftovers, and rank-stage rows
+        #     past the retain cap) -> _resolve_leftover_provisional, i.e. deleted
+        #     if never acted on.
+        #
+        # The judge-rejected exclusion in (2) is deliberate and is the one place
+        # the three-stage display can't be purely additive: a job the judge
+        # actually looked at and rejected must not come back as an "unreviewed"
+        # card, both because the label would be a lie and because "a job with a
+        # stored reject verdict under the current signature is never resurfaced"
+        # is an invariant the rest of the pipeline (both judge fallbacks, the
+        # backlog top-up) already enforces.
+        leftovers = list(provisional_by_id.values())
+        rejected_ids = {
+            r.identity_hash for r in db.execute(
+                select(JobSeen).where(
+                    JobSeen.profile_id == profile_id,
+                    JobSeen.identity_hash.in_([r.external_id for r in leftovers if r.external_id]),
+                    JobSeen.eval_verdict == "reject",
+                )
+            ).scalars().all()
+        }
+        retainable = sorted(
+            (r for r in leftovers
+             if r.status not in ("saved", "applied")
+             and r.provisional_stage == PROVISIONAL_STAGE_RANK
+             and (r.external_id or "") not in rejected_ids),
+            key=lambda r: (r.rank_score if r.rank_score is not None else 0),
+            reverse=True,
+        )[:UNREVIEWED_RETAIN_MAX]
+        retain_ids = {id(r) for r in retainable}
+        for row in leftovers:
+            if row.status not in ("saved", "applied") and id(row) in retain_ids:
+                _retain_unreviewed_provisional(db, row)
+            else:
+                _resolve_leftover_provisional(db, row)
 
         if marks:
             processed_ids, shown_ids = marks

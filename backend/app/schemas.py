@@ -9,6 +9,23 @@ class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ── Auth ────────────────────────────────────────────────────────────────────
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class LoginOut(BaseModel):
+    token: str
+    user_id: int
+    username: str
+
+
+class MeOut(BaseModel):
+    user_id: int
+    username: str
+
+
 # ── Profiles ────────────────────────────────────────────────────────────────
 class ProfileCreate(BaseModel):
     name: Optional[str] = None
@@ -109,12 +126,6 @@ class SuggestOut(BaseModel):
     suggestions: list[str]
 
 
-class ConfidenceOut(BaseModel):
-    score: int
-    missing: list[str]
-    tip: str
-
-
 class ContextHeaderOut(BaseModel):
     """What the AI is told about the candidate, read-only (see profile_intel)."""
 
@@ -147,6 +158,7 @@ class RoleOut(ORMModel):
     fit_rank: Optional[int] = None
     rank_score: Optional[int] = None
     provisional: bool = False
+    provisional_stage: Optional[str] = None  # "embed" | "rank" | None -- see models.Role
     ai_analysis: Optional[str] = None
     verdict: Optional[str] = None
     work_style: Optional[str] = None

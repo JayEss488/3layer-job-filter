@@ -37,6 +37,13 @@ from crawl4ai import (
 import requests
 from requests.auth import HTTPBasicAuth
 from urllib.parse import urlsplit
+
+# Generated, worldwide country reference data (see scripts/gen_countries.py).
+# This module is plain data with no heavy deps, and lives next to this file so
+# the standalone path resolves it too. Insert our own dir defensively in case
+# this is imported with a cwd that isn't the repo root.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import countries_data as _cd
 # ── Add these near the top, after imports ──────────────────────────────────────
 import queue
 from crawl4ai import CacheMode
@@ -79,6 +86,15 @@ SERPENT_API_KEY = os.getenv("SERPENT_API_KEY", "")
 # serper (cheap, lots of credits); "serpent" or "serpapi" for comparison.
 GOOGLE_SEARCH_PROVIDER = os.getenv("GOOGLE_SEARCH_PROVIDER", "serper").strip().lower()
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
+# Careerjet public search API: free, worldwide (90+ countries via locale_code).
+# The API keys access on (affid, Referer): the shared example affid from
+# Careerjet's own API samples works for a localhost referer, which is truthful
+# for this single-user localhost prototype and lets it run out of the box.
+# Careerjet is migrating to a registered v4 API -- get a free affid at
+# https://www.careerjet.com/partners/api and set CAREERJET_AFFID (+ your site as
+# CAREERJET_REFERER) for a durable production setup.
+CAREERJET_AFFID = os.getenv("CAREERJET_AFFID", "213e213hd127076e2214578c256a6f66")
+CAREERJET_REFERER = os.getenv("CAREERJET_REFERER", "http://localhost/")
 # ATS-token harvesting (harvest_ats_tokens) needs a domain-restricted search.
 # serper.dev's free tier rejects `site:`-operator queries outright ("Query
 # pattern not allowed for free accounts"), so by default it builds a plain
@@ -158,6 +174,12 @@ _FIXED_TEMPERATURE_MODELS = ("gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra")
 
 PROFILE_CACHE_DAYS  = 7
 MAX_CONCURRENT      = 5       # Max general simultaneous crawl requests
+# Phase 5 scrape timing knobs (env-tunable). The wall-clock budget caps each
+# per-cluster scrape phase; whatever hasn't finished falls back to its snippet.
+# The per-page timeout is the dominant per-hang cost -- an anti-bot page that
+# never renders burns the whole thing -- so it's kept below the budget.
+SCRAPE_BUDGET_SECONDS = float(os.getenv("SCRAPE_BUDGET_SECONDS", "80"))
+SCRAPE_PAGE_TIMEOUT_MS = int(os.getenv("SCRAPE_PAGE_TIMEOUT_MS", "20000"))
 RELEVANCE_THRESHOLD = 0.35    # Balanced threshold preventing snippet penalty
 TOP_CANDIDATES      = 25      # Pool size handed to the final evaluator
 FINAL_PICKS         = 12      # Max results returned, quality-gated
@@ -340,43 +362,150 @@ def normalize_location(location_str: str) -> str:
 # free-text job location string belongs to. Keyed by the 2-letter Adzuna code
 # used throughout the engine/snapshot. Kept intentionally small/high-signal:
 # false negatives (returning None) are safe, false positives are not.
-_COUNTRY_TOKENS = {
-    "gb": {"united kingdom", "uk", "u.k.", "great britain", "england", "scotland",
-           "wales", "northern ireland", "london", "manchester", "birmingham",
-           "leeds", "glasgow", "edinburgh", "bristol", "liverpool", "sheffield",
-           "newcastle", "nottingham", "leicester", "coventry", "cardiff", "belfast",
-           "cambridge", "oxford", "reading", "brighton", "aberdeen", "dundee",
-           "southampton", "portsmouth", "milton keynes", "essex", "kent", "surrey",
-           "sussex", "hampshire", "yorkshire", "lancashire", "cheshire", "devon",
-           "cornwall", "southend", "southend-on-sea"},
-    "us": {"united states", "usa", "u.s.", "u.s.a.", "america", "new york",
-           "san francisco", "los angeles", "chicago", "seattle", "austin",
-           "boston", "texas", "california", "florida", "washington", "denver",
-           "atlanta", "dallas", "houston", "san diego", "philadelphia"},
-    "ca": {"canada", "toronto", "vancouver", "montreal", "ottawa", "calgary"},
-    "au": {"australia", "sydney", "melbourne", "brisbane", "perth"},
-    "de": {"germany", "deutschland", "berlin", "munich", "munchen", "hamburg", "frankfurt"},
-    "fr": {"france", "paris", "lyon", "marseille"},
-    "in": {"india", "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "pune"},
-    "it": {"italy", "italia", "rome", "milan", "turin"},
-    "nl": {"netherlands", "holland", "amsterdam", "rotterdam", "the hague"},
-    "at": {"austria", "vienna"},
-    "pl": {"poland", "warsaw", "krakow", "wroclaw"},
-    "sg": {"singapore"},
-    "za": {"south africa", "johannesburg", "cape town", "pretoria"},
+# Curated high-signal tokens layered ON TOP of the generated worldwide data
+# (countries_data), so long-standing behaviour never regresses even if a name
+# drops out of the dataset (e.g. UK county/region names Adzuna/Reed emit as a
+# job location, which aren't cities). These are merged into the generated
+# per-country token sets below.
+# Country-level names/aliases checked BEFORE city tokens (pass 1), so an explicit
+# country wins over a city that also exists elsewhere. These supplement the
+# generated name tokens with UK county/region names and abbreviations the
+# dataset doesn't carry as cities.
+_CURATED_NAME_EXTRA = {
+    "gb": {"u.k.", "great britain", "britain", "england", "scotland", "wales",
+           "northern ireland", "essex", "kent", "surrey", "sussex", "hampshire",
+           "yorkshire", "lancashire", "cheshire", "devon", "cornwall",
+           "milton keynes", "southend-on-sea"},
+    "us": {"u.s.", "u.s.a.", "america", "texas", "california", "florida",
+           "washington"},
+    "de": {"deutschland", "munchen"},
+    "it": {"italia"},
+    "nl": {"holland"},
 }
+
+# The original hand-curated city tokens, restored as pass-2 extras so the core
+# markets never lose a city the dataset spells differently (geonames stores "New
+# York City", not "new york") or ranks below the population threshold.
+_CURATED_CITY_EXTRA = {
+    "gb": {"london", "manchester", "birmingham", "leeds", "glasgow", "edinburgh",
+           "bristol", "liverpool", "sheffield", "newcastle", "nottingham",
+           "leicester", "coventry", "cardiff", "belfast", "cambridge", "oxford",
+           "reading", "brighton", "aberdeen", "dundee", "southampton",
+           "portsmouth", "southend",
+           # High-volume towns/cities the geonames threshold or an earlier-sorting
+           # country would otherwise miss -- so a non-scoped source's listing here
+           # positively tags gb instead of leaning on the keep-unknowns fallback.
+           # Multi-syllable/unambiguous only -- generic single words that are also
+           # well-known foreign cities (york -> New York, newport -> Newport Beach,
+           # plymouth/gloucester -> MA, bath -> ME, hull, stoke) are deliberately
+           # NOT added: they'd false-match a foreign location, and the keep-unknowns
+           # fallback already keeps a bare UK-town listing without a positive tag.
+           "slough", "watford", "luton", "basingstoke",
+           "swindon", "milton keynes", "stevenage", "warrington",
+           "guildford", "chelmsford", "peterborough", "northampton",
+           "colchester", "farnborough", "bracknell", "high wycombe",
+           "aylesbury", "crawley", "maidenhead", "wokingham", "newbury",
+           "harlow", "blackburn", "rochdale", "middlesbrough", "wrexham",
+           "swansea", "telford", "wolverhampton", "solihull", "croydon"},
+    "us": {"new york", "san francisco", "los angeles", "chicago", "seattle",
+           "austin", "boston", "denver", "atlanta", "dallas", "houston",
+           "san diego", "philadelphia"},
+    "ca": {"toronto", "vancouver", "montreal", "ottawa", "calgary"},
+    "au": {"sydney", "melbourne", "brisbane", "perth"},
+    "de": {"berlin", "munich", "hamburg", "frankfurt"},
+    "fr": {"paris", "lyon", "marseille"},
+    "in": {"bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "pune"},
+    "it": {"rome", "milan", "turin", "venice"},
+    "nl": {"amsterdam", "rotterdam", "the hague"},
+    "at": {"vienna"},
+    "pl": {"warsaw", "krakow", "wroclaw"},
+    "za": {"johannesburg", "cape town", "pretoria"},
+}
+
+
+def _build_country_tokens():
+    """Merge the generated worldwide data with the curated extras into two
+    lookups: single-word tokens (matched on a word boundary) and multi-word /
+    punctuated phrases (matched as substrings, which are specific enough)."""
+    words: dict[str, set[str]] = {}
+    phrases: dict[str, set[str]] = {}
+    merged: dict[str, set[str]] = {}
+    for code in _cd.CC_DISPLAY:
+        toks = set(_cd.COUNTRY_TOKENS.get(code, []))
+        toks |= _CURATED_NAME_EXTRA.get(code, set())
+        toks |= _CURATED_CITY_EXTRA.get(code, set())
+        merged[code] = toks
+        for t in toks:
+            (phrases if (" " in t or "." in t or "-" in t) else words).setdefault(
+                code, set()).add(t)
+    return words, phrases, merged
+
+
+_COUNTRY_WORD_TOKENS, _COUNTRY_PHRASE_TOKENS, _COUNTRY_TOKENS = _build_country_tokens()
 
 
 def country_of(job_location: str) -> str | None:
     """Best-effort country code for a free-text job location, or None if it
-    can't be confidently determined (ambiguous/blank/unrecognised)."""
+    can't be confidently determined (ambiguous/blank/unrecognised). Single-word
+    tokens (city/country names) match on a whole-word boundary so a short token
+    can't false-positive as a substring ("nice" inside "venice"); multi-word or
+    punctuated tokens ("new york", "u.k.") match as substrings, which are
+    specific enough. Country-name tokens are checked before city tokens so an
+    explicit country in the string wins over a city that also exists elsewhere."""
     loc = (job_location or "").strip().lower()
     if not loc:
         return None
-    for code, tokens in _COUNTRY_TOKENS.items():
-        if any(tok in loc for tok in tokens):
+    loc_words = set(re.findall(r"[a-z]+", loc))
+
+    def _hit(code: str) -> bool:
+        if _COUNTRY_WORD_TOKENS.get(code, set()) & loc_words:
+            return True
+        return any(p in loc for p in _COUNTRY_PHRASE_TOKENS.get(code, set()))
+
+    # Pass 1: country name/alias (highest confidence).
+    for code, names in _cd.COUNTRY_NAME_TOKENS.items():
+        nset = set(names) | _CURATED_NAME_EXTRA.get(code, set())
+        w = {n for n in nset if " " not in n and "." not in n and "-" not in n}
+        p = nset - w
+        if (w & loc_words) or any(ph in loc for ph in p):
+            return code
+    # Pass 2: city tokens.
+    for code in _cd.CITY_TOKENS:
+        if _hit(code):
             return code
     return None
+
+
+def country_matches(job_location: str, allowed) -> bool:
+    """True if the location positively names one of the `allowed` country codes,
+    by country-name/alias token OR city token. Unlike country_of (which returns a
+    single first-in-sort-order match and so can misroute an ambiguous city -- e.g.
+    "Newcastle" resolves to `au` because Australia sorts before `gb` in the
+    worldwide token set, even though gb also carries "newcastle"), this checks the
+    allowed codes DIRECTLY, so a city that IS a valid allowed-country city is
+    recognised regardless of collisions elsewhere. Used by the country filter to
+    keep a job whose town is a legitimate allowed-country place before falling back
+    to country_of's single guess to decide 'confirmed foreign'."""
+    loc = (job_location or "").strip().lower()
+    if not loc:
+        return False
+    allowed = set(allowed or ())
+    if not allowed:
+        return False
+    loc_words = set(re.findall(r"[a-z]+", loc))
+    for code in allowed:
+        # Country name / alias (same split as country_of's pass 1).
+        nset = set(_cd.COUNTRY_NAME_TOKENS.get(code, [])) | _CURATED_NAME_EXTRA.get(code, set())
+        w = {n for n in nset if " " not in n and "." not in n and "-" not in n}
+        p = nset - w
+        if (w & loc_words) or any(ph in loc for ph in p):
+            return True
+        # City tokens (the merged word/phrase sets country_of's pass 2 reads).
+        if _COUNTRY_WORD_TOKENS.get(code, set()) & loc_words:
+            return True
+        if any(ph in loc for ph in _COUNTRY_PHRASE_TOKENS.get(code, set())):
+            return True
+    return False
 
 
 # ── Paid-"training"/placement-scheme detection ─────────────────────────────────
@@ -519,12 +648,15 @@ def fetch_reed_details(job_ids: List[str]) -> Dict[str, str]:
 
 # Country-level location strings that Adzuna's `where` geocoder rejects (the cc
 # endpoint already scopes the country, so these must be omitted, not passed).
-_ADZUNA_COUNTRY_LEVEL = {
-    "united kingdom", "great britain", "uk", "u.k.", "gb",
-    "united states", "united states of america", "usa", "us", "u.s.",
-    "canada", "australia", "germany", "france", "india", "italy",
-    "netherlands", "austria", "poland", "singapore", "south africa",
+# Generated from the Adzuna-supported nodes' names/aliases, plus a few bare
+# codes/abbreviations the generator doesn't carry as tokens.
+_ADZUNA_COUNTRY_LEVEL = set(_cd.ADZUNA_COUNTRY_LEVEL) | {
+    "uk", "gb", "us", "usa", "u.s.", "u.k.",
 }
+
+# Adzuna only operates in these country nodes; any other cc returns
+# UNSUPPORTED_COUNTRY, so we skip the call entirely (see fetch_adzuna).
+_ADZUNA_SUPPORTED = _cd.ADZUNA_SUPPORTED
 
 
 _ADZUNA_PAREN_RE = re.compile(r"\([^)]*\)")
@@ -555,6 +687,12 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
     # Ensure clean lowercase ISO code string (default to 'gb')
     cc = country_code.strip().lower() if country_code else "gb"
 
+    # Adzuna doesn't operate in this country -- calling it just returns
+    # UNSUPPORTED_COUNTRY (log noise + wasted HTTP). Skip; Google Jobs / JSearch
+    # / Careerjet / the ATS pool cover these places instead.
+    if cc not in _ADZUNA_SUPPORTED:
+        return []
+
     base_params = {
         "app_id": ADZUNA_APP_ID,
         "app_key": ADZUNA_APP_KEY,
@@ -573,12 +711,28 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
     last_page_full = False
     for page in range(1, pages + 1):
         url = f"https://api.adzuna.com/v1/api/jobs/{cc}/search/{page}"
-        try:
-            r = requests.get(url, params=base_params, timeout=12)
-            body = r.json()
-            results = body.get("results", [])
-        except Exception as e:
-            emit(f"   [!] Adzuna ({cc}) API Error: {e}")
+        # Adzuna intermittently returns an empty/invalid body (parsed as
+        # "Expecting value: line 1 column 1") -- usually transient rate-limiting,
+        # not a real outage. A single silent break here used to drop the whole
+        # term's Adzuna results with no retry, and with no per-source balancing
+        # downstream that collapsed a run onto the careerjet aggregator. Retry once
+        # with a short backoff and a longer timeout before giving up on the term
+        # (mirrors the JSearch read-timeout retry).
+        results = None
+        for attempt in range(2):
+            try:
+                timeout = 12 if attempt == 0 else 20
+                r = requests.get(url, params=base_params, timeout=timeout)
+                body = r.json()
+                results = body.get("results", [])
+                break
+            except Exception as e:
+                if attempt == 0:
+                    emit(f"   [!] Adzuna ({cc}) API Error: {e} -- retrying once")
+                    time.sleep(1.5)
+                    continue
+                emit(f"   [!] Adzuna ({cc}) API Error: {e} -- giving up on this term")
+        if results is None:
             last_page_full = False
             break
         for job in results:
@@ -988,6 +1142,89 @@ def fetch_jsearch(query: str, location: str = "United Kingdom") -> List[Dict]:
         return []
 
 
+# Careerjet interface locales for markets where the local language (not English)
+# is the natural default, so results/currency come back sensibly. Any cc not
+# listed defaults to en_<CC>, which Careerjet accepts for its many English
+# locales (en_AE, en_SA, en_NG, en_IE, ...). The `location` param does the actual
+# geo-scoping regardless, so an imperfect locale still returns in-country jobs.
+_CAREERJET_LOCALES = {
+    "fr": "fr_FR", "de": "de_DE", "es": "es_ES", "it": "it_IT", "nl": "nl_NL",
+    "pt": "pt_PT", "br": "pt_BR", "pl": "pl_PL", "at": "de_AT", "ch": "de_CH",
+    "be": "fr_BE", "ru": "ru_RU", "ua": "uk_UA", "tr": "tr_TR", "jp": "ja_JP",
+    "cn": "zh_CN", "tw": "zh_TW", "kr": "ko_KR", "vn": "vi_VN", "th": "th_TH",
+    "id": "id_ID", "mx": "es_MX", "ar": "es_AR", "cl": "es_CL", "co": "es_CO",
+    "se": "sv_SE", "no": "no_NO", "dk": "da_DK", "fi": "fi_FI", "gr": "el_GR",
+    "cz": "cs_CZ", "hu": "hu_HU", "ro": "ro_RO", "sa": "en_SA", "ae": "en_AE",
+    "qa": "en_QA", "kw": "en_KW", "eg": "en_EG", "ng": "en_NG", "ke": "en_KE",
+    "za": "en_ZA", "in": "en_IN", "sg": "en_SG", "my": "en_MY", "ph": "en_PH",
+    "hk": "en_HK", "au": "en_AU", "nz": "en_NZ", "ca": "en_CA", "ie": "en_IE",
+    "us": "en_US", "gb": "en_GB",
+}
+
+
+def _careerjet_locale(country_code: str) -> str:
+    cc = (country_code or "gb").strip().lower()
+    return _CAREERJET_LOCALES.get(cc, f"en_{cc.upper()}")
+
+
+def fetch_careerjet(query: str, location: str = "United Kingdom",
+                    country_code: str = "gb", pages: int = 1) -> List[Dict]:
+    """Careerjet public search API -- free and worldwide, the coverage backstop
+    for countries Adzuna/Reed don't serve. `location` geo-scopes the search;
+    `locale_code` sets the interface region. Fails soft (returns [] on any
+    error) like every other source."""
+    if not CAREERJET_AFFID:
+        return []
+    clean_loc = normalize_location(location)
+    params = {
+        "keywords": query,
+        "location": clean_loc,
+        "affid": CAREERJET_AFFID,
+        "locale_code": _careerjet_locale(country_code),
+        "pagesize": 50,
+        "page": 1,
+        "sort": "relevance",
+        # The API requires these (it geolocates the caller); fixed placeholders
+        # are fine since `location`/`locale_code` drive the actual scoping.
+        "user_ip": "11.22.33.44",
+        "user_agent": "Mozilla/5.0 (compatible; four-in-a-thousand/1.0)",
+    }
+    # Careerjet rejects the call (403 "Undeclared referrer") without a Referer
+    # header, and the shared example affid only accepts certain referers -- see
+    # CAREERJET_REFERER. Set your own affid+referer for production.
+    headers = {"Referer": CAREERJET_REFERER}
+    jobs: List[Dict] = []
+    try:
+        r = requests.get("http://public.api.careerjet.net/search",
+                         params=params, headers=headers, timeout=12)
+        data = r.json()
+    except Exception as e:
+        emit(f"   [!] Careerjet API Error: {e}")
+        return []
+    if data.get("type") != "JOBS":
+        # A bad locale / no match returns type "ERROR" (with an `error` message)
+        # or a "LOCATIONS"/"KEYWORDS" suggestion payload, not jobs. Surface a
+        # real error once so a misconfigured affid/locale is visible.
+        if data.get("type") == "ERROR":
+            emit(f"   [!] Careerjet ({params['locale_code']}): {data.get('error')}")
+        return []
+    for job in data.get("jobs", []):
+        # Descriptions come back with <b>…</b> highlight markup; strip to plain
+        # text so the gate/rank stages read it like every other source's snippet.
+        jobs.append({
+            "board": "careerjet",
+            "title": _strip_html(job.get("title", "") or ""),
+            "company": job.get("company", "") or "",
+            "url": job.get("url", "") or "",
+            "location": job.get("locations", "") or clean_loc,
+            # Careerjet exposes salary only as a free-text string, not min/max.
+            "salary_min": None,
+            "salary_max": None,
+            "snippet": _strip_html(job.get("description", "") or ""),
+        })
+    return jobs
+
+
 # ── Source protocol + tiers ──────────────────────────────────────────────────
 # "fast" = cheap, text-complete, safe for the first (latency-sensitive) run.
 # "broad" = slower / credit-heavy; only included in the rotation on later runs.
@@ -1008,12 +1245,10 @@ def _terms(profile: Dict) -> List[str]:
 
 
 # 2-letter code -> display name, for geo-scoped sources that need a *non-empty*
-# location string (Google/JSearch). Adzuna/Reed instead take an empty string.
-_CC_DISPLAY = {
-    "gb": "United Kingdom", "us": "United States", "ca": "Canada", "au": "Australia",
-    "de": "Germany", "fr": "France", "in": "India", "it": "Italy", "nl": "Netherlands",
-    "at": "Austria", "pl": "Poland", "sg": "Singapore", "za": "South Africa",
-}
+# location string (Google/JSearch/Careerjet). Adzuna/Reed instead take an empty
+# string. Sourced from the generated worldwide data so any country a profile can
+# resolve to gets its correct display name (not a UK fallback).
+_CC_DISPLAY = dict(_cd.CC_DISPLAY)
 
 
 def _geo_scoped_location(profile: Dict) -> str:
@@ -1100,6 +1335,20 @@ class RemotiveSource:
     name, tier = "remotive", "broad"
     def fetch_term(self, profile, term):
         return fetch_remotive(term)
+    def fetch(self, profile, since=None):
+        out: List[Dict] = []
+        for term in _terms(profile):
+            out.extend(self.fetch_term(profile, term))
+        return out
+
+
+class CareerjetSource:
+    # "fast" tier (plain HTTP, text-complete): runs every run incl. the first, so
+    # countries Adzuna/Reed can't serve still get geo-targeted results up front.
+    name, tier = "careerjet", "fast"
+    def fetch_term(self, profile, term):
+        return fetch_careerjet(term, _google_location(profile),
+                               profile.get("adzuna_country_code", "gb"))
     def fetch(self, profile, since=None):
         out: List[Dict] = []
         for term in _terms(profile):
@@ -1323,7 +1572,18 @@ def select_sources_for_run(profile: Dict) -> List[JobSource]:
     # that Workday / SmartRecruiters / custom career pages publish -- i.e. it's how
     # we reach the "unreachable" tier we can't integrate directly. Costs SerpAPI
     # credits, but the per-source toggle lets the user disable it if spend matters.
+    # Careerjet is free and worldwide, but it's an AGGREGATOR (blank-company
+    # reposts, no structured salary) -- valuable only as a coverage backstop for
+    # the ~230 countries Adzuna (19) and Reed (UK only) can't serve. When the
+    # profile's country IS served by Adzuna, those clean structured feeds already
+    # cover it and careerjet just crowds the (unbalanced) pool with noise -- a
+    # measured UK run collapsed onto careerjet when Adzuna flaked. So join it to
+    # the always-on tier ONLY for countries Adzuna can't serve; elsewhere it stays
+    # available via the per-source toggle. Reed adds nothing to this test: it's
+    # gb-only and gb is Adzuna-supported.
     always = [AdzunaSource(), ReedSource(), GoogleJobsSource()]
+    if (profile.get("adzuna_country_code") or "gb").strip().lower() not in _ADZUNA_SUPPORTED:
+        always.append(CareerjetSource())
     # Remaining credit-heavy / overlapping sources: one per run on rotation keeps
     # RapidAPI spend bounded while still adding breadth.
     rotation = [JSearchSource(), RemotiveSource()]
@@ -1507,6 +1767,11 @@ def get_db() -> sqlite3.Connection:
     # timeout that surfaces as an outright "database is locked" and loses a
     # batch's cache entries (re-paying for them next run).
     conn = sqlite3.connect(DB_PATH, timeout=30)
+    # WAL keeps the several concurrent gate-cache writers from ever seeing a
+    # reader-vs-writer "database is locked" (which busy_timeout can't wait out);
+    # with WAL only writer-vs-writer serialises, and the 30s timeout covers that.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -1569,7 +1834,16 @@ def _ats_db_path() -> str:
 
 
 def _ats_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(_ats_db_path())
+    # timeout=30 (busy_timeout) + WAL match the backend engine's SQLite settings
+    # (backend/app/database.py): this raw connection *writes* to jobmatch.db
+    # (save_company_ats, during the end-of-run ATS harvest) concurrently with the
+    # backend search thread's own commits. WAL is a persistent DB-level property
+    # so it's normally already on, but setting it here keeps the standalone
+    # seed_ats.py path consistent; the default 5s busy-timeout was thin for the
+    # concurrent-writer case and is bumped to 30s to match.
+    conn = sqlite3.connect(_ats_db_path(), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
     # Schema matches the backend CompanyATS ORM model so both agree on the table
     # whichever process creates it first.
@@ -1943,6 +2217,15 @@ def api_candidates(jobs, profile_embedding):
 
 MAX_MUST_HAVE_GAPS = 3   # discard when a role states more hard gaps than this
 _GATE_BATCH = 20         # listings per LLM call
+# Worker cap for screen_gate's and rank_gate's own per-batch fan-out. Raised 3 -> 4
+# when engine.GATE_ROUND_SIZE went 40 -> 80: an 80-candidate round is exactly 4
+# _GATE_BATCH sub-calls, so at 3 workers it ran as two waves (3 then 1) and the
+# second wave was three-quarters idle. At 4 it is one wave, which is most of what
+# keeps the tripled RANK_EXAMINE_BUDGET from costing proportional wall time. Still
+# bounded rather than unlimited, for the original reason -- firing every batch at
+# once risks a short-window rate cap, and rank_gate's own retry path already
+# suspects one. THIS is the knob to turn back down if 429s/401s start appearing.
+_GATE_MAX_WORKERS = 4
 
 
 def _profile_signature(profile: dict) -> str:
@@ -2200,6 +2483,13 @@ Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms')
   target roles above word-for-word is presumptively sector_confidence="match" -- only override this if
   the listing's actual described duties clearly diverge from that function despite the title (e.g. a
   titled "Research Analyst" role whose duties are entirely sales or admin).
+  That word-for-word presumption does NOT apply to a title that names two different professions and is
+  only told apart by the duties -- e.g. "Automation Engineer" (software/test/RPA automation) vs
+  (industrial control systems, PLCs, robotics); "Analyst" (data) vs (financial, intelligence,
+  business-process); "Engineer" (software) vs (mechanical/electrical/civil); "Designer" (product/UX) vs
+  (mechanical/graphic). For those, ignore the title agreement entirely and judge the described duties:
+  a clearly different profession is sector_confidence="mismatch", and too little description to tell
+  which profession it is is sector_confidence="ambiguous" -- never "match" on the title alone.
 - sector_confidence="mismatch" if it is CLEARLY a different job function -- e.g. the candidate targets
   Data Analyst/Insights roles and the listing is a Product Manager, Communications Officer, or Intelligence/
   Security Analyst role: even in a related or adjacent industry, or with a shared word like "Analyst" in
@@ -2365,20 +2655,35 @@ SOFT_GATE_AXES = ("_seniority_ok", "_requirements_ok", "_skills_ok", "_salary_ok
                    "_work_arrangement_ok")
 
 
+# Fraction of a gate round that can sail through every soft axis clean before the
+# round is treated as non-discriminating and the hard-drop threshold tightens from
+# 2+ failures to 1+. Loosened from 0.5 to 0.35 (i.e. the gate now tightens SOONER)
+# alongside engine.RANK_EXAMINE_BUDGET going 40-80 -> 240: the gate's job is to
+# stop the mid tier paying to rank hopeless candidates, and tripling the intake
+# both makes that saving worth more and removes the reason to be lenient -- a
+# wrongly-dropped borderline job used to cost a scarce slot out of ~40 examined,
+# where now there are 200 more candidates behind it. The per-axis bar is unchanged
+# (still "false only on a CLEAR mismatch, default true when unsure"), so even the
+# tightened threshold needs one real, confident mismatch signal, not a coin flip,
+# and the cluster-level MIN_RESULTS floor backfill still catches over-pruning.
+_GATE_CLEAN_ROUND_FRACTION = 0.35
+
+
 def dynamic_hard_drop_threshold(soft_fail_counts: list[int]) -> int:
     """Given each in-sector candidate's soft-axis failure count for one gate
     round, decide how many failures should hard-drop a listing. Fixed at 2+
     normally (two independent LLM signals agreeing on a mismatch), but when
-    over half the round is sailing through every axis clean, that's a sign the
-    round is thin on real mismatches rather than that everyone genuinely fits
-    -- tighten to 1+ so a single confirmed mismatch is enough, instead of
-    waiting for a second signal that a lax round is unlikely to produce.
-    Shared by screen_gate's own diagnostic log and engine.py's actual
-    hard-drop decision so the two can't disagree on what "hard-dropped" means."""
+    more than _GATE_CLEAN_ROUND_FRACTION of the round is sailing through every
+    axis clean, that's a sign the round is thin on real mismatches rather than
+    that everyone genuinely fits -- tighten to 1+ so a single confirmed mismatch
+    is enough, instead of waiting for a second signal that a lax round is
+    unlikely to produce. Shared by screen_gate's own diagnostic log and
+    engine.py's actual hard-drop decision so the two can't disagree on what
+    "hard-dropped" means."""
     if not soft_fail_counts:
         return 2
     clean = sum(1 for n in soft_fail_counts if n == 0)
-    return 1 if clean / len(soft_fail_counts) > 0.5 else 2
+    return 1 if clean / len(soft_fail_counts) > _GATE_CLEAN_ROUND_FRACTION else 2
 
 
 def _sanitize_key_requirements(raw) -> list[dict]:
@@ -2443,7 +2748,16 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     enough to skip rank_gate/the judge.
 
     Cached per (profile signature, job id) in the shared gate_cache under
-    gate="screen_v10" (bumped from "screen_v9": a live audit found the sector axis
+    gate="screen_v11" (bumped from "screen_v10": screen_v10's own word-for-word
+    title presumption below turned out to have a hole -- a job title can name two
+    genuinely different professions ("Automation Engineer": software/RPA vs
+    industrial PLC/robotics work), so an exact match against a target role is no
+    evidence of a function match for those. A live run passed an industrial
+    controls role straight through this axis on the title alone and it reached the
+    candidate as a top pick. The prompt now carves those titles out of the
+    presumption and requires the described DUTIES to decide, so a v10 verdict was
+    reached under a materially more permissive sector rule and must not be reused.
+    "screen_v10" was bumped from "screen_v9": a live audit found the sector axis
     anchoring on the candidate's skills list instead of the target-role list -- a
     listing titled exactly "Research Analyst" (one of the candidate's own named
     target roles) was wrongly called sector_confidence="mismatch" because its
@@ -2491,13 +2805,11 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    # screen_v10 (from screen_v9): sector axis no longer anchors on the skills
-    # list and presumes a verbatim target-role title match; seniority_high/
-    # seniority_low direction guidance fixed and now requires a named
-    # seniority_signal anchor -- old v9 rows were judged under the confused
-    # direction guidance and the skills-anchored sector read, and must not be
-    # reused as if they still mean the same thing.
-    keys = [_gate_cache_key("screen_v10", sig, _gate_job_id(c)) for c in candidates]
+    # screen_v11 (from screen_v10): the verbatim-title presumption no longer
+    # applies to titles that name two different professions (see the docstring's
+    # "Automation Engineer" case) -- a v10 row could have been passed on the title
+    # alone and must not be reused as if it still means the same thing.
+    keys = [_gate_cache_key("screen_v11", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -2631,7 +2943,7 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
         # Safe to parallelize: each call only writes to its own batch's candidate
         # dicts, and every cache write is collected here and stored once, below,
         # on this thread.
-        with ThreadPoolExecutor(max_workers=min(3, len(batches))) as pool:
+        with ThreadPoolExecutor(max_workers=min(_GATE_MAX_WORKERS, len(batches))) as pool:
             for entries in pool.map(_screen_one_batch, batches):
                 new_entries.extend(entries)
 
@@ -2674,11 +2986,25 @@ def _rank_prompt(profile: dict, listing_block: str) -> str:
         if profile.get("_multi_cluster") else ""
     )
     salary_floor = profile.get("salary_floor") or 0
+    # The candidate's own words, when they wrote any (snapshot.build_snapshot's
+    # engine_profile["intent_text"]). Placed immediately after the target-role
+    # titles because that is what it disambiguates: the titles alone can't say
+    # which of an ambiguous title's two professions the candidate means, and this
+    # stage previously had no access to the answer at all. Marked as outranking
+    # the inferred tags for the same reason it does at the final judge -- it is
+    # the one signal the candidate wrote themselves.
+    intent = (profile.get("intent_text") or "").strip()
+    intent_block = (
+        "\nWhat the candidate says they are looking for, IN THEIR OWN WORDS (this is the most "
+        "authoritative signal here -- where it conflicts with the inferred tags below, believe "
+        f"this):\n\"{intent}\"\n"
+        if intent else ""
+    )
     return f"""You are estimating how well each job listing fits ONE candidate, as a rough numeric score.
 This score gates which listings proceed to detailed review -- a wrong score buries a job silently, so
 when genuinely unsure between two scores, prefer the higher one.
 
-Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms') or [], profile.get('target_role_weight_tiers'))}
+Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms') or [], profile.get('target_role_weight_tiers'))}{intent_block}
 Candidate seniority: {profile.get('seniority', 'mid-level')}
 Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'), profile.get('skill_evidence_tiers'))}
 Candidate location: {profile.get('location') or 'none stated'}
@@ -2722,6 +3048,11 @@ SCORING -- two components, in this order (for listings with no hard downgrade):
    distinguish analytical work (interpreting data, building insights, reporting) from operational work
    (data entry, processing, validation, administration) -- a role titled "Analyst" or "Technician" that is
    mostly the latter is a WEAKER function match than the title alone suggests, even within the right field.
+   Some titles name two different professions and are told apart only by the duties -- "Automation
+   Engineer" (software/test/RPA) vs (industrial PLCs, control systems, robotics), "Engineer" (software) vs
+   (mechanical/electrical/civil), "Designer" (product/UX) vs (mechanical/graphic), "Analyst" (data) vs
+   (financial/intelligence). An exact title match against a target role counts for nothing on those: read
+   the duties, and score the wrong profession low however precisely the titles agree.
    A listing tagged "[gate note: role-function fit vs target roles was ambiguous, not a confirmed match]"
    means an earlier, shorter-text screening pass could not confidently tell -- judge FUNCTION MATCH
    yourself from the fuller text below rather than assuming it's already settled; score it on what you
@@ -2867,8 +3198,19 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     with `_rank_score` (0-100, higher is better) and `_rank_note` (short audit
     phrase, "" if none) in place and returns the full list unfiltered -- the
     caller applies its own cutoff (e.g. drop the bottom fraction, cap at N).
-    Cached per (profile signature, job id) in gate_cache under gate="rank_v7"
-    (bumped from "rank_v6": the prompt gained a boilerplate-scope guard telling the
+    Cached per (profile signature + intent hash, job id) in gate_cache under
+    gate="rank_v9.{intent_tag}"
+    (bumped from "rank_v8": the prompt gained the candidate's own intent text --
+    previously visible only to the final judge, leaving this stage scoring
+    function fit against bare role TITLES with no access to what the candidate
+    meant by them. The intent hash rides in the gate name so an edit to that box
+    re-scores without also invalidating screen_gate, which never sees it.
+    "rank_v8" was bumped from "rank_v7": FUNCTION MATCH gained the shared-title carve-out --
+    titles like "Automation Engineer" name two different professions, so an exact
+    match against a target role is worth nothing without reading the duties. A v7
+    score could have been driven by exactly that title agreement and isn't
+    comparable. "rank_v7" was
+    bumped from "rank_v6": the prompt gained a boilerplate-scope guard telling the
     model to ignore a scraped page's nav/footer/"Similar jobs"/salary-histogram
     sections so a neighbouring role's salary can't misfire the SALARY/LOCATION
     downgrades -- a score computed without that guard, against text that may carry
@@ -2906,12 +3248,23 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    # "rank_v7" (not "rank_v6"): the gate name doubles as part of the cache key, and
+    # "rank_v9" (not "rank_v8"): the gate name doubles as part of the cache key, and
     # _gate_cache_key has no model field -- bumping it forces every previously
-    # scored job to be re-ranked under the reworded prompt (now with the boilerplate-
-    # scope guard, see the docstring) instead of serving a stale score forever. Bump
-    # again if the rank model/prompt changes again.
-    keys = [_gate_cache_key("rank_v7", sig, _gate_job_id(c)) for c in candidates]
+    # scored job to be re-ranked under the reworded prompt (now with the shared-title
+    # carve-out and the candidate's own intent text, see the docstring) instead of
+    # serving a stale score forever. Bump again if the rank model/prompt changes again.
+    #
+    # The intent text is folded into the GATE NAME rather than into
+    # _profile_signature, which is shared with screen_gate: screen_gate is
+    # deliberately never shown intent (see _rank_prompt), so putting it in the
+    # shared signature would re-run every cheap screen call for a guaranteed
+    # identical answer every time the candidate edits that box. Here it must
+    # participate, or an edit to the single most authoritative want-signal would
+    # keep serving scores computed without it.
+    intent_tag = hashlib.sha1(
+        (profile.get("intent_text") or "").strip().lower().encode()
+    ).hexdigest()[:8]
+    keys = [_gate_cache_key(f"rank_v9.{intent_tag}", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -2936,7 +3289,7 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
         # _score_rank_batch's own 401 retry path above already suspects a burst/
         # short-window rate cap on MID_MODEL -- firing every batch at once risks
         # making that worse rather than better, so this stays bounded.
-        with ThreadPoolExecutor(max_workers=min(3, len(batches))) as pool:
+        with ThreadPoolExecutor(max_workers=min(_GATE_MAX_WORKERS, len(batches))) as pool:
             futures = [pool.submit(_score_rank_batch, batch, profile) for batch in batches]
             for batch, fut in zip(batches, futures):
                 scores, notes, batch_failed = fut.result()
@@ -3084,6 +3437,34 @@ def _scrape_succeeded(result, markdown: str) -> bool:
     return bool(result.success and markdown and len(markdown) > 150
                 and not _looks_like_redirect_stub(markdown)
                 and not _looks_like_expired_listing(markdown))
+
+
+def _scrape_worth_retrying(e: Exception) -> bool:
+    """Whether a failed scrape attempt is worth a second try. Only the transient
+    "empty shell / incomplete markup" case is -- a page whose JS hadn't finished
+    hydrating on the first pass can render on a retry (that's the
+    "[RETRY SUCCESS] Bypassed script wall" path). A navigation/anti-bot TIMEOUT
+    (crawl4ai's "Failed on navigating ACS-GOTO ... Timeout Nms exceeded",
+    typically an aggregator redirect wall like jobviewtrack.com) never resolves
+    on retry -- it just burns another full page_timeout, historically the single
+    biggest waste in Phase 5 -- so we give up on it immediately and fall straight
+    through to the alt-source / snippet fallback. Dead-listing and redirect-stub
+    ValueErrors are terminal too: retrying a confirmed-dead or click-tracking
+    page recovers nothing."""
+    msg = str(e).lower()
+    return "empty page shell" in msg or "incomplete markup" in msg
+
+
+def _is_antibot_timeout(e: Exception) -> bool:
+    """A navigation/anti-bot timeout -- crawl4ai's "Failed on navigating ACS-GOTO
+    ... Timeout Nms exceeded", typically an aggregator redirect/anti-bot wall.
+    These pages already burned the full page_timeout and reliably never resolve, so
+    the caller also skips the alt-source lookup for them: re-searching for the same
+    posting almost never recovers an anti-bot-walled aggregator repost and just
+    spends another ~20s page load. Empty-shell/dead/redirect-stub cases are
+    excluded here so they still get their alt-source attempt."""
+    msg = str(e).lower()
+    return "timeout" in msg or "navigating" in msg
 
 
 # Every scrape's CrawlerRunConfig sets markdown_generator=DefaultMarkdownGenerator
@@ -3264,7 +3645,7 @@ def verify_not_duplicated(job: dict, country_code: str = "gb") -> str | None:
 
 async def scrape_full_details(
     jobs: list[dict], crawler: AsyncWebCrawler, blocked_domains: frozenset[str] | set[str] = frozenset(),
-    total_budget_seconds: float = 60.0, country_code: str = "gb",
+    total_budget_seconds: float = SCRAPE_BUDGET_SECONDS, country_code: str = "gb",
     sem: "asyncio.Semaphore | None" = None, alt_budget: list[int] | None = None,
 ) -> list[dict]:
     """Fetches each job's real page, capped concurrency, with retries. Every
@@ -3318,7 +3699,7 @@ async def scrape_full_details(
                     run_config = CrawlerRunConfig(
                         cache_mode=CacheMode.BYPASS,
                         wait_until="networkidle",
-                        page_timeout=28000,
+                        page_timeout=SCRAPE_PAGE_TIMEOUT_MS,
                         markdown_generator=DefaultMarkdownGenerator(content_filter=PruningContentFilter()),
                     )
 
@@ -3338,27 +3719,35 @@ async def scrape_full_details(
                     else:
                         raise ValueError("Scraper returned an empty page shell or incomplete markup structure.")
 
-                except Exception:
-                    if attempt == max_retries:
-                        alt_text = ""
-                        if alt_budget[0] > 0:
-                            alt_budget[0] -= 1
-                            alt_text = await _find_alternate_posting(job, crawler, country_code)
-                        if alt_text:
-                            job["full_text"] = alt_text
-                            alt_found += 1
-                            emit(f"   [ALT-SOURCE] Recovered {job['company']} posting via search after scrape failure")
-                        elif dead_signal:
-                            job["_dead_reason"] = dead_signal
-                            job["full_text"] = job.get("snippet", "")
-                            dead_confirmed += 1
-                            emit(f"   [CONFIRMED DEAD] {job['company']} -- {dead_signal}; "
-                                 f"no alternate posting found, excluding before final judge")
-                        else:
-                            emit(f"   [!] [PHASE 5 FAILURE] Blocked at {job['company']}. Preserving snippet summary.")
-                            job["full_text"] = job.get("snippet", "")
-                    else:
+                except Exception as e:
+                    # Give up now if this is the last attempt OR the failure is one
+                    # a retry can't fix (anti-bot navigation timeout, dead listing,
+                    # redirect stub). Only the transient empty-shell case loops back
+                    # for the cool-down retry -- see _scrape_worth_retrying.
+                    if attempt < max_retries and _scrape_worth_retrying(e):
                         emit(f"   [BLOCKED/SHELL] Cool-down applied for {job['company']} (Attempt #{attempt}). Retrying...")
+                        continue
+                    alt_text = ""
+                    # Skip the alt-source lookup on an anti-bot timeout -- re-searching
+                    # an anti-bot-walled aggregator repost almost never recovers it and
+                    # just spends another ~20s page load. Fall straight to snippet.
+                    if alt_budget[0] > 0 and not _is_antibot_timeout(e):
+                        alt_budget[0] -= 1
+                        alt_text = await _find_alternate_posting(job, crawler, country_code)
+                    if alt_text:
+                        job["full_text"] = alt_text
+                        alt_found += 1
+                        emit(f"   [ALT-SOURCE] Recovered {job['company']} posting via search after scrape failure")
+                    elif dead_signal:
+                        job["_dead_reason"] = dead_signal
+                        job["full_text"] = job.get("snippet", "")
+                        dead_confirmed += 1
+                        emit(f"   [CONFIRMED DEAD] {job['company']} -- {dead_signal}; "
+                             f"no alternate posting found, excluding before final judge")
+                    else:
+                        emit(f"   [!] [PHASE 5 FAILURE] Blocked at {job['company']}. Preserving snippet summary.")
+                        job["full_text"] = job.get("snippet", "")
+                    break
 
         return job
 
@@ -3496,7 +3885,7 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
-FINAL_EVAL_PROMPT_VERSION = 15
+FINAL_EVAL_PROMPT_VERSION = 17
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -3601,6 +3990,19 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    more than one distinct field, judge sector fit against the NEAREST one, never penalise a role for not
    matching their OTHER field. If genuinely unsure whether the field is unrelated, do not raise a sector
    objection.
+   SHARED / AMBIGUOUS JOB TITLES: a number of titles name two genuinely different professions and can
+   only be told apart by the duties described - e.g. "Automation Engineer" (software test/RPA/pipeline
+   automation) versus (industrial control systems, PLCs, robotics, plant machinery); "Analyst" (data)
+   versus (financial, intelligence, business-process); "Engineer" (software) versus (mechanical,
+   electrical, civil); "Designer" (product/UX) versus (mechanical, graphic); "Architect" (software)
+   versus (buildings). For any such title, a WORD-FOR-WORD match between the listing's title and one of
+   the candidate's target roles is NOT evidence the field matches - it is exactly the case this rule
+   exists for. Decide the field from the duties the listing actually describes, and from the domain the
+   candidate's own evidence sits in; when those turn out to be different professions, exclude the role
+   under this rule however precisely the titles agree, and say so in the "disqualified" reason. Being a
+   supported graduate/trainee entry route into the other profession does not change this: it makes the
+   role a career change, which is a different question from fit, and one the candidate has not asked for
+   unless their own words say so.
    Passing this rule does NOT mean the role matches the candidate's preferred sectors/causes - it only
    means the field isn't clearly wrong. Whether it actually lands in a sector the candidate said they
    want is judged separately, as a RANKING signal rather than a gate - see "sector_match" in reasoning
@@ -3741,6 +4143,37 @@ D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the c
    the professional-competency bar to requirements that never asked for it. Typically 4-10 core items and
    2-6 secondary items; never exceed 12 total -- don't pad to hit a count, and don't split one requirement
    into several near-duplicates to inflate it.
+   WRITE EACH REQUIREMENT AS THE JD STATES IT, at the JD's own level of specificity -- never as an
+   abstraction the candidate happens to satisfy. This is the single most common way this judgment goes
+   wrong: the checklist gets drafted AFTER an impression has already formed, pitched at whatever level
+   makes every item "met", and then reports a clean sheet for a role the candidate plainly could not do.
+   Three rules that prevent it:
+   - NOT A CAPACITY OR AN ATTITUDE. "Ability to learn X", "willingness to train", "interest in Y",
+     "graduate-level technical foundation", "analytical problem-solving", "eagerness" and the like are
+     not judgeable requirements, because no candidate can fail them -- never write one as a checklist
+     item. Where the JD says the person will be TRAINED in X on the job, the judgeable requirement is
+     still X itself ("met": false when there is no evidence of X); the training on offer is a fit
+     argument for step E, not a reason the requirement is met.
+   - KEEP THE JD'S OWN SPECIFICITY. If it asks for a Computer Science degree, the item is "Computer
+     Science degree", not "a related technical degree". If it asks for PLC/control-system experience,
+     the item is that, not "systems experience". If it asks for ETL work, the item is "ETL", not "data
+     transformation". Widening the ask until the candidate's profile covers it is the same error as
+     marking it met with no evidence, and is harder to spot afterwards.
+   - THE DOMAIN-DEFINING ASKS ARE ALWAYS "core". Whatever the person actually spends most days doing --
+     the named technical domain, the named tooling, the subject matter that makes this job the job it is
+     -- is core by definition and cannot be filed as "secondary" because the candidate lacks it. If you
+     find yourself putting the role's central technical subject in "secondary" while the core list holds
+     only general aptitudes, stop: that is the shape of a role the candidate is not actually equipped
+     for, and the checklist is being bent to hide it.
+   START FROM THE "[key requirements]" HINT WHERE THE JOB BLOCK CARRIES ONE. Those items were pulled
+   out of this listing by an earlier screening pass that had never seen the candidate, so they cannot
+   have been shaped to fit them -- which is exactly the failure mode the three rules above exist to
+   prevent, and the reason this is worth anchoring on rather than re-deriving. Carry each hint item into
+   your checklist in the JD's own words, keeping its "required"/"nice_to_have" tag as your core/secondary
+   split unless the fuller text you have plainly contradicts it; then ADD whatever further requirements
+   that pass could not see (it read a truncated opening, you have the full posting), and only then judge
+   "met" for each. Doing it in that order saves you re-deriving the JD side from scratch and keeps the
+   list honest. Where the hint is absent, build the checklist yourself under the same three rules.
 E. Write "top_match_reason" as a short (2-4 sentence), first-person narrative in your own voice explaining
    why you ranked this role the way you did -- e.g. "I rank this role as a strong fit because ..." --
    synthesizing the want-fit and can-do-fit reasoning from step B into flowing prose a candidate can read
@@ -3806,11 +4239,26 @@ sits within one of the candidate's stated sector interests, false otherwise. Nev
 which list a role is in; only orders roles within a fit_level and is named in "top_match_reason" when
 false for an included role.
 
-"fit_level" grades the pick more finely than the list it's in, and must agree with that list:
-items in "strong" are "very_strong" (both want-fit and can-do-fit are compelling, no serious
-concerns) or "strong" (genuinely strong, one real but surmountable concern); items in
-"backup" are "ok" (a plausible fit with real gaps) or "stretch" (they'd be reaching for it).
-Grade honestly -- "very_strong" should be rare.
+"fit_level" is the grade the candidate actually SEES on this pick, so it must be earned, not
+inferred from the fact that you decided to include the role. Derive it mechanically from your
+own step-D checklist and your own "concerns" list, and never grade a role higher than those
+two support. A concern "touches a core requirement" when it names, qualifies, or weakens the
+evidence for one of your "core" items (an evidence-strength caveat on a core skill -- "your
+evidence is portfolio-based, not paid" -- IS such a concern, not a footnote):
+- "very_strong": every core requirement "met": true, "sector_match": true, and NO concern
+  touching a core requirement. Genuinely rare -- often none in a batch, seldom more than one.
+- "strong": every core requirement "met": true, and at most ONE concern touching a core
+  requirement, which the candidate's other evidence plausibly closes.
+- "ok": exactly one core requirement "met": false, OR two or more concerns touching core
+  requirements.
+- "stretch": two or more core requirements "met": false.
+Grade every pick this way whichever list it is in. "ok" and "stretch" are the expected grades
+for a "backup" item, but they are also the correct, honest grades for a "strong"-list role
+that survived the disqualifiers and is worth showing while still leaving the candidate real
+gaps to close -- a role does NOT become a "strong" fit_level by virtue of being in "strong".
+If a role reads better to you than the rubric allows, do not soften the rule: re-check whether
+your step-D checklist was written at the JD's own level of specificity, since a checklist
+padded with unfailable aptitudes is what produces an unearned grade.
 
 "role_salary"/"work_style"/"role_seniority"/"deadline" are FACTS READ OFF THIS POSTING, not
 judgements about the candidate. Report only what this posting's own description actually says: use null
@@ -3828,6 +4276,16 @@ language text a candidate can understand without the rest of the analysis."""
 # carries all the rules; the per-call user prompt is just the CV + the jobs payload.
 _FINAL_EVAL_SYSTEM = f"""You are an elite talent placement advisor matching a candidate to open job vacancies.
 You are given a candidate profile and a set of job postings, and must return TWO lists: "strong" and "backup".
+
+WHAT THE BRACKETED HINTS IN A JOB BLOCK ARE. Some blocks carry notes in square brackets --
+"[key requirements: ...]", "[screen note: ...]", "[earlier screening pass thought: ...]", "[source: ...]",
+"[posting-volume note: ...]". These come from cheaper earlier passes that saw LESS of the posting than you
+do (often only its truncated opening) and, in the case of "[key requirements]", had not seen the candidate
+at all. Use them to know WHERE TO LOOK, not what to conclude: they save you re-deriving the JD side from
+nothing, and they flag which checks are likely to matter for this listing. You have the fuller text, so
+your reading always wins where they disagree, and a hint is never grounds to skip a DISQUALIFIER or to
+soften a "fit_level" the rubric doesn't support. In particular, "[earlier screening pass thought: ...]" is
+one cheap model's one-line impression -- treat it as a claim to verify, never as evidence of fit.
 
 SCOPE OF EACH POSTING'S TEXT -- read first. Each posting's text is scraped from a web page and may contain
 unrelated boilerplate wrapped around the actual job description: site navigation, page footers, a "Similar jobs"
@@ -3902,6 +4360,17 @@ def _final_eval_job_block(i: int, j: dict) -> str:
             for r in key_reqs
         )
         hint += f"[key requirements: {req_text}]\n"
+    # rank_gate's own one-line verdict on this listing (_rank_note, see
+    # _rank_prompt's "note" field) -- already computed by the mid tier and, until
+    # now, thrown away after it decided which jobs got here. It is the cheapest
+    # possible hand-off between tiers: one already-written phrase naming what the
+    # mid tier thought drove the fit, so this call can verify a specific claim
+    # instead of re-deriving the same read from scratch. The numeric score is
+    # deliberately NOT passed -- a number anchors a grade, a phrase points at
+    # something checkable.
+    rank_note = (j.get("_rank_note") or "").strip()
+    if rank_note:
+        hint += f"[earlier screening pass thought: {rank_note}]\n"
     return (f"JOB {i+1}: {j['title']} at {j['company']}\n"
             f"Location: {j.get('location') or 'not stated'}\nURL: {j['url']}\n{hint}\n"
             f"{j.get('full_text','')[:FINAL_EVAL_JOB_TEXT_CHARS]}")

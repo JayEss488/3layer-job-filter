@@ -67,12 +67,18 @@ export default function SearchPage() {
   // (e.g. the gap right after a cancel) — never render it as a real result.
   const active = (roles ?? []).filter((r) => r.status !== "crossed" && !r.provisional);
   const crossed = (roles ?? []).filter((r) => r.status === "crossed" && !r.provisional);
-  // Mid-run "being verified" cards for the current run only.
-  const verifying = running
+  // Mid-run cards for the current run only, split by which paint produced them.
+  // `verifying` (rank stage: cheap gate passed, 0-100 estimate) renders above
+  // `earlyMatches` (embedding stage: nothing has looked at it yet) — a role
+  // promoted from one to the other is the SAME row updated in place by the
+  // backend, so it moves between these lists rather than appearing in both.
+  const provisionalNow = running
     ? (roles ?? []).filter(
         (r) => r.provisional && r.search_run_id === status?.id && r.status !== "crossed",
       )
     : [];
+  const verifying = provisionalNow.filter((r) => r.provisional_stage !== "embed");
+  const earlyMatches = provisionalNow.filter((r) => r.provisional_stage === "embed");
 
   // Second-search semantics: an unreviewed ('new') role left over from an
   // earlier run shouldn't interleave with this run's fresh picks by fit_rank
@@ -85,11 +91,26 @@ export default function SearchPage() {
     (max, r) => (r.search_run_id != null && (max === null || r.search_run_id > max) ? r.search_run_id : max),
     null
   );
+  // Roles the quick scorer rated but the full review never reached (retained by
+  // engine._retain_unreviewed_provisional: provisional false, stage still
+  // "rank"). They carry no verdict and no fit_rank, so they must be pulled out
+  // of `current` before it's rendered as this run's ranked picks.
+  const unreviewed = active.filter(
+    (r) => r.provisional_stage === "rank" && r.status === "new" && r.search_run_id === latestRunId
+  );
+  const isUnreviewed = (r: Role) => r.provisional_stage === "rank";
   const current = active.filter(
-    (r) => r.status === "new" && (r.search_run_id == null || r.search_run_id === latestRunId)
+    (r) =>
+      r.status === "new" &&
+      !isUnreviewed(r) &&
+      (r.search_run_id == null || r.search_run_id === latestRunId)
   );
   const previous = active.filter(
-    (r) => r.status === "new" && r.search_run_id != null && r.search_run_id !== latestRunId
+    (r) =>
+      r.status === "new" &&
+      !isUnreviewed(r) &&
+      r.search_run_id != null &&
+      r.search_run_id !== latestRunId
   );
   // Saved roles are a completed decision from any run -- shown in their own
   // section below, never mixed into the ranked `current`/`previous` lists
@@ -132,7 +153,12 @@ export default function SearchPage() {
 
         {!running && (
           <div className="meta-row">
-            Showing <span className="count">{active.length + crossed.length} results</span>
+            {/* Quick-scored-only rows are shown but aren't results — counting them
+                here would inflate "N results" with roles nothing reviewed. */}
+            Showing{" "}
+            <span className="count">
+              {active.length - unreviewed.length + crossed.length} results
+            </span>
             {status?.finished_at && ` — last searched ${timeAgo(status.finished_at)}`}
           </div>
         )}
@@ -159,6 +185,53 @@ export default function SearchPage() {
                   key={role.id}
                   role={role}
                   showRank
+                  indentActions
+                  actions={
+                    <>
+                      <button
+                        className={`btn ${kept ? "btn-primary" : "btn-secondary"}`}
+                        onClick={() => (kept ? cross.mutate(role.id) : tick.mutate(role.id))}
+                        title={kept ? "Click to un-keep (pass)" : "Keep this role even if the AI review later rates it lower"}
+                      >
+                        {kept ? "✓ Kept" : "✓ Keep"}
+                      </button>
+                      <button className="btn btn-secondary" onClick={() => applyRole.mutate(role.id)}>
+                        Mark as applied
+                      </button>
+                      <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
+                        ✗ Pass
+                      </button>
+                    </>
+                  }
+                />
+              );
+            })}
+          </>
+        )}
+
+        {/* Paint 1 of 3, kept underneath once the later paints land. These come
+            straight off the semantic pre-filter — no model has read them — so
+            they're framed as "what the search is looking at", not as results.
+            Same Keep/Pass/Applied actions as any other card: a Keep here follows
+            the identical leftover rules (see engine._resolve_leftover_provisional),
+            so keeping something the run never verifies returns it to your Inbox
+            rather than silently staying saved. */}
+        {running && earlyMatches.length > 0 && (
+          <>
+            <div className="crossed-section-label">
+              Early matches — found by keyword/semantic similarity, not yet reviewed
+            </div>
+            <div className="annotation" style={{ padding: "0 0 8px" }}>
+              No AI has read these yet. They&apos;re here so you can see what the search picked
+              up straight away — most will be replaced above as the review progresses.
+            </div>
+            {earlyMatches.map((role) => {
+              const kept = role.status === "saved";
+              return (
+                <RoleCard
+                  key={role.id}
+                  role={role}
+                  variant="dim"
                   indentActions
                   actions={
                     <>
@@ -275,6 +348,48 @@ export default function SearchPage() {
                 }
               />
             ))}
+          </>
+        )}
+
+        {/* Paint 3 of 3's trailing section: roles the quick scorer rated well but
+            the full AI review ran out of budget before reaching. Anything the
+            judge actually looked at and rejected is excluded on the backend, so
+            this is only ever "not reached", never "reviewed and failed". No rank
+            badge — their fit_rank is null and they aren't part of this run's
+            ranking. */}
+        {!running && unreviewed.length > 0 && (
+          <>
+            <div className="crossed-section-label">
+              quick-scored only — the full review didn&apos;t reach these
+            </div>
+            {unreviewed.map((role) => {
+              const saved = role.status === "saved";
+              return (
+                <RoleCard
+                  key={role.id}
+                  role={role}
+                  showAnalysis
+                  variant="dim"
+                  actions={
+                    <>
+                      <button
+                        className={`btn ${saved ? "btn-primary" : "btn-secondary"}`}
+                        onClick={() => (saved ? cross.mutate(role.id) : tick.mutate(role.id))}
+                        title={saved ? "Click to unsave" : undefined}
+                      >
+                        {saved ? "✓ Saved" : "✓ Save"}
+                      </button>
+                      <button className="btn btn-secondary" onClick={() => applyRole.mutate(role.id)}>
+                        Mark as applied
+                      </button>
+                      <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
+                        ✗ Pass
+                      </button>
+                    </>
+                  }
+                />
+              );
+            })}
           </>
         )}
 

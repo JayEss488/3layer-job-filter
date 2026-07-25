@@ -3,3 +3,6 @@
 /out
 next-env.d.ts
 *.tsbuildinfo
+
+# Local env (NEXT_PUBLIC_API_URL) -- deployed value is set in Vercel, not here
+.env*.local

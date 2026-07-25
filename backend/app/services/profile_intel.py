@@ -294,19 +294,27 @@ def _intent_block(intent_text: str, what: str) -> str:
     )
 
 
-def _families_prompt(text: str, intent_text: str, intent_missing: bool) -> str:
+def _families_prompt(
+    text: str, intent_text: str, intent_missing: bool, want_intent_draft: bool = True
+) -> str:
     """Half one of the formation pair: role families (+ their titles) and a
     first-person intent draft. Both are short outputs about what the candidate
     WANTS, which is why they stayed together while the long descriptive summary
-    moved to its own call."""
+    moved to its own call.
+
+    want_intent_draft=False drops the intent task and its field entirely -- see
+    generate_families for why the short-document path doesn't want one."""
     intent_task = (
         "Draft one 2-3 sentence first-person statement of what kind of roles, sectors, and "
         "level this candidate is after, based only on the document above."
         if intent_missing else
         'The candidate already has an intent statement -- return "" for this field, it will be ignored.'
     )
-    tasks = [_FAMILIES_TASK, f"INTENT DRAFT\n{intent_task}"]
-    fields = ['"families": [{"label": "...", "roles": ["...", "..."]}]', '"intent_draft": "..."']
+    tasks = [_FAMILIES_TASK]
+    fields = ['"families": [{"label": "...", "roles": ["...", "..."]}]']
+    if want_intent_draft:
+        tasks.append(f"INTENT DRAFT\n{intent_task}")
+        fields.append('"intent_draft": "..."')
     numbered = "\n\n".join(f"TASK {i} -- {t}" for i, t in enumerate(tasks, start=1))
     return f"""Candidate's CV / notes:
 {text[:40000]}
@@ -349,17 +357,30 @@ def generate_summary(text: str, intent_text: str | None) -> dict:
     }
 
 
-def generate_families(text: str, intent_text: str | None) -> dict | None:
+def generate_families(
+    text: str, intent_text: str | None, *, want_intent_draft: bool = True
+) -> dict | None:
     """Pure MID LLM call producing the candidate's role families (label + titles)
     and a first-person intent draft. DB-free so formation can run it in a thread
     alongside the summary and extraction calls. Returns None on a call failure or
     when no usable families came back (a transient failure, distinguishable from a
-    genuinely empty profile so the caller leaves existing state untouched)."""
+    genuinely empty profile so the caller leaves existing state untouched).
+
+    want_intent_draft=False (the short-document path -- see formation._is_short_cv)
+    skips the draft altogether. A short CV gives the model too little to paraphrase
+    honestly, so the draft comes back as a restatement of the extracted titles that
+    then reaches the final judge as "the candidate's OWN words" (snapshot.py ranks
+    intent_text above everything else) and quietly widens the search: a live run
+    drafted "...with openness to roles involving automation" off a data/software CV,
+    which is one of the things that let an industrial-controls role through as a top
+    pick. An empty box the candidate can optionally fill is strictly better than a
+    confident guess they never wrote."""
     if not text or not text.strip():
         return None
     intent_missing = not (intent_text or "").strip()
     data = llm_json(
-        _families_prompt(text, intent_text or "", intent_missing),
+        _families_prompt(text, intent_text or "", intent_missing,
+                         want_intent_draft=want_intent_draft),
         model=MID_MODEL,
     )
     raw_families = data.get("families") if isinstance(data.get("families"), list) else []
@@ -385,7 +406,7 @@ def generate_families(text: str, intent_text: str | None) -> dict | None:
     }
 
 
-def _prompt(background: str, pinned: list[str], intent_missing: bool, skip_header: bool) -> str:
+def _prompt(background: str, pinned: list[str], intent_missing: bool, short_cv: bool) -> str:
     pinned_block = (
         "The candidate has already PINNED these target roles -- do not repeat or reword "
         "them, only propose complementary/additional titles:\n" + "\n".join(f"- {r}" for r in pinned)
@@ -401,13 +422,18 @@ def _prompt(background: str, pinned: list[str], intent_missing: bool, skip_heade
     # parsing.py's CV_SHORT_WORD_THRESHOLD handling) -- a separately-generated
     # "Looking for" paraphrase of the same background would add compression with
     # no benefit, so skip TASK 2 and the "header" field entirely rather than pay
-    # for a narrative restatement of text short enough to just read directly.
+    # for a narrative restatement of text short enough to just read directly. The
+    # same short-document flag also drops the INTENT DRAFT task, for the reason in
+    # generate_families' docstring -- a guessed statement of what the candidate
+    # wants reaches the judge as if they'd written it. This is the regenerate/edit
+    # path; formation.py's first-parse path suppresses it the same way.
     tasks = [_TARGET_ROLES_TASK]
-    if not skip_header:
+    if not short_cv:
         tasks.append(_HEADER_TASK)
-    tasks.append(f"INTENT DRAFT\n{intent_task}")
+        tasks.append(f"INTENT DRAFT\n{intent_task}")
     numbered_tasks = "\n\n".join(f"TASK {i} -- {t}" for i, t in enumerate(tasks, start=1))
-    header_field = "" if skip_header else ', "header": "..."'
+    header_field = "" if short_cv else ', "header": "..."'
+    intent_field = "" if short_cv else ', "intent_draft": "..."'
     return f"""Candidate background:
 {background or 'No background on file yet.'}
 
@@ -415,7 +441,7 @@ def _prompt(background: str, pinned: list[str], intent_missing: bool, skip_heade
 
 {numbered_tasks}
 
-Return ONLY JSON: {{"target_roles": ["..."]{header_field}, "intent_draft": "..."}}"""
+Return ONLY JSON: {{"target_roles": ["..."]{header_field}{intent_field}}}"""
 
 
 def _generate(ctx: dict) -> dict | None:

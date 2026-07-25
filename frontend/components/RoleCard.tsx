@@ -91,8 +91,13 @@ function factChips(role: Role): string[] {
   // was silent, and no chip is better than a guessed one. While provisional,
   // the cheap rank stage's estimate is the only fit signal there is — surface
   // it honestly as an estimate (it disappears when the real verdict lands).
+  // The estimate shows while provisional AND on a retained "quick-scored only"
+  // row (provisional false, stage still "rank") -- there it is the only fit
+  // signal that role will ever have, so hiding it would leave a bare card.
   return [
-    role.provisional && role.rank_score != null ? `Fit estimate ${role.rank_score}/100` : null,
+    role.rank_score != null && (role.provisional || role.provisional_stage === "rank")
+      ? `Fit estimate ${role.rank_score}/100`
+      : null,
     role.salary_text,
     role.work_style,
     role.seniority_level,
@@ -138,7 +143,14 @@ export function RoleCard({
         </div>
         <div className="card-corner">
           {role.provisional ? (
-            <span className="verdict v-verifying">Verifying…</span>
+            // An embedding-stage card has had NO model look at it — saying
+            // "Verifying…" would imply a review is underway on this specific
+            // role when it may never be examined at all.
+            <span className="verdict v-verifying">
+              {role.provisional_stage === "embed" ? "Not yet reviewed" : "Verifying…"}
+            </span>
+          ) : role.provisional_stage === "rank" ? (
+            <span className="verdict v-verifying">Quick-scored only</span>
           ) : (
             verdict &&
             VERDICT_LABEL[verdict] && (

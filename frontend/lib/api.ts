@@ -3,7 +3,6 @@ import type {
   AttributesResponse,
   AttributeType,
   Blocklist,
-  Confidence,
   ContextHeader,
   CvParseTiming,
   Enforcement,
@@ -22,14 +21,35 @@ import type {
   Stats,
 } from "./types";
 
+import { clearAuth, getToken } from "./auth";
+
 const BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+
+/** Bearer header for the current token, or {} when logged out. */
+function authHeaders(): Record<string, string> {
+  const t = getToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+/** On an expired/invalid token, drop it and bounce to the login page. */
+export function handleUnauthorized(): void {
+  clearAuth();
+  if (typeof window !== "undefined" && window.location.pathname !== "/login") {
+    window.location.href = "/login";
+  }
+}
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(),
+      ...(init?.headers as Record<string, string> | undefined),
+    },
   });
   if (!res.ok) {
+    if (res.status === 401) handleUnauthorized();
     let detail = res.statusText;
     try {
       const body = await res.json();
@@ -44,6 +64,24 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // auth
+  login: async (username: string, password: string) => {
+    const res = await fetch(`${BASE}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      const detail = await res
+        .json()
+        .then((b) => b.detail)
+        .catch(() => null);
+      throw new Error(detail || "Login failed");
+    }
+    return (await res.json()) as { token: string; user_id: number; username: string };
+  },
+  me: () => req<{ user_id: number; username: string }>("/me"),
+
   // profiles
   listProfiles: () => req<Profile[]>("/profiles"),
   createProfile: (name?: string) =>
@@ -135,8 +173,12 @@ export const api = {
     const res = await fetch(`${BASE}/profiles/${id}/parse-cv`, {
       method: "POST",
       body: form,
+      headers: authHeaders(),
     });
-    if (!res.ok) throw new Error((await res.json()).detail || "Upload failed");
+    if (!res.ok) {
+      if (res.status === 401) handleUnauthorized();
+      throw new Error((await res.json()).detail || "Upload failed");
+    }
     return (await res.json()) as Attribute[];
   },
   suggest: (id: number, type: AttributeType, context?: string) =>
@@ -146,7 +188,6 @@ export const api = {
     }),
   regenerateTargetRoles: (id: number) =>
     req<Attribute[]>(`/profiles/${id}/regenerate-target-roles`, { method: "POST" }),
-  confidence: (id: number) => req<Confidence>(`/profiles/${id}/confidence`),
   contextHeader: (id: number) => req<ContextHeader>(`/profiles/${id}/context-header`),
   updateContextHeader: (id: number, header: string) =>
     req<ContextHeader>(`/profiles/${id}/context-header`, {
@@ -212,8 +253,12 @@ export const api = {
     const res = await fetch(`${BASE}/settings/cv-parse-timing`, {
       method: "POST",
       body: form,
+      headers: authHeaders(),
     });
-    if (!res.ok) throw new Error((await res.json()).detail || "Timing run failed");
+    if (!res.ok) {
+      if (res.status === 401) handleUnauthorized();
+      throw new Error((await res.json()).detail || "Timing run failed");
+    }
     return (await res.json()) as CvParseTiming;
   },
 

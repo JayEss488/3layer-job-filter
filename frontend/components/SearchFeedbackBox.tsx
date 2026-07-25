@@ -46,10 +46,7 @@ export function SearchFeedbackBox({ profileId }: { profileId: number }) {
     try {
       const created = await api.interpretFeedback(profileId);
       if (created.length > 0) {
-        await Promise.all([
-          qc.invalidateQueries({ queryKey: ["attributes", profileId] }),
-          qc.invalidateQueries({ queryKey: ["confidence", profileId] }),
-        ]);
+        await qc.invalidateQueries({ queryKey: ["attributes", profileId] });
         const names = created
           .map((a) => `${a.type === "avoid" ? "avoid" : "need"}: "${a.value}"`)
           .join(", ");

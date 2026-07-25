@@ -1,6 +1,6 @@
 """SQLAlchemy engine + session. SQLite for the prototype; the same models work
 against Postgres by changing DATABASE_URL only."""
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from .config import DATABASE_URL
@@ -17,6 +17,26 @@ connect_args = (
 engine = create_engine(DATABASE_URL, connect_args=connect_args, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
+
+
+if DATABASE_URL.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _conn_record):
+        """Put SQLite in WAL mode on every connection. A plain busy_timeout is
+        NOT enough here: in the default rollback-journal mode a reader holding a
+        SHARED lock while the search thread's frequent mid-run commits want an
+        EXCLUSIVE lock is a genuine deadlock that SQLite fails *immediately*
+        (SQLITE_BUSY / "database is locked"), never waiting out the timeout --
+        which crashed a real UAE run mid-gate while the frontend polled
+        /roles + /search/status every ~200ms. WAL lets readers read from a
+        snapshot without ever blocking the single writer, so only writer-vs-
+        writer serialises, and busy_timeout covers that. synchronous=NORMAL is
+        the safe, faster pairing for WAL."""
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.close()
 
 
 def get_db():
@@ -58,7 +78,8 @@ def _migrate_columns():
                          ("snapshot_samples", "TEXT")],
         "roles": [("source", "TEXT"), ("search_run_id", "INTEGER"), ("verdict", "TEXT"),
                    ("work_style", "TEXT"), ("seniority_level", "TEXT"), ("deadline_text", "TEXT"),
-                   ("rank_score", "INTEGER"), ("provisional", "BOOLEAN DEFAULT 0")],
+                   ("rank_score", "INTEGER"), ("provisional", "BOOLEAN DEFAULT 0"),
+                   ("provisional_stage", "TEXT")],
         "profiles": [("cv_text", "TEXT"), ("cv_summary", "TEXT"), ("intent_text", "TEXT"),
                      ("search_feedback", "TEXT")],
         "profile_attributes": [("proficiency", "TEXT"), ("evidence_origin", "TEXT"),

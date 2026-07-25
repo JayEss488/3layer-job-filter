@@ -1,0 +1,103 @@
+"""Owner-only usage analytics. Guarded by a shared secret (the ADMIN_TOKEN env
+var, sent as the `X-Admin-Token` header), NOT by user login -- there is no admin
+user account in the beta. Reads the EventLog stream (services/analytics.py) and
+rolls it up per user. If ADMIN_TOKEN is unset the endpoint is locked (403)."""
+import hmac
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from ..config import ADMIN_TOKEN
+from ..database import get_db
+from ..models import EventLog, User
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+# Map an EventLog.event_type slug to the per-user counter it increments.
+_EVENT_FIELDS = {
+    "login": "logins",
+    "search_started": "searches",
+    "role_tick": "ticks",
+    "role_cross": "crosses",
+    "role_ignore": "ignores",
+    "role_apply": "applies",
+    "profile_created": "profiles_created",
+}
+
+
+def _check_admin(x_admin_token: str | None = Header(None)) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Analytics endpoint is disabled (ADMIN_TOKEN not set).")
+    if not x_admin_token or not hmac.compare_digest(x_admin_token, ADMIN_TOKEN):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@router.get("/analytics")
+def analytics(_: None = Depends(_check_admin), db: Session = Depends(get_db)):
+    """Per-user activity rollup + headline totals, newest sign-ups first."""
+    users = db.execute(select(User).order_by(User.id)).scalars().all()
+
+    # counts and last-activity per (user, event_type), one grouped query
+    grouped = db.execute(
+        select(
+            EventLog.user_id,
+            EventLog.event_type,
+            func.count(EventLog.id),
+            func.max(EventLog.created_at),
+        ).group_by(EventLog.user_id, EventLog.event_type)
+    ).all()
+
+    counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    last_active: dict[int, datetime] = {}
+    for user_id, event_type, n, last in grouped:
+        field = _EVENT_FIELDS.get(event_type)
+        if field:
+            counts[user_id][field] += int(n)
+        if last and (user_id not in last_active or last > last_active[user_id]):
+            last_active[user_id] = last
+
+    cutoff = datetime.utcnow() - timedelta(days=7)
+    per_user = []
+    totals = defaultdict(int)
+    active_7d = 0
+    for u in users:
+        c = counts.get(u.id, {})
+        la = last_active.get(u.id)
+        row = {
+            "user_id": u.id,
+            "username": u.username,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "last_active": la.isoformat() if la else None,
+            "logins": c.get("logins", 0),
+            "searches": c.get("searches", 0),
+            "ticks": c.get("ticks", 0),
+            "crosses": c.get("crosses", 0),
+            "ignores": c.get("ignores", 0),
+            "applies": c.get("applies", 0),
+            "profiles_created": c.get("profiles_created", 0),
+        }
+        per_user.append(row)
+        for k in ("logins", "searches", "ticks", "crosses", "ignores", "applies"):
+            totals[k] += row[k]
+        if la and la >= cutoff:
+            active_7d += 1
+
+    # never-logged-in users are the most useful signal at the top
+    per_user.sort(key=lambda r: (r["last_active"] is not None, r["last_active"] or "", r["user_id"]))
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "totals": {
+            "users": len(users),
+            "active_last_7d": active_7d,
+            "searches": totals["searches"],
+            "ticks": totals["ticks"],
+            "crosses": totals["crosses"],
+            "applies": totals["applies"],
+            "logins": totals["logins"],
+        },
+        "users": per_user,
+    }
