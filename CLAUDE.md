@@ -373,15 +373,56 @@ of what the last finished run already recorded — see the search-pipeline secti
    could drift from the candidate's actual current target roles and let a
    same-industry-different-function listing (e.g. a Lead Product Manager role surfacing
    for a Data & Insights candidate) through as "adjacent enough" — a live gate-harness
-   diagnostic (`tests/gate_harness.py`) caught exactly this on a real profile. It now
+   diagnostic (`tests/gate_harness.py`) caught exactly this on a real profile.
+   **`tests/gate_harness.py --ground-truth` is the way to check this stage's calibration**:
+   it samples only listings the expensive judge has already ruled on (`JobSeen.eval_verdict`,
+   balanced across verdicts) and scores the gate against those labels as two SEPARATE rates
+   — good-jobs-kept and bad-jobs-caught — never one accuracy number, because dropping a job
+   the judge liked destroys a result the user never sees while keeping one it rejects merely
+   wastes a rank/judge call. Pair it with `--text-mode`: a judged row has been scraped, so it
+   carries a `full_text` the gate never had at gate time, and re-screening it in the default
+   `auto` mode measures a stage that doesn't exist. Running `snippet` (what the gate really
+   had) against `full` (what it could do) is what separates a MISCALIBRATED gate from a
+   STARVED one — opposite findings needing opposite fixes, and neither number alone tells
+   them apart. It now
    judges purely on job-FUNCTION similarity to the candidate's own stated target roles,
    which were already part of this axis's prompt anyway; `rank_gate`'s prompt dropped the
-   same `sectors` guess for the same reason. `listing_ok` catches listings that clearly
+   same `sectors` guess for the same reason.
+   A `--ground-truth` audit on 113 labelled listings (2026-07-27) drove **screen_v11 → v12**,
+   correcting three axes that were dropping judge-approved roles. The work-arrangement axis is
+   now an explicit two-row conflict table in which **hybrid never conflicts with anything** (it
+   has on-site days, so it satisfies an On-site preference, and remote days, so it partly
+   satisfies a Remote one — it had been hard-dropping hybrid roles for an On-site candidate),
+   plus "if you couldn't classify the listing you cannot fail this axis". The seniority axis
+   gained an **entry-level floor** (for a Graduate/Junior/Entry candidate, a graduate/junior/
+   entry listing is a MATCH and can never be `seniority_low` — it had been citing "Graduate
+   Analyst (graduate/early-career bar)" as evidence a graduate role sat *beneath* a Junior
+   candidate) plus a restated direction self-check, after a plainly-`_high` argument came back
+   under the `_low` code yet again. And `listing_ok` is now told to **read past board page
+   furniture** (see below). Retention went 15/26 → 23/26 with **no loss of real screening
+   power**: the raw catch rate fell 46% → 23%, but all 23 rejects the old gate caught and the
+   new one passes had been dropped by exactly those broken axes, and *none* were knowable from
+   the text the gate had (11 sat only in the scraped page, 9 carry no recorded reason at all).
+   The old gate was dropping them for unrelated wrong reasons and happening to be right — the
+   count of disqualifiers genuinely visible-and-missed is 1 before and 1 after. Don't read a
+   fall in this stage's drop count as a regression without checking that distinction.
+   `listing_ok` catches listings that clearly
    aren't one specific job posting at all — a job board's own search-results/category
    page or generic aggregator blurb that slipped past discovery-time filtering (e.g.
    `_looks_like_category_page`, which only runs at discovery time on Google-organic
    results and can't see this in a stored snippet) — since re-scraping/ranking/judging
-   non-job text wastes every downstream stage. `hard_gate_ok` enforces the candidate's OWN stated non-negotiables — the `avoid` and
+   non-job text wastes every downstream stage. **It is explicitly told to read past board
+   page furniture** (v12): where a candidate carries scraped `full_text`, crawl4ai keeps the
+   board's own chrome, so an Adzuna posting arrives opening with `## <Title> jobs in <City> /
+   Create email alert / ❮ back to last search` — verbatim the category-page pattern this axis
+   is told to reject, sitting inside its 2000-char window, on an *unconditional hard drop*.
+   Re-running the ground-truth sample with full text instead of teasers sent this axis from 3
+   failures to **50** (retention 42%), i.e. supplying the gate more text was actively
+   counterproductive; after the fix it's 0, and the full-text pass holds the same 88.5%
+   retention as the teaser pass while catching nearly twice as many bad roles (44% vs 23%).
+   That ordering — more text strictly better — is what would make widening
+   `REED_ENRICH_PRE_GATE_CAP` worth doing; it was not true before v12.
+   `hard_gate_ok` enforces the candidate's OWN stated non-negotiables — the `avoid` and
    `must_have` attribute chips (see the data model above) — and is false only when the
    listing *clearly* involves an avoid item or clearly can't satisfy a must-have,
    defaulting to true when the listing is silent, so a thin listing isn't dropped for
@@ -529,7 +570,7 @@ of what the last finished run already recorded — see the search-pipeline secti
    identically to a fresh one), and are rendered by `engine._compose_analysis`. There is
    still no separate JD-summarisation pass — the three-axis read happens inside this same
    call, on the `full_text` it already receives, deliberately avoiding an extra paid call
-   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 16)
+   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 18)
    or every already-persisted verdict is served stale forever.
    **`fit_level` is derived mechanically from the model's own step-D requirements
    checklist and `concerns`, not from an overall impression, and is decoupled from which
@@ -553,7 +594,23 @@ of what the last finished run already recorded — see the search-pipeline secti
    domain-defining asks are core by definition and cannot be demoted to secondary
    because the candidate lacks them. Since the rubric reads off the checklist, a padded
    checklist is the way an unearned grade gets produced — fix that before touching the
-   rubric thresholds.
+   rubric thresholds. v18 adds the two remaining halves of that discipline. (a) Step D's
+   **fourth** checklist rule, the mirror of the widening error: an ask the posting itself
+   says it TRAINS for, labels beneficial/desirable/not essential, or states alongside a
+   weaker actual minimum is **secondary**, never core, and may never be the concern that
+   drives the grade down — the item still sits on the checklist `met: false` (the
+   capacity rule is unchanged), but an employer budgeting to teach X is not screening on
+   X. A live pick was graded `ok` partly on "no evidence of uploading data into a custom
+   workplace analytics platform" for a posting whose own text promised a two-week
+   training period on that platform. Step C carries the display half: such a gap must
+   quote the JD's framing in the same breath and never be listed first. (b) Step E's
+   **wording lock** — `top_match_reason` is written AFTER `fit_level` and must match its
+   register, with an explicit per-grade vocabulary and an explicit ban on the
+   qualifier-laundered forms ("a strong graduate fit", "a strong entry-level option")
+   that a live run produced under an "OK fit" badge three times. The prose sits directly
+   under the badge on the card, so a mismatch reads as the system contradicting itself;
+   the failure is near-always in one direction (an `ok` pick narrated as strong) because
+   the paragraph gets drafted from the case FOR the role rather than from the verdict.
    **Tier hand-off — what the cheap/mid stages pass forward so the judge re-derives
    less** (`full_auto._final_eval_job_block`, all as bracketed notes in each job block;
    the judge's system prompt has a `WHAT THE BRACKETED HINTS IN A JOB BLOCK ARE`
@@ -796,6 +853,16 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   just a "you're being redirected" page) is detected and treated as a failed scrape
   rather than persisted as real content, and the whole phase has a 60s total wall-clock
   budget — whatever hasn't finished by then falls back to its snippet.
+- `screen_gate` **re-asks for any listing a response omitted**. The cheap model regularly
+  returns valid JSON that simply skips some of the listings it was given (a live 113-listing
+  run silently skipped 17). Those used to fall through to the "everything ok" fail-open
+  default *and* get written to `gate_cache` as a real verdict — so a listing no model had ever
+  looked at was recorded as passing every axis, permanently, and was never re-screened. It now
+  re-asks for just the skipped ones (one bounded retry, a much shorter prompt); anything still
+  unjudged stays fail-open for the run but is **not cached**. `_screen_one_batch` also sets
+  `c["_gate_unjudged"]`, because an unjudged listing is otherwise byte-identical to one the
+  model actively cleared — the fail-open default sets every axis true, and `"missing_decision"`
+  is normalised out of the packed `_gate_reason` by the `seniority_ok` branch.
 - `emit()` (`full_auto.py`) catches `UnicodeEncodeError` and re-encodes ASCII-safe —
   a log line containing an emoji used to crash whatever phase was running on a
   console whose stdout isn't UTF-8-capable (confirmed reproducible on this repo's own

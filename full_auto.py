@@ -2528,6 +2528,16 @@ REAL LISTING CHECK
 - A real posting that is simply thin, vague, or informally written is NOT covered by this -- only
   content that clearly is not describing one specific role at all. When unsure or genuinely
   ambiguous, listing_ok=true.
+- IGNORE PAGE FURNITURE. Some listings arrive as text scraped from a job board's web page, so the
+  posting is wrapped in the board's own chrome: a heading like "Business Intelligence Analyst jobs in
+  Peterborough", "back to last search", "Create email alert", "Leave us your email address and we'll
+  send you similar new jobs", cookie and privacy notices, "Loading...", breadcrumbs, an "Apply for this
+  job" link, or a trailing list of similar vacancies with their own titles and salaries. NONE of that
+  is evidence about what the page is -- it is the same furniture the board wraps around every posting,
+  including real ones, and it frequently appears BEFORE the posting itself. Read past it and judge only
+  the posting body. If ONE specific role is described anywhere in the text, listing_ok=true no matter
+  how much surrounding chrome came with it. Set listing_ok=false only when, having ignored the
+  furniture, there is no single role being described at all.
 
 SENIORITY / EXPERIENCE / HARD REQUIREMENTS
 Candidate seniority: {profile.get('seniority', 'mid-level')}
@@ -2549,9 +2559,21 @@ alone satisfy a requirement that clearly expects professional/production-level c
   is a production-level professional role in a field the candidate has only shallow/non-commercial
   evidence for (e.g. "Data Scientist" expecting production ML/DS work from a candidate whose only DS
   evidence is academic-tagged).
+  ENTRY-LEVEL FLOOR -- read this before ever using "seniority_low". "Below the candidate" is measured
+  against the CANDIDATE'S OWN stated seniority at the top of this block, not against some general idea
+  of a serious job. When that stated seniority is Graduate, Junior, Entry-level or equivalent, there is
+  almost nothing left below them: a Graduate, Junior, Entry-level, Trainee or "0-2 years" listing is a
+  DIRECT MATCH for them and is seniority_ok=true. Only genuinely sub-entry work -- an unpaid internship,
+  school work-experience, a pre-degree apprenticeship -- can be "seniority_low" for such a candidate,
+  and even then only when the listing says so plainly. A listing titled "Graduate X" or "Junior X" is
+  never by itself evidence of a level mismatch for a graduate or junior candidate; if anything it is
+  evidence of a match, and doubly so when it echoes one of their target roles above.
   (These two directions are opposite failures -- "_high" always means the ROLE outranks the
   CANDIDATE, "_low" always means the CANDIDATE outranks the role's real level or lacks the
-  professional depth it expects. Do not mix them up.)
+  professional depth it expects. Do not mix them up. Sanity-check yourself before answering: if the
+  reason you are about to give is that the role demands MORE than the candidate has -- more years, more
+  ownership, more scope, a higher pay band than their level -- that is "seniority_high", never
+  "seniority_low", no matter how the sentence is phrased.)
 - A stated salary/pay figure is also a real signal of the listing's TRUE seniority band, often
   more reliable than the title -- a title can be inflated or watered down, a number the employer
   is actually paying usually can't. If the listing states a salary, weigh it alongside the title
@@ -2607,10 +2629,20 @@ Candidate location: {profile.get('location') or 'n/a'}
   otherwise -- including when it states a specific city/office location and simply doesn't mention
   remote/hybrid/work-from-home at all -- treat it as on-site at that location. Don't default an
   unlabeled listing to remote just because remote wasn't ruled out.
-- work_arrangement_ok=false only if the candidate stated a work-type preference above AND the
-  listing's classified arrangement clearly conflicts with it (e.g. candidate wants remote-only and
-  the listing is on-site with no remote mention). If the candidate stated no preference, or the
-  listing's arrangement could match, work_arrangement_ok=true.{_strict("_work_arrangement_ok")}
+- Then apply this conflict table, and nothing else. There are exactly TWO conflicts:
+    listing is fully REMOTE  + candidate stated ONLY On-site           -> work_arrangement_ok=false
+    listing is ON-SITE       + candidate stated ONLY Remote            -> work_arrangement_ok=false
+  Every other combination is work_arrangement_ok=true. In particular:
+  - A HYBRID listing NEVER conflicts with anything. Hybrid includes on-site days, so it satisfies an
+    On-site preference, and it includes remote days, so it partly satisfies a Remote one. Do not fail
+    this axis on a hybrid listing for any candidate, whatever they stated.
+  - If the candidate stated more than one preference, the listing only has to match ONE of them.
+  - If the candidate stated no preference, work_arrangement_ok=true always.
+  - If you could not confidently classify the LISTING's arrangement in the step above, you cannot fail
+    this axis -- work_arrangement_ok=true. The on-site default there is for reading the listing, not a
+    licence to fail a listing you couldn't read.
+  Note this axis is about the working PATTERN only, never about the city/country -- a listing in the
+  wrong place is a location question, judged elsewhere, not an arrangement conflict.{_strict("_work_arrangement_ok")}
 
 KEY REQUIREMENTS (context for the final judge -- not a filter here)
 Also extract up to 4 of the listing's most important, CONCRETE requirements (a specific tool,
@@ -2748,7 +2780,35 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     enough to skip rank_gate/the judge.
 
     Cached per (profile signature, job id) in the shared gate_cache under
-    gate="screen_v11" (bumped from "screen_v10": screen_v10's own word-for-word
+    gate="screen_v12". Bumped from "screen_v11" after a ground-truth audit
+    (`tests/gate_harness.py --ground-truth --text-mode snippet`) scored this stage
+    against 113 listings the expensive judge had already ruled on, and found it
+    keeping only 15 of 26 judge-approved roles. Reading all 11 drops individually,
+    7 were real failures and they sat in exactly two axes, both fixed here:
+      * WORK ARRANGEMENT was rejecting hybrid listings for a candidate whose stated
+        preference is On-site (4 of the 7). A hybrid role has on-site days, so it
+        cannot conflict with wanting on-site -- and it has remote days, so it partly
+        satisfies wanting remote. The axis is now an explicit two-row conflict table
+        in which hybrid never conflicts with anything, plus an explicit "if you
+        couldn't classify the listing you cannot fail this axis" (one dropped
+        listing mentioned no arrangement at all, which the classification step says
+        to read as on-site, i.e. a match for that candidate).
+      * SENIORITY was firing "seniority_low" -- the candidate outranks the role --
+        on Graduate and Junior listings for a candidate whose stated seniority is
+        Junior, citing signals like "Graduate Analyst (graduate/early-career bar)"
+        as evidence (3 of the 7). The axis now carries an explicit entry-level
+        floor: for a graduate/junior/entry candidate, a graduate/junior/entry
+        listing is a direct match, and only genuinely sub-entry work can be "low".
+        A third case returned a plainly seniority_HIGH argument under the low code,
+        so the direction rule is restated with a self-check.
+    REAL LISTING CHECK was fixed in the same pass on separate evidence: re-running
+    the same sample with scraped full text instead of the teaser sent this axis from
+    3 failures to 50, because crawl4ai keeps the board's own chrome and postings
+    arrive opening with "## <Title> jobs in <City> / Create email alert / back to
+    last search" -- verbatim the category-page pattern this axis is told to reject,
+    and it is an unconditional hard drop. The axis is now told to read past page
+    furniture and judge only the posting body, so more text stops making the gate
+    worse. (Bumped from "screen_v10": screen_v10's own word-for-word
     title presumption below turned out to have a hole -- a job title can name two
     genuinely different professions ("Automation Engineer": software/RPA vs
     industrial PLC/robotics work), so an exact match against a target role is no
@@ -2805,11 +2865,15 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
+    # screen_v12 (from screen_v11): three axes were materially loosened/corrected
+    # after a ground-truth audit (tests/gate_harness.py --ground-truth) scored this
+    # stage against 113 listings the final judge had already ruled on. A v11 verdict
+    # was reached under all three of the old rules and must not be reused.
     # screen_v11 (from screen_v10): the verbatim-title presumption no longer
     # applies to titles that name two different professions (see the docstring's
     # "Automation Engineer" case) -- a v10 row could have been passed on the title
     # alone and must not be reused as if it still means the same thing.
-    keys = [_gate_cache_key("screen_v11", sig, _gate_job_id(c)) for c in candidates]
+    keys = [_gate_cache_key("screen_v12", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -2849,46 +2913,94 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
         shared list, so several of these can run concurrently (see the pool
         below) without two threads touching the same object."""
         new_entries: list[tuple[str, bool, str, str | None]] = []
-        listing_block = "\n".join(
-            f"{i+1}. {c['title']} @ {c.get('company','')} | "
-            f"{(c.get('location') or 'location unknown')}"
-            f"{_listing_salary_suffix(c)} | "
-            f"{(c.get('full_text') or c.get('snippet') or '')[:GATE_LISTING_TEXT_CHARS]}"
-            for i, (c, _k) in enumerate(batch)
-        )
-        prompt = _screen_prompt(profile, listing_block)
+
+        def _ask(items: list[tuple[dict, str]]):
+            """One LLM call over `items`, numbered 1..len(items). Returns
+            (decisions, key_requirements) keyed by that 1-based position, or None
+            if the call or its JSON failed outright. Only positions the model
+            actually ruled on are present -- the caller decides what to do about
+            any it skipped, rather than a silent default standing in for a
+            verdict."""
+            listing_block = "\n".join(
+                f"{i+1}. {c['title']} @ {c.get('company','')} | "
+                f"{(c.get('location') or 'location unknown')}"
+                f"{_listing_salary_suffix(c)} | "
+                f"{(c.get('full_text') or c.get('snippet') or '')[:GATE_LISTING_TEXT_CHARS]}"
+                for i, (c, _k) in enumerate(items)
+            )
+            got: dict[int, tuple[str, bool, bool, bool, str | None, bool, bool, bool, bool, str]] = {}
+            reqs: dict[int, list[dict]] = {}
+            try:
+                raw = llm(_screen_prompt(profile, listing_block), require_json=True, temperature=0,
+                          system="You screen job listings for role-function fit (match/ambiguous/"
+                                 "mismatch), the candidate's own hard filters, whether the text is even "
+                                 "a real single job posting, seniority, requirements, skills, salary, "
+                                 "and work-arrangement fit. Be inclusive when unsure. Return exactly one "
+                                 "decision object per listing -- never skip one.")
+                for d in json.loads(clean_json(raw)).get("decisions", []):
+                    n = d.get("n")
+                    if isinstance(n, int) and 1 <= n <= len(items):
+                        sector_confidence = str(d.get("sector_confidence", "match")).strip().lower()
+                        if sector_confidence not in ("match", "ambiguous", "mismatch"):
+                            sector_confidence = "match"
+                        seniority_signal = d.get("seniority_signal")
+                        got[n] = (sector_confidence,
+                                  bool(d.get("hard_gate_ok", True)),
+                                  bool(d.get("listing_ok", True)),
+                                  bool(d.get("seniority_ok", True)),
+                                  str(seniority_signal) if seniority_signal else None,
+                                  bool(d.get("requirements_ok", True)),
+                                  bool(d.get("skills_ok", True)),
+                                  bool(d.get("salary_ok", True)),
+                                  bool(d.get("work_arrangement_ok", True)),
+                                  str(d.get("reason", "ok")))
+                        reqs[n] = _sanitize_key_requirements(d.get("key_requirements"))
+            except Exception as e:
+                emit(f"[gate:screen] batch parse failed ({e}); keeping batch (fail-open).")
+                return None
+            return got, reqs
+
         decisions: dict[int, tuple[str, bool, bool, bool, str | None, bool, bool, bool, bool, str]] = {}
         key_reqs_by_n: dict[int, list[dict]] = {}
-        try:
-            raw = llm(prompt, require_json=True, temperature=0,
-                      system="You screen job listings for role-function fit (match/ambiguous/mismatch), "
-                             "the candidate's own hard filters, whether the text is even a real single "
-                             "job posting, seniority, requirements, skills, salary, and work-arrangement "
-                             "fit. Be inclusive when unsure.")
-            for d in json.loads(clean_json(raw)).get("decisions", []):
-                n = d.get("n")
-                if isinstance(n, int):
-                    sector_confidence = str(d.get("sector_confidence", "match")).strip().lower()
-                    if sector_confidence not in ("match", "ambiguous", "mismatch"):
-                        sector_confidence = "match"
-                    seniority_signal = d.get("seniority_signal")
-                    decisions[n] = (sector_confidence,
-                                    bool(d.get("hard_gate_ok", True)),
-                                    bool(d.get("listing_ok", True)),
-                                    bool(d.get("seniority_ok", True)),
-                                    str(seniority_signal) if seniority_signal else None,
-                                    bool(d.get("requirements_ok", True)),
-                                    bool(d.get("skills_ok", True)),
-                                    bool(d.get("salary_ok", True)),
-                                    bool(d.get("work_arrangement_ok", True)),
-                                    str(d.get("reason", "ok")))
-                    key_reqs_by_n[n] = _sanitize_key_requirements(d.get("key_requirements"))
-        except Exception as e:
-            emit(f"[gate:screen] batch parse failed ({e}); keeping batch (fail-open).")
-            decisions = {i + 1: ("match", True, True, True, None, True, True, True, True, "gate_error")
-                         for i in range(len(batch))}
+        result = _ask(batch)
+        if result is not None:
+            decisions, key_reqs_by_n = result
+            # The model routinely returns valid JSON that simply OMITS some of the
+            # listings it was given (a live 113-listing run silently skipped 17).
+            # That used to fall through to the "everything ok" default below AND get
+            # written to gate_cache as if it were a real verdict -- so a listing no
+            # model had ever ruled on was recorded as passing every axis, permanently.
+            # Re-ask for just the skipped ones instead: a much shorter prompt, and in
+            # practice they come back. Bounded to a single retry.
+            missing = [i for i in range(len(batch)) if (i + 1) not in decisions]
+            if missing:
+                emit(f"[gate:screen] {len(missing)} of {len(batch)} listing(s) omitted from the "
+                     f"response; re-asking for those only.")
+                retry = _ask([batch[i] for i in missing])
+                if retry:
+                    retry_decisions, retry_reqs = retry
+                    for pos, original_i in enumerate(missing, start=1):
+                        if pos in retry_decisions:
+                            decisions[original_i + 1] = retry_decisions[pos]
+                            key_reqs_by_n[original_i + 1] = retry_reqs.get(pos, [])
+                still_missing = [i for i in missing if (i + 1) not in decisions]
+                if still_missing:
+                    emit(f"[gate:screen] {len(still_missing)} listing(s) still unjudged after retry; "
+                         f"keeping them (fail-open) and NOT caching a verdict for them.")
 
         for i, (c, key) in enumerate(batch):
+            # Whether this listing got a real verdict, as opposed to the fail-open
+            # default. Gates the cache write below: a fabricated pass must never be
+            # persisted, or the job is never re-screened and the omission becomes
+            # permanent. It still flows on through this run, unfiltered, as before.
+            judged = (i + 1) in decisions
+            # Explicit, because it is otherwise unrecoverable downstream: the
+            # fail-open default sets every axis true, and "missing_decision" is
+            # normalised out of the packed _gate_reason by the seniority_ok branch
+            # below, so an unjudged listing is byte-identical to one the model
+            # actively cleared. Diagnostics (tests/gate_harness.py) read this to
+            # tell "passed" from "never looked at".
+            c["_gate_unjudged"] = not judged
             (sector_confidence, hard_gate_ok, listing_ok, seniority_ok, seniority_signal,
              requirements_ok, skills_ok, salary_ok, work_arrangement_ok, reason) = decisions.get(
                 i + 1, ("match", True, True, True, None, True, True, True, True, "missing_decision")
@@ -2928,7 +3040,9 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             c["_gate_reason"] = packed_reason
             key_reqs = key_reqs_by_n.get(i + 1, [])
             c["_key_requirements"] = key_reqs
-            new_entries.append((key, sector_ok, packed_reason, json.dumps(key_reqs) if key_reqs else None))
+            if judged:
+                new_entries.append((key, sector_ok, packed_reason,
+                                    json.dumps(key_reqs) if key_reqs else None))
         return new_entries
 
     batches = [to_judge[start:start + _GATE_BATCH]
@@ -3885,7 +3999,7 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
-FINAL_EVAL_PROMPT_VERSION = 17
+FINAL_EVAL_PROMPT_VERSION = 18
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -4125,6 +4239,13 @@ C. List every notable gap in "concerns", ONE item per gap (a missing requirement
    load-bearing skill, a seniority gap, a want-fit mismatch worth flagging) -- put the single one most
    likely to sink this application FIRST, since the candidate sees these as a plain count before they
    expand the list.
+   A gap the POSTING ITSELF says it doesn't screen on -- one it trains for, or labels beneficial/
+   desirable/not essential (step D's fourth rule) -- is only worth listing when it is genuinely material,
+   must never be listed first, and must carry the JD's own framing in the same breath (e.g. "no prior use
+   of their in-house analytics platform, though the posting says training is provided"). An unqualified
+   "no evidence of X" for an X the employer has said it will teach reads to the candidate as a rejection
+   on a requirement that was never asked of them, and it is the fastest way to talk a viable application
+   out of an honest fit.
 D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the candidate, used purely to
    keep this judgment disciplined): list the JD's individually-judgeable requirements (both explicitly
    stated and clearly implied), each tagged "core" (the requirements identified as genuinely mandatory in
@@ -4165,6 +4286,24 @@ D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the c
      find yourself putting the role's central technical subject in "secondary" while the core list holds
      only general aptitudes, stop: that is the shape of a role the candidate is not actually equipped
      for, and the checklist is being bent to hide it.
+   - NEVER HOLD THE CANDIDATE TO A BAR THE JD ITSELF DOES NOT SET. This is the mirror of the widening
+     error above and is just as common: an ask the posting explicitly marks as NOT an entry condition
+     gets scored as though it were one. Three cases, all of which make the item "secondary", never
+     "core", and none of which may be the concern that drives the grade down:
+       (a) The JD says it will TRAIN the hire in it, or that it is learned on the job (e.g. "successful
+           candidates complete a two-week training period on our platform"). The item still belongs on
+           the checklist as X itself with "met": false if there is no evidence of X (see the capacity
+           rule above) -- but an employer who is budgeting to teach X is not screening on X, so it
+           cannot be a core requirement.
+       (b) The JD explicitly labels it beneficial / desirable / advantageous / "a plus" / "highly
+           beneficial" / "not essential". The posting's own word for it governs, even where the skill
+           sounds central to you.
+       (c) The JD states it as a preference while stating a DIFFERENT, weaker bar as the actual
+           requirement (e.g. "degree in a quantitative subject preferred; 2:2 minimum required") -- the
+           stated minimum is the core item, the preference is secondary.
+     Where the candidate MEETS the JD's own stated minimum, say so as a positive in "can_do_fit" or step
+     E rather than passing over it in silence; a checklist that records only shortfalls misrepresents a
+     posting the candidate genuinely clears.
    START FROM THE "[key requirements]" HINT WHERE THE JOB BLOCK CARRIES ONE. Those items were pulled
    out of this listing by an earlier screening pass that had never seen the candidate, so they cannot
    have been shaped to fit them -- which is exactly the failure mode the three rules above exist to
@@ -4175,11 +4314,30 @@ D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the c
    "met" for each. Doing it in that order saves you re-deriving the JD side from scratch and keeps the
    list honest. Where the hint is absent, build the checklist yourself under the same three rules.
 E. Write "top_match_reason" as a short (2-4 sentence), first-person narrative in your own voice explaining
-   why you ranked this role the way you did -- e.g. "I rank this role as a strong fit because ..." --
-   synthesizing the want-fit and can-do-fit reasoning from step B into flowing prose a candidate can read
-   standalone, not a restatement of "concerns" or a bare list of keywords. If "sector_match" (step G) is
-   false for this role, say so plainly here -- e.g. "this sits outside the [sector] work you said you
-   want, but ..." -- so that trade-off is visible rather than silent.
+   why you ranked this role the way you did, synthesizing the want-fit and can-do-fit reasoning from step
+   B into flowing prose a candidate can read standalone, not a restatement of "concerns" or a bare list of
+   keywords. If "sector_match" (step G) is false for this role, say so plainly here -- e.g. "this sits
+   outside the [sector] work you said you want, but ..." -- so that trade-off is visible rather than
+   silent.
+   WRITE THIS AFTER YOU HAVE DERIVED "fit_level", AND MATCH ITS STRENGTH WORDING TO THAT GRADE. This
+   paragraph is displayed on the same card as the grade badge, directly under it, so a paragraph calling a
+   role "a strong fit" under an "OK fit" badge reads as the system contradicting itself and quietly
+   destroys the grade's meaning -- an "ok" pick gets described as strong far more often than the reverse,
+   because the narrative gets drafted from the positive case for the role rather than from the verdict.
+   Use the grade's own register and do not reach for a higher one:
+   - "very_strong": "an excellent fit", "a very strong match".
+   - "strong": "a strong fit", "a strong match".
+   - "ok": "a reasonable fit", "a credible option", "a solid fit on paper but ...", "worth a look" -- NOT
+     "strong", in any construction ("a strong graduate fit", "a strong entry-level option", "strong on
+     paper" all violate this).
+   - "stretch": "a stretch", "an ambitious application", "a long shot but ...".
+   The qualifier does not launder the word: "strong FOR A GRADUATE", "strong ENTRY-LEVEL option",
+   "strong GIVEN your experience level" are all still "strong" to a reader, and are the specific phrasings
+   this rule exists to stop. If the role genuinely reads stronger than that vocabulary allows, the fix is
+   to re-check the step-D checklist and the rubric, not to upgrade the adjective here.
+   You may still describe an INDIVIDUAL element in its own strongest honest terms ("your SQL evidence is
+   strong here", "the tooling overlap is excellent") -- the rule constrains your verdict on the ROLE AS A
+   WHOLE, not every use of the word.
 F. Classify the FUNCTIONAL NATURE of the day-to-day work in "role_type" -- one short sentence naming the
    kind of role this is (e.g. "This is a programme delivery role featuring admin and facilitation tasks",
    "This is a technical individual-contributor engineering role", "This is a client-facing sales role").

@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -1086,6 +1086,26 @@ def _embed_text_hash(engine, text: str) -> str:
     return hashlib.sha1(f"{engine.EMBED_MODEL}\n{text}".encode()).hexdigest()
 
 
+def _embed_chunk_safe(engine, texts: list[str]) -> list[list[float]] | None:
+    """One embedding chunk, tolerant of a rate limit. A 429 on this org's shared
+    TPM budget is routinely transient (the error itself reports a sub-2s retry
+    window), so one retry after a short fixed backoff recovers most of them
+    without needing to parse the API's suggested wait out of the error text.
+    Any other/repeated failure gives up on just this chunk -- returns None
+    rather than raising, so the caller can keep every other chunk's results
+    instead of losing the whole batch (see _ensure_embeddings)."""
+    for attempt in range(2):
+        try:
+            return engine.get_embeddings_batch(texts)
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(5)
+                continue
+            engine.emit(f"[pipeline] embedding chunk failed ({len(texts)} texts), "
+                        f"skipping for this run: {e}")
+            return None
+
+
 def _ensure_embeddings(engine, db: Session, rows: list[JobSeen]) -> tuple[int, int]:
     """Assign an embedding to any row missing one, computing via OpenAI only for
     text not already in the global JobEmbedding cache. Each distinct job TEXT is
@@ -1115,22 +1135,32 @@ def _ensure_embeddings(engine, db: Session, rows: list[JobSeen]) -> tuple[int, i
     if to_compute:
         c_hashes = list(to_compute)
         c_texts = [to_compute[h] for h in c_hashes]
+        hash_chunks = [c_hashes[i:i+EMBED_CHUNK_SIZE] for i in range(0, len(c_hashes), EMBED_CHUNK_SIZE)]
         chunks = [c_texts[i:i+EMBED_CHUNK_SIZE] for i in range(0, len(c_texts), EMBED_CHUNK_SIZE)]
+        # Each chunk's result is applied independently (rather than the previous
+        # all-or-nothing ex.map, where one chunk raising -- e.g. a 429 -- lost every
+        # OTHER chunk's already-successful vectors too, including chunks that ran
+        # before it). A run that hit the org TPM cap used to re-submit its ENTIRE
+        # missing-embedding backlog on every subsequent run (nothing from that run
+        # ever got persisted), compounding: more unembedded rows -> a bigger burst
+        # next time -> more likely to hit the cap again. Now a failed/rate-limited
+        # chunk just leaves its rows unembedded for this run (scored 0.0 and sunk to
+        # the bottom by _score_rows, never a crash) while every OTHER chunk's result
+        # is still kept and committed, so the backlog shrinks run over run instead of
+        # regenerating itself.
+        vector_chunks: list[list[list[float]] | None] = [None] * len(chunks)
         if len(chunks) == 1:
-            vectors = engine.get_embeddings_batch(chunks[0])
+            vector_chunks[0] = _embed_chunk_safe(engine, chunks[0])
         else:
-            # A first run embeds several hundred fresh rows (measured: 651 -> 7
-            # sequential OpenAI calls, ~15s of the run). The chunks are independent,
-            # so overlap them -- bounded at EMBED_MAX_WORKERS workers for the same
-            # rate-limit-burst reason the gate/rank pools cap at 3. ex.map preserves
-            # input order, which the zip below depends on. get_embeddings_batch only
-            # touches the module-level OpenAI client (thread-safe, no DB); the row
-            # writes + commit stay on this thread.
-            vectors = []
             with ThreadPoolExecutor(max_workers=min(EMBED_MAX_WORKERS, len(chunks))) as ex:
-                for chunk_result in ex.map(engine.get_embeddings_batch, chunks):
-                    vectors.extend(chunk_result)
-        computed = {h: _encode_embedding(v) for h, v in zip(c_hashes, vectors)}
+                futures = {ex.submit(_embed_chunk_safe, engine, c): i for i, c in enumerate(chunks)}
+                for fut in as_completed(futures):
+                    vector_chunks[futures[fut]] = fut.result()
+        for hashes_slice, vectors in zip(hash_chunks, vector_chunks):
+            if vectors is None:
+                continue
+            for h, v in zip(hashes_slice, vectors):
+                computed[h] = _encode_embedding(v)
         # Persist the fresh vectors into the shared cache. Guard the PK against a
         # concurrent search thread having inserted the same hash meanwhile: add
         # each in its own nested transaction so one collision doesn't poison the
@@ -1151,7 +1181,7 @@ def _ensure_embeddings(engine, db: Session, rows: list[JobSeen]) -> tuple[int, i
         if enc is not None:
             r.embedding = enc
     db.commit()
-    return len(missing) - len(to_compute), len(to_compute)
+    return len(missing) - len(to_compute), len(computed)
 
 
 def _encode_embedding(vec) -> str:
@@ -3062,6 +3092,26 @@ def _retain_unreviewed_provisional(db: Session, row: Role) -> None:
                        else f"{_UNREVIEWED_MARKER}\n{row.ai_analysis}")
 
 
+_INTERRUPTED_LEFTOVER_MARKER = (
+    "⚠ The search was stopped before this role could be reviewed further — showing "
+    "what was found so far.")
+
+
+def _retain_interrupted_provisional(db: Session, row: Role) -> None:
+    """Pin an untouched ('new') provisional row on screen after its run was
+    cancelled, crashed, or orphaned by a server restart, instead of deleting it
+    -- see _cleanup_provisional_roles. Whichever stage it was painted at
+    ('embed' or 'rank') is left as-is: RoleCard's corner label already renders
+    both correctly regardless of the `provisional` flag, so no relabelling is
+    needed here, just the honest "search stopped" note. fit_rank is cleared so
+    it sorts after any later run's real picks (NULLS LAST), same convention as
+    _retain_unreviewed_provisional. Caller commits."""
+    row.provisional = False
+    row.fit_rank = None
+    row.ai_analysis = (_INTERRUPTED_LEFTOVER_MARKER if not row.ai_analysis
+                       else f"{_INTERRUPTED_LEFTOVER_MARKER}\n{row.ai_analysis}")
+
+
 def _resolve_leftover_provisional(db: Session, row: Role, marker: str | None = None) -> None:
     """Apply the leftover rules to ONE provisional row that did NOT land in the
     final picks (or whose run ended early). Never-acted 'new' rows are
@@ -3119,15 +3169,27 @@ def _resolve_leftover_provisional(db: Session, row: Role, marker: str | None = N
 
 
 def _cleanup_provisional_roles(db: Session, run_id: int) -> None:
-    """Remove/retain the provisional rows of a run that ended without
-    finalizing (cancel, failure, server restart) -- preserves the invariant
-    that a cancelled/failed run leaves nothing user-visible behind, except
-    rows the user explicitly kept."""
+    """Resolve the provisional rows of a run that ended without finalizing
+    (cancel, failure, server restart).
+
+    An untouched 'new' row -- whatever the run had managed to paint on screen,
+    embed- or rank-stage -- is now PINNED as a non-provisional leftover
+    (_retain_interrupted_provisional) rather than deleted: the whole point of
+    the progressive paint is to avoid a blank screen, and wiping it the moment
+    a run is interrupted defeated that. It stays visible, honestly marked, until
+    the next search run's own results replace it (same "an unreviewed role
+    persists until the user acts on it" precedent as _prune_previous_roles).
+    A row the user explicitly acted on (saved/applied) keeps the pre-existing
+    interrupted-marker retain path; 'crossed' still soft-deletes -- the user
+    already dismissed it."""
     rows = db.query(Role).filter(
         Role.search_run_id == run_id, Role.provisional.is_(True)
     ).all()
     for row in rows:
-        _resolve_leftover_provisional(db, row, marker=_RETAINED_MARKER_INTERRUPTED)
+        if row.status == "new":
+            _retain_interrupted_provisional(db, row)
+        else:
+            _resolve_leftover_provisional(db, row, marker=_RETAINED_MARKER_INTERRUPTED)
     if rows:
         db.commit()
 

@@ -6,6 +6,7 @@ import { useEffect, useRef } from "react";
 import { Nav } from "@/components/Nav";
 import { RoleCard } from "@/components/RoleCard";
 import { SearchFeedbackBox } from "@/components/SearchFeedbackBox";
+import { SearchProgress } from "@/components/SearchProgress";
 import { TrainingBanner } from "@/components/TrainingBanner";
 import { api } from "@/lib/api";
 import { useRoles, useSearchStatus } from "@/lib/hooks";
@@ -91,14 +92,17 @@ export default function SearchPage() {
     (max, r) => (r.search_run_id != null && (max === null || r.search_run_id > max) ? r.search_run_id : max),
     null
   );
-  // Roles the quick scorer rated but the full review never reached (retained by
-  // engine._retain_unreviewed_provisional: provisional false, stage still
-  // "rank"). They carry no verdict and no fit_rank, so they must be pulled out
-  // of `current` before it's rendered as this run's ranked picks.
+  // Roles that never got a full review: either the quick scorer rated them but
+  // the full review never reached them (engine._retain_unreviewed_provisional,
+  // stage "rank"), or the run was cancelled/crashed/restarted before this row
+  // got past the embedding pre-filter at all (engine._retain_interrupted_provisional,
+  // stage "embed" or "rank" pinned as a leftover instead of being deleted).
+  // Either way they carry no fit_rank, so they must be pulled out of `current`
+  // before it's rendered as this run's ranked picks.
+  const isUnreviewed = (r: Role) => r.provisional_stage === "rank" || r.provisional_stage === "embed";
   const unreviewed = active.filter(
-    (r) => r.provisional_stage === "rank" && r.status === "new" && r.search_run_id === latestRunId
+    (r) => isUnreviewed(r) && r.status === "new" && r.search_run_id === latestRunId
   );
-  const isUnreviewed = (r: Role) => r.provisional_stage === "rank";
   const current = active.filter(
     (r) =>
       r.status === "new" &&
@@ -126,19 +130,25 @@ export default function SearchPage() {
         <TrainingBanner />
 
         {running && (
-          <div className="warning-banner warning-banner-row">
-            <span>
-              <span className="spinner">◴</span> {status?.message || "Building your matches…"} This
-              takes a couple of minutes — top candidates appear below as soon as they're ranked,
-              then get upgraded once the full AI review finishes.
-            </span>
-            <button
-              className="btn btn-ghost sm"
-              onClick={() => activeId && cancelSearch.mutate(activeId)}
-              disabled={cancelSearch.isPending}
-            >
-              {cancelSearch.isPending ? "Cancelling…" : "Cancel Search"}
-            </button>
+          <div className="warning-banner">
+            {/* The stage timeline carries the "how long does this take" answer
+                (see SearchProgress); the engine's own live phase message and the
+                cancel control sit under it. */}
+            <SearchProgress
+              startedAt={status?.started_at}
+              stage1Done={earlyMatches.length > 0 || verifying.length > 0}
+              stage2Done={verifying.length > 0}
+            />
+            <div className="warning-banner-row search-progress-foot">
+              <span>{status?.message || "Starting up…"}</span>
+              <button
+                className="btn btn-ghost sm"
+                onClick={() => activeId && cancelSearch.mutate(activeId)}
+                disabled={cancelSearch.isPending}
+              >
+                {cancelSearch.isPending ? "Cancelling…" : "Cancel Search"}
+              </button>
+            </div>
           </div>
         )}
         {status?.status === "error" && (
@@ -175,8 +185,9 @@ export default function SearchPage() {
               Top candidates so far — verifying with the full AI review…
             </div>
             <div className="annotation" style={{ padding: "0 0 8px" }}>
-              These are provisional. Anything you don&apos;t Keep will disappear once the
-              full review finishes if it doesn&apos;t make the final cut.
+              Quick-scored by AI (about 2 minutes in). These are provisional — anything you
+              don&apos;t Keep will disappear once the full review finishes, at around 4 minutes,
+              if it doesn&apos;t make the final cut.
             </div>
             {verifying.map((role) => {
               const kept = role.status === "saved";
@@ -222,8 +233,10 @@ export default function SearchPage() {
               Early matches — found by keyword/semantic similarity, not yet reviewed
             </div>
             <div className="annotation" style={{ padding: "0 0 8px" }}>
-              No AI has read these yet. They&apos;re here so you can see what the search picked
-              up straight away — most will be replaced above as the review progresses.
+              No AI has read these yet — they land first (about 45 seconds in) precisely
+              because nothing has reviewed them. They&apos;re here so you can see what the
+              search picked up straight away; most will be replaced above as the review
+              progresses.
             </div>
             {earlyMatches.map((role) => {
               const kept = role.status === "saved";

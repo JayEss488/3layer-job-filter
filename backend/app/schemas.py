@@ -181,7 +181,12 @@ class SearchStatusOut(ORMModel):
     status: str
     message: Optional[str] = None
     warning: Optional[str] = None
-    result_count: int
+    # Optional despite the model column defaulting to 0: a row not created
+    # through the ORM's normal insert path (e.g. a hand-edited/migrated row)
+    # can still have NULL here, and this endpoint 500ing while a run is
+    # "running" silently kills the whole progressive-paint display for that
+    # profile (the frontend's status poll never resolves to "running").
+    result_count: Optional[int] = None
     started_at: datetime
     finished_at: Optional[datetime] = None
 

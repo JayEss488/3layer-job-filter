@@ -288,7 +288,7 @@ export interface SearchStatus {
   status: "running" | "done" | "error" | "cancelled";
   message?: string | null;
   warning?: string | null;
-  result_count: number;
+  result_count: number | null;
   started_at: string;
   finished_at?: string | null;
 }

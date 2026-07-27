@@ -10,6 +10,7 @@ raw_api_jobs.json
 .offline_test/
 .embedding_analysis/
 tests/gate_reports/
+tests/tier_reports/
 tests/prompt_pipeline_reports/
 tests/profile_formation_reports/
 tests/medium_vs_strong_reports/

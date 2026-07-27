@@ -149,6 +149,11 @@ export function RoleCard({
             <span className="verdict v-verifying">
               {role.provisional_stage === "embed" ? "Not yet reviewed" : "Verifying…"}
             </span>
+          ) : role.provisional_stage === "embed" ? (
+            // A pinned leftover from an interrupted run (see
+            // engine._retain_interrupted_provisional): still true that no model
+            // has looked at it, same label as the live provisional case above.
+            <span className="verdict v-verifying">Not yet reviewed</span>
           ) : role.provisional_stage === "rank" ? (
             <span className="verdict v-verifying">Quick-scored only</span>
           ) : (
