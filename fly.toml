@@ -1,0 +1,37 @@
+# Fly.io config for the BACKEND only (FastAPI + full_auto engine).
+# Frontend deploys separately to Vercel -- see DEPLOYMENT.md.
+#
+# Uses the existing Dockerfile as-is. Single-instance by design (SQLite lives
+# on a Fly volume, which only one machine can mount at a time) -- do not raise
+# min/max machine counts above 1 without first moving to Postgres.
+
+app = "four-in-a-thousand-api"
+primary_region = "lhr"
+
+[build]
+
+[env]
+  DATABASE_URL = "sqlite:////data/jobmatch.db"
+
+[[mounts]]
+  source = "data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"

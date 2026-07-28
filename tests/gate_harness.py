@@ -22,10 +22,31 @@ a real search run, it is NOT pre-filtered to embed_score >= RELEVANCE_FLOOR, so
 results here are broader/noisier than what a live run would actually feed the gate
 (this is called out in the report's "warnings" list too).
 
+GROUND-TRUTH MODE (--ground-truth) answers the question the plain report can't:
+does the gate drop the right jobs? It samples only listings the expensive final
+judge has ALREADY ruled on (JobSeen.eval_verdict), so every gate decision can be
+scored against a real label -- reported as two separate rates, never one accuracy
+number, because the two errors have opposite costs: dropping a job the judge liked
+destroys a result the user never sees, while keeping one the judge later rejects
+merely wastes a rank/judge call.
+
+--text-mode is what makes that measurement honest. In production the gate runs
+BEFORE Phase 5 scraping, so for most jobs it reads only a ~455-char API teaser --
+but any job with a judge verdict is by definition one that got scraped, so its row
+now carries a full_text the gate never had. Running the same sample twice:
+    --text-mode snippet   what the gate really had     (production reality)
+    --text-mode full      what the gate could do       (if text were supplied)
+separates a MISCALIBRATED gate (misses the bar in both modes -- fix the prompt)
+from a STARVED one (catches it only with full text -- fix the text supply, e.g.
+wider Reed-style per-job enrichment). Those two findings call for opposite work,
+and neither number alone distinguishes them.
+
 Usage:
     venv/Scripts/python tests/gate_harness.py --dry-run --sample-size 5
     venv/Scripts/python tests/gate_harness.py --sample-size 5 --seed 1
     venv/Scripts/python tests/gate_harness.py --profile-id 7 --sample-size 100
+    venv/Scripts/python tests/gate_harness.py --ground-truth --text-mode snippet
+    venv/Scripts/python tests/gate_harness.py --ground-truth --text-mode full
 
 --dry-run builds and shows the real prompts with placeholder (all-true) verdicts
 and makes NO screen_gate/llm() calls -- but build_snapshot's own small one-off
@@ -39,6 +60,7 @@ import argparse
 import json
 import math
 import random
+import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -101,6 +123,17 @@ def parse_args():
     p.add_argument("--sample-size", type=int, default=100,
                     help="How many cached JobSeen rows to sample (default 100).")
     p.add_argument("--seed", type=int, default=None, help="Random seed for the sample (default: unseeded).")
+    p.add_argument("--ground-truth", action="store_true",
+                    help="Sample ONLY listings the expensive final judge has already ruled on "
+                         "(JobSeen.eval_verdict set), so the gate's decisions can be scored against "
+                         "a real label instead of eyeballed. Enables the agreement matrix.")
+    p.add_argument("--text-mode", choices=("auto", "snippet", "full"), default="auto",
+                    help="Which text screen_gate is allowed to read. 'auto' (default) = production's "
+                         "own rule, full_text or snippet. 'snippet' = the API teaser only, which is "
+                         "what the gate ACTUALLY had at gate time for most jobs (full_text is written "
+                         "by Phase 5, after the gate). 'full' = the scraped posting. Run the same "
+                         "--ground-truth sample under 'snippet' and 'full' to separate a "
+                         "MISCALIBRATED gate from a STARVED one -- see the module docstring.")
     p.add_argument("--out-dir", default=None,
                     help="Output directory (default: tests/gate_reports/).")
     p.add_argument("--dry-run", action="store_true",
@@ -130,19 +163,52 @@ def _resolve_profile(db, models, profile_id):
     return profile
 
 
-def _sample_jobs(db, models, profile_id, sample_size, seed):
-    rows = db.query(models.JobSeen).filter(
+def _sample_jobs(db, models, profile_id, sample_size, seed, ground_truth=False):
+    """Pure-random sample of the profile's cached listings, or -- with
+    ground_truth -- only those the expensive judge has already ruled on.
+
+    The ground-truth sample is drawn BALANCED across the judge's verdicts rather
+    than proportionally. Rejects outnumber strongs roughly 3:1 in a real store,
+    and a proportional draw would make the "does the gate wrongly block good
+    jobs?" half of the question rest on a handful of rows -- which is the half a
+    gate change is most likely to break and the half a summary statistic hides.
+    Both halves are reported separately for the same reason (see
+    _ground_truth_stats), never as one blended accuracy number."""
+    q = db.query(models.JobSeen).filter(
         models.JobSeen.profile_id == profile_id,
         models.JobSeen.dead_reason.is_(None),
-    ).all()
+    )
+    if ground_truth:
+        q = q.filter(models.JobSeen.eval_verdict.isnot(None))
+    rows = q.all()
     if not rows:
         raise SystemExit(
-            f"no non-dead JobSeen rows for profile {profile_id} -- run a real search at least "
-            "once first so there's something cached to sample from."
+            f"no {'judge-labelled ' if ground_truth else ''}non-dead JobSeen rows for profile "
+            f"{profile_id} -- run a real search at least once first so there's something cached "
+            "to sample from." + (" (--ground-truth additionally needs at least one run to have "
+                                 "reached the final judge.)" if ground_truth else "")
         )
     n_available = len(rows)
     rng = random.Random(seed)
-    sample = rng.sample(rows, min(sample_size, n_available))
+    if not ground_truth:
+        return rng.sample(rows, min(sample_size, n_available)), n_available
+
+    by_verdict = defaultdict(list)
+    for r in rows:
+        by_verdict[r.eval_verdict].append(r)
+    # Round-robin across verdicts, so a scarce class is exhausted before a
+    # plentiful one is capped rather than being crowded out proportionally.
+    for group in by_verdict.values():
+        rng.shuffle(group)
+    sample, verdicts = [], sorted(by_verdict)
+    while len(sample) < min(sample_size, n_available):
+        took = False
+        for v in verdicts:
+            if by_verdict[v] and len(sample) < sample_size:
+                sample.append(by_verdict[v].pop())
+                took = True
+        if not took:
+            break
     return sample, n_available
 
 
@@ -169,6 +235,101 @@ def _score_sampled_rows(engine_svc, engine, rows, cluster_embeddings):
             d["_embed_fallback"] = True
             d["embed_score"] = None
     return scored
+
+
+def _apply_text_mode(engine, scored, text_mode):
+    """Constrain what text screen_gate is allowed to read, and record what it
+    actually got.
+
+    This exists because sampling from JobSeen SYSTEMATICALLY FLATTERS THE GATE.
+    In production the gate runs BEFORE Phase 5 scraping, so for most jobs it sees
+    only the source API's ~500-char teaser (see CLAUDE.md's "Text supply" note:
+    ~91% of a measured store averaged ~455 chars). But a job that reached the
+    expensive judge is exactly a job that got scraped, so its row now carries a
+    full_text the gate never had -- re-screening it in 'auto' mode hands the gate
+    the full posting and measures a stage that doesn't exist.
+
+    So the comparison, not either number alone, is the finding:
+      --text-mode snippet -> what the gate really had. Misses here are the ones
+                             production actually suffers.
+      --text-mode full    -> what the gate could do if the text were supplied.
+    A requirement the gate misses in BOTH modes is a calibration problem (the
+    prompt saw the bar and waved it through). One it catches only in 'full' is a
+    text-supply problem, and no amount of prompt tuning will fix it -- the fix is
+    upstream (Reed-style per-job enrichment, a wider _enrich cap), which is a
+    different and much cheaper change than re-tuning a prompt that was right all
+    along.
+    """
+    for d in scored:
+        snippet = d.get("snippet") or ""
+        full = d.get("full_text") or ""
+        # Stashed BEFORE the snippet mode blanks full_text below: the
+        # "was the disqualifier only in the scraped text?" bucket needs the real
+        # full text to compare against in EVERY mode, and reading it back off
+        # d["full_text"] in snippet mode would find "" and silently misfile every
+        # such job as "not found in any text" -- collapsing the starved-vs-
+        # miscalibrated distinction this whole function exists to draw.
+        d["_full_text_original"] = full
+        if text_mode == "snippet":
+            d["full_text"] = ""          # forces screen_gate's own `full_text or snippet` to fall back
+            served = snippet
+        else:
+            served = full or snippet
+        # The exact window screen_gate will read (its listing block truncates to
+        # GATE_LISTING_TEXT_CHARS), kept so the "was the disqualifier even
+        # visible?" check below tests the real text rather than the whole row.
+        d["_gate_text_seen"] = served[:engine.GATE_LISTING_TEXT_CHARS]
+        d["_gate_text_chars"] = len(d["_gate_text_seen"])
+        d["_snippet_chars"] = len(snippet)
+        d["_full_text_chars"] = len(full)
+        d["_text_mode"] = text_mode
+
+
+_QUOTE_RE = re.compile(r"[\"“”‘’']([^\"“”‘’']{12,})"
+                       r"[\"“”‘’']")
+
+
+def _normalize_for_match(s):
+    """Collapse case, whitespace and the smart/straight quote and dash variants
+    that differ between the judge's quoted reason and the source posting."""
+    s = (s or "").lower()
+    s = s.replace("’", "'").replace("‘", "'")
+    s = s.replace("“", '"').replace("”", '"')
+    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _disqualifier_visibility(reason, gate_text, snippet, full_text):
+    """Given the judge's disqualifier reason (which quotes the JD clause it
+    relied on -- see full_auto's QUOTE-THEN-CLASSIFY rule), work out whether that
+    clause was present in the text the gate was given.
+
+    This is the whole point of the ground-truth mode. "The gate missed a 3-years
+    bar" is not a finding on its own: if the bar was never in the gate's text,
+    the gate was not wrong, it was blind, and the two call for opposite fixes.
+
+    Returns None when the reason quotes nothing matchable (some reasons are
+    paraphrases, and a scam/duplicate verdict quotes no requirement at all) --
+    reported as its own bucket rather than silently scored either way.
+    """
+    quotes = _QUOTE_RE.findall(reason or "")
+    if not quotes:
+        return None
+    # The longest quoted span is the requirement clause; shorter ones tend to be
+    # a tool name that appears incidentally all over the posting.
+    needle = _normalize_for_match(max(quotes, key=len))
+    # Judge quotes are frequently truncated mid-phrase by the upstream
+    # key_requirements cap (e.g. 'Advanced Excel (large datasets, statistical
+    # functions, macro'), so a prefix probe beats requiring the whole span.
+    probe = needle[:60]
+    if len(probe) < 12:
+        return None
+    return {
+        "quote": needle[:160],
+        "in_gate_text": probe in _normalize_for_match(gate_text),
+        "in_snippet": probe in _normalize_for_match(snippet),
+        "in_full_text": probe in _normalize_for_match(full_text),
+    }
 
 
 def _install_capture_hooks(engine, llm_calls):
@@ -252,10 +413,17 @@ def _dry_run_stand_in(engine, cluster_profile, batch, llm_calls):
     rest of the harness's bucketing logic still runs end-to-end."""
     for start in range(0, len(batch), engine._GATE_BATCH):
         sub = batch[start:start + engine._GATE_BATCH]
+        # Must mirror screen_gate's own listing block exactly, including the
+        # `full_text or snippet` preference and the GATE_LISTING_TEXT_CHARS
+        # window -- this previously used snippet[:450], which showed a --dry-run
+        # reviewer a materially shorter prompt than the live call actually sends
+        # and would have hidden exactly the text-supply question --text-mode
+        # exists to answer.
         listing_block = "\n".join(
             f"{i + 1}. {c['title']} @ {c.get('company', '')} | "
             f"{(c.get('location') or 'location unknown')}"
-            f"{engine._listing_salary_suffix(c)} | {(c.get('snippet') or '')[:450]}"
+            f"{engine._listing_salary_suffix(c)} | "
+            f"{(c.get('full_text') or c.get('snippet') or '')[:engine.GATE_LISTING_TEXT_CHARS]}"
             for i, c in enumerate(sub)
         )
         prompt = engine._screen_prompt(cluster_profile, listing_block)
@@ -299,24 +467,33 @@ def _run_cluster_rounds(engine, engine_svc, cluster_profile, cluster_idx, jobs, 
             engine.screen_gate(batch, cluster_profile)
         round_calls = llm_calls[before:]
 
+        # screen_gate re-asks for any listing a response omitted (see its
+        # _screen_one_batch), so a round can now produce MORE calls than batches.
+        # Only the first `n_batches` map positionally onto slices of `batch`;
+        # mapping a retry call that way would slice past the end and flag real
+        # listings as missing. Retries are recorded but not position-mapped, and
+        # the omission flag below is resolved from the FINAL annotation instead of
+        # from the first response, so a listing the retry recovered is no longer
+        # reported as unjudged.
+        n_batches = math.ceil(len(batch) / gate_batch) if batch else 0
         for batch_index, call in enumerate(round_calls):
             call["cluster_idx"] = cluster_idx
             call["round_index"] = round_index
             call["batch_index"] = batch_index
-            if dry_run:
+            call["is_retry"] = batch_index >= n_batches
+            if dry_run or call["is_retry"]:
                 continue
             sub = batch[batch_index * gate_batch:(batch_index + 1) * gate_batch]
             if call.get("error") is not None:
                 for j in sub:
                     j["_llm_call_failed"] = True
-                continue
-            try:
-                decisions = json.loads(engine.clean_json(call["raw_response"])).get("decisions", [])
-                present_ns = {d.get("n") for d in decisions if isinstance(d.get("n"), int)}
-            except Exception:
-                present_ns = set()
-            for i, j in enumerate(sub):
-                if (i + 1) not in present_ns:
+
+        if not dry_run:
+            for j in batch:
+                # screen_gate sets _gate_unjudged on anything it never got a real
+                # verdict for, first call or retry -- more reliable than re-parsing
+                # raw responses here, and correct however many retries it made.
+                if j.get("_gate_unjudged"):
                     j["_missing_from_response"] = True
 
         def _clears_hard(j):
@@ -390,6 +567,105 @@ def _finalize_job_record(d, cluster_labels):
         "dead_reason": None,  # sampling excludes dead rows by construction
         "llm_call_failed": d.get("_llm_call_failed", False),
         "missing_from_response": d.get("_missing_from_response", False),
+        # --- ground truth (only meaningful when the row carries a judge verdict) ---
+        "judge_verdict": d.get("_eval_verdict"),
+        "judge_reason": d.get("_judge_reason"),
+        "gate_kept": d.get("_bucket") == "survivor",
+        "disqualifier_visibility": d.get("_disqualifier_visibility"),
+        "gate_text_chars": d.get("_gate_text_chars"),
+        "snippet_chars": d.get("_snippet_chars"),
+        "full_text_chars": d.get("_full_text_chars"),
+    }
+
+
+def _attach_ground_truth(scored):
+    """Pull each row's judge verdict + disqualifier reason off the cached
+    eval_analysis and score whether the gate could have seen what the judge
+    rejected on. Free -- no LLM calls, all of it already persisted."""
+    for d in scored:
+        if not d.get("_eval_verdict"):
+            continue
+        reason = None
+        try:
+            analysis = json.loads(d.get("_eval_analysis") or "{}")
+        except Exception:
+            analysis = {}
+        concerns = [c for c in (analysis.get("concerns") or []) if str(c).strip()]
+        if concerns:
+            reason = str(concerns[0])
+        d["_judge_reason"] = reason
+        d["_disqualifier_visibility"] = _disqualifier_visibility(
+            reason, d.get("_gate_text_seen") or "", d.get("snippet") or "",
+            d.get("_full_text_original") or "",
+        )
+
+
+def _ground_truth_stats(job_records):
+    """Score the gate against the judge's verdicts.
+
+    Reported as two INDEPENDENT rates, never one accuracy figure, because the two
+    errors have opposite costs and opposite fixes. A gate dropping a job the
+    judge would have liked destroys a result the user will never see; a gate
+    keeping a job the judge later rejects only wastes a rank/judge call. A single
+    blended number lets a change that trades several of the first for many of the
+    second look like an improvement.
+    """
+    labelled = [j for j in job_records if j["judge_verdict"]]
+    if not labelled:
+        return None
+
+    strong = [j for j in labelled if j["judge_verdict"] == "strong"]
+    reject = [j for j in labelled if j["judge_verdict"] == "reject"]
+    other = [j for j in labelled if j["judge_verdict"] not in ("strong", "reject")]
+
+    kept_strong = [j for j in strong if j["gate_kept"]]
+    dropped_strong = [j for j in strong if not j["gate_kept"]]
+    kept_reject = [j for j in reject if j["gate_kept"]]
+    dropped_reject = [j for j in reject if not j["gate_kept"]]
+
+    def _pct(n, d):
+        return round(100.0 * n / d, 1) if d else None
+
+    # Of the rejects the gate let through, how many were even knowable from the
+    # text it read? Splits "the gate was wrong" from "the gate was blind".
+    vis = Counter()
+    for j in kept_reject:
+        v = j.get("disqualifier_visibility")
+        if v is None:
+            vis["no_quoted_requirement"] += 1
+        elif v["in_gate_text"]:
+            vis["visible_to_gate_but_missed"] += 1
+        elif v["in_full_text"]:
+            vis["only_in_full_text"] += 1
+        else:
+            vis["not_found_in_any_text"] += 1
+
+    return {
+        "n_labelled": len(labelled),
+        "n_strong": len(strong), "n_reject": len(reject), "n_other_verdict": len(other),
+        # The number that matters most: good jobs the cheap gate killed.
+        "strong_kept": len(kept_strong), "strong_dropped": len(dropped_strong),
+        "strong_retention_pct": _pct(len(kept_strong), len(strong)),
+        "strong_dropped_detail": [
+            {"title": j["title"], "company": j["company"], "bucket": j["bucket"],
+             "axes": j["axes"], "gate_reason_decoded": j["gate_reason_decoded"],
+             "url": j["url"]}
+            for j in dropped_strong
+        ],
+        # The saving: bad jobs the cheap gate caught before the mid/strong tiers paid.
+        "reject_dropped": len(dropped_reject), "reject_kept": len(kept_reject),
+        "reject_catch_pct": _pct(len(dropped_reject), len(reject)),
+        "missed_reject_visibility": dict(vis),
+        "missed_reject_detail": [
+            {"title": j["title"], "company": j["company"],
+             "judge_reason": j["judge_reason"],
+             "visibility": j.get("disqualifier_visibility"),
+             "gate_text_chars": j.get("gate_text_chars"),
+             "snippet_chars": j.get("snippet_chars"),
+             "full_text_chars": j.get("full_text_chars"),
+             "url": j["url"]}
+            for j in kept_reject
+        ],
     }
 
 
@@ -478,6 +754,27 @@ def _print_final_summary(stats, sample_actual, n_available):
         print(f"  ** RELIABILITY WARNING: {stats['gate_error_count']} LLM call failure(s), "
               f"{stats['missing_decision_count']} listing(s) omitted from a response ** "
               f"identities: {stats['flagged_job_identities'][:20]}")
+
+
+def _print_ground_truth(gt, text_mode):
+    print("\n=== Gate vs the final judge (ground truth) ===")
+    print(f"  text mode: {text_mode}  |  {gt['n_labelled']} labelled listing(s): "
+          f"{gt['n_strong']} strong, {gt['n_reject']} reject"
+          + (f", {gt['n_other_verdict']} other" if gt["n_other_verdict"] else ""))
+    print(f"\n  GOOD JOBS KEPT   {gt['strong_kept']}/{gt['n_strong']} "
+          f"({gt['strong_retention_pct']}%) -- the gate let these reach the judge")
+    if gt["strong_dropped_detail"]:
+        print(f"  ** {gt['strong_dropped']} judge-approved listing(s) the gate would now DROP: **")
+        for j in gt["strong_dropped_detail"]:
+            failed = [a for a, ok in (j["axes"] or {}).items() if ok is False]
+            print(f"     - {(j['title'] or '')[:60]} @ {j['company']}  [{j['bucket']}] "
+                  f"failed={failed}")
+    print(f"\n  BAD JOBS CAUGHT  {gt['reject_dropped']}/{gt['n_reject']} "
+          f"({gt['reject_catch_pct']}%) -- caught before rank/judge spend")
+    if gt["missed_reject_visibility"]:
+        print(f"  of the {gt['reject_kept']} the gate let through:")
+        for k, v in sorted(gt["missed_reject_visibility"].items(), key=lambda kv: -kv[1]):
+            print(f"     {v:>3}  {k}")
 
 
 def _write_json_report(path, report):
@@ -794,10 +1091,16 @@ def main():
         profile = _resolve_profile(db, models, args.profile_id)
         print(f"[gate_harness] profile {profile.id} ({profile.name!r})")
 
-        rows, n_available = _sample_jobs(db, models, profile.id, args.sample_size, args.seed)
+        rows, n_available = _sample_jobs(db, models, profile.id, args.sample_size, args.seed,
+                                          ground_truth=args.ground_truth)
         if len(rows) < args.sample_size:
-            print(f"[gate_harness] WARNING: only {n_available} non-dead cached listings available "
-                  f"for this profile; sampling all of them (requested {args.sample_size}).")
+            print(f"[gate_harness] WARNING: only {n_available} "
+                  f"{'judge-labelled ' if args.ground_truth else ''}non-dead cached listings "
+                  f"available for this profile; sampling all of them (requested "
+                  f"{args.sample_size}).")
+        if args.ground_truth:
+            print(f"[gate_harness] --ground-truth: scoring the gate against {len(rows)} listing(s) "
+                  f"the final judge has already ruled on; --text-mode={args.text_mode}")
 
         print("[gate_harness] building profile snapshot (small real API cost: region-inference "
               "+ role-clustering, same as analyze_embedding_gate.py already accepts)...")
@@ -810,6 +1113,8 @@ def main():
               + "; ".join(f"{c['label']}={c['roles']}" for c in role_clusters))
 
         scored = _score_sampled_rows(engine_svc, engine, rows, cluster_embeddings)
+        _apply_text_mode(engine, scored, args.text_mode)
+        _attach_ground_truth(scored)
         by_cluster = defaultdict(list)
         for d in scored:
             by_cluster[d.get("_cluster", 0)].append(d)
@@ -855,13 +1160,36 @@ def main():
                     _print_job_line(rec)
 
         aggregate_stats = _build_aggregate_stats(job_records)
+        ground_truth = _ground_truth_stats(job_records)
+        if ground_truth:
+            _print_ground_truth(ground_truth, args.text_mode)
 
         warnings = [
             f"Production's real candidate queues are pre-filtered to embed_score >= "
-            f"RELEVANCE_FLOOR ({engine_svc.RELEVANCE_FLOOR}); this harness's pure-random sample "
+            f"RELEVANCE_FLOOR ({engine_svc.RELEVANCE_FLOOR}); this harness's sample "
             f"deliberately skips that filter, so results here are broader/noisier than what a "
             f"live search run would actually feed to the gate."
         ]
+        if args.ground_truth:
+            warnings.append(
+                "Ground-truth labels are the expensive judge's own stored verdicts. They are a "
+                "strong reference, not an oracle -- a 'reject' means the judge disqualified the "
+                "role, which the candidate may still disagree with, and the judge saw scraped "
+                "full text the gate did not."
+            )
+            warnings.append(
+                f"Labelled rows are only those that got far enough to be judged, i.e. rows that "
+                f"already survived the embedding pre-filter, the gate and the rank floor on some "
+                f"earlier run. Jobs the gate dropped and nothing ever judged CANNOT appear here, "
+                f"so 'strong_retention_pct' measures the gate's consistency on jobs it has "
+                f"previously let through, and is an UPPER bound on its true recall."
+            )
+            if args.text_mode == "auto":
+                warnings.append(
+                    "--text-mode=auto on a judged sample hands the gate the Phase-5-scraped "
+                    "full_text it did NOT have at gate time in production. Re-run with "
+                    "--text-mode=snippet for the honest production comparison."
+                )
         if len(rows) < args.sample_size:
             warnings.append(f"Requested sample_size={args.sample_size} but only {n_available} "
                              f"non-dead cached listings were available; sampled all {len(rows)}.")
@@ -891,6 +1219,8 @@ def main():
             "seed": args.seed, "dry_run": args.dry_run, "model": engine.CHEAP_MODEL,
             "sample_requested": args.sample_size, "sample_actual": len(rows),
             "n_available_in_db": n_available,
+            "ground_truth_mode": args.ground_truth, "text_mode": args.text_mode,
+            "ground_truth": ground_truth,
             "profile_formation": formation,
             "clusters": clusters_meta,
             "jobs": job_records,

@@ -546,6 +546,25 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append("Sector interests: " + "; ".join(sector_targets))
     if location or work_types:
         cv_lines.append(f"Location: {location} ({', '.join(work_types) or 'any'})")
+    # Its own line, separate from the place above, because the judge's
+    # LOCATION/VISA/RELOCATION disqualifier runs two independent checks and was
+    # conflating them: geography (can they physically take it) and stated
+    # arrangement (is it the pattern they asked for). Folded into the Location
+    # parenthetical, the work types read as a footnote to the place, and a
+    # fully-remote listing -- geographically fine for everyone -- passed the
+    # whole rule for a candidate who had ticked only On-site/Hybrid. The
+    # Hard/Soft is stated here rather than left implicit so the judge knows
+    # whether a mismatch excludes the role or only deprioritises it, matching
+    # the HARD REQUIREMENTS / PREFERENCES split used for avoid/must_have below.
+    if work_types:
+        binding = (
+            "binding -- a listing matching none of these is disqualified"
+            if work_types_hard else
+            "a preference -- weigh it, but it is not grounds to reject a role"
+        )
+        cv_lines.append(
+            f"Work arrangement wanted ({binding}): {', '.join(work_types)}"
+        )
     if customs:
         cv_lines.append("Constraints: " + "; ".join(customs))
     # Candidate's own hard filters, surfaced prominently so the judge's HARD

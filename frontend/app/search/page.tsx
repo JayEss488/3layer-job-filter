@@ -103,12 +103,26 @@ export default function SearchPage() {
   const unreviewed = active.filter(
     (r) => isUnreviewed(r) && r.status === "new" && r.search_run_id === latestRunId
   );
-  const current = active.filter(
-    (r) =>
-      r.status === "new" &&
-      !isUnreviewed(r) &&
-      (r.search_run_id == null || r.search_run_id === latestRunId)
-  );
+  // A role the user Kept (or marked applied) mid-run that the judge then picked
+  // is upgraded IN PLACE at finalization -- same row, status untouched, but now
+  // carrying this run's real fit_rank (engine.py's finalization loop). It is a
+  // ranked pick of this run like any other, so it belongs in `current` with its
+  // badge. Filing it under "already saved" instead dropped rank 1 out of the
+  // ranked list and made the visible numbering start at 2.
+  //
+  // The duplicate-rank-badge bug this section split was originally added to fix
+  // is a DIFFERENT case: a saved role from an EARLIER run, whose fit_rank is
+  // only unique within that run and would collide with this run's numbering.
+  // Scoping to latestRunId + a non-null fit_rank keeps that case out, and also
+  // keeps out a saved leftover the judge never reached (fit_rank null).
+  const isCurrentRankedPick = (r: Role) =>
+    r.fit_rank != null && !isUnreviewed(r) && r.search_run_id === latestRunId;
+  const inCurrent = (r: Role) =>
+    !isUnreviewed(r) &&
+    (r.status === "new"
+      ? r.search_run_id == null || r.search_run_id === latestRunId
+      : isCurrentRankedPick(r));
+  const current = active.filter(inCurrent);
   const previous = active.filter(
     (r) =>
       r.status === "new" &&
@@ -116,11 +130,10 @@ export default function SearchPage() {
       r.search_run_id != null &&
       r.search_run_id !== latestRunId
   );
-  // Saved roles are a completed decision from any run -- shown in their own
-  // section below, never mixed into the ranked `current`/`previous` lists
-  // (their fit_rank is only unique within whichever run produced it, so
-  // mixing them in caused duplicate rank badges alongside this run's picks).
-  const savedRoles = active.filter((r) => r.status === "saved");
+  // Saved roles that aren't one of this run's ranked picks: a completed decision
+  // from an earlier run, or one this run kept but never ranked. Shown unranked in
+  // their own section below.
+  const savedRoles = active.filter((r) => r.status === "saved" && !inCurrent(r));
 
   return (
     <div className="app">
@@ -269,8 +282,14 @@ export default function SearchPage() {
           </>
         )}
 
+        {/* `current` now also holds this run's ranked picks the user already
+            acted on mid-run (a Keep during the quick-scoring paint, or a Mark as
+            applied) — same row, upgraded in place by the judge, so it keeps its
+            rank badge here rather than being demoted into the unranked "already
+            saved" section. */}
         {!running && current.map((role: Role) => {
           const saved = role.status === "saved";
+          const applied = role.status === "applied";
           return (
             <RoleCard
               key={role.id}
@@ -284,11 +303,16 @@ export default function SearchPage() {
                     className={`btn ${saved ? "btn-primary" : "btn-secondary"}`}
                     onClick={() => (saved ? cross.mutate(role.id) : tick.mutate(role.id))}
                     title={saved ? "Click to unsave" : undefined}
+                    disabled={applied}
                   >
                     {saved ? "✓ Saved" : "✓ Save"}
                   </button>
-                  <button className="btn btn-secondary" onClick={() => applyRole.mutate(role.id)}>
-                    Mark as applied
+                  <button
+                    className="btn btn-secondary"
+                    onClick={() => applyRole.mutate(role.id)}
+                    disabled={applied}
+                  >
+                    {applied ? "✓ Applied" : "Mark as applied"}
                   </button>
                   <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
                     ✗ Pass

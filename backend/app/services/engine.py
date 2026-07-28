@@ -184,7 +184,7 @@ PROVISIONAL_STAGE_EMBED = "embed"
 PROVISIONAL_STAGE_RANK = "rank"
 _PROVISIONAL_STAGES_AFTER_EMBED = (PROVISIONAL_STAGE_RANK,)
 # A candidate whose text is already rich enough to judge (ATS description, a
-# Reed full description fetched by _enrich_reed_full_text, a persisted full_text
+# Reed/Adzuna full description fetched pre-gate by _enrich_pre_gate, a persisted full_text
 # from an earlier run, or a long-enough snippet -- i.e. _needs_full_scrape is
 # False) gets this added to its ORDERING score when the judge pool is filled.
 # Not to its rank score, and not to the floor test: a bad job stays rejected
@@ -206,6 +206,14 @@ RICH_TEXT_SELECTION_BONUS = 3.0
 # lower embed-score by construction, and re-scraped by phase 5 anyway if it
 # survives to the judge -- rides its teaser.
 REED_ENRICH_PRE_GATE_CAP = 100
+# The same budget for Adzuna (_enrich_adzuna_full_text), set lower on purpose. Every
+# argument above applies, but each Adzuna fetch is a ~100KB HTML page rather than a
+# small JSON body and the host 429s after a handful of rapid requests, so it runs at
+# ADZUNA_DETAIL_MAX_WORKERS(3) rather than Reed's 12 -- roughly a quarter of the
+# throughput per wave. 40 keeps its worst case comparable to Reed's measured 4.1s
+# while still covering the whole first examine round (GATE_FIRST_ROUND=20) plus
+# headroom, which is the slice that actually decides what the user sees first.
+ADZUNA_ENRICH_PRE_GATE_CAP = 40
 # Absolute cutoff on rank_gate's 0-100 fit score, replacing the old relative
 # bottom-20%-of-whatever-batch trim (RANK_AUTOREJECT_FRACTION). MID_MODEL is a
 # materially stronger model now (see full_auto.py's model tier comments), so
@@ -664,6 +672,8 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             continue
         h = identity_hash(job)
         upd_dt = _parse_iso(job.get("updated_at")) if job.get("updated_at") else None
+        posted_dt = _parse_iso(job.get("posted_at")) if job.get("posted_at") else None
+        expires_dt = _parse_iso(job.get("expires_at")) if job.get("expires_at") else None
 
         existing = seen_this_batch.get(h)
         if existing is None:
@@ -707,6 +717,7 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
                 title=title, company=job.get("company"), location=job.get("location"),
                 url=job.get("url"), snippet=job.get("snippet", ""),
                 state="new", source_updated_at=upd_dt, first_seen=now, last_seen=now,
+                posted_at=posted_dt, expires_at=expires_dt,
             )
             db.add(row)
             seen_this_batch[h] = row
@@ -721,6 +732,17 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             new_snippet = job.get("snippet", "") or ""
             if len(new_snippet) > len(existing.snippet or ""):
                 existing.snippet = new_snippet
+            # Keep the EARLIEST posting date any source has claimed, and backfill
+            # when we hold none. Earliest rather than latest because a job that
+            # reaches us from two sources is usually one posting an aggregator has
+            # re-listed, and taking the newer date would let a months-old listing
+            # launder itself fresh every time it's re-syndicated -- the precise
+            # thing the staleness signal exists to catch. Expiry is the opposite:
+            # an employer can genuinely extend a closing date, so the newest wins.
+            if posted_dt and (existing.posted_at is None or posted_dt < existing.posted_at):
+                existing.posted_at = posted_dt
+            if expires_dt and (existing.expires_at is None or expires_dt > existing.expires_at):
+                existing.expires_at = expires_dt
             if upd_dt and existing.source_updated_at and upd_dt > existing.source_updated_at:
                 existing.state = "new"
                 existing.source_updated_at = upd_dt
@@ -753,6 +775,38 @@ def _new_rows(db: Session, profile_id: int, limit: int = STORE_SCORE_CAP) -> lis
         .where(JobSeen.profile_id == profile_id, JobSeen.state == "new",
                JobSeen.dead_reason.is_(None))
         .order_by(JobSeen.first_seen.desc())
+        .limit(limit)
+    ).scalars().all()
+
+
+def _gate_reopened_rows(
+    db: Session, profile_id: int, gate_sig: str, limit: int = STORE_SCORE_CAP,
+) -> list[JobSeen]:
+    """Rows the CHEAP gate retired under a DIFFERENT profile signature than the one
+    this run is using -- i.e. rows whose only reason for being out of the pool is a
+    verdict the candidate's own edits have since invalidated. See
+    JobSeen.gate_signature for why this exists at all.
+
+    Scoped tightly on purpose:
+    * `eval_verdict IS NULL` -- only rows the gate dropped before the judge saw them.
+      A row the expensive judge already ruled on is the judge's to resurface, under
+      its own eval_signature rule (_backlog_rows), and re-opening a stored 'reject'
+      here would route around the "a reject under the current signature is never
+      resurfaced" invariant the whole pipeline is built on.
+    * `gate_signature IS DISTINCT FROM :sig` -- an unchanged profile re-opens nothing,
+      so this can never turn into re-gating the same rows every run. A NULL signature
+      (retired before this column existed) counts as different, so the one-off effect
+      of shipping this is that the existing backlog re-opens once, which is the
+      intent.
+    Re-opened rows are cheap: their screen/rank calls are served from gate_cache
+    whenever the change didn't actually affect them, and they still have to clear
+    RELEVANCE_FLOOR and win an examine slot on embed score like anything else."""
+    return db.execute(
+        select(JobSeen)
+        .where(JobSeen.profile_id == profile_id, JobSeen.state == "enriched",
+               JobSeen.dead_reason.is_(None), JobSeen.eval_verdict.is_(None),
+               or_(JobSeen.gate_signature.is_(None), JobSeen.gate_signature != gate_sig))
+        .order_by(JobSeen.last_seen.desc())
         .limit(limit)
     ).scalars().all()
 
@@ -791,20 +845,33 @@ def _rows_to_dicts(rows: list[JobSeen]) -> list[dict]:
         "snippet": r.snippet or "", "full_text": r.full_text or r.snippet or "",
         "_identity": r.identity_hash,
         "_has_full_text": bool(r.full_text),
+        # ISO strings rather than datetimes: these ride into full_auto, which is
+        # DB-agnostic and formats them via _listing_age_tag. Often None -- see
+        # JobSeen.posted_at on why an unknown date must stay unknown.
+        "_posted_at": r.posted_at.isoformat() if r.posted_at else None,
+        "_expires_at": r.expires_at.isoformat() if r.expires_at else None,
         "_eval_verdict": r.eval_verdict,
         "_eval_signature": r.eval_signature,
         "_eval_analysis": r.eval_analysis,
     } for r in rows]
 
 
-def _mark(db: Session, profile_id: int, identities: list[str], state: str) -> None:
+def _mark(db: Session, profile_id: int, identities: list[str], state: str,
+          gate_sig: str | None = None) -> None:
+    """`gate_sig` stamps WHICH profile the retirement decision was made under, so it
+    can be re-opened when that profile changes -- see _gate_reopened_rows. Passed
+    only for the 'enriched' mark; a 'shown' row is out of the pool for a reason that
+    has nothing to do with a gate verdict."""
     if not identities:
         return
+    values: dict = {JobSeen.state: state}
+    if gate_sig:
+        values[JobSeen.gate_signature] = gate_sig
     db.query(JobSeen).filter(
         JobSeen.profile_id == profile_id,
         JobSeen.identity_hash.in_(identities),
         JobSeen.state != "shown",   # never downgrade a shown row
-    ).update({JobSeen.state: state}, synchronize_session=False)
+    ).update(values, synchronize_session=False)
     db.commit()
 
 
@@ -853,27 +920,57 @@ def _enrich_reed_full_text(engine, db: Session, profile_id: int, jobs: list[dict
     Mutates the passed dicts in place (full_text + _has_full_text, the latter
     being what _needs_full_scrape and full_auto._gate_job_id's cache-key
     richness marker both read). Returns how many were enriched."""
-    by_job_id: dict[str, list[dict]] = defaultdict(list)
+    return _enrich_pre_gate(engine, db, profile_id, jobs, "reed",
+                            engine.reed_job_id, engine.fetch_reed_details)
+
+
+def _enrich_adzuna_full_text(engine, db: Session, profile_id: int, jobs: list[dict]) -> int:
+    """The Adzuna twin of _enrich_reed_full_text -- see full_auto's
+    ADZUNA_DETAIL_ENRICH_ENABLED for the measurements behind it.
+
+    Adzuna mattered more than Reed and was fixed later because it looked unfixable:
+    its search API truncates at exactly 500 chars, it has no per-job detail route,
+    and the tracking URL it hands out is a JS interstitial Phase 5 correctly refuses
+    to treat as a posting. So an Adzuna row had NO path to real text at any stage,
+    and the expensive judge was grading these on a company blurb. Adzuna's own
+    /details/{ad_id} page turns out to serve the whole description as JSON-LD to a
+    plain GET, which closes it the same cheap way Reed's detail endpoint did.
+
+    Keyed on the listing URL rather than an extracted id (see fetch_adzuna_details)
+    because the ad id alone doesn't say which of Adzuna's country TLDs to ask."""
+    return _enrich_pre_gate(engine, db, profile_id, jobs, "adzuna",
+                            lambda url: url or None, engine.fetch_adzuna_details)
+
+
+def _enrich_pre_gate(engine, db: Session, profile_id: int, jobs: list[dict], board: str,
+                     key_of, fetch) -> int:
+    """Shared body of the per-source pre-gate enrichers above: group the candidates
+    of one board by whatever key its detail fetcher is keyed on, fetch, then write
+    the winners back to both the in-memory dicts and JobSeen.
+
+    Factored out rather than duplicated because the write-back half is where the
+    subtle rules live -- only text that BEATS the snippet is stored (so a degenerate
+    detail response can't overwrite a better teaser), `_has_full_text` must be set or
+    the gate cache-key richness marker goes stale, and the DB write is one indexed
+    SELECT + commit like _persist_scrape. A second copy of that would drift."""
+    by_key: dict[str, list[dict]] = defaultdict(list)
     for j in jobs:
-        if j.get("_has_full_text") or canonical_key(j.get("board")) != "reed":
+        if j.get("_has_full_text") or canonical_key(j.get("board")) != board:
             continue
-        job_id = engine.reed_job_id(j.get("url") or "")
-        if job_id:
-            by_job_id[job_id].append(j)
-    if not by_job_id:
+        key = key_of(j.get("url") or "")
+        if key:
+            by_key[key].append(j)
+    if not by_key:
         return 0
 
-    texts = engine.fetch_reed_details(list(by_job_id))
+    texts = fetch(list(by_key))
     if not texts:
         return 0
 
-    # Same shape as _persist_scrape: one indexed SELECT, assign, commit -- and,
-    # like it, deliberately only stores text that actually beats the snippet, so
-    # a degenerate/near-empty detail response can't overwrite a better teaser.
     by_identity: dict[str, str] = {}
     enriched = 0
-    for job_id, text in texts.items():
-        for j in by_job_id.get(job_id, []):
+    for key, text in texts.items():
+        for j in by_key.get(key, []):
             if len(text) <= len(j.get("snippet") or ""):
                 continue
             j["full_text"] = text
@@ -928,19 +1025,24 @@ def _persist_dead_scrapes(db: Session, profile_id: int, jobs: list[dict]) -> Non
 
 
 def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
-                      strong: list[dict], backup: list[dict], disqualified: list[dict],
+                      strong: list[dict], backup: list[dict], excluded: list[dict],
                       eval_sig: str) -> None:
     """Store the final-AI verdict per freshly-judged job so an unchanged profile never
-    re-pays the expensive model for it. Jobs the AI omitted are recorded as 'reject';
-    ones it flagged as hard-disqualified carry the AI's own reason in eval_analysis
-    (see the "disqualified" list in the final-eval schema) instead of the blank
-    analysis a plain reject used to get -- jobs simply not chosen among the best
-    options (passed disqualifiers but weren't picked) still record no reasoning."""
+    re-pays the expensive model for it. Jobs the AI omitted are recorded as 'reject',
+    and `excluded` carries the AI's own reason for each of them in eval_analysis --
+    both the hard DISQUALIFIERS hits (`_disqualifier` True) and the ones that merely
+    lost out to better picks (False). Only the former used to get a reason: a
+    ground-truth audit found 15 of 24 rejects in the judge pool recording nothing at
+    all, so there was no way to tell a job the judge deliberately passed over from one
+    the cheaper tiers had misread on its way in. A reject with no matching entry (the
+    model failed to account for a job_number) still falls through to the blank
+    analysis, so the gap shows up as funnel_counts["final_reject_reasoned"] falling
+    short rather than as a silent return to the old behaviour."""
     if not judged:
         return
     strong_ids = {s.get("_identity") for s in strong if s.get("_identity")}
     backup_by = {b.get("_identity"): b for b in backup if b.get("_identity")}
-    disqualified_by = {d.get("_identity"): d.get("reason", "") for d in disqualified if d.get("_identity")}
+    excluded_by = {d.get("_identity"): d.get("reason", "") for d in excluded if d.get("_identity")}
     now = datetime.utcnow()
     verdicts: dict[str, tuple[str, str]] = {}
     for j in judged:
@@ -951,8 +1053,8 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             verdict, src = "strong", next(s for s in strong if s.get("_identity") == ident)
         elif ident in backup_by:
             verdict, src = "backup", backup_by[ident]
-        elif ident in disqualified_by:
-            verdict, src = "reject", {"concerns": [disqualified_by[ident]]} if disqualified_by[ident] else {}
+        elif ident in excluded_by:
+            verdict, src = "reject", {"concerns": [excluded_by[ident]]} if excluded_by[ident] else {}
         else:
             verdict, src = "reject", j
         analysis = json.dumps({
@@ -1889,11 +1991,17 @@ def _run_cluster_final_eval(
         _cluster_eval_start = time.monotonic()
         strong, backup, disqualified = engine.final_evaluation_split(fresh, eng_profile, cv_text=cv_text)
         _rejected_this_call = len(fresh) - len(strong) - len(backup) if strong is not None else 0
+        # `disqualified` now carries BOTH exclusion kinds (see final_evaluation_split):
+        # hard DISQUALIFIERS hits and jobs that merely lost out. Report them separately
+        # -- the hard count is the diagnostic that says whether the judge is actually
+        # rejecting anyone, and folding the out-competed ones in would inflate it.
+        _hard = sum(1 for d in (disqualified or []) if d.get("_disqualifier")) if strong is not None else 0
+        _reasoned = len(disqualified) if strong is not None else 0
         engine.emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}) took "
                     f"{time.monotonic() - _cluster_eval_start:.1f}s for {len(fresh)} job(s) -> "
                     f"{len(strong) if strong is not None else 0} strong, "
                     f"{len(backup) if strong is not None else 0} backup, {_rejected_this_call} rejected "
-                    f"({len(disqualified) if strong is not None else 0} with a disqualifier reason)")
+                    f"({_hard} on a disqualifier, {_reasoned} of {_rejected_this_call} with a recorded reason)")
         if strong is None:
             # The call itself failed (exception/malformed response) -- nothing
             # was actually judged. Don't persist any verdict, and don't treat
@@ -2033,6 +2141,12 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
 
     _check_cancelled(db, run)
 
+    # The same signature screen_gate/rank_gate key their cache on. Computed once
+    # here because it is needed at BOTH ends of the run: to decide which
+    # gate-retired rows this profile has since invalidated (pool assembly below)
+    # and to stamp the rows this run retires (see _mark/_gate_reopened_rows).
+    gate_sig = engine._profile_signature(eng_profile)
+
     # Role clusters: usually one (today's behavior), sometimes several for a
     # candidate targeting genuinely different fields. Each gets its own
     # embedding so a job matching ONE of the candidate's role interests can
@@ -2160,7 +2274,21 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                   if r.identity_hash not in seen_ids]
     rows = rows + resurfaced
     seen_ids.update(r.identity_hash for r in resurfaced)
-    n_fresh = len(rows) - len(resurfaced)
+    # ...plus rows the cheap gate retired under a profile the candidate has since
+    # edited. Unlike the two pulls above this is uncapped: it isn't a "top-up when
+    # thin" safety net but a correction to the pool's definition, and capping it at
+    # BACKLOG_TOPUP would silently keep most of the invalidated backlog out. They
+    # cost one cosine each here and still have to clear RELEVANCE_FLOOR and out-score
+    # everything else for an examine slot.
+    reopened = [r for r in _gate_reopened_rows(db, profile_id, gate_sig)
+                if r.identity_hash not in seen_ids]
+    if reopened:
+        rows = rows + reopened
+        seen_ids.update(r.identity_hash for r in reopened)
+        emit(f"[pipeline] re-opened {len(reopened)} row(s) the cheap gate retired under an "
+             f"older profile signature (profile has changed since)")
+    funnel["pool_gate_reopened"] = len(reopened)
+    n_fresh = len(rows) - len(resurfaced) - len(reopened)
     if len(rows) < TARGET_POOL:
         # Thin-run safety net (the original behaviour): still short of a full pool, so
         # top up with any other enriched rows (except known rejects) to avoid an empty
@@ -2170,7 +2298,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         rows = rows + extra
         resurfaced = resurfaced + extra
     emit(f"[pipeline] pool assembled: {n_fresh} fresh 'new' + {len(resurfaced)} "
-         f"resurfaced backlog row(s) -> {len(rows)} total")
+         f"resurfaced backlog + {len(reopened)} gate-reopened row(s) -> {len(rows)} total")
     funnel["pool_rows"] = len(rows)
     funnel["pool_resurfaced"] = len(resurfaced)
     _snap("pool", rows)
@@ -2309,15 +2437,27 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # reaches a gate. Runs here, on the main thread, before the cluster pool
     # starts, because it commits to the request session; that also puts it
     # squarely in front of time-to-first-card, which is why it's capped at
-    # REED_ENRICH_PRE_GATE_CAP rather than following cluster_examine_cap all the
-    # way out to RANK_EXAMINE_BUDGET. See _enrich_reed_full_text.
+    # REED_ENRICH_PRE_GATE_CAP / ADZUNA_ENRICH_PRE_GATE_CAP rather than following
+    # cluster_examine_cap all the way out to RANK_EXAMINE_BUDGET. Between them these
+    # two sources are ~91% of the store's text-starved rows (see the text-supply note
+    # in CLAUDE.md). See _enrich_reed_full_text / _enrich_adzuna_full_text.
     enrich_slice = min(cluster_examine_cap, -(-REED_ENRICH_PRE_GATE_CAP // _n))
     to_enrich = [j for queue in queues.values() for j in queue[:enrich_slice]]
     n_enriched = _enrich_reed_full_text(engine, db, profile_id, to_enrich)
     funnel["reed_enriched"] = n_enriched
+    # Adzuna runs on its own, narrower slice -- see ADZUNA_ENRICH_PRE_GATE_CAP. It is
+    # the same blocking main-thread HTTP sitting in front of first paint that the Reed
+    # cap exists to bound, but each response is a ~100KB page from a host that
+    # rate-limits, so it cannot ride the same budget.
+    adz_slice = min(cluster_examine_cap, -(-ADZUNA_ENRICH_PRE_GATE_CAP // _n))
+    to_enrich_adz = [j for queue in queues.values() for j in queue[:adz_slice]]
+    n_adz = _enrich_adzuna_full_text(engine, db, profile_id, to_enrich_adz)
+    funnel["adzuna_enriched"] = n_adz
+    n_enriched += n_adz
     if n_enriched:
-        emit(f"[pipeline] enriched {n_enriched} Reed candidate(s) with their full description "
-             f"before gating (cached for future runs; these now skip phase 5)")
+        emit(f"[pipeline] enriched {n_enriched} candidate(s) with their full description "
+             f"before gating ({funnel['reed_enriched']} Reed, {n_adz} Adzuna; cached for "
+             f"future runs; these now skip phase 5)")
     t0 = _lap("enrich", t0)
 
     # Judge every cluster's queue concurrently. Both budgets above
@@ -2513,7 +2653,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         # guaranteed non-empty fallback in _gate_rank_refill_cluster. Kept as
         # a defensive backstop.
         emit("[pipeline] STOP: gate+rank produced nothing despite non-empty queues -> 0 results")
-        return [], True, ([j["_identity"] for j in scored], []), timings, \
+        return [], True, ([j["_identity"] for j in scored], [], gate_sig), timings, \
             _compose_fallback_warning(role_clusters, fallback_notes), funnel
     _check_cancelled(db, run)
 
@@ -2627,8 +2767,17 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
 
     final_by_cluster: dict[int, list[dict]] = {}
     final_fresh_judged = final_reused_from_cache = 0
-    final_strong = final_backup = final_disqualified = 0
+    final_strong = final_backup = final_disqualified = final_reject_reasoned = 0
     final_scam_verified_dropped = 0
+
+    def _hard_dq(entries) -> int:
+        """Judge exclusions that fired a DISQUALIFIERS rule, as opposed to jobs that
+        merely lost out. Both kinds ride in the same list now (see
+        full_auto.final_evaluation_split) so that every reject carries a reason; this
+        keeps `final_disqualified` meaning what it meant before -- "did the judge
+        actually hard-reject anyone" -- rather than silently becoming "how many
+        weren't picked", which is nearly all of them and diagnoses nothing."""
+        return sum(1 for d in (entries or []) if d.get("_disqualifier"))
     scam_verify_budget = [SCAM_VERIFY_MAX_PER_RUN]
 
     _progress(db, run, "Reading job pages & final AI review…")
@@ -2673,7 +2822,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             _persist_verdicts(db, profile_id, r["fresh"], r["strong"], r["backup"], r["disqualified"], r["eval_sig"])
         final_strong += len(r["strong"])
         final_backup += len(r["backup"])
-        final_disqualified += len(r["disqualified"])
+        final_disqualified += _hard_dq(r["disqualified"])
+        final_reject_reasoned += len(r["disqualified"])
 
         if r["extras_for_to_evaluate"]:
             # So judged_ids (computed from to_evaluate after this loop, used to
@@ -2689,7 +2839,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             final_fresh_judged += len(r["extras_fresh"])
             final_strong += len(r["b_strong"])
             final_backup += len(r["b_backup"])
-            final_disqualified += len(r["b_disqualified"])
+            final_disqualified += _hard_dq(r["b_disqualified"])
+            final_reject_reasoned += len(r["b_disqualified"])
 
         fallback_notes[idx].update(r["fallback_tags"])
 
@@ -2739,7 +2890,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                 "judge_reused_from_cache": r["reused_from_cache"] + r["backfill_reused_from_cache"],
                 "judge_strong": len(r["strong"]) + len(r["b_strong"]),
                 "judge_backup": len(r["backup"]) + len(r["b_backup"]),
-                "judge_disqualified": len(r["disqualified"]) + len(r["b_disqualified"]),
+                "judge_disqualified": _hard_dq(r["disqualified"]) + _hard_dq(r["b_disqualified"]),
+                "judge_reject_reasoned": len(r["disqualified"]) + len(r["b_disqualified"]),
                 "picks": len(picks),
                 "fallbacks": sorted(fallback_notes[idx]),
             })
@@ -2749,6 +2901,10 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     funnel["final_strong"] = final_strong
     funnel["final_backup"] = final_backup
     funnel["final_disqualified"] = final_disqualified
+    # Every judged job that didn't make a list should now carry the AI's own reason.
+    # Watching this against final_fresh_judged - strong - backup is how a regression
+    # in the judge honouring "account for every job_number" stays visible.
+    funnel["final_reject_reasoned"] = final_reject_reasoned
     funnel["final_scam_verified_dropped"] = final_scam_verified_dropped
 
     # Same fair-allocation logic as pooling/top-N: total output stays capped at
@@ -2826,7 +2982,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     ]
     shown_ids = [f.get("_identity") for f in final if f.get("_identity")]
     warning = _compose_fallback_warning(role_clusters, fallback_notes)
-    return final, harsh or bool(fallback_notes), (processed_ids, shown_ids), timings, warning, funnel
+    return final, harsh or bool(fallback_notes), (processed_ids, shown_ids, gate_sig), timings, warning, funnel
 
 
 def reap_stale_search_runs(db: Session) -> int:
@@ -3378,8 +3534,11 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 _resolve_leftover_provisional(db, row)
 
         if marks:
-            processed_ids, shown_ids = marks
-            _mark(db, profile_id, processed_ids, "enriched")  # everything we evaluated
+            processed_ids, shown_ids, gate_sig = marks
+            # gate_sig stamps WHICH profile this retirement was decided under, so a
+            # later profile edit re-opens exactly the rows it invalidated (see
+            # _gate_reopened_rows). "shown" carries none: it isn't a gate verdict.
+            _mark(db, profile_id, processed_ids, "enriched", gate_sig)  # everything we evaluated
             _mark(db, profile_id, shown_ids, "shown")         # the up-to-10 displayed
 
         run.result_count = len(final)

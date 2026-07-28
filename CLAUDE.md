@@ -107,11 +107,22 @@ than expecting structured logs.
   The `/search` page uses it to bucket a still-`new` role left over from an earlier run
   into its own "from earlier searches" section below the current run's picks, instead of
   interleaving every past run's unreviewed roles by `fit_rank` (each run numbers its own
-  1..N, so ranks collide across runs). `saved` roles (any run) get their own "already
+  1..N, so ranks collide across runs). `saved` roles get their own "already
   saved" section, unranked (no `showRank`) — they used to sit inside the same ranked
   `current` list as this run's fresh picks, which caused literal duplicate rank badges
   (a saved role's stale fit_rank from its own original run colliding on-screen with an
-  unrelated fit_rank=N from the new run). The `/my-roles` "Inbox" tab (every
+  unrelated fit_rank=N from the new run). **That section is scoped to saved roles that
+  are NOT one of this run's ranked picks** (`isCurrentRankedPick`: non-null `fit_rank`,
+  `search_run_id === latestRunId`, no `provisional_stage`) — the original "any saved
+  role" wording was too broad, and swallowed the one case where the rank badge is
+  genuinely correct: a role the user **Kept mid-run** (or marked applied) that the judge
+  then picked is upgraded in place at finalization with this run's own `fit_rank` and
+  `status` untouched, so it is a current ranked pick that merely happens to be `saved`.
+  Filing it under "already saved" pulled rank 1 out of the ranked list, and the visible
+  numbering started at 2 with no indication anything was missing. `applied` rows from
+  this run come back for the same reason — previously they matched no section's status
+  filter at all and rendered nowhere while still being counted in "Showing N results".
+  The `/my-roles` "Inbox" tab (every
   `status=new` role, any run) is deliberately unaffected — this is `/search`-page-only
   display grouping of the same underlying rows, not a new status or a data change.
   **Progressive paint — the /search page is written three times per run**
@@ -201,6 +212,39 @@ than expecting structured logs.
   `eval_signature` = a hash of the cluster CV so it's reused only while the profile is
   unchanged). A re-queued row (posting changed at source) clears `full_text`/`eval_*` so
   it's re-scraped and re-judged.
+  **`state` is what decides whether a row is even a candidate, and its retirement rule
+  was for a long time the single biggest constraint on how many roles a run could
+  return.** The pool is `state='new'` plus a ≤`BACKLOG_TOPUP`(40) resurfacing of rows
+  the judge already graded strong/backup; everything marked `enriched` is out. A row is
+  marked `enriched` once a run has *examined* it — which includes every row the CHEAP
+  gate dropped, long before the judge ever saw it. Because the gate examines in
+  embed-score order, what it retires is disproportionately the **top** of the store, and
+  the retirement was permanent and profile-independent. Measured on a live store: 882
+  retired rows of which **838 cleared the relevance floor**, against **274** in the
+  entire remaining pool — i.e. 75% of every genuinely-relevant listing ever discovered
+  was locked out, and three consecutive runs saw their candidate queue fall 436 → 359 →
+  114 while fresh discovery (mean cosine 0.315) could not replace the head of the
+  distribution it was consuming. `gate_signature` fixes this as the gate-side twin of
+  `eval_signature`: `_mark(..., "enriched", gate_sig)` stamps *which* profile the
+  retirement was decided under, and `_gate_reopened_rows` re-admits any row whose
+  `gate_signature` differs from the current one. Deliberately narrow — only rows with
+  `eval_verdict IS NULL` (gate-dropped, never judged), so it can't route around the
+  "a job with a stored `reject` verdict under the current signature is never resurfaced"
+  invariant, and uncapped, because it corrects the pool's *definition* rather than
+  topping it up when thin. An unchanged profile re-opens nothing, so this can never
+  become re-gating the same rows every run; a NULL signature (retired before the column
+  existed) counts as different, so shipping it re-opens the existing backlog once. Count
+  lands in `funnel_counts.pool_gate_reopened`.
+  `posted_at`/`expires_at` are the employer's stated posting/closing dates, distinct
+  from `source_updated_at` (a change-detection key) and from `first_seen` (when *we*
+  discovered it, which for a months-old listing says nothing about its age). Until these
+  existed **only the ATS feeds carried a date at all** — Reed, Adzuna, JSearch and
+  Careerjet, i.e. most real listings, produced rows with no age at any stage, so nothing
+  in the pipeline could notice a months-old posting ranking top. Both are nullable and
+  often null; every consumer treats unknown as *no penalty*, never as old. On refresh
+  the **earliest** claimed `posted_at` wins (an aggregator re-listing an old posting must
+  not launder it fresh) and the **latest** `expires_at` (an employer can genuinely
+  extend a closing date).
 - **`CompanyATS`**: cached vendor/token registry for the ATS discovery tier (Greenhouse,
   Lever, Ashby, Workable, Recruitee, Personio), populated by `seed_ats.py` (curated,
   live-validated) and grown by `harvest.py`'s occasional `site:`-search harvest — this
@@ -390,7 +434,8 @@ of what the last finished run already recorded — see the search-pipeline secti
    same `sectors` guess for the same reason.
    A `--ground-truth` audit on 113 labelled listings (2026-07-27) drove **screen_v11 → v12**,
    correcting three axes that were dropping judge-approved roles. The work-arrangement axis is
-   now an explicit two-row conflict table in which **hybrid never conflicts with anything** (it
+   now an explicit two-row conflict table in which **a hybrid LISTING never conflicts with
+   anything** (it
    has on-site days, so it satisfies an On-site preference, and remote days, so it partly
    satisfies a Remote one — it had been hard-dropping hybrid roles for an On-site candidate),
    plus "if you couldn't classify the listing you cannot fail this axis". The seniority axis
@@ -406,6 +451,57 @@ of what the last finished run already recorded — see the search-pipeline secti
    The old gate was dropping them for unrelated wrong reasons and happening to be right — the
    count of disqualifiers genuinely visible-and-missed is 1 before and 1 after. Don't read a
    fall in this stage's drop count as a regression without checking that distinction.
+   **screen_v12 → v13** then carved the one exception back out of that entry-level floor:
+   apprenticeships. v12's floor protected every apprenticeship except a "pre-degree" one, so a
+   below-degree scheme passed the seniority axis clean for a graduate — and, worse, the scheme's
+   skill list *matching* the candidate read as evidence of fit at every tier (a live run scored
+   two analyst apprenticeships 84 and 90 at `rank_gate` and the final judge graded a BI
+   Apprenticeship at National Minimum Wage **Strong fit**). An apprenticeship is a place on a
+   course that happens to come with a job: it exists to teach someone who does *not* yet hold the
+   qualification or the skills, and many carry an explicit eligibility bar against applicants who
+   already hold an equivalent qualification. The rule fires only on **both** conditions — the
+   candidate already holds a qualification at or above the level the scheme awards (for a
+   degree-holder: any below-degree scheme; degree apprenticeships and Level 7 schemes are
+   explicitly exempt, as are graduate schemes/programmes, which hire at the candidate's own level)
+   **and** their evidence already covers what it says it will train them in, so an apprenticeship
+   in a field they genuinely lack stays a real opportunity. Training-rate pay corroborates but is
+   never required. Mirrored at all three tiers together — `screen_v13` (the floor's own
+   APPRENTICESHIPS block), `rank_v10` (HARD DOWNGRADES rule f), eval 19 (DISQUALIFIERS rule 3's
+   second paragraph) — because the live failure passed all three; leaving any one behind
+   reinstates the hole at that stage.
+   **screen_v13 → v14 (+ `rank_v12`, eval 21)** closed the CANDIDATE-side twin of the v12
+   hybrid fix, which had let fully-remote roles reach the results page for a candidate who
+   stated On-site and Hybrid. All three tiers had the same shape of hole, and it survived the
+   v12 audit because the audit sampled a profile whose stated preference was On-site alone:
+   * v12's conflict table phrased **both** rows "candidate stated **ONLY** X". A candidate
+     stating On-site AND Hybrid matched neither row, so a remote listing fell into "every
+     other combination → `work_arrangement_ok=true`" — with "apply this table, and nothing
+     else" overriding the table's own "the listing only has to match ONE of them" bullet.
+     The hybrid carve-out is about the *listing* being hybrid; it was being read as making a
+     hybrid *candidate* compatible with everything. The remote row is now "stated preferences
+     NOT including Remote", and the prompt states explicitly that Hybrid on the candidate
+     side is not a wildcard. The on-site row is unchanged (still "stated ONLY Remote") —
+     deliberately, since that half is the retention-sensitive one.
+   * `rank_gate`'s HARD DOWNGRADE (d) was a pure FEASIBILITY test — "clearly cannot work
+     given the candidate's stated location" — which a remote listing always passes. It is now
+     split into a GEOGRAPHY half (unchanged) and a STATED ARRANGEMENT half.
+   * The final judge's DISQUALIFIER 2 ended "**If location is remote** … do not raise a
+     location objection", and `NO LOCATION COMMENTARY` separately forbids mentioning
+     arrangement in `concerns` — so the judge could neither reject a remote role nor even
+     flag it. Same two-check split; `snapshot.build_snapshot` now emits a dedicated
+     "Work arrangement wanted (binding | a preference): …" CV line carrying the row's
+     Hard/Soft, so the judge knows whether a mismatch excludes or only deprioritises.
+     Folded into the `Location: <city> (<work types>)` parenthetical it read as a footnote
+     to the place, which is part of why the rule collapsed into geography alone.
+   Note where enforcement actually bites for a default profile: work-type rows default to
+   **Soft** (`config.enforcement_for`), so `hard_axes` is empty, the cheap gate only demotes
+   (one soft-axis failure), and the judge only deprioritises. The mechanical filter is
+   `rank_gate`'s ≤15 cap landing under `RANK_REJECT_SCORE_FLOOR` (50) — the same way the
+   salary floor, also a Soft-by-default type, is enforced (rule e). Flipping Dashboard →
+   Preferences → Work style to **Hard** adds `_work_arrangement_ok` to `hard_axes` (an
+   unconditional cheap-gate drop, no `MIN_RESULTS` backfill) and makes it a judge
+   disqualifier. The default was left Soft on purpose: the cheap gate reads a ~455-char
+   teaser, and this is the exact axis whose over-firing caused the 15/26 retention collapse.
    `listing_ok` catches listings that clearly
    aren't one specific job posting at all — a job board's own search-results/category
    page or generic aggregator blurb that slipped past discovery-time filtering (e.g.
@@ -505,7 +601,7 @@ of what the last finished run already recorded — see the search-pipeline secti
    never lift a genuinely poor job over the floor, and gate_cache still stores the
    model's own number so the bonus can be retuned without invalidating a single score.
    `rank_gate`'s
-   prompt (`_rank_prompt`, cache gate "rank_v9.{intent hash}") carries **the candidate's
+   prompt (`_rank_prompt`, cache gate "rank_v12.{intent hash}") carries **the candidate's
    own `intent_text`** — which used to reach only the final judge, leaving this stage
    scoring function fit against bare role TITLES with no access to what the candidate
    meant by them, precisely the signal needed to tell an ambiguous title's two
@@ -553,12 +649,28 @@ of what the last finished run already recorded — see the search-pipeline secti
    anything with a persisted `full_text` from a prior run — see
    `engine.py::_needs_full_scrape`) → **Phase 6 final LLM evaluation runs once per
    cluster**, each a **single** expensive call (`full_auto.final_evaluation_split`)
-   returning a strict `strong` list, a lenient disqualifier-only `backup` list, and an
-   optional `disqualified` list (a short AI-authored reason for any job hard-excluded by
-   a DISQUALIFIERS rule, persisted into that job's `eval_analysis` instead of the blank
-   field a plain reject used to get — added because 100% of historical reject verdicts
-   had zero captured reasoning, which made a past investigation into thin results unable
-   to see why anything was excluded). The judge is deliberately structured as an explicit
+   returning a strict `strong` list, a lenient disqualifier-only `backup` list, and
+   **two exclusion lists that account for every remaining job**: `disqualified` (hard
+   DISQUALIFIERS hits, reason must carry the verbatim quoted clause) and `not_selected`
+   (passed the disqualifiers but wasn't among the best picks). Every `job_number` the
+   judge is given must appear in exactly one of the four lists. Both exclusion lists ride
+   home merged in the third return slot, each entry tagged **`_disqualifier`** True/False
+   — a 3-tuple because every caller and the failure sentinel are built around one, and
+   both are consumed identically (a reject verdict plus the AI's own reason, persisted
+   into `eval_analysis`). Only `disqualified` used to be requested at all, so a job the
+   judge merely passed over recorded **nothing**: a ground-truth audit found 15 of 24
+   rejects in the judge pool carrying no reason, which made it impossible to tell a job
+   that was beaten from one the cheaper tiers had misread on its way in — the single
+   biggest blocker on auditing this pipeline, and free to fix. Keep the two kinds
+   distinct downstream: `funnel_counts["final_disqualified"]` and the per-cluster
+   `judge_disqualified` count **only** `_disqualifier` entries (that count is the
+   diagnostic for "is the judge hard-rejecting anyone", and folding in the out-competed
+   ones would inflate it to nearly everything), while `funnel_counts
+   ["final_reject_reasoned"]` counts both. A reject with no matching entry still falls
+   through to a blank analysis, so a judge that stops honouring "account for every
+   job_number" shows up as `final_reject_reasoned` falling short of
+   `final_fresh_judged - strong - backup` rather than as a silent regression.
+   The judge is deliberately structured as an explicit
    **reasoning** step, not a similarity score (`full_auto._FINAL_EVAL_REASONING`): it is
    told to (A) read the JD on three axes — required vs nice-to-have, the *real* seniority
    bar (an "entry-level" label can be marketing), and actual day-to-day vs aspirational
@@ -570,7 +682,7 @@ of what the last finished run already recorded — see the search-pipeline secti
    identically to a fresh one), and are rendered by `engine._compose_analysis`. There is
    still no separate JD-summarisation pass — the three-axis read happens inside this same
    call, on the `full_text` it already receives, deliberately avoiding an extra paid call
-   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 18)
+   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 21)
    or every already-persisted verdict is served stale forever.
    **`fit_level` is derived mechanically from the model's own step-D requirements
    checklist and `concerns`, not from an overall impression, and is decoupled from which
@@ -632,6 +744,17 @@ of what the last finished run already recorded — see the search-pipeline secti
    look delegable but aren't — the judge reads phase-5-scraped full text while
    `rank_gate` often saw only a ~455-char teaser, so a handed-down fact would be
    strictly worse than the one it can read itself.
+   **`[key requirements]` also goes DOWN a tier, to `rank_gate`** (`_key_requirements_
+   text`, shared by both blocks so they can't describe the same hand-off differently).
+   It had gone only to the final judge, leaving the mid tier re-deriving the asks from
+   raw prose while a cleaner, already-tagged version sat unused on the candidate dict.
+   Free — `screen_gate` extracted it from the first `GATE_LISTING_TEXT_CHARS` of the
+   same string `rank_gate` reads more of — and its value is precisely the
+   required/nice-to-have split, which is what HARD DOWNGRADE (a)/(b) turn on and what a
+   scoring pass reading a wall of text most often blurs. The prompt states both limits:
+   the list is capped and was read from a SHORTER excerpt, so it is never complete (an
+   ask appearing only in the fuller text still counts), and it is an extraction, not a
+   verdict — it says what the employer asked for, never whether the candidate meets it.
    Disqualifier rule 5 (SECTOR/DOMAIN FIT) also carries a **shared/ambiguous job title**
    carve-out: some titles name two different professions and are told apart only by the
    duties ("Automation Engineer" = software/RPA vs industrial PLC/robotics; "Analyst" =
@@ -640,13 +763,17 @@ of what the last finished run already recorded — see the search-pipeline secti
    field match — see the matching carve-outs in `_screen_prompt`'s ROLE FUNCTION FIT
    (which had the inverse rule: a verbatim title match was *presumptively* a match) and
    `_rank_prompt`'s FUNCTION MATCH. All three were changed together and all three cache
-   versions bumped (`screen_v11`, `rank_v8`, eval 16); leaving any one behind reinstates
+   versions bumped (`screen_v11`, `rank_v8`, eval 16 — all since superseded); leaving any one behind reinstates
    the hole at that stage.
    The
    LOCATION/VISA/RELOCATION disqualifier rule
    applies the same on-site-unless-stated-otherwise classification as the gate's
-   work-arrangement axis above before judging eligibility, rather than treating an
-   unstated work arrangement as automatically compatible. Whether the judge is actually
+   work-arrangement axis above, then runs **two** checks off it (eval 21): GEOGRAPHY (can
+   the candidate physically take it — a remote role always passes) and STATED ARRANGEMENT
+   (does it match one of the candidate's stated work types — a remote role passes only for
+   a candidate who listed Remote). Keep those separate: collapsing them into the single
+   feasibility test the rule used to be is exactly what let remote roles through, since the
+   rule then ended "if location is remote … do not raise a location objection". Whether the judge is actually
    rejecting anything was hard to see from the console before — a per-cluster line now
    reports `N strong, N backup, N rejected (N with a disqualifier reason)` after every
    fresh judge call (`engine.py`'s `final_evaluation cluster[...] took Xs...` line), and
@@ -689,8 +816,28 @@ of what the last finished run already recorded — see the search-pipeline secti
    some of the original design's cost savings back without reproducing its starvation
    failure.
 
+   **Listing age.** `full_auto._listing_age_tag` renders `JobSeen.posted_at`/
+   `expires_at` (see the data model) as a `[listing age: ...]` note in both the
+   `rank_gate` listing block and `_final_eval_job_block`. Past `STALE_LISTING_DAYS`
+   (45) it reads "STALE, treat as a negative"; a closing date inside 7 days, or already
+   passed, is stated too. **It is a downgrade, never a filter**: a live months-old
+   posting is still applicable-to, it is just a materially worse use of an application
+   than an equally-good fresh one, because most of its shortlist is already decided.
+   `rank_gate` takes it as SCORING component 3 (≈-10, applied after function/depth fit,
+   explicitly unable to outweigh a good function match); the final judge is told to name
+   it in `concerns`, let it push a *borderline* grade down one step, and break ties
+   toward the fresher role. A passed closing date is the one hard case — it feeds
+   `rank_gate`'s CLOSED LISTING downgrade (rule c). Two things must stay true: a listing
+   with **no** age tag has an unknown date and is never penalised for it (roughly a
+   third of the store, and silence is not evidence of age); and the tag is the one
+   bracketed hint in a job block that is **not** an earlier pass's opinion but a fact
+   from the board's API that the posting text usually doesn't state — so the judge's
+   standing "your reading of the fuller text always wins over a hint" rule is explicitly
+   carved out for it, since there is nothing in the text to check it against.
+
    **Text supply: what the cheap stages can actually read.** `GATE_LISTING_TEXT_CHARS`
-   (2000) and `RANK_LISTING_TEXT_CHARS` (3000) are *ceilings*, and for most candidates
+   (2000) and `RANK_LISTING_TEXT_CHARS` (**5000**, raised from 3000 — see below) are
+   *ceilings*, and for most candidates
    there is nothing like that much to truncate. A measured live store (838 rows) broke
    down as **402 Adzuna rows averaging 497 chars and 361 Reed rows averaging 455** —
    both APIs truncate their description to a ~500-char teaser — against only ~67 ATS
@@ -704,6 +851,45 @@ of what the last finished run already recorded — see the search-pipeline secti
    work that should have happened three stages earlier. (Those two constants' own
    comments describe an audit of a real Reed posting whose requirements started at char
    ~1980 — that was a *scraped* `full_text`, not what a freshly-discovered job supplies.)
+
+   **The ATS rows were not the exception they looked like.** An ATS posting is the one
+   source that arrives text-complete at discovery, which is exactly why losing part of
+   it there is unrecoverable: `_needs_full_scrape` skips ATS rows and
+   `SNIPPET_SUFFICIENT_CHARS` waves through anything that long, so *nothing* downstream
+   ever re-fetches one. Several vendors split a posting across **several** response
+   fields and `fetch_ats` was storing only the first: Lever returns the opening blurb in
+   `descriptionPlain` and puts "What You'll Do"/"What You'll Bring" in a separate
+   `lists` array (plus `additionalPlain`); Recruitee splits `requirements` out of
+   `description`; Workable documents `requirements`/`benefits` alongside it. In every
+   case the dropped part is the **requirements section** — the half a fit judgement
+   turns on — while the part kept is the company marketing blurb. Measured on the live
+   Lever posting that surfaced this (computercare "Data Analyst"): 2,064 chars stored,
+   **4,417 dropped**, including the "2-4+ years of experience working across data
+   engineering and analytics domains" bar. The final judge graded it a *strong*
+   entry-level fit, correctly, on the only text it was ever given — the intro genuinely
+   reads entry-level ("an excellent opportunity for someone who wants to gain hands-on
+   experience"). `_ats_text`/`_lever_text` now merge the sections in the vendor's own
+   order, capped at `ATS_SNIPPET_CHARS` (8000, matching `FINAL_EVAL_JOB_TEXT_CHARS` —
+   no point storing more than the judge can read). Greenhouse (`content`) and Ashby
+   (`descriptionPlain`, measured 5.5k on a live board) really are whole-posting fields
+   and were never affected. Note `_embed_text` only reads `snippet[:2000]`, so this
+   changes no embedding and costs no re-embedding.
+
+   Once a candidate *does* carry a page, the ceiling starts binding, and
+   `RANK_LISTING_TEXT_CHARS` went **3000 → 5000** on that basis. A `tier_analysis
+   --text-mode full` run located by character offset the exact clause the final judge
+   quoted when rejecting a job the mid tier had scored into the judge pool: of the 5
+   locatable ones, 4 sat at offsets 3456 / 3758 / 3817 / 4546 — past the old cap, all
+   under 5000. The characters were already in `JobSeen.full_text`, just unread, so this
+   is the one text fix that needs no extra fetching. Store shape behind the number:
+   median scraped page 3227 chars, p75 4592, p90 6079, max 8000 (`FINAL_EVAL_JOB_TEXT_
+   CHARS`' own cap), with 109 of 192 pages longer than 3000 — the old cap was truncating
+   the majority of pages, right where a JD's requirements section tends to start.
+   Nothing was found between 5000 and 8000, so raising it further has no evidence yet.
+   **This was only safe after screen_v12**: before `listing_ok` learned to read past
+   board chrome, giving the cheap tiers more text made them strictly worse. Re-check
+   that ordering (`tests/gate_harness.py --ground-truth`, snippet vs full) before
+   raising any of these budgets again.
 
    `fetch_reed_details` closes this for Reed: its per-JOB endpoint returns the whole
    description (measured avg ~3900 chars, ~8.6x the teaser) for one plain HTTP call, no
@@ -719,17 +905,52 @@ of what the last finished run already recorded — see the search-pipeline secti
    however many were enriched. Independent of the Settings full-scrape toggle, which
    governs browser page-reading before the *final judge*, not this.
 
-   **Adzuna has no equivalent endpoint** (its `description` is truncated with no
-   per-job detail route), so those rows stay teaser-only until Phase 5 scrapes the
-   finalists. Pre-gate browser-scraping them was considered and rejected: ~4-5s/page
-   would add minutes per run.
+   **Adzuna** has no per-job *API* route (its `description` is truncated with no
+   detail endpoint), and for a long time that read as unfixable — so its rows stayed
+   teaser-only until Phase 5, which then couldn't scrape them either: the API hands
+   out a `/jobs/land/ad/{id}` tracking URL that resolves to a JS interstitial,
+   correctly detected by `_looks_like_redirect_stub` and abandoned. Net effect, an
+   Adzuna row had **no path to real text at any stage** — 225 of 261 in a measured
+   store carried none, and the *final judge* was grading them on 500 chars of company
+   blurb (23 of 38 `strong` verdicts in that store were issued with no `full_text` at
+   all). `fetch_adzuna_details` closes it: Adzuna's own **website** detail page for
+   the same ad id (`/details/{id}`, on the host the listing arrived on — so no
+   country-TLD map is needed) returns 200 to a plain GET and carries the whole
+   description in a JSON-LD `JobPosting` block. Measured 4,792 chars for the Avara
+   Foods listing that prompted this, against its 500-char teaser, including the
+   "Proven experience working as a Data Analyst" clause the judge needed and never
+   saw. Read from the JSON-LD rather than the rendered markup: it's a stable
+   schema.org contract, and it arrives already scoped to this posting so the board's
+   "similar jobs" list can't leak in.
+   Throttled much harder than the Reed twin — `ADZUNA_DETAIL_MAX_WORKERS` (3, vs
+   Reed's 12) and `ADZUNA_ENRICH_PRE_GATE_CAP` (40, vs 100) — because each response
+   is a ~100KB HTML page and the host starts returning 429 after a handful of rapid
+   requests; on repeated 429s the batch is abandoned outright rather than retried,
+   since being rate-limited out of *discovery* (same host) would cost far more than
+   the text is worth. Both enrichers share `engine._enrich_pre_gate`, which owns the
+   subtle half: only text that BEATS the snippet is stored, `_has_full_text` must be
+   set or the gate cache-key richness marker goes stale, and the DB write is one
+   indexed SELECT + commit.
+   *Following* the tracking redirect was tried first and doesn't work — the land URL
+   403s a plain HTTP client and is bot-walled behind the browser too. Pre-gate
+   browser-scraping was considered and rejected separately: ~4-5s/page would add
+   minutes per run.
 
-   Because of all this, `full_auto._gate_job_id` carries a **two-state text-richness
-   marker** (`:full`). `_gate_cache_key` keys on (gate, profile signature, job id) and
+   Because of all this, `full_auto._gate_job_id` carries a **text-richness marker**.
+   `_gate_cache_key` keys on (gate, profile signature, job id) and
    *not* on the text that was judged, so without the marker a verdict reached on the
    455-char teaser would be served forever for a job whose full description has since
    arrived — silently cancelling the enrichment for exactly the jobs that most needed
-   re-judging. Keep that marker in sync with whatever `_has_full_text` means.
+   re-judging. The marker used to be **two-state** (`:full` or nothing), which keyed on
+   *where* the text came from and so could not see a text that grew **in place** — an
+   ATS row never has `full_text` at all, so when `fetch_ats` started merging in the
+   requirements sections (above), every one of those rows kept serving the verdict it
+   reached on its blurb alone, permanently. It is now `:{full|t}{len//1000}`, bucketing
+   the length in 1k steps: text that grows materially re-screens, text merely re-fetched
+   identically does not, and no global `screen_v` bump (which would re-screen the whole
+   store to get identical answers for the untouched majority) is needed. Keep it in sync
+   with whatever `_has_full_text` means — and prefer extending this marker over a
+   version bump whenever a change affects only *some* rows' text.
 
    **Concurrency (what runs at the same time as what).** Three levels, all added
    because a live 3-cluster run spent `gate=83s`, `scrape=48s`, `final_eval=53s` doing

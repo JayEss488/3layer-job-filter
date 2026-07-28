@@ -282,6 +282,15 @@ class JobSeen(Base):
     embedding = Column(Text)           # JSON-encoded vector, cached once per job
     state = Column(Text, nullable=False, default="new")       # new|enriched|shown
     source_updated_at = Column(DateTime)                      # ATS updated_at when present
+    # When the EMPLOYER posted / closes the listing, as stated by the source --
+    # distinct from source_updated_at (a change-detection key for the re-queue
+    # rule) and from first_seen (when WE happened to discover it, which for a
+    # months-old listing discovered today says nothing about its age). Nullable
+    # everywhere and often null: a source that states no date must leave the age
+    # unknown rather than have one inferred, since every consumer treats
+    # "unknown" as "no penalty". See full_auto.py's posting-date normalisation.
+    posted_at = Column(DateTime)
+    expires_at = Column(DateTime)
     # Cross-run reuse of the two most expensive artifacts, so a job that resurfaces
     # (backlog top-up, re-queue) skips re-scraping and re-judging. Cleared when a
     # source-updated row is re-queued so a changed posting is re-scraped/re-judged.
@@ -290,6 +299,19 @@ class JobSeen(Base):
     eval_analysis = Column(Text)       # JSON: summary/top_match_reason/concerns
     eval_signature = Column(Text)      # profile signature at eval time (validity key)
     evaluated_at = Column(DateTime)
+    # The gate-side twin of eval_signature: full_auto._profile_signature at the time
+    # this row was retired to state='enriched' by the CHEAP gate (dropped before the
+    # judge ever saw it). Retirement used to be a bare state flip with no signature,
+    # i.e. permanent and profile-independent -- which quietly made it the single
+    # biggest constraint on how many roles a run could find. Every gate-dropped row
+    # left the candidate pool forever, and since the gate examines the highest-scoring
+    # rows first, what it removed was disproportionately the top of the store: a
+    # measured live store held 882 retired rows of which 838 cleared the relevance
+    # floor, against 274 in the whole remaining pool. Scoping it lets a profile edit
+    # re-open exactly the rows whose gate verdict that edit invalidated -- matching how
+    # eval_signature already works for the judge -- while an unchanged profile still
+    # never re-gates the same row twice. NULL = retired before this existed.
+    gate_signature = Column(Text)
     # Set only on a HIGH-CONFIDENCE dead/expired-listing signal from Phase 5
     # scraping (status_404/status_410/expired_phrase, see full_auto.py's
     # _dead_listing_signal) with no alternate posting found. Deliberately its

@@ -55,6 +55,36 @@ quickest path, but the Dockerfile runs anywhere (Fly.io, Railway, a VM).
      just gets the full current schema from `create_all`, which is what a new
      beta wants.
 
+### On Fly.io (from local, using the fly CLI)
+A `fly.toml` is included (app `four-in-a-thousand-api`, region `lhr`, SQLite on a
+Fly volume mounted at `/data`, single instance -- same one-disk-one-instance rule
+as Render). Run these from the repo root, in order:
+
+```
+fly auth login
+fly apps create four-in-a-thousand-api
+fly volumes create data --region lhr --size 1
+fly secrets set AUTH_SECRET=<generate> ADMIN_TOKEN=<generate> FRONTEND_ORIGINS=http://localhost:3000 OPENAI_API_KEY=... REED_API_KEY=... ADZUNA_APP_ID=... ADZUNA_APP_KEY=... SERPER_DEV_API_KEY=... SERPAPI_KEY=... RAPIDAPI_KEY=...
+fly deploy
+```
+
+- `fly auth login`/`apps create` are interactive (browser + naming) so run them
+  yourself rather than scripting them.
+- The volume must be created in the **same region** as `primary_region` in
+  `fly.toml`.
+- `DATABASE_URL` is already set in `fly.toml`'s `[env]` block
+  (`sqlite:////data/jobmatch.db`) -- don't also pass it to `fly secrets set`.
+- `CAREERJET_AFFID`/`CAREERJET_REFERER` have working defaults baked into
+  `full_auto.py`; only set them as secrets if you get your own Careerjet
+  partner credentials later.
+- Update `FRONTEND_ORIGINS` (and redeploy: `fly deploy`, no rebuild needed --
+  `fly secrets set` alone triggers a release) once the Vercel URL exists.
+- `fly deploy` builds the same `Dockerfile` remotely on Fly's builders --
+  Chromium + its OS deps included -- so no local Docker install is required.
+- Logs: `fly logs`. Shell on the running machine: `fly ssh console`.
+- Chromium/Crawl4AI need real RAM; `fly.toml` requests `shared-cpu-2x`/2GB. If
+  a search run OOMs, bump `memory` in `fly.toml` and redeploy.
+
 ### Seed the 50 beta logins
 Run `scripts/gen_beta_users.py` **against the deployed database** so the accounts
 land where the app reads them:

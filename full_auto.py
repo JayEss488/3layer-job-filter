@@ -125,6 +125,33 @@ ALT_SOURCE_LOOKUP_MAX_PER_RUN = int(os.getenv("ALT_SOURCE_LOOKUP_MAX_PER_RUN", "
 REED_DETAIL_ENRICH_ENABLED = os.getenv("REED_DETAIL_ENRICH_ENABLED", "true").lower() == "true"
 REED_DETAIL_MAX_PER_RUN = int(os.getenv("REED_DETAIL_MAX_PER_RUN", "150"))
 
+# Adzuna full-description enrichment (see fetch_adzuna_details). Adzuna's search API
+# truncates `description` to an exact-500-char teaser and offers no per-job detail
+# route, so its rows were the single largest block of permanently text-starved
+# candidates in the store: a measured 261-row live sample had 225 with no full_text
+# at all. Phase 5 can't fix it either -- the API hands out a /jobs/land/ad/ tracking
+# URL that resolves to a JS interstitial, which _looks_like_redirect_stub correctly
+# detects and gives up on, so those jobs reach the FINAL judge on 500 chars of
+# company blurb. (Measured: 23 of 38 `strong` verdicts in one store were issued with
+# no full_text at all, and the Avara Foods listing that prompted this was graded
+# strong on a teaser whose text ends before the word "requirements" appears.)
+#
+# The fix is not to follow that redirect -- the land URL 403s a plain HTTP client and
+# is bot-walled behind the browser too. Adzuna's own detail page for the same ad id
+# (/details/{id} on the same host) returns 200 to an ordinary GET and carries the
+# whole description in a JSON-LD JobPosting block: measured 5,675 chars for the Avara
+# listing against its 500-char teaser, including the "Proven experience working as a
+# Data Analyst" clause the judge needed and never saw.
+#
+# Tuned far more conservatively than the Reed equivalent above, for two measured
+# reasons: the response is a ~100KB HTML page rather than a small JSON body, and the
+# host starts returning 429 after only a handful of rapid requests -- so this uses a
+# narrow pool and abandons the whole batch on repeated 429s rather than hammering a
+# host we depend on for discovery.
+ADZUNA_DETAIL_ENRICH_ENABLED = os.getenv("ADZUNA_DETAIL_ENRICH_ENABLED", "true").lower() == "true"
+ADZUNA_DETAIL_MAX_PER_RUN = int(os.getenv("ADZUNA_DETAIL_MAX_PER_RUN", "80"))
+ADZUNA_DETAIL_MAX_WORKERS = int(os.getenv("ADZUNA_DETAIL_MAX_WORKERS", "3"))
+
 # Pages fetched per (source, term) by gather_jobs' per-run discovery, cut from
 # the fetchers' own pages=3 default (which the legacy standalone path keeps).
 # One page still returns up to 100 (Reed) / 50 (Adzuna) results per term, and a
@@ -238,10 +265,30 @@ GATE_LISTING_TEXT_CHARS = 2000
 # the title/opening blurb screen_gate's coarser checks can get by on. Same
 # Reed.co.uk audit that motivated GATE_LISTING_TEXT_CHARS found the full core
 # JD (title through the closing "What's on Offer" section) ran to ~2450
-# characters before board "Similar Jobs" boilerplate started -- 3000 covers
-# that with headroom while staying well short of the judge's full 8000-char
-# budget.
-RANK_LISTING_TEXT_CHARS = 3000
+# characters before board "Similar Jobs" boilerplate started.
+#
+# Raised 3000 -> 5000 (2026-07-27) on measured evidence, not headroom. A
+# tier_analysis --text-mode full run located, by character offset, the exact
+# clause the final judge quoted when it rejected a job this stage had scored into
+# the judge pool: of the 5 locatable ones, 4 sat at offsets 3456 / 3758 / 3817 /
+# 4546 -- past the old 3000 cap and ALL under 5000. That is the single
+# highest-yield text change available here, because it needs no extra fetching:
+# the characters are already sitting in JobSeen.full_text, just unread. The store
+# they came from ran median 3227 / p75 4592 / p90 6079 chars per scraped page
+# (max 8000, FINAL_EVAL_JOB_TEXT_CHARS' own cap), with 109 of 192 pages longer
+# than 3000 -- so the old cap was truncating the majority of pages, and doing it
+# right where a JD's requirements section tends to start. Note this only spends
+# input tokens on candidates that HAVE a scraped page; the ~91% of the store
+# carrying only a ~455-char source teaser is unaffected either way (see the
+# text-supply note in CLAUDE.md). Raising it further has no evidence behind it
+# yet -- nothing was found between 5000 and 8000.
+#
+# Worth doing only because screen_v12 fixed listing_ok's board-chrome
+# false-positive: before that, supplying the cheap tiers MORE text made them
+# strictly worse, so this change would have backfired. Re-check that ordering
+# still holds (tests/gate_harness.py --ground-truth, snippet vs full) before
+# raising any of these budgets again.
+RANK_LISTING_TEXT_CHARS = 5000
 
 # Below this many available chars (and with no enriched/scraped full_text), a
 # listing reaching rank_gate is tagged as a truncated source teaser in the
@@ -592,7 +639,9 @@ def fetch_reed(query: str, location: str = "United Kingdom", country_code: str =
                 "location": job.get("locationName", ""),
                 "salary_min": job.get("minimumSalary"),
                 "salary_max": job.get("maximumSalary"),
-                "snippet": job.get("jobDescription", "")
+                "snippet": job.get("jobDescription", ""),
+                "posted_at": _uk_date_to_iso(job.get("date")),
+                "expires_at": _uk_date_to_iso(job.get("expirationDate")),
             })
         last_page_full = len(results) >= page_size
         if len(results) < page_size:  # last page reached
@@ -643,6 +692,103 @@ def fetch_reed_details(job_ids: List[str]) -> Dict[str, str]:
     with ThreadPoolExecutor(max_workers=12) as ex:
         out = {job_id: text for job_id, text in ex.map(_one, ids) if text}
     emit(f"   [reed] full descriptions fetched for {len(out)}/{len(ids)} listing(s)")
+    return out
+
+
+# Adzuna's API hands out a click-tracking URL ending in the numeric ad id
+# (https://www.adzuna.co.uk/jobs/land/ad/5786752438?se=...). The id plus that URL's
+# OWN host is everything fetch_adzuna_details needs, which is why it takes URLs
+# rather than (id, country) pairs -- Adzuna's per-country websites live on a dozen
+# different TLDs (.co.uk/.com/.de/.com.au/...) that don't follow from the API's
+# two-letter country code, and reusing the host the listing arrived on sidesteps
+# having to maintain that mapping at all.
+_ADZUNA_AD_ID_RE = re.compile(r"adzuna\.[a-z.]+/(?:jobs/)?(?:land/ad|details)/(\d+)", re.I)
+
+
+def adzuna_ad_id(url: str) -> str | None:
+    m = _ADZUNA_AD_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def _adzuna_detail_url(url: str) -> str | None:
+    ad_id = adzuna_ad_id(url)
+    if not ad_id:
+        return None
+    host = _scrape_host(url)
+    return f"https://{host}/details/{ad_id}" if host else None
+
+
+def _adzuna_description_from_html(page: str) -> str:
+    """Pull the JobPosting description out of an Adzuna detail page.
+
+    Read from the page's JSON-LD rather than by scraping its rendered markup: the
+    schema.org block is a stable contract the site maintains for search engines,
+    while the surrounding HTML is ordinary site chrome that redesigns freely. It
+    also arrives already scoped to THIS posting, so none of the board's "similar
+    jobs" list can leak in -- the exact contamination the final judge's SCOPE OF
+    EACH POSTING'S TEXT rule exists to warn about."""
+    for m in re.finditer(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>',
+                         page or "", re.S | re.I):
+        try:
+            data = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                text = _strip_html(item.get("description") or "")
+                if text:
+                    return text
+    return ""
+
+
+def fetch_adzuna_details(urls: List[str]) -> Dict[str, str]:
+    """Adzuna listing URL -> full plain-text description, for the ones that resolved.
+
+    The Adzuna counterpart to fetch_reed_details -- see ADZUNA_DETAIL_ENRICH_ENABLED
+    for why this exists and why it's throttled harder. Keyed by the ORIGINAL url the
+    caller passed (not the derived /details/ one) so the caller can map results back
+    onto its own job dicts without re-deriving anything.
+
+    Fails SOFT and per-url exactly like the Reed version: a non-200, a timeout, or a
+    page with no JSON-LD JobPosting simply doesn't appear in the returned dict and the
+    caller keeps whatever text it had. On repeated 429s the whole remaining batch is
+    abandoned rather than retried -- enrichment is an optimisation, and getting rate-
+    limited out of DISCOVERY (which shares this host) would cost far more than the
+    text is worth."""
+    seen = list(dict.fromkeys(u for u in urls if u))[:ADZUNA_DETAIL_MAX_PER_RUN]
+    targets = [(u, _adzuna_detail_url(u)) for u in seen]
+    targets = [(u, d) for u, d in targets if d]
+    if not targets or not ADZUNA_DETAIL_ENRICH_ENABLED:
+        return {}
+
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+    }
+    throttled = [0]        # consecutive-ish 429 count, shared across workers
+    _THROTTLE_GIVE_UP = 3
+
+    def _one(target: tuple[str, str]) -> tuple[str, str]:
+        original, detail_url = target
+        if throttled[0] >= _THROTTLE_GIVE_UP:
+            return original, ""
+        try:
+            r = requests.get(detail_url, headers=headers, timeout=15)
+            if r.status_code == 429:
+                throttled[0] += 1
+                return original, ""
+            if r.status_code != 200:
+                return original, ""
+            return original, _adzuna_description_from_html(r.text)
+        except Exception:
+            return original, ""
+
+    with ThreadPoolExecutor(max_workers=max(1, ADZUNA_DETAIL_MAX_WORKERS)) as ex:
+        out = {u: text for u, text in ex.map(_one, targets) if text}
+    note = " (rate-limited, batch cut short)" if throttled[0] >= _THROTTLE_GIVE_UP else ""
+    emit(f"   [adzuna] full descriptions fetched for {len(out)}/{len(targets)} listing(s){note}")
     return out
 
 
@@ -744,7 +890,8 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
                 "location": (job.get("location") or {}).get("display_name", ""),
                 "salary_min": job.get("salary_min"),
                 "salary_max": job.get("salary_max"),
-                "snippet": job.get("description", "")
+                "snippet": job.get("description", ""),
+                "posted_at": _loose_date_to_iso(job.get("created")),
             })
         if page == 1 and not results:
             emit(f"   [!] Adzuna ({cc}) returned 0 results for '{query}' "
@@ -772,7 +919,8 @@ def fetch_remotive(query: str) -> List[Dict]:
                 # Remotive is remote-first; candidate_required_location is a
                 # geographic eligibility string (e.g. "USA Only", "Worldwide").
                 "location": job.get("candidate_required_location") or "Remote",
-                "snippet": job.get("description", "")
+                "snippet": job.get("description", ""),
+                "posted_at": _loose_date_to_iso(job.get("publication_date")),
             })
         return jobs
     except Exception as e:
@@ -1134,7 +1282,9 @@ def fetch_jsearch(query: str, location: str = "United Kingdom") -> List[Dict]:
                 "location": "Remote" if job.get("job_is_remote") else loc,
                 "salary_min": job.get("job_min_salary"),
                 "salary_max": job.get("job_max_salary"),
-                "snippet": job.get("job_description", "")
+                "snippet": job.get("job_description", ""),
+                "posted_at": _loose_date_to_iso(job.get("job_posted_at_datetime_utc")),
+                "expires_at": _loose_date_to_iso(job.get("job_offer_expiration_datetime_utc")),
             })
         return jobs
     except Exception as e:
@@ -1221,6 +1371,7 @@ def fetch_careerjet(query: str, location: str = "United Kingdom",
             "salary_min": None,
             "salary_max": None,
             "snippet": _strip_html(job.get("description", "") or ""),
+            "posted_at": _loose_date_to_iso(job.get("date")),
         })
     return jobs
 
@@ -1356,6 +1507,83 @@ class CareerjetSource:
         return out
 
 
+# ── Posting-date normalisation ───────────────────────────────────────────────
+# Every source states when a job was posted and every source states it differently.
+# Until this existed only the ATS feeds carried a date at all, so the four sources
+# that supply most real listings (Reed, Adzuna, JSearch, Careerjet) produced rows
+# with no age at any stage -- which is why a months-old listing could rank top with
+# nothing anywhere in the pipeline able to notice. Each helper fails soft to None:
+# an unparseable date must mean "age unknown" (and so no penalty), never "old".
+
+def _epoch_ms_to_iso(v) -> str | None:
+    """Lever's createdAt/updatedAt are epoch milliseconds."""
+    try:
+        return datetime.utcfromtimestamp(int(v) / 1000).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _uk_date_to_iso(v) -> str | None:
+    """Reed states dates as DD/MM/YYYY."""
+    try:
+        return datetime.strptime(str(v).strip(), "%d/%m/%Y").isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def _loose_date_to_iso(v) -> str | None:
+    """ISO-ish timestamps from Adzuna (`created`), JSearch
+    (`job_posted_at_datetime_utc`), Remotive (`publication_date`) and Careerjet
+    (`date`). Tolerates a trailing Z and a bare 'YYYY-MM-DD HH:MM:SS'."""
+    s = (str(v).strip() if v else "")
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None).isoformat()
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s[:19], fmt).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+# A listing this old is stated to the scoring tiers as a negative. Not a filter and
+# not a disqualifier: a live 4-month-old posting is still applicable-to, it is just
+# a materially worse use of the candidate's time than an equally-good fresh one
+# (most of the shortlist is long gone), so it belongs as a downgrade on an otherwise
+# equal role rather than a drop. Below this it isn't mentioned at all -- ordinary
+# board latency is not a signal and naming it would invite the model to penalise it.
+STALE_LISTING_DAYS = 45
+
+
+def _listing_age_tag(job: dict, now: datetime | None = None) -> str:
+    """Bracketed age/closing note for a listing block, or "" when the source stated
+    no date. Silence must stay silent: roughly a third of the store has no date at
+    all, and an absent date is not evidence of an old posting."""
+    now = now or datetime.utcnow()
+    bits: List[str] = []
+    posted = _loose_date_to_iso(job.get("_posted_at"))
+    if posted:
+        days = (now - datetime.fromisoformat(posted)).days
+        if days >= STALE_LISTING_DAYS:
+            months = days // 30
+            age = f"{months} month{'s' if months != 1 else ''}" if months >= 2 else f"{days} days"
+            bits.append(f"posted ~{age} ago -- STALE, treat as a negative")
+        elif days >= 0:
+            bits.append(f"posted {days} day{'s' if days != 1 else ''} ago")
+    expires = _loose_date_to_iso(job.get("_expires_at"))
+    if expires:
+        left = (datetime.fromisoformat(expires) - now).days
+        if left < 0:
+            bits.append("the stated closing date has PASSED")
+        elif left <= 7:
+            bits.append(f"closes in {left} day{'s' if left != 1 else ''}")
+    return f"[listing age: {'; '.join(bits)}] " if bits else ""
+
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -1416,6 +1644,44 @@ def _fetch_personio(url: str, token: str) -> List[Dict]:
     return out
 
 
+# An ATS posting is the one discovery-time source that arrives text-COMPLETE, so
+# nothing downstream ever re-fetches it: _needs_full_scrape skips ATS rows and
+# SNIPPET_SUFFICIENT_CHARS waves through anything this long. That makes losing part
+# of the description here unrecoverable at every later stage, which is exactly what
+# was happening -- several vendors split a posting across SEVERAL fields and we were
+# storing only the first one. Lever returns the opening blurb in `descriptionPlain`
+# and puts "What You'll Do" / "What You'll Bring" in a separate `lists` array;
+# Recruitee splits `requirements` out of `description`; Workable documents
+# `requirements`/`benefits` alongside it. In every case the omitted part is the
+# REQUIREMENTS section, i.e. the half a fit judgement actually turns on, while the
+# part we kept is the company marketing blurb. Measured on the live Lever posting
+# that prompted this (computercare Data Analyst): 2,064 chars stored, 4,019 dropped,
+# including the "2-4+ years of experience" bar the final judge then graded a
+# "strong" entry-level fit without ever seeing.
+ATS_SNIPPET_CHARS = 8000   # matches FINAL_EVAL_JOB_TEXT_CHARS -- no point storing
+                           # more than the judge can ever read
+
+
+def _ats_text(*parts: str) -> str:
+    """Join a posting's sections into one plain-text description, dropping empties.
+    Sections are emitted in the vendor's own order so the requirements land after
+    the summary, the way the JD reads."""
+    return "\n\n".join(p for p in (_strip_html(p or "") for p in parts) if p)[:ATS_SNIPPET_CHARS]
+
+
+def _lever_text(j: dict) -> str:
+    """Lever posting -> full description. `lists` is an array of
+    {text: <heading>, content: <html <li> blocks>}; the heading carries real signal
+    ("What You'll Bring") so it's kept as a line of its own."""
+    sections: List[str] = [j.get("descriptionPlain") or j.get("description") or ""]
+    for lst in j.get("lists") or []:
+        if not isinstance(lst, dict):
+            continue
+        sections.append(f"{(lst.get('text') or '').strip()}\n{lst.get('content') or ''}")
+    sections.append(j.get("additionalPlain") or j.get("additional") or "")
+    return _ats_text(*sections)
+
+
 def fetch_ats(vendor: str, token: str) -> List[Dict]:
     tmpl = ATS_FEEDS.get(vendor)
     if not tmpl:
@@ -1445,14 +1711,19 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
             out.append({"board": f"gh:{token}", "title": j.get("title", ""),
                         "company": token, "url": j.get("absolute_url", ""),
                         "location": (j.get("location") or {}).get("name", ""),
-                        "snippet": _strip_html(j.get("content", ""))[:3000],
-                        "updated_at": j.get("updated_at")})
+                        "snippet": _ats_text(j.get("content", "")),
+                        "updated_at": j.get("updated_at"),
+                        "posted_at": j.get("updated_at")})
         elif vendor == "lever":
             out.append({"board": f"lever:{token}", "title": j.get("text", ""),
                         "company": token, "url": j.get("hostedUrl", ""),
                         "location": (j.get("categories") or {}).get("location", ""),
-                        "snippet": _strip_html(j.get("descriptionPlain", ""))[:3000],
-                        "updated_at": j.get("createdAt")})
+                        "snippet": _lever_text(j),
+                        # createdAt is epoch MILLISECONDS, not ISO -- _parse_iso
+                        # silently returned None for every Lever row until this
+                        # was normalised (see _epoch_ms_to_iso).
+                        "updated_at": _epoch_ms_to_iso(j.get("createdAt")),
+                        "posted_at": _epoch_ms_to_iso(j.get("createdAt"))})
         elif vendor == "workable":
             loc = j.get("location") or {}
             out.append({"board": f"workable:{token}", "title": j.get("title", ""),
@@ -1460,22 +1731,30 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
                         "url": j.get("url") or j.get("application_url", ""),
                         "location": loc.get("location_str") or ", ".join(
                             x for x in [loc.get("city"), loc.get("country")] if x),
-                        "snippet": _strip_html(j.get("description", ""))[:3000],
-                        "updated_at": j.get("published_on") or j.get("created_at")})
+                        "snippet": _ats_text(j.get("description", ""),
+                                             j.get("requirements", ""),
+                                             j.get("benefits", "")),
+                        "updated_at": j.get("published_on") or j.get("created_at"),
+                        "posted_at": j.get("published_on") or j.get("created_at")})
         elif vendor == "recruitee":
             out.append({"board": f"recruitee:{token}", "title": j.get("title", ""),
                         "company": token,
                         "url": j.get("careers_url") or j.get("careers_apply_url", ""),
                         "location": j.get("location") or ", ".join(
                             x for x in [j.get("city"), j.get("country")] if x),
-                        "snippet": _strip_html(j.get("description", ""))[:3000],
-                        "updated_at": j.get("published_at")})
+                        "snippet": _ats_text(j.get("description", ""),
+                                             j.get("requirements", "")),
+                        "updated_at": j.get("published_at"),
+                        "posted_at": j.get("published_at")})
         else:  # ashby
             out.append({"board": f"ashby:{token}", "title": j.get("title", ""),
                         "company": token, "url": j.get("jobUrl", ""),
                         "location": j.get("location", ""),
-                        "snippet": _strip_html(j.get("descriptionPlain", ""))[:3000],
-                        "updated_at": j.get("publishedAt")})
+                        # Ashby's descriptionPlain IS the whole posting (measured
+                        # 5.5k chars on a live board) -- no split fields to merge.
+                        "snippet": _ats_text(j.get("descriptionPlain", "")),
+                        "updated_at": j.get("publishedAt"),
+                        "posted_at": j.get("publishedAt")})
     return out
 
 
@@ -2246,16 +2525,29 @@ def _profile_signature(profile: dict) -> str:
 def _gate_job_id(job: dict) -> str:
     """Stable per-job key. Prefer the backend's cross-source identity when present.
 
-    Carries a two-state TEXT-RICHNESS marker, because _gate_cache_key below keys on
+    Carries a TEXT-RICHNESS marker, because _gate_cache_key below keys on
     (gate, profile signature, this) and NOT on the text that was actually judged.
     The same job can reach a gate with wildly different amounts of text: a ~455-char
     Reed/Adzuna search teaser when it's brand new, or its full description once
     fetch_reed_details or a Phase 5 scrape has supplied one (see engine.py's
     _has_full_text). Without the marker, a verdict reached on the teaser would be
     served forever for a job we can now actually read -- silently cancelling the
-    enrichment for exactly the jobs that most needed re-judging."""
+    enrichment for exactly the jobs that most needed re-judging.
+
+    The marker used to be two-state (`:full` or nothing), which keyed only on
+    WHERE the text came from and so missed a text that grew in place. An ATS row
+    never has full_text -- its description arrives complete at discovery and
+    nothing re-fetches it -- so when fetch_ats started merging in the requirements
+    sections several vendors return as separate fields, every one of those rows
+    kept serving the verdict reached on its company blurb alone, permanently.
+    Bucketing the length in 1k steps fixes that class of change generically: text
+    that grows materially re-screens, text that is merely re-fetched identically
+    does not, and no global cache-version bump (which would re-screen the whole
+    store to get identical answers for the untouched majority) is needed."""
     ident = job.get("_identity") or make_job_id(job.get("board", ""), job.get("url", ""))
-    return f"{ident}:full" if job.get("_has_full_text") else ident
+    text = job.get("full_text") or job.get("snippet") or ""
+    marker = "full" if job.get("_has_full_text") else "t"
+    return f"{ident}:{marker}{len(text) // 1000}"
 
 
 def _gate_cache_key(gate: str, sig: str, job_id: str) -> str:
@@ -2564,10 +2856,29 @@ alone satisfy a requirement that clearly expects professional/production-level c
   of a serious job. When that stated seniority is Graduate, Junior, Entry-level or equivalent, there is
   almost nothing left below them: a Graduate, Junior, Entry-level, Trainee or "0-2 years" listing is a
   DIRECT MATCH for them and is seniority_ok=true. Only genuinely sub-entry work -- an unpaid internship,
-  school work-experience, a pre-degree apprenticeship -- can be "seniority_low" for such a candidate,
-  and even then only when the listing says so plainly. A listing titled "Graduate X" or "Junior X" is
+  school work-experience, or an apprenticeship/training scheme the candidate is already past the level
+  of (see below) -- can be "seniority_low" for such a candidate, and even then only when the listing
+  says so plainly. A listing titled "Graduate X" or "Junior X" is
   never by itself evidence of a level mismatch for a graduate or junior candidate; if anything it is
   evidence of a match, and doubly so when it echoes one of their target roles above.
+  APPRENTICESHIPS AND TRAINING SCHEMES -- the one case where the floor does not protect a listing. A
+  listing whose title or text makes it a formal apprenticeship, traineeship or structured training
+  scheme ("Apprentice", "Apprenticeship", "Level 2/3/4/5 ...", "you will study towards a qualification",
+  "we will train you in ...") is not an ordinary entry-level job: it is a place on a course that comes
+  with a job, and its purpose is to teach someone who does NOT yet hold the qualification or the skills.
+  Set seniority_ok=false, reason="seniority_low", when BOTH hold:
+    (i) the candidate already holds a qualification at or above the level the scheme awards -- for a
+        candidate with a completed degree that means any BELOW-degree scheme (Level 2-5, "advanced"/
+        "higher" apprenticeship, or one awarding a qualification they already have). A DEGREE
+        apprenticeship, or a Level 7/master's-level scheme, is not below such a candidate and stays
+        seniority_ok=true; and
+    (ii) the candidate's own skills/background above already cover the core things the scheme says it
+        will train them in -- an apprenticeship in a field they genuinely lack is a real opportunity
+        and stays seniority_ok=true.
+  A training rate of pay ("National Minimum Wage", "apprentice rate", a wage plainly under the going
+  graduate rate for the field) corroborates (i) but is not required for it. Quote the scheme wording you
+  relied on in "seniority_signal". This is NOT licence to fail graduate schemes, graduate programmes or
+  junior roles -- those hire you at your level and are direct matches.
   (These two directions are opposite failures -- "_high" always means the ROLE outranks the
   CANDIDATE, "_low" always means the CANDIDATE outranks the role's real level or lacks the
   professional depth it expects. Do not mix them up. Sanity-check yourself before answering: if the
@@ -2630,13 +2941,18 @@ Candidate location: {profile.get('location') or 'n/a'}
   remote/hybrid/work-from-home at all -- treat it as on-site at that location. Don't default an
   unlabeled listing to remote just because remote wasn't ruled out.
 - Then apply this conflict table, and nothing else. There are exactly TWO conflicts:
-    listing is fully REMOTE  + candidate stated ONLY On-site           -> work_arrangement_ok=false
-    listing is ON-SITE       + candidate stated ONLY Remote            -> work_arrangement_ok=false
+    listing is fully REMOTE  + candidate stated preferences NOT including Remote  -> work_arrangement_ok=false
+    listing is ON-SITE       + candidate stated ONLY Remote                       -> work_arrangement_ok=false
   Every other combination is work_arrangement_ok=true. In particular:
   - A HYBRID listing NEVER conflicts with anything. Hybrid includes on-site days, so it satisfies an
     On-site preference, and it includes remote days, so it partly satisfies a Remote one. Do not fail
-    this axis on a hybrid listing for any candidate, whatever they stated.
-  - If the candidate stated more than one preference, the listing only has to match ONE of them.
+    this axis on a hybrid listing for any candidate, whatever they stated. This carve-out is about the
+    LISTING being hybrid; it says nothing about a candidate who stated Hybrid.
+  - A candidate who stated Hybrid wants office days. A fully REMOTE listing offers none, so it does NOT
+    satisfy a Hybrid preference -- "Hybrid" on the candidate side is not a wildcard, and stating
+    On-site and/or Hybrid without Remote is an explicit statement that fully-remote is not wanted.
+  - If the candidate stated more than one preference, the listing only has to match ONE of them --
+    matching ONE is required, though: a listing matching none of several stated preferences conflicts.
   - If the candidate stated no preference, work_arrangement_ok=true always.
   - If you could not confidently classify the LISTING's arrangement in the step above, you cannot fail
     this axis -- work_arrangement_ok=true. The on-site default there is for reading the listing, not a
@@ -2741,6 +3057,29 @@ def _sanitize_key_requirements(raw) -> list[dict]:
     return out
 
 
+def _key_requirements_text(c: dict) -> str:
+    """screen_gate's extracted JD asks, rendered as one inline phrase. Shared by
+    rank_gate's listing block and the final judge's job block so the two can't
+    describe the same hand-off differently.
+
+    Worth passing DOWN a tier as well as up: these items were pulled by a pass that
+    had never seen the candidate, so they cannot have been bent to fit them -- and
+    screen_gate reads a listing's first GATE_LISTING_TEXT_CHARS while rank_gate reads
+    the first RANK_LISTING_TEXT_CHARS of the same string, so this costs nothing and
+    adds nothing rank_gate couldn't in principle read itself. Its value is that the
+    asks arrive already separated from the surrounding prose and already tagged
+    required vs nice-to-have, which is exactly the distinction HARD DOWNGRADE (a)
+    turns on and the one a scoring pass reading a wall of text most often blurs."""
+    key_reqs = c.get("_key_requirements") or []
+    if not key_reqs:
+        return ""
+    return ", ".join(
+        f"{r['item']} ({r['necessity']}"
+        + (", professional-level expected)" if r.get("professional_level_expected") else ")")
+        for r in key_reqs
+    )
+
+
 def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     """Merged role-function+hard-filter+real-listing+seniority+requirements+skills+
     salary+work-arrangement screen (cheap model, temperature 0) that replaces the
@@ -2780,7 +3119,19 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     enough to skip rank_gate/the judge.
 
     Cached per (profile signature, job id) in the shared gate_cache under
-    gate="screen_v12". Bumped from "screen_v11" after a ground-truth audit
+    gate="screen_v14". Bumped from "screen_v13" to close the WORK ARRANGEMENT
+    table's candidate-side hole: both of v12's conflict rows were phrased "candidate
+    stated ONLY X", so a candidate stating On-site AND Hybrid matched neither row and
+    a fully-REMOTE listing fell into "every other combination -> ok". The v12 hybrid
+    carve-out is about the LISTING being hybrid; it was being read as making a Hybrid
+    CANDIDATE compatible with everything. The remote row now reads "stated preferences
+    NOT including Remote". "screen_v13" was bumped from "screen_v12" when the
+    ENTRY-LEVEL FLOOR gained
+    its apprenticeship/training-scheme exception -- see the floor's own text; v12
+    protected every apprenticeship but a "pre-degree" one, which is why a below-degree
+    BI apprenticeship at National Minimum Wage passed this axis clean for a graduate
+    who already had the Power BI/SQL/Excel it offered to teach. "screen_v12" was
+    bumped from "screen_v11" after a ground-truth audit
     (`tests/gate_harness.py --ground-truth --text-mode snippet`) scored this stage
     against 113 listings the expensive judge had already ruled on, and found it
     keeping only 15 of 26 judge-approved roles. Reading all 11 drops individually,
@@ -2865,6 +3216,16 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
+    # screen_v14 (from screen_v13): the WORK ARRANGEMENT conflict table's remote row
+    # went from "candidate stated ONLY On-site" to "stated preferences NOT including
+    # Remote". Under v13 a candidate stating On-site AND Hybrid matched neither
+    # conflict row, so every fully-remote listing passed this axis clean -- a v13
+    # verdict was reached under a rule that could not fail those and must not be reused.
+    # screen_v13 (from screen_v12): the ENTRY-LEVEL FLOOR gained its apprenticeship/
+    # training-scheme exception. v12's floor explicitly protected every apprenticeship
+    # except a "pre-degree" one, so a below-degree scheme for a graduate whose skills
+    # already cover what it teaches passed the seniority axis clean -- a v12 verdict
+    # was reached under a rule that could not fail those and must not be reused.
     # screen_v12 (from screen_v11): three axes were materially loosened/corrected
     # after a ground-truth audit (tests/gate_harness.py --ground-truth) scored this
     # stage against 113 listings the final judge had already ruled on. A v11 verdict
@@ -2873,7 +3234,7 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     # applies to titles that name two different professions (see the docstring's
     # "Automation Engineer" case) -- a v10 row could have been passed on the title
     # alone and must not be reused as if it still means the same thing.
-    keys = [_gate_cache_key("screen_v12", sig, _gate_job_id(c)) for c in candidates]
+    keys = [_gate_cache_key("screen_v14", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -3125,6 +3486,17 @@ Candidate location: {profile.get('location') or 'none stated'}
 Candidate work-type preference: {', '.join(profile.get('work_types') or []) or 'none stated'}
 Candidate stated salary floor: {salary_floor if salary_floor else 'none stated'}
 {_candidate_background_block(profile)}{multi_note}
+Some listings carry a bracketed "[key requirements (extracted by an earlier pass): ...]" tag. Those are
+this posting's own stated asks, each tagged "required" or "nice_to_have", pulled out by an earlier
+screening pass that had NEVER seen the candidate -- so they describe what the employer asked for, not
+what anyone thought would suit this person. Start the HARD DOWNGRADES check below from that list where it
+is present: a "required" item there is exactly the kind of stated bar rule (a) and (b) turn on. Two
+limits. The list is capped at a few items and was read from a SHORTER excerpt than you are shown, so it
+is never complete -- an ask that appears only in the fuller text below still counts, and you must read
+that text rather than treating the tag as the whole picture. And it is an extraction, not a verdict: it
+says what the posting asks for, never whether the candidate meets it, which is yours to judge. A listing
+with no such tag is not a listing with no requirements.
+
 Some listing text is scraped from a web page and may include unrelated boilerplate around the actual job:
 site navigation, a page footer, a "Similar jobs" list or a salary histogram carrying OTHER roles' figures.
 Judge only the posting itself -- never treat a salary, requirement or location from such a footer as this
@@ -3145,15 +3517,32 @@ b. REQUIRED CREDENTIAL OR TOOL: the listing names a specific certification, qual
    tool as REQUIRED (not nice-to-have) and nothing in the candidate's skills/background above
    evidences it or plainly covers it.
 c. CLOSED LISTING: the text says the vacancy is closed -- e.g. "the application deadline has now
-   passed", "no longer accepting applications".
+   passed", "no longer accepting applications" -- or its "[listing age: ...]" tag says the stated
+   closing date has PASSED.
 d. LOCATION / WORK ARRANGEMENT: first classify the LISTING's own arrangement -- explicit remote/
    distributed/work-from-home wording means remote; explicit hybrid wording means hybrid; a stated
-   city/office with no remote/hybrid mention means ON-SITE there (never remote-by-default). Downgrade
-   only if that classified arrangement clearly cannot work given the candidate's stated location and
-   work-type preference above (e.g. on-site or hybrid in another country), or the listing requires an
-   already-held work permit / right-to-work in a country that clearly isn't the candidate's.
+   city/office with no remote/hybrid mention means ON-SITE there (never remote-by-default). Two
+   separate downgrades follow from that, and BOTH count:
+   - GEOGRAPHY: the classified arrangement clearly cannot work given the candidate's stated location
+     (e.g. on-site or hybrid in another country), or the listing requires an already-held work
+     permit / right-to-work in a country that clearly isn't the candidate's.
+   - STATED ARRANGEMENT: the classified arrangement matches NONE of the candidate's stated work-type
+     preferences above. A fully REMOTE listing is not automatically fine -- remote is always
+     geographically workable, but a candidate who listed On-site and/or Hybrid and did NOT list
+     Remote has said they want office presence, and a remote-only role gives them none of it. A
+     HYBRID listing matches any stated preference (it has both office and remote days). If the
+     candidate stated no work-type preference at all, this half of the rule does not apply.
 e. SALARY: the listing states a salary clearly below the candidate's stated floor (never a downgrade
    when either is unstated or the ranges could plausibly overlap).
+f. OVER-QUALIFIED FOR A TRAINING SCHEME: the listing is a formal apprenticeship, traineeship or
+   structured training scheme ("Apprentice"/"Apprenticeship" in the title, "Level 2/3/4/5", "you will
+   study towards a qualification", "we will train you in ..."), AND the candidate above already holds a
+   qualification at or above the level it awards (for a degree-holder: any below-degree scheme), AND
+   their listed skills already cover what it says it will teach. Such a scheme exists to train someone
+   who lacks those things -- matching its skill list well makes it a WORSE fit, not a better one, and
+   many carry an eligibility bar against applicants who already hold an equivalent qualification. A
+   DEGREE apprenticeship or Level 7/master's-level scheme is not covered by this, nor is a graduate
+   scheme or graduate programme -- those hire at the candidate's level and are normal listings.
 
 SCORING -- two components, in this order (for listings with no hard downgrade):
 1. FUNCTION MATCH (the primary driver of the score): does the role's actual day-to-day work match the
@@ -3178,6 +3567,11 @@ SCORING -- two components, in this order (for listings with no hard downgrade):
    preferred"/"preferred" reflects the candidate's own past tick feedback -- nudge the score up a little for
    a strong match on it. One tagged "deprioritize"/"lower priority" reflects past cross feedback -- nudge
    the score down a little if the listing leans heavily on it.
+3. STALENESS (a small adjustment, applied last): a listing whose "[listing age: ...]" tag marks it STALE
+   has been open for months -- usually still live, but most of its shortlist is already decided, so it is
+   a worse use of an application than an equally-good fresh role. Subtract roughly 10 points, more for a
+   very old one. This is a nudge, never a downgrade: a stale role that fits well still outscores a fresh
+   one that doesn't, and a listing with NO age tag has an unknown date and is never penalised for it.
 
 Give each listing a fit_score from 0 (clearly wrong fit) to 100 (excellent fit). Judge relatively across
 the whole batch -- spread scores out rather than clustering everything near one number.
@@ -3213,11 +3607,21 @@ def _score_rank_batch(
                     "its requirements section is likely cut off] ")
         return ""
 
+    def _req_tag(c: dict) -> str:
+        # See _key_requirements_text: screen_gate already extracted this listing's
+        # asks, tagged required vs nice-to-have, and until now handed them only to
+        # the final judge -- so this stage was re-deriving them from raw prose while
+        # a cleaner version of the same information sat unused on the candidate dict.
+        req_text = _key_requirements_text(c)
+        return f"[key requirements (extracted by an earlier pass): {req_text}] " if req_text else ""
+
     listing_block = "\n".join(
         f"{i+1}. {c['title']} @ {c.get('company','')} | "
         f"{(c.get('location') or 'location unknown')}{_listing_salary_suffix(c)} | "
         f"{_teaser_tag(c)}"
+        f"{_listing_age_tag(c)}"
         f"{'[gate note: role-function fit vs target roles was ambiguous, not a confirmed match] ' if c.get('_sector_ambiguous') else ''}"
+        f"{_req_tag(c)}"
         f"{(c.get('full_text') or c.get('snippet') or '')[:RANK_LISTING_TEXT_CHARS]}"
         for i, (c, _k) in enumerate(batch)
     )
@@ -3313,8 +3717,29 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     phrase, "" if none) in place and returns the full list unfiltered -- the
     caller applies its own cutoff (e.g. drop the bottom fraction, cap at N).
     Cached per (profile signature + intent hash, job id) in gate_cache under
-    gate="rank_v9.{intent_tag}"
-    (bumped from "rank_v8": the prompt gained the candidate's own intent text --
+    gate="rank_v12.{intent_tag}"
+    (bumped from "rank_v11": HARD DOWNGRADE (d) was a pure FEASIBILITY test -- "clearly
+    cannot work given the candidate's stated location" -- which a fully-remote listing
+    always passes, so a candidate's stated On-site/Hybrid preference could never fire it.
+    It is now split into a geography half and a stated-arrangement half, so a v11 score
+    was reached under a rule that could not downgrade a remote-only role. "rank_v11" was
+    bumped from "rank_v10": listing blocks now carry a "[listing age: ...]" tag and
+    SCORING gained component 3, staleness, so a v10 score was reached with no way to
+    know how long the posting had been open. The same bump also covers the ATS text
+    fix -- an ATS listing's stored text now includes the requirements sections several
+    vendors return in separate fields, so a v10 score for one of those was reached on
+    the company blurb alone. "rank_v10" was itself
+    bumped from "rank_v9" for three changes at once, any one of which makes a v9 score
+    non-comparable. (1) HARD DOWNGRADES gained rule f, over-qualification for a training
+    scheme: a v9 score was reached under a rule set in which an apprenticeship whose
+    skill list the candidate already matched scored HIGHER for that match, not lower --
+    a live run scored two below-degree analyst apprenticeships 84 and 90 for a graduate
+    who already held every tool they offered to teach. (2) RANK_LISTING_TEXT_CHARS went
+    3000 -> 5000, so a v9 score for any job with a scraped page was reached on strictly
+    less text than this one sees -- see that constant's own comment for the offsets that
+    justified it. (3) The listing block now carries screen_gate's extracted
+    "[key requirements]" tag, previously handed only to the final judge. "rank_v9" was
+    bumped from "rank_v8": the prompt gained the candidate's own intent text --
     previously visible only to the final judge, leaving this stage scoring
     function fit against bare role TITLES with no access to what the candidate
     meant by them. The intent hash rides in the gate name so an edit to that box
@@ -3362,10 +3787,12 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    # "rank_v9" (not "rank_v8"): the gate name doubles as part of the cache key, and
+    # "rank_v12" (not "rank_v11"): the gate name doubles as part of the cache key, and
     # _gate_cache_key has no model field -- bumping it forces every previously
     # scored job to be re-ranked under the reworded prompt (now with the shared-title
-    # carve-out and the candidate's own intent text, see the docstring) instead of
+    # carve-out, the candidate's own intent text, the training-scheme
+    # over-qualification downgrade, and HARD DOWNGRADE (d)'s stated-arrangement
+    # half, see the docstring) instead of
     # serving a stale score forever. Bump again if the rank model/prompt changes again.
     #
     # The intent text is folded into the GATE NAME rather than into
@@ -3378,7 +3805,7 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     intent_tag = hashlib.sha1(
         (profile.get("intent_text") or "").strip().lower().encode()
     ).hexdigest()[:8]
-    keys = [_gate_cache_key(f"rank_v9.{intent_tag}", sig, _gate_job_id(c)) for c in candidates]
+    keys = [_gate_cache_key(f"rank_v12.{intent_tag}", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -3999,7 +4426,13 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
-FINAL_EVAL_PROMPT_VERSION = 18
+# 21 (from 20): DISQUALIFIER 2 (LOCATION/VISA/RELOCATION) split into a geography
+# check and a stated-work-arrangement check. Under v20 the rule ended "If location is
+# remote ... do not raise a location objection", so a fully-remote listing was waved
+# through for every candidate, whatever they had stated -- and NO LOCATION COMMENTARY
+# forbade even mentioning it in "concerns", so the judge could neither reject nor flag
+# it. A v20 verdict was reached under a rule that could not fail a remote role.
+FINAL_EVAL_PROMPT_VERSION = 21
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -4040,10 +4473,27 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    remote/distributed/work-from-home, treat it as remote; if it explicitly says hybrid, treat it as
    hybrid; otherwise -- including when it states a specific city/office location and simply doesn't
    mention remote/hybrid/work-from-home at all -- treat it as on-site at that location, not remote.
-   If the role's location under that classification (or an explicit on-site/relocation/visa/work-
-   authorization requirement in the text) clearly puts it outside where the candidate can realistically
-   work, exclude it. If location is remote, or plainly compatible with the candidate's location above,
-   do not raise a location objection.
+   Then run TWO separate checks. They fail in opposite directions, and passing one is not passing
+   the other.
+   (a) GEOGRAPHY -- can the candidate physically take it? If the role's location under that
+   classification (or an explicit on-site/relocation/visa/work-authorization requirement in the text)
+   clearly puts it outside where the candidate can realistically work, exclude it. A remote role, or
+   one plainly compatible with the candidate's location above, passes this check.
+   (b) STATED WORK ARRANGEMENT -- is it the arrangement they asked for? The candidate profile may
+   carry a "Work arrangement" line listing the arrangements they want (On-site / Hybrid / Remote,
+   any combination). If it does, the listing's classified arrangement must match at least ONE of
+   them. A HYBRID listing matches any of the three (it has both office days and remote days). A
+   fully REMOTE listing matches ONLY a candidate who listed Remote -- being remote makes a role
+   geographically workable for everyone, but a candidate who listed On-site and/or Hybrid and did
+   NOT list Remote has stated they want office presence, and a remote-only role offers none. Do not
+   read "Hybrid" on the CANDIDATE's side as a wildcard. When that line marks the preference as
+   binding, a listing matching none of the stated arrangements is a disqualifier, exactly like a
+   geography failure; when it marks it as a preference only, keep the role, but when choosing which
+   roles go in "strong" prefer an otherwise-comparable one that does match. Either way this is
+   handled here and via the "work_style" fact -- NO LOCATION COMMENTARY below still applies, so it
+   never appears in "concerns" or any other prose field. If the profile states no work arrangement at all, or
+   you could not confidently classify the listing's arrangement, this check does not apply -- never
+   invent an arrangement objection from silence.
    If the listing's own location/eligibility signals are internally contradictory (e.g. a "compatible
    timezone" framing alongside an explicit country-selector or eligibility list that excludes the
    candidate's country), do not silently resolve the contradiction either way - keep the role but add a
@@ -4053,6 +4503,19 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    it is actually a paid training course, "traineeship"/placement programme, bootcamp, or any scheme
    where the candidate enrols in (or pays/finances) training and is only promised a job or interview
    afterwards rather than being hired directly, exclude it entirely - it is not a job.
+   OVER-QUALIFIED FOR A TRAINING SCHEME. Separately from the above, a formal apprenticeship,
+   traineeship or structured training scheme IS a real job (the candidate is employed while training),
+   so it is not excluded by the paragraph above -- but it is a place on a course, and it exists to teach
+   someone who does NOT yet hold the qualification or the skills. Exclude it when the candidate already
+   holds a qualification at or above the level the scheme awards (for a degree-holder: any below-degree
+   scheme -- Level 2-5, "advanced"/"higher" apprenticeship) AND their evidence already covers the core
+   things it says it will train them in. Matching such a scheme's skill list closely makes it a WORSE
+   fit, not a better one, and many carry an explicit eligibility bar against applicants already holding
+   an equivalent qualification (quote it when the text states one). A training rate of pay ("National
+   Minimum Wage", "apprentice rate") corroborates this but is not required. NOT covered: degree
+   apprenticeships, Level 7/master's-level schemes, graduate schemes and graduate programmes -- those
+   hire at the candidate's own level and are judged as normal roles. Also not covered: an apprenticeship
+   in a field the candidate genuinely lacks, which is a real opportunity for them.
 
 4. SCAM / CV-FARMING RISK: Some listings are not genuine hiring employers but lead-generation or
    CV-harvesting operations designed to collect applications/CVs rather than fill a real role. Judge on
@@ -4381,13 +4844,24 @@ optional list, using this item shape for "strong"/"backup":
  "backup": [ {same item shape} ],
  "disqualified": [
    {"job_number": 3, "reason": "one short phrase naming which DISQUALIFIER applied, including the verbatim quoted clause you relied on (see QUOTE-THEN-CLASSIFY above)"}
+ ],
+ "not_selected": [
+   {"job_number": 7, "reason": "one short phrase naming the main thing that kept this out of both lists, quoting the JD clause it rests on where one exists"}
  ]}
 Include a "disqualified" entry for every job you excluded from BOTH lists above because it failed one of
-the DISQUALIFIERS rules -- this is the only place that reasoning needs recording, so it stays auditable.
-The "reason" must contain the exact quoted clause from QUOTE-THEN-CLASSIFY, not just a paraphrase of the
-rule name, so a misfire can be checked against the listing text afterward. Do NOT add an entry for a job
-that simply wasn't picked among the best-fitting options (one that passed the disqualifiers but wasn't
-chosen for "strong"/"backup") -- leave those out of all three lists.
+the DISQUALIFIERS rules. The "reason" must contain the exact quoted clause from QUOTE-THEN-CLASSIFY, not
+just a paraphrase of the rule name, so a misfire can be checked against the listing text afterward.
+
+EVERY REMAINING JOB GETS A "not_selected" ENTRY. Between "strong", "backup", "disqualified" and
+"not_selected", every job_number you were given must appear exactly once -- no job may be silently
+dropped from all four lists. "not_selected" is for the jobs that passed the disqualifiers but weren't
+among the best-fitting options: say in one short phrase what actually kept each one out (e.g. "core
+requirement unmet: \\"3+ years in a commercial analytics team\\"", "function is data entry rather than
+analysis", "weaker tooling overlap than the picks above"). Where a specific JD clause drove it, quote
+that clause verbatim inside the reason exactly as QUOTE-THEN-CLASSIFY requires; where the job was simply
+out-competed by better picks rather than failing anything, say that plainly instead of inventing a fault.
+These reasons are never shown to the candidate -- they exist so a later audit can tell a job that was
+beaten from one that was quietly misread, which a blank reject cannot distinguish.
 "scam_suspect" (on "strong"/"backup" items only): true if the SCAM/CV-FARMING rule's softer signals
 raised exactly ONE flag on this listing (not enough alone to disqualify it into the list above); false
 otherwise. Omit or leave false when you saw none of those signals.
@@ -4444,6 +4918,14 @@ nothing, and they flag which checks are likely to matter for this listing. You h
 your reading always wins where they disagree, and a hint is never grounds to skip a DISQUALIFIER or to
 soften a "fit_level" the rubric doesn't support. In particular, "[earlier screening pass thought: ...]" is
 one cheap model's one-line impression -- treat it as a claim to verify, never as evidence of fit.
+"[listing age: ...]" is the one exception to all of the above: it is not an earlier pass's opinion but a
+FACT from the job board's own API, which the posting text itself usually does not state, so you cannot
+check it and must take it as given. A listing marked STALE has been open for months. It is normally still
+live, so this is not a disqualifier and never on its own a reason to reject -- but most of its shortlist is
+already decided, so it is a materially worse use of an application than an equally-good fresh role. Treat it
+as a real concern: name it in "concerns" and let it push a borderline grade down one step, and prefer the
+fresher role when choosing between two comparable picks. A block with NO age tag has an unknown posting
+date: say nothing about its age and never assume it is old.
 
 SCOPE OF EACH POSTING'S TEXT -- read first. Each posting's text is scraped from a web page and may contain
 unrelated boilerplate wrapped around the actual job description: site navigation, page footers, a "Similar jobs"
@@ -4510,13 +4992,8 @@ def _final_eval_job_block(i: int, j: dict) -> str:
         hint += f"[source: sourced via a registered {vendor} ATS/careers-page account]\n"
     volume_hint = j.get("_posting_volume_hint")
     hint += f"[posting-volume note: {volume_hint}]\n" if volume_hint else ""
-    key_reqs = j.get("_key_requirements") or []
-    if key_reqs:
-        req_text = ", ".join(
-            f"{r['item']} ({r['necessity']}"
-            + (", professional-level expected)" if r.get("professional_level_expected") else ")")
-            for r in key_reqs
-        )
+    req_text = _key_requirements_text(j)
+    if req_text:
         hint += f"[key requirements: {req_text}]\n"
     # rank_gate's own one-line verdict on this listing (_rank_note, see
     # _rank_prompt's "note" field) -- already computed by the mid tier and, until
@@ -4529,6 +5006,9 @@ def _final_eval_job_block(i: int, j: dict) -> str:
     rank_note = (j.get("_rank_note") or "").strip()
     if rank_note:
         hint += f"[earlier screening pass thought: {rank_note}]\n"
+    age_tag = _listing_age_tag(j).strip()
+    if age_tag:
+        hint += f"{age_tag}\n"
     return (f"JOB {i+1}: {j['title']} at {j['company']}\n"
             f"Location: {j.get('location') or 'not stated'}\nURL: {j['url']}\n{hint}\n"
             f"{j.get('full_text','')[:FINAL_EVAL_JOB_TEXT_CHARS]}")
@@ -4581,7 +5061,8 @@ def _run_final_eval(jobs: list[dict], cv_text: str | None
 Judge the {len(jobs)} complete job postings below. Return up to {FINAL_PICKS} genuinely strong fits in
 "strong" (best first), and up to 3 least-bad disqualifier-only survivors in "backup" (best first; empty
 if "strong" already covers it or nothing qualifies). For any job you hard-exclude from both lists via a
-DISQUALIFIERS rule, add it to "disqualified" with a short reason.
+DISQUALIFIERS rule, add it to "disqualified" with a short reason. Put every job that is in none of those
+three lists into "not_selected" with a short reason -- all {len(jobs)} job numbers must be accounted for.
 
 Jobs Payload:
 {jobs_block}"""
@@ -4654,17 +5135,39 @@ Jobs Payload:
                 out.append(merged)
         return out
 
+    # Both exclusion lists ride home in the same slot, each entry tagged with
+    # _disqualifier so the caller can still tell them apart (the disqualifier COUNT
+    # is a real diagnostic -- see engine.py's funnel_counts["judge_disqualified"]).
+    # Merged rather than returned as a fourth element because every caller and the
+    # failure sentinel are built around a 3-tuple, and both lists are consumed the
+    # same way: a reject verdict plus the AI's own reason for it.
+    excluded = _merge(data.get("disqualified"), len(jobs))
+    for d in excluded:
+        d["_disqualifier"] = True
+    seen = {d.get("_identity") for d in excluded}
+    # Disqualified wins if the model listed a job in both -- a hard exclusion is the
+    # more specific statement, and its reason carries the quoted clause.
+    for d in _merge(data.get("not_selected"), len(jobs)):
+        if d.get("_identity") in seen:
+            continue
+        d["_disqualifier"] = False
+        excluded.append(d)
     return (_merge(data.get("strong"), FINAL_PICKS),
             _merge(data.get("backup"), min(3, len(jobs))),
-            _merge(data.get("disqualified"), len(jobs)))
+            excluded)
 
 
 def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None = None
                            ) -> tuple[list[dict] | None, list[dict] | None, list[dict] | None]:
-    """Backend entry point: (strong, backup, disqualified) from Phase 6. The backend
+    """Backend entry point: (strong, backup, excluded) from Phase 6. The backend
     uses `strong` when non-empty, else `backup` (tagged as a non-strong fallback);
-    `disqualified` carries a short AI-authored reason for hard-excluded jobs, persisted
-    into their reject verdict instead of leaving it blank. Returns (None, None, None)
+    `excluded` carries a short AI-authored reason for EVERY job that reached the judge
+    and didn't make either list, persisted into its reject verdict instead of leaving it
+    blank. Each entry is tagged `_disqualifier`: True for a hard DISQUALIFIERS exclusion,
+    False for one that passed the disqualifiers but was simply out-competed. Both used to
+    collapse into a blank reject unless a disqualifier fired -- a ground-truth audit found
+    15 of 24 rejects in the judge pool carrying no reason at all, which made it impossible
+    to tell whether the cheaper tiers upstream could have known. Returns (None, None, None)
     only if EVERY chunk's call failed -- see _run_final_eval's except branch -- so the
     caller can tell that apart from a real judgment that rejected everyone.
 
