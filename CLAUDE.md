@@ -990,8 +990,20 @@ of what the last finished run already recorded — see the search-pipeline secti
 
 Key cost/reliability guards layered into this pipeline (tune via env vars, see
 `config.py` / top of `full_auto.py`):
-- `MAX_SEARCHES_PER_DAY` (default 6) — global daily search cap, shared across all
-  profiles (not per-profile).
+- `MAX_SEARCHES_PER_DAY` (default 6) — daily search cap **per USER** (counted by
+  `routers/search.py::_searches_today`, which joins `Profile` and filters on
+  `user_id`), not a single global pool — one beta user can't exhaust everyone's
+  quota. A user's profiles share their one allowance. Note a run killed mid-flight
+  (crash, restart, host OOM) still counts: the row exists and it really did spend
+  API credits.
+- `MAX_CONCURRENT_SEARCHES` (default 2) — orthogonal *capacity* guard: how many runs
+  may be in flight process-wide, counted off `SearchRun.status == "running"` so two
+  simultaneous kickoffs can't both slip past it. Each concurrent run drives its own
+  headless Chromium (`full_auto.MAX_CONCURRENT` pages apiece) plus several thread
+  pools, so it's effectively a memory ceiling — on a 2GB VM a few simultaneous runs
+  OOM the machine, killing *every* user's search rather than delaying one. Over the
+  limit returns 503, not 429 (a retryable "busy", not a spent quota). Raise it only
+  alongside the VM's memory.
 - `DISCOVERY_ATS_CACHE_TTL_HOURS` (default 4) — skips re-querying the ~40-company ATS
   batch on back-to-back searches within the window; the term-based API sources always
   fetch fresh.

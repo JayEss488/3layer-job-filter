@@ -6,7 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..config import MAX_SEARCHES_PER_DAY
+from ..config import MAX_CONCURRENT_SEARCHES, MAX_SEARCHES_PER_DAY
 from ..database import get_db
 from ..deps import get_profile_or_404, get_role_or_404
 from ..models import Profile, ProfileAttribute, Role, SearchRun
@@ -63,6 +63,22 @@ def start_search(
         raise HTTPException(
             status_code=429,
             detail=f"Daily search limit reached ({MAX_SEARCHES_PER_DAY}/day). Try again tomorrow.",
+        )
+
+    # Capacity guard (see config.MAX_CONCURRENT_SEARCHES): counted off the DB
+    # rather than an in-process registry because start_search commits its
+    # status="running" row before returning, so two near-simultaneous kickoffs
+    # can't both slip through the check the way they could against a counter
+    # only populated once the background task starts executing. Orphaned rows
+    # can't wedge this shut -- they're reaped on shutdown and at startup.
+    in_flight = db.execute(
+        select(func.count(SearchRun.id)).where(SearchRun.status == "running")
+    ).scalar() or 0
+    if in_flight >= MAX_CONCURRENT_SEARCHES:
+        raise HTTPException(
+            status_code=503,
+            detail="The server is busy running other searches right now. "
+                   "Please try again in a few minutes.",
         )
 
     # "Run first search" confirms everything onboarding parsed -- except target_role,

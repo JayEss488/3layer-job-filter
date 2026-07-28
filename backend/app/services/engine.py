@@ -1868,7 +1868,28 @@ class SearchCancelled(Exception):
     asyncio.run() call to run_search_task, which catches it distinctly from a
     generic failure -- the cancel endpoint already set status="cancelled" on
     its own session/request, and run_search_task must never overwrite that
-    back to "error" or "done"."""
+    back to "error" or "done".
+
+    Also raised when the PROCESS is shutting down (see _shutdown_requested).
+    In that case nothing has set a status yet, and the run is marked by
+    request_shutdown_cancel on the way out (or the startup reaper, on a hard
+    kill) -- not here."""
+
+
+# Set by the SIGTERM/SIGINT handler installed in main.py. A signal handler runs
+# between arbitrary bytecodes on the main thread, so it must not touch the DB or
+# take a lock; assigning a module-level bool is the only safe thing to do there,
+# and every cancel checkpoint below reads it for free (no SELECT). This is what
+# gets the search to stop *before* the host's kill grace period expires: uvicorn
+# waits for background tasks BEFORE firing the lifespan shutdown event, so a
+# lifespan hook alone would run only after the search had already finished.
+_shutdown_requested = False
+
+
+def request_process_shutdown() -> None:
+    """Signal-handler-safe: flip the flag every cancel checkpoint polls."""
+    global _shutdown_requested
+    _shutdown_requested = True
 
 
 def _check_cancelled(db: Session, run: SearchRun) -> None:
@@ -1877,6 +1898,8 @@ def _check_cancelled(db: Session, run: SearchRun) -> None:
     session; this session's in-memory `run` won't reflect that commit until
     reloaded, so db.refresh() (a real SELECT) is required here rather than
     trusting the attribute already on the object."""
+    if _shutdown_requested:
+        raise SearchCancelled()
     db.refresh(run)
     if run.cancel_requested:
         raise SearchCancelled()
@@ -1898,6 +1921,11 @@ def _make_cancel_check(run_id: int, min_interval: float = 3.0):
     state = {"next_check": 0.0, "cancelled": False}
 
     def check() -> None:
+        # Checked before the throttle and without a SELECT: on shutdown the
+        # whole point is to stop writing immediately, not up to min_interval
+        # seconds later, and the host is already counting down to SIGKILL.
+        if _shutdown_requested:
+            raise SearchCancelled()
         with lock:
             if state["cancelled"]:
                 raise SearchCancelled()
@@ -2985,6 +3013,21 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     return final, harsh or bool(fallback_notes), (processed_ids, shown_ids, gate_sig), timings, warning, funnel
 
 
+# Shared by the startup reaper and the shutdown handler below, so the two halves
+# of "this process died with a search in flight" can't drift apart in wording.
+RESTART_INTERRUPT_MESSAGE = (
+    "Search was interrupted by a server restart. Please run a new search."
+)
+
+# Run ids whose run_search_task is still executing in this process. Used only by
+# request_shutdown_cancel, to tell "the workers have unwound" from "the settle
+# timeout expired". Deliberately not derived from thread names: the task runs on
+# anyio's shared BackgroundTasks pool, whose threads are generic workers and
+# outlive any one task. set.add/discard are atomic under the GIL, and the only
+# read is a truthiness test, so this needs no lock.
+_active_search_runs: set[int] = set()
+
+
 def reap_stale_search_runs(db: Session) -> int:
     """Called once at process startup (see main.py). Any SearchRun still
     status="running" was orphaned by the PREVIOUS process lifetime -- crash,
@@ -2992,14 +3035,18 @@ def reap_stale_search_runs(db: Session) -> int:
     worker thread died with that process and nothing else will ever revisit
     the row. Left alone it permanently occupies a daily search-cap slot
     and /search/status serves a run stuck at "running" forever. Returns
-    the number of rows reaped."""
+    the number of rows reaped.
+
+    This is the backstop, not the only path: request_shutdown_cancel() below
+    normally reaches these rows first, on the way down. It stays because a hard
+    kill (SIGKILL, OOM, host loss) never runs a shutdown handler at all."""
     stale = db.execute(select(SearchRun).where(SearchRun.status == "running")).scalars().all()
     if not stale:
         return 0
     now = datetime.utcnow()
     for run in stale:
         run.status = "error"
-        run.message = "Search was interrupted by a server restart. Please run a new search."
+        run.message = RESTART_INTERRUPT_MESSAGE
         run.finished_at = now
     db.commit()
     # A run killed after its gate+rank phase left provisional Role rows behind
@@ -3007,6 +3054,51 @@ def reap_stale_search_runs(db: Session) -> int:
     for run in stale:
         _cleanup_provisional_roles(db, run.id)
     return len(stale)
+
+
+def request_shutdown_cancel(db: Session, settle_timeout: float = 4.0) -> int:
+    """Called on process shutdown (see main.py). Marks every in-flight run the
+    same way reap_stale_search_runs would at the next boot, but *before* the
+    process goes away -- the point being the `cancel_requested` flag, which the
+    pipeline's worker threads poll (_make_cancel_check, one SELECT per ~3s).
+    Setting it makes them raise SearchCancelled at their next checkpoint and
+    unwind through the normal cancel path instead of being killed mid-write.
+
+    Why it matters on a container host: the search worker holds the SQLite file
+    open on a mounted volume, so a worker still writing when the supervisor
+    tears the machine down leaves the volume busy and the database unmounted
+    uncleanly (observed on Fly as repeated `error umounting /data: EBUSY`
+    followed by `recovering journal` on the next boot). Journal recovery is
+    doing its job there, but it's a crash-consistency path being exercised on
+    every single restart, which is not a thing to rely on routinely.
+
+    Waits up to `settle_timeout` seconds for the workers to notice. Sized
+    against the 3s cancel-check interval and kept well inside the host's
+    kill grace period -- this runs while the supervisor is already counting
+    down to SIGKILL, so it must never block indefinitely.
+
+    Returns the number of runs marked."""
+    running = db.execute(select(SearchRun).where(SearchRun.status == "running")).scalars().all()
+    if not running:
+        return 0
+    now = datetime.utcnow()
+    for run in running:
+        # cancel_requested is what the worker threads actually poll; status is
+        # set here too so /search/status is already truthful the moment the
+        # process comes back, rather than depending on the startup reaper.
+        run.cancel_requested = True
+        run.status = "error"
+        run.message = RESTART_INTERRUPT_MESSAGE
+        run.finished_at = now
+    db.commit()
+
+    # Give the workers a moment to observe the flag and stop writing. They clean
+    # up their own provisional rows on the way out (the SearchCancelled path in
+    # run_search_task); the startup reaper covers whatever didn't make it.
+    deadline = time.monotonic() + settle_timeout
+    while _active_search_runs and time.monotonic() < deadline:
+        time.sleep(0.25)
+    return len(running)
 
 
 def _prune_previous_roles(db: Session, profile_id: int) -> None:
@@ -3371,6 +3463,7 @@ def run_search_task(profile_id: int, run_id: int) -> None:
     that's running `uvicorn app.main:app` (the backend terminal/window)."""
     db = SessionLocal()
     run = db.get(SearchRun, run_id)
+    _active_search_runs.add(run_id)  # see request_shutdown_cancel
     _safe_print(f"\n[pipeline] ── search run {run_id} for profile {profile_id} starting ──")
     try:
         import full_auto as engine  # lazy: pulls in crawl4ai only now
@@ -3576,4 +3669,5 @@ def run_search_task(profile_id: int, run_id: int) -> None:
             db.commit()
         _safe_print(f"[pipeline] ── search run {run_id} FAILED, see traceback above ──\n")
     finally:
+        _active_search_runs.discard(run_id)
         db.close()

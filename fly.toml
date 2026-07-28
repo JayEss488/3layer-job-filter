@@ -8,6 +8,14 @@
 app = "four-in-a-thousand-api"
 primary_region = "lhr"
 
+# Time between SIGINT and the SIGKILL, i.e. how long the app gets to put itself
+# away. Raised from the 5s default because a search is an in-process background
+# task holding the SQLite file open on the volume below: main.py's signal
+# handler tells it to stop, and it needs a moment to unwind and release the DB.
+# Without that room the machine is torn down mid-write and /data unmounts dirty
+# (`EBUSY`, then `recovering journal` on the next boot).
+kill_timeout = "25s"
+
 [build]
 
 [env]

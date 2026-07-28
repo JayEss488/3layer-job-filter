@@ -49,8 +49,20 @@ FRONTEND_ORIGINS = os.getenv(
     "FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",")
 
-# Cost guard: max live searches, shared across all profiles, per calendar day.
+# Cost guard: max live searches PER USER, per calendar day (see
+# routers/search.py::_searches_today, which counts a user's own runs only). It
+# is not a global/shared pool -- one beta user cannot exhaust everyone's quota.
 MAX_SEARCHES_PER_DAY = int(os.getenv("MAX_SEARCHES_PER_DAY", "6"))
+
+# Capacity guard, orthogonal to the per-user daily cap above: how many searches
+# may be IN FLIGHT across the whole process at once. Each concurrent run drives
+# its own headless Chromium (full_auto.MAX_CONCURRENT pages apiece) plus several
+# thread pools, so this is really a memory ceiling -- on the 2GB Fly VM a
+# handful of simultaneous runs is enough to OOM the machine, which kills every
+# user's search at once rather than just delaying one. Degrading to "try again
+# in a few minutes" is strictly better than that. Raise this only alongside the
+# VM's memory.
+MAX_CONCURRENT_SEARCHES = int(os.getenv("MAX_CONCURRENT_SEARCHES", "2"))
 
 # Cost/time guard: skip re-querying the ~40-company ATS rotation batch (the
 # single largest chunk of a run's discovery calls) when the last fetch for

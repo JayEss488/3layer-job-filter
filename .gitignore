@@ -20,6 +20,7 @@ memory_archive/
 
 # Beta credentials handed out manually -- never commit plaintext
 beta_credentials.txt
+beta_credentials_prod.txt
 
 # Untracked-but-kept-local dev/archive material (removed from the repo for the
 # beta; delete locally if you don't want them)

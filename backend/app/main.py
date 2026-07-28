@@ -73,6 +73,69 @@ def _startup():
 
     seed_baseline_if_empty()
 
+    _install_shutdown_signal_handlers()
+
+
+def _install_shutdown_signal_handlers() -> None:
+    """Make SIGTERM/SIGINT reach the running search immediately.
+
+    A search runs as an in-process BackgroundTask, and uvicorn waits for those
+    to finish BEFORE firing the lifespan "shutdown" event -- so a shutdown hook
+    alone runs only once the search is already over, which on a container host
+    means never (the supervisor SIGKILLs first). Observed on Fly as the machine
+    being torn down with the search still writing: `error umounting /data:
+    EBUSY` on the way out, `recovering journal` on the way back in.
+
+    So we chain onto uvicorn's own handler rather than replacing it: flip the
+    cooperative-cancel flag (all a signal handler may safely do -- no DB, no
+    locks), then delegate so uvicorn's normal graceful shutdown still happens.
+    Installed from the startup event, which uvicorn runs inside its own
+    capture_signals() block, so its handler is already in place to chain to.
+
+    Best-effort: signal.signal only works on the main thread, and Windows has
+    no SIGTERM to speak of -- neither case is fatal, it just falls back to the
+    startup reaper."""
+    import signal
+
+    from .services.engine import request_process_shutdown
+
+    def _make(previous):
+        def _handler(signum, frame):
+            request_process_shutdown()
+            if callable(previous):
+                previous(signum, frame)
+        return _handler
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _make(signal.getsignal(sig)))
+        except (ValueError, OSError, AttributeError) as e:
+            print(f"[startup] could not hook {sig!r} for graceful search cancel: {e!r}")
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    """Ask any in-flight search to stop before the process goes away.
+
+    A search runs as an in-process BackgroundTask, so it dies with the process
+    no matter what -- this doesn't save the run, it just lets the worker unwind
+    through the normal cancel path (releasing the SQLite file) instead of being
+    killed mid-write. Without it, a container host tearing the machine down
+    finds the volume still busy and the database unmounted uncleanly. The
+    startup reaper still covers the hard-kill case, where nothing runs here."""
+    from .database import SessionLocal
+    from .services.engine import request_shutdown_cancel
+
+    db = SessionLocal()
+    try:
+        n = request_shutdown_cancel(db)
+        if n:
+            print(f"[shutdown] signalled {n} in-flight search run(s) to stop")
+    except Exception as e:  # never block shutdown on this
+        print(f"[shutdown] could not signal in-flight searches: {e!r}")
+    finally:
+        db.close()
+
 
 @app.get("/health")
 def health():
