@@ -345,11 +345,17 @@ def _install_capture_hooks(engine, llm_calls):
     original_llm = engine.llm
     default_model = engine.CHEAP_MODEL
 
-    def _logging_llm(prompt, system="", model=default_model, require_json=False, temperature=0.2):
+    # **kw, not an enumerated signature: full_auto.llm grew stage/cache_key/
+    # cache_retention for prompt-cache accounting, and a wrapper that names each
+    # parameter explicitly breaks with a TypeError the moment it grows another.
+    # They're passed straight through so a harness run exercises the same cache
+    # routing a real run does.
+    def _logging_llm(prompt, system="", model=default_model, require_json=False,
+                     temperature=0.2, **kw):
         start = time.monotonic()
         try:
             raw = original_llm(prompt, system=system, model=model,
-                                require_json=require_json, temperature=temperature)
+                                require_json=require_json, temperature=temperature, **kw)
         except Exception as e:
             llm_calls.append({
                 "prompt": prompt, "system": system, "model": model, "temperature": temperature,

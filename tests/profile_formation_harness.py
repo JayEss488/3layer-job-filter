@@ -131,8 +131,11 @@ def main():
     sys.path.insert(0, str(ROOT / "backend"))
     sys.path.insert(0, str(ROOT))
 
-    from app.config import CV_SHORT_WORD_THRESHOLD, CV_SUMMARY_RAW_MAX_CHARS
+    from app.config import (
+        CV_SHORT_WORD_THRESHOLD, CV_SUMMARY_MAX_CHARS, CV_SUMMARY_RAW_MAX_CHARS,
+    )
     from app.services import families, parsing, profile_intel
+    from app.services.profile_intel import clip_summary
     from app.services.llm import CHEAP_MODEL, MID_MODEL, llm_json
 
     # SAMPLE_CV currently sits under CV_SHORT_WORD_THRESHOLD, so this run
@@ -176,9 +179,12 @@ def main():
         str(f.get("label")).strip() for f in (families_response.get("families") or [])
         if isinstance(f, dict) and str(f.get("label") or "").strip()
     ]
+    # Mirrors formation.persist_formation / profile_intel.generate_summary, both of
+    # which clip through profile_intel.clip_summary now -- a raw slice here would
+    # report a mid-word cut this harness's caller no longer gets in production.
     cv_summary = (
-        SAMPLE_CV.strip()[:CV_SUMMARY_RAW_MAX_CHARS] if is_short
-        else str(summary_response.get("cv_summary") or "").strip()
+        clip_summary(SAMPLE_CV, CV_SUMMARY_RAW_MAX_CHARS) if is_short
+        else clip_summary(str(summary_response.get("cv_summary") or ""), CV_SUMMARY_MAX_CHARS)
     )
 
     # Stage 3 simulates the family-rename reconciliation (families.py's

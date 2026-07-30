@@ -23,7 +23,10 @@ interface Props {
 
 /** Section markers emitted by engine._compose_analysis. */
 const QUALIFICATION = "§qualification";
+/** Retired at FINAL_EVAL_PROMPT_VERSION 23 — still parsed so verdicts judged
+ *  under 22 or earlier keep rendering their narrative until re-judged. */
 const AI_REASONING = "§ai-reasoning";
+const APPLY_HIGHLIGHTS = "§apply-highlights";
 
 interface Analysis {
   /** The judge's role-type + summary sentence pair, joined into one headline. */
@@ -37,7 +40,10 @@ interface Analysis {
   qualificationVerdict: string[];
   /** Concern count + bullets ("⚠ ..."/"- ..." lines) — behind "Show more". */
   qualification: string[];
-  /** One synthesized narrative paragraph — behind "Show more". */
+  /** What this employer screens on + what to lead with — behind "Show more". */
+  applyHighlights: string[];
+  /** Pre-v23 narrative paragraph — behind "Show more". Replaced by
+   *  `applyHighlights`; only ever populated on a not-yet-re-judged row. */
   aiReasoning: string[];
 }
 
@@ -57,14 +63,17 @@ interface Analysis {
  */
 function parseAnalysis(text: string): Analysis {
   const out: Analysis = {
-    headline: null, notes: [], legacy: [], qualificationVerdict: [], qualification: [], aiReasoning: [],
+    headline: null, notes: [], legacy: [], qualificationVerdict: [], qualification: [],
+    applyHighlights: [], aiReasoning: [],
   };
-  let bucket: "lead" | "qualification" | "aiReasoning" = "lead";
+  let bucket: "lead" | "qualification" | "applyHighlights" | "aiReasoning" = "lead";
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
     if (line === QUALIFICATION) {
       bucket = "qualification";
+    } else if (line === APPLY_HIGHLIGHTS) {
+      bucket = "applyHighlights";
     } else if (line === AI_REASONING) {
       bucket = "aiReasoning";
     } else if (bucket === "lead" && line.startsWith("§")) {
@@ -118,8 +127,17 @@ export function RoleCard({
   const companyLine = [role.company, role.location].filter(Boolean).join(" — ");
   const a = role.ai_analysis ? parseAnalysis(role.ai_analysis) : null;
   const hasNewSections =
-    !!a && (a.qualificationVerdict.length > 0 || a.qualification.length > 0 || a.aiReasoning.length > 0);
-  const hasDetail = !!a && (a.legacy.length > 0 || a.qualification.length > 0 || a.aiReasoning.length > 0);
+    !!a &&
+    (a.qualificationVerdict.length > 0 ||
+      a.qualification.length > 0 ||
+      a.applyHighlights.length > 0 ||
+      a.aiReasoning.length > 0);
+  const hasDetail =
+    !!a &&
+    (a.legacy.length > 0 ||
+      a.qualification.length > 0 ||
+      a.applyHighlights.length > 0 ||
+      a.aiReasoning.length > 0);
   const hasBody = !!a && (a.notes.length > 0 || a.qualificationVerdict.length > 0 || hasDetail);
   const facts = factChips(role);
   const verdict = role.verdict as RoleVerdict | null | undefined;
@@ -208,6 +226,14 @@ export function RoleCard({
                         >
                           {l}
                         </div>
+                      ))}
+                    </div>
+                  )}
+                  {a.applyHighlights.length > 0 && (
+                    <div className="an-sec">
+                      <div className="an-h">Highlight when applying</div>
+                      {a.applyHighlights.map((l, i) => (
+                        <div key={i}>{l}</div>
                       ))}
                     </div>
                   )}

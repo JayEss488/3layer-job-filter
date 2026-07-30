@@ -199,7 +199,7 @@ export default function SearchPage() {
             </div>
             <div className="annotation" style={{ padding: "0 0 8px" }}>
               Quick-scored by AI (about 2 minutes in). These are provisional — anything you
-              don&apos;t Keep will disappear once the full review finishes, at around 4 minutes,
+              don&apos;t Keep will disappear once the full review finishes, at around 5 minutes,
               if it doesn&apos;t make the final cut.
             </div>
             {verifying.map((role) => {

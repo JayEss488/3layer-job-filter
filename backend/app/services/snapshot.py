@@ -546,6 +546,31 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append("Sector interests: " + "; ".join(sector_targets))
     if location or work_types:
         cv_lines.append(f"Location: {location} ({', '.join(work_types) or 'any'})")
+    # GEOGRAPHY (the judge's LOCATION/VISA/RELOCATION disqualifier, part (a)) judges
+    # physical feasibility purely from the place name above unless told otherwise --
+    # which contradicts location_scope's own definition the moment scope isn't
+    # "local": "national" means the candidate is deliberately searching country-wide,
+    # not narrowed to their city (see snapshot.build_snapshot's scope handling), yet
+    # without this line the judge had no way to know that and would flag an on-site/
+    # hybrid role in a different city of the SAME country as "geographically
+    # impractical" -- exactly the scope the candidate opted into. Kept as its own
+    # line (not folded into "Location" above) so it reads as an instruction about how
+    # to apply GEOGRAPHY, not as another fact about the candidate.
+    _scope_note = {
+        "local": f"the candidate is searching only near {location or 'their stated location'} "
+                 "-- an on-site/hybrid role elsewhere is genuinely impractical for them.",
+        "national": "the candidate has deliberately opted into a country-wide search, not "
+                     f"narrowed to {location or 'their stated location'} -- an on-site/hybrid role "
+                     "elsewhere in their OWN country must NOT be treated as geographically "
+                     "impractical merely for being a different city or far away; only a role in a "
+                     "different country, or one requiring an already-held visa/right-to-work the "
+                     "candidate clearly lacks, fails GEOGRAPHY.",
+        "international": "the candidate has deliberately opted into a worldwide search -- distance "
+                          "or country alone is never grounds to fail GEOGRAPHY for them; only an "
+                          "explicit visa/right-to-work requirement they clearly can't meet does.",
+    }.get(scope)
+    if _scope_note:
+        cv_lines.append("Location search scope: " + _scope_note)
     # Its own line, separate from the place above, because the judge's
     # LOCATION/VISA/RELOCATION disqualifier runs two independent checks and was
     # conflating them: geography (can they physically take it) and stated

@@ -22,6 +22,7 @@ from ..models import JobSeen, Role, Setting
 SOURCES: list[dict] = [
     {"key": "reed",        "label": "Reed",             "kind": "api", "board_prefix": "reed"},
     {"key": "adzuna",      "label": "Adzuna",           "kind": "api", "board_prefix": "adzuna"},
+    {"key": "usajobs",     "label": "USAJOBS",          "kind": "api", "board_prefix": "usajobs"},
     {"key": "google_jobs", "label": "Google Jobs",      "kind": "api", "board_prefix": "google_jobs"},
     {"key": "jsearch",     "label": "JSearch",          "kind": "api", "board_prefix": "jsearch"},
     {"key": "careerjet",   "label": "Careerjet",        "kind": "api", "board_prefix": "careerjet"},

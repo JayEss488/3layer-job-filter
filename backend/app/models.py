@@ -296,7 +296,7 @@ class JobSeen(Base):
     # source-updated row is re-queued so a changed posting is re-scraped/re-judged.
     full_text = Column(Text)           # scraped page text, persisted so no re-scrape
     eval_verdict = Column(Text)        # strong|backup|reject (final-AI decision)
-    eval_analysis = Column(Text)       # JSON: summary/top_match_reason/concerns
+    eval_analysis = Column(Text)       # JSON: summary/filters_on/highlight/concerns
     eval_signature = Column(Text)      # profile signature at eval time (validity key)
     evaluated_at = Column(DateTime)
     # The gate-side twin of eval_signature: full_auto._profile_signature at the time

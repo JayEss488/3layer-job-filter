@@ -20,6 +20,7 @@ import random
 import re
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -71,6 +72,12 @@ def emit(msg: str):
 REED_API_KEY = os.getenv("REED_API_KEY", "")
 ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
 ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
+# USAJOBS: the US federal government's own hiring site. Free, self-service API --
+# register an email at https://developer.usajobs.gov/apirequest and a key comes
+# back by return. Needs BOTH a key and a registered User-Agent (the email itself,
+# not a browser string) on every request; see fetch_usajobs.
+USAJOBS_API_KEY = os.getenv("USAJOBS_API_KEY", "")
+USAJOBS_USER_AGENT = os.getenv("USAJOBS_USER_AGENT", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 # serper.dev: a cheaper Google *organic* search API (no Google-Jobs engine). We
 # prefer it over SerpAPI for the two organic-search jobs -- ATS-token discovery
@@ -103,8 +110,15 @@ CAREERJET_REFERER = os.getenv("CAREERJET_REFERER", "http://localhost/")
 # allows site: search, to get the precise query back with no other changes.
 SERPER_SITE_OPERATOR_OK = os.getenv("SERPER_SITE_OPERATOR_OK", "false").strip().lower() == "true"
 # Hard cap on (vendor, keyword) query combos per harvest_ats_tokens() call, so
-# one profile edit can't burn through the whole serper/CSE credit balance.
-ATS_HARVEST_MAX_QUERIES = int(os.getenv("ATS_HARVEST_MAX_QUERIES", "30"))
+# one profile edit can't burn through the whole serper/CSE credit balance. Sized
+# to the actual combo count: harvest.derive_keywords returns up to 16 keyword
+# phrases x the 6 ATS vendors here = 96 combos. At the old default of 30, a live
+# test (3 profiles, real CV text) showed the keyword-major loop exhausting the
+# budget after only ~5 of 16 keywords every time ("skipped 66 of 96 combos"),
+# silently discarding the back 11 keywords every run regardless of quality. 96
+# gives full coverage; only lower this back down alongside a lower
+# derive_keywords cap, or the same silent truncation comes back.
+ATS_HARVEST_MAX_QUERIES = int(os.getenv("ATS_HARVEST_MAX_QUERIES", "96"))
 # Alternate-source lookup on scrape failure (see _find_alternate_posting): when a
 # job's own link can't be scraped (dead link, click-tracking redirect, anti-bot
 # block), search for the same posting elsewhere by title+company before giving up
@@ -161,6 +175,7 @@ ADZUNA_DETAIL_MAX_WORKERS = int(os.getenv("ADZUNA_DETAIL_MAX_WORKERS", "3"))
 # the coverage trade-off stays visible per term.
 REED_PAGES_PER_TERM = int(os.getenv("REED_PAGES_PER_TERM", "1"))
 ADZUNA_PAGES_PER_TERM = int(os.getenv("ADZUNA_PAGES_PER_TERM", "1"))
+USAJOBS_PAGES_PER_TERM = int(os.getenv("USAJOBS_PAGES_PER_TERM", "1"))
 
 DEBUG_SAVE_RAW = True
 
@@ -904,6 +919,68 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
     return jobs
 
 
+def _usajobs_to_float(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_usajobs(query: str, location: str = "", country_code: str = "us", pages: int = 1) -> List[Dict]:
+    """USAJOBS is the US federal government's own hiring site -- covers federal
+    (plus some excepted-service/legislative) postings no other source here
+    reaches at all. Skips execution if the profile's resolved country isn't US,
+    or no key/User-Agent is registered (see USAJOBS_API_KEY/USAJOBS_USER_AGENT).
+    `location` is a city/state string; empty means nationwide (LocationName
+    omitted), the same convention fetch_reed/fetch_adzuna use for national/
+    international scope."""
+    if (country_code or "us").strip().lower() != "us" or not USAJOBS_API_KEY or not USAJOBS_USER_AGENT:
+        return []
+
+    url = "https://data.usajobs.gov/api/search"
+    headers = {
+        "Host": "data.usajobs.gov",
+        "User-Agent": USAJOBS_USER_AGENT,
+        "Authorization-Key": USAJOBS_API_KEY,
+    }
+    page_size = 250  # USAJOBS' max ResultsPerPage
+    jobs: List[Dict] = []
+    last_page_full = False
+    for page in range(1, pages + 1):
+        params = {"Keyword": query, "ResultsPerPage": page_size, "Page": page}
+        if location and location.strip():
+            params["LocationName"] = location
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=12)
+            results = r.json().get("SearchResult", {}).get("SearchResultItems", [])
+        except Exception as e:
+            emit(f"   [!] USAJOBS API Error: {e}")
+            last_page_full = False
+            break
+        for item in results:
+            job = item.get("MatchedObjectDescriptor", {}) or {}
+            remun = (job.get("PositionRemuneration") or [{}])[0]
+            summary = ((job.get("UserArea") or {}).get("Details") or {}).get("JobSummary", "")
+            jobs.append({
+                "board": "usajobs",
+                "title": job.get("PositionTitle", ""),
+                "company": job.get("OrganizationName", ""),
+                "url": job.get("PositionURI", ""),
+                "location": job.get("PositionLocationDisplay", ""),
+                "salary_min": _usajobs_to_float(remun.get("MinimumRange")),
+                "salary_max": _usajobs_to_float(remun.get("MaximumRange")),
+                "snippet": summary,
+                "posted_at": _loose_date_to_iso(job.get("PublicationStartDate")),
+                "expires_at": _loose_date_to_iso(job.get("ApplicationCloseDate")),
+            })
+        last_page_full = len(results) >= page_size
+        if len(results) < page_size:
+            break
+    if last_page_full:
+        emit(f"   [usajobs] '{query}': page cap ({pages}) hit with a full page -- more results likely available")
+    return jobs
+
+
 def fetch_remotive(query: str) -> List[Dict]:
     """Queries global remote listings filtered cleanly by search term."""
     url = f"https://remotive.com/api/remote-jobs?search={query}&limit=50"
@@ -1460,6 +1537,22 @@ class AdzunaSource:
         return out
 
 
+class USAJobsSource:
+    # "fast" tier like Reed/Adzuna: a plain, free, structured-API call that
+    # self-gates to nothing for a non-US profile (see fetch_usajobs), so it
+    # costs nothing to include unconditionally.
+    name, tier = "usajobs", "fast"
+    def fetch_term(self, profile, term):
+        return fetch_usajobs(term, _geo_scoped_location(profile),
+                             profile.get("adzuna_country_code", "gb"),
+                             pages=USAJOBS_PAGES_PER_TERM)
+    def fetch(self, profile, since=None):
+        out: List[Dict] = []
+        for term in _terms(profile):
+            out.extend(self.fetch_term(profile, term))
+        return out
+
+
 class GoogleJobsSource:
     name, tier = "google_jobs", "broad"   # organic discovery via serper.dev/SerpAPI
     def fetch_term(self, profile, term):
@@ -1859,8 +1952,11 @@ def select_sources_for_run(profile: Dict) -> List[JobSource]:
     # measured UK run collapsed onto careerjet when Adzuna flaked. So join it to
     # the always-on tier ONLY for countries Adzuna can't serve; elsewhere it stays
     # available via the per-source toggle. Reed adds nothing to this test: it's
-    # gb-only and gb is Adzuna-supported.
-    always = [AdzunaSource(), ReedSource(), GoogleJobsSource()]
+    # gb-only and gb is Adzuna-supported. USAJobs is the US federal government's
+    # own hiring site -- free, and (like Reed) self-gates to nothing for a
+    # non-US profile, so it costs nothing to include unconditionally; it's the
+    # only source here that reaches federal postings at all.
+    always = [AdzunaSource(), ReedSource(), GoogleJobsSource(), USAJobsSource()]
     if (profile.get("adzuna_country_code") or "gb").strip().lower() not in _ADZUNA_SUPPORTED:
         always.append(CareerjetSource())
     # Remaining credit-heavy / overlapping sources: one per run on rotation keeps
@@ -1868,20 +1964,18 @@ def select_sources_for_run(profile: Dict) -> List[JobSource]:
     rotation = [JSearchSource(), RemotiveSource()]
 
     cur = _load_cursor(profile)
-    # First run uses the always-on sources (Adzuna, Reed, Google Jobs) across
-    # several terms so one narrow term can't zero it out. Google Jobs adds some
-    # SerpAPI latency/credits here, but it's the first run's best shot at the
-    # Workday/SmartRecruiters/custom-site tier we can't integrate directly.
-    if profile.get("first_run"):
-        profile["search_terms_batch"] = terms[:TERMS_PER_RUN]
-        return always
-
-    # Later runs: slide a window over the term list so successive runs explore
-    # different terms, and add one rotating broad source. Wrap the window with
-    # modulo indexing rather than a plain slice -- a slice near the tail of
-    # `terms` silently returns fewer than TERMS_PER_RUN terms (the `or
-    # terms[:TERMS_PER_RUN]` fallback below only fires when the slice is fully
-    # empty, not merely short), so a run could under-query without any signal.
+    # Slide a window over the term list so successive runs explore different
+    # terms, and add one rotating broad source -- including on the first run.
+    # cur=0 naturally selects terms[:TERMS_PER_RUN] and rotation[0] (JSearch),
+    # so no special-casing is needed there; this used to hard-return `always`
+    # only on first_run, which meant a niche/non-tech profile (whose ATS batch
+    # is mostly irrelevant, see the always-on comment above) got zero benefit
+    # from JSearch/Remotive on the one run that most needs the extra breadth.
+    # Wrap the window with modulo indexing rather than a plain slice -- a slice
+    # near the tail of `terms` silently returns fewer than TERMS_PER_RUN terms
+    # (the `or terms[:TERMS_PER_RUN]` fallback below only fires when the slice
+    # is fully empty, not merely short), so a run could under-query without
+    # any signal.
     n = len(terms)
     if n <= TERMS_PER_RUN:
         profile["search_terms_batch"] = list(terms)
@@ -1949,7 +2043,8 @@ def select_ats_batch_for_run(profile: Dict) -> List[tuple]:
 
 def gather_jobs(profile: Dict) -> List[Dict]:
     """Orchestrates job harvesting: rotated source tier(s) + a batch of ATS
-    feeds, all fetched concurrently. Tiered + cheap on the first run."""
+    feeds, all fetched concurrently -- the rotation tier runs from the first
+    run onward (see select_sources_for_run)."""
     # Per-source visibility toggle: the backend passes the set of disabled source
     # keys (API source names like "adzuna"/"google_jobs" and ATS vendor names like
     # "greenhouse"/"lever"). Anything in it is skipped for this run.
@@ -2180,7 +2275,7 @@ def delete_company_ats(vendor: str, token: str) -> None:
     conn.close()
 
 
-def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
+def harvest_ats_tokens(sector_keywords: List[str], location: str = "") -> List[tuple]:
     """Maintenance job (not run on every search): finds company ATS board tokens
     via a domain-targeted search, then upserts them into company_ats. Prefers
     serper.dev (cheap, avoids the SerpAPI limit) and falls back to SerpAPI. Run
@@ -2192,7 +2287,23 @@ def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
     free plan) -- see SERPER_SITE_OPERATOR_OK. A per-call query budget
     (ATS_HARVEST_MAX_QUERIES) protects the credit balance, and a circuit
     breaker stops the whole run the first time serper rejects a query pattern,
-    instead of repeating the same rejection for every remaining combo."""
+    instead of repeating the same rejection for every remaining combo.
+
+    `location` (a plain place name, e.g. "Dubai" or "United Arab Emirates" --
+    see harvest.py's caller for how it's derived from the candidate's own
+    location attribute) is an optional SOFT bias appended to the query text,
+    not a hard filter: a live test harvesting for a Dubai-based candidate with
+    no location term found 78 companies, every one a US/European tech company,
+    because the search has nothing else to prefer a company with an actual
+    regional presence. Deliberately not a hard geographic filter at validation
+    time -- that would need to inspect every found company's live job locations
+    and would risk dropping a genuinely relevant company that simply has no
+    open req in that country/region right now (e.g. a remote-friendly
+    employer); the real per-listing location enforcement already happens
+    downstream in the main discovery pipeline (_filter_by_country, the cheap
+    gate's work-arrangement axis, the final judge's LOCATION disqualifier) once
+    an actual job from this company is discovered, so this only needs to bias
+    which companies get found in the first place, not gate them here."""
     if not (SERPER_DEV_API_KEY or SERPAPI_KEY):
         emit("   [!] No SERPER_DEV_API_KEY or SERPAPI_KEY set; cannot harvest ATS tokens.")
         return []
@@ -2237,7 +2348,8 @@ def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
         domain = site_domains[vendor]
         token_re = token_res[vendor]
         if SERPER_DEV_API_KEY:
-            query = f"site:{domain} {keyword}" if SERPER_SITE_OPERATOR_OK else f"{keyword} {domain}"
+            base = f"site:{domain} {keyword}" if SERPER_SITE_OPERATOR_OK else f"{keyword} {domain}"
+            query = f"{base} {location}" if location else base
             links_raw, rejected = _serper_search_raw(query, num=20)
             if rejected:
                 serper_blocked = True
@@ -2249,7 +2361,7 @@ def harvest_ats_tokens(sector_keywords: List[str]) -> List[tuple]:
             links = [res.get("link", "") for res in links_raw]
         else:
             # SerpAPI's free tier isn't blocked on site:, so keep using it there.
-            query = f"site:{domain} {keyword}"
+            query = f"site:{domain} {keyword} {location}" if location else f"site:{domain} {keyword}"
             try:
                 r = requests.get("https://serpapi.com/search",
                                  params={"engine": "google", "q": query, "api_key": SERPAPI_KEY},
@@ -2384,8 +2496,85 @@ def clean_json(raw: str) -> str:
     return raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
 
+# ── Prompt-cache accounting ───────────────────────────────────────────────────
+# Every prompt in this pipeline is a long FIXED prefix followed by a short
+# variable payload (screen/rank: the whole profile block, then the listings;
+# judge: the entire system prompt, then the CV + jobs), which is exactly the
+# shape OpenAI's automatic prompt caching discounts. Nothing here used to read
+# `usage` back, so whether that discount was actually landing was unknowable --
+# and the fixed prefixes are big enough (screen ~4.5k, rank ~2.5k, judge ~12k
+# tokens) that the answer is worth roughly 110k tokens a run. These counters make
+# it observable per stage; engine.py resets them per run and reports the rollup
+# into funnel_counts.
+_LLM_USAGE_LOCK = threading.Lock()
+_LLM_USAGE: dict[str, dict[str, int]] = {}
+
+
+def reset_llm_usage() -> None:
+    with _LLM_USAGE_LOCK:
+        _LLM_USAGE.clear()
+
+
+def llm_usage_snapshot() -> dict[str, dict[str, int]]:
+    with _LLM_USAGE_LOCK:
+        return {k: dict(v) for k, v in _LLM_USAGE.items()}
+
+
+def _record_llm_usage(stage: str, model: str, usage) -> None:
+    """Accumulate one call's token usage under `stage`. Tolerates a missing or
+    partial `usage` object (some error paths and non-OpenAI-compatible proxies
+    omit it) rather than letting accounting break a real pipeline stage."""
+    if not stage or usage is None:
+        return
+    try:
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0)
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+    except Exception:
+        return
+    with _LLM_USAGE_LOCK:
+        row = _LLM_USAGE.setdefault(
+            stage, {"calls": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+        )
+        row["calls"] += 1
+        row["prompt_tokens"] += prompt_tokens
+        row["cached_tokens"] += cached
+        row["completion_tokens"] += completion
+        row["model"] = model
+
+
+def emit_llm_usage_summary() -> dict[str, dict[str, int]]:
+    """One console line per stage: prompt tokens, how many of them were served
+    from the prompt cache, and the resulting hit rate. A hit rate near zero on a
+    stage with a multi-thousand-token fixed prefix means the cache is not being
+    reused and the prefix is being paid for in full on every call -- which is the
+    specific failure `prompt_cache_key` below exists to prevent."""
+    snap = llm_usage_snapshot()
+    for stage, row in sorted(snap.items()):
+        prompt_tokens = row.get("prompt_tokens", 0)
+        cached = row.get("cached_tokens", 0)
+        pct = (100.0 * cached / prompt_tokens) if prompt_tokens else 0.0
+        emit(f"[tokens] {stage:<8} {row.get('model','?')}: {row.get('calls',0)} calls, "
+             f"{prompt_tokens} prompt ({cached} cached, {pct:.0f}%), "
+             f"{row.get('completion_tokens',0)} completion")
+    return snap
+
+
 def llm(prompt: str, system: str = "", model: str = CHEAP_MODEL,
-        require_json: bool = False, temperature: float = 0.2) -> str:
+        require_json: bool = False, temperature: float = 0.2,
+        stage: str = "", cache_key: str = "", cache_retention: str = "") -> str:
+    """`cache_key` is OpenAI's `prompt_cache_key` -- a ROUTING hint only. Requests
+    sharing one are steered to the same cache, which is what this pipeline needs:
+    it fires its calls concurrently (4-wide gate batches, all clusters at once,
+    concurrent judge chunks), and concurrent requests otherwise spread across
+    machines and each miss a prefix the others just wrote. It can never serve the
+    wrong cache -- the API still requires an exact prefix match, so a stale or
+    coarse key costs at most a miss.
+
+    `cache_retention="24h"` extends a prefix's lifetime past the default few
+    minutes of inactivity. Worth it only for a prefix that is identical across
+    RUNS, not merely within one -- see the judge call site."""
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
@@ -2394,8 +2583,13 @@ def llm(prompt: str, system: str = "", model: str = CHEAP_MODEL,
     args = {"model": model, "messages": msgs, "temperature": temperature}
     if require_json:
         args["response_format"] = {"type": "json_object"}
-        
+    if cache_key:
+        args["prompt_cache_key"] = cache_key
+    if cache_retention:
+        args["prompt_cache_retention"] = cache_retention
+
     resp = client.chat.completions.create(**args)
+    _record_llm_usage(stage, model, getattr(resp, "usage", None))
     return resp.choices[0].message.content.strip()
 
 
@@ -2699,6 +2893,49 @@ def seniority_gate(candidates: list[dict], profile: dict) -> list[dict]:
 
 
 _SENIORITY_BAD_CODES = ("seniority_high", "seniority_low", "too_many_gaps")
+
+# Deterministic backstop for the ENTRY-LEVEL FLOOR text in _screen_prompt below.
+# Measured (tests/tier_analysis.py, 2026-07-29): the cheap model does not reliably
+# apply that rule across a full _GATE_BATCH-sized call -- an unambiguous
+# "Graduate X"/"Junior X" listing flipped between seniority_ok true/false across
+# otherwise-identical repeated calls at temperature=0 (same batch, same listings,
+# same prompt). Rather than trust the model to get this right every time, a title
+# match forces the correction in code. Deliberately narrow in two ways: (1) only
+# "graduate"/"junior"/"entry-level" tokens, NOT "intern"/"trainee"/"apprentice"/
+# "placement" -- those interact with the APPRENTICESHIP carve-out above, which is
+# SUPPOSED to still fail some of them, and this must not swallow that; (2) only
+# overrides "seniority_low" (candidate outranks the role), never "seniority_high"
+# or "too_many_gaps" -- a title containing "graduate" out of context (e.g.
+# "Graduate Program Director") could still genuinely be _high, and that direction
+# was never the failure mode observed, so it's left to the model untouched.
+_UNAMBIGUOUS_ENTRY_TITLE_RE = re.compile(r"\b(graduate|junior|entry[- ]level)\b", re.I)
+_CANDIDATE_JUNIOR_WORDS = ("intern", "graduate", "entry", "junior", "student", "trainee",
+                           "apprentice", "placement")
+
+
+def _apply_entry_level_floor(candidates: list[dict], profile: dict) -> int:
+    """Corrects any "seniority_low" verdict screen_gate gave an unambiguous
+    graduate/junior/entry-level-titled listing, for a candidate whose own stated
+    seniority is itself Graduate/Junior/Entry (etc.) -- see the constants above
+    for why. Runs on EVERY candidate (cache-hit or freshly judged) so a stale
+    cached mis-verdict self-corrects too, not just a fresh one. Deliberately
+    applied AFTER gate_cache is written (see the call site) so the cache keeps
+    storing the model's own raw verdict -- still auditable via
+    tests/gate_harness.py -- while every consumer sees the corrected one."""
+    seniority = (profile.get("seniority") or "").lower()
+    if not any(w in seniority for w in _CANDIDATE_JUNIOR_WORDS):
+        return 0
+    fixed = 0
+    for c in candidates:
+        if c.get("_seniority_ok") is False and _UNAMBIGUOUS_ENTRY_TITLE_RE.search(c.get("title") or ""):
+            parts = (c.get("_gate_reason") or "").split("|")
+            if parts and parts[0] == "seniority_low":
+                c["_seniority_ok"] = True
+                c["_seniority_signal"] = None
+                parts[0] = "ok"
+                c["_gate_reason"] = "|".join(parts)
+                fixed += 1
+    return fixed
 
 
 def _annotate_with_weight_tiers(
@@ -3293,6 +3530,7 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             reqs: dict[int, list[dict]] = {}
             try:
                 raw = llm(_screen_prompt(profile, listing_block), require_json=True, temperature=0,
+                          stage="screen", cache_key=f"screen_v14:{sig}",
                           system="You screen job listings for role-function fit (match/ambiguous/"
                                  "mismatch), the candidate's own hard filters, whether the text is even "
                                  "a real single job posting, seniority, requirements, skills, salary, "
@@ -3423,6 +3661,7 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
                 new_entries.extend(entries)
 
     _gate_cache_store(new_entries)
+    entry_floor_fixed = _apply_entry_level_floor(candidates, profile)
     in_sector = sum(1 for c in candidates if c.get("_sector_ok"))
     ambiguous_sector = sum(1 for c in candidates if c.get("_sector_ambiguous"))
     soft_fail_counts = [
@@ -3438,9 +3677,11 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     # finding one direction of mismatch.
     seniority_high = sum(1 for c in candidates if (c.get("_gate_reason") or "").split("|")[0] == "seniority_high")
     seniority_low = sum(1 for c in candidates if (c.get("_gate_reason") or "").split("|")[0] == "seniority_low")
+    fixed_note = f", {entry_floor_fixed} entry-level-floor override(s)" if entry_floor_fixed else ""
     emit(f"[gate:screen] {len(candidates)} in -> {in_sector} in-sector ({ambiguous_sector} ambiguous), "
          f"{all_soft_ok} pass all soft axes, {hard_dropped} hard-dropped ({threshold}+ soft-axis "
-         f"failures), seniority drops: {seniority_high} high / {seniority_low} low ({n_cached} from cache)")
+         f"failures), seniority drops: {seniority_high} high / {seniority_low} low{fixed_note} "
+         f"({n_cached} from cache)")
     return candidates
 
 
@@ -3451,6 +3692,28 @@ def _listing_salary_suffix(c: dict) -> str:
     if salary_min and salary_max:
         return f" | Salary: {salary_min}-{salary_max}"
     return f" | Salary: {salary_min or salary_max}"
+
+
+def _location_scope_note(profile: dict) -> str:
+    """Human-readable gloss on profile['location_scope'] for the HARD DOWNGRADE (d)
+    GEOGRAPHY check below -- without it, the model has only the candidate's raw place
+    name and no way to know "national"/"international" scope means they deliberately
+    opted OUT of a city-radius search (see snapshot.build_snapshot's location_scope
+    handling), so it judged bare distance instead and downgraded a same-country
+    on-site/hybrid role for merely being far from the candidate's city -- exactly the
+    scope a national search opts into. Mirrors the "Location search scope" CV line
+    snapshot.py adds for the final judge (same fix, same reasoning, independent text
+    since this stage builds its prompt from profile fields, not the synthetic CV)."""
+    scope = (profile.get("location_scope") or "national").lower()
+    location = profile.get("location") or "their stated location"
+    if scope == "local":
+        return f"local -- only near {location} is workable; a distant on-site/hybrid role is impractical."
+    if scope == "international":
+        return "international -- the candidate will consider on-site/hybrid roles anywhere in the world; distance/country alone is never a GEOGRAPHY downgrade for them, only an unmet visa/right-to-work requirement is."
+    return (f"national -- the candidate opted into a country-wide search, not narrowed to {location}; "
+            "an on-site/hybrid role elsewhere in their OWN country is NOT a GEOGRAPHY downgrade merely "
+            "for being a different city or far away, only a different country or an unmet visa/"
+            "right-to-work requirement is.")
 
 
 def _rank_prompt(profile: dict, listing_block: str) -> str:
@@ -3483,6 +3746,7 @@ Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms')
 Candidate seniority: {profile.get('seniority', 'mid-level')}
 Candidate core skills: {_annotate_with_weight_tiers(profile.get('key_skills') or [], profile.get('skill_weight_tiers'), profile.get('skill_evidence_tiers'))}
 Candidate location: {profile.get('location') or 'none stated'}
+Candidate location search scope: {_location_scope_note(profile)}
 Candidate work-type preference: {', '.join(profile.get('work_types') or []) or 'none stated'}
 Candidate stated salary floor: {salary_floor if salary_floor else 'none stated'}
 {_candidate_background_block(profile)}{multi_note}
@@ -3524,8 +3788,12 @@ d. LOCATION / WORK ARRANGEMENT: first classify the LISTING's own arrangement -- 
    city/office with no remote/hybrid mention means ON-SITE there (never remote-by-default). Two
    separate downgrades follow from that, and BOTH count:
    - GEOGRAPHY: the classified arrangement clearly cannot work given the candidate's stated location
-     (e.g. on-site or hybrid in another country), or the listing requires an already-held work
-     permit / right-to-work in a country that clearly isn't the candidate's.
+     search scope (see "Candidate location search scope" above -- it defines what "cannot work"
+     means and overrides a bare distance/city reading: under "national" scope, an in-country on-site
+     or hybrid role is NEVER a GEOGRAPHY failure merely for being a different city or far away, and
+     under "international" scope distance/country alone is never one either), or the listing requires
+     an already-held work permit / right-to-work in a country that clearly isn't the candidate's --
+     that half applies regardless of scope.
    - STATED ARRANGEMENT: the classified arrangement matches NONE of the candidate's stated work-type
      preferences above. A fully REMOTE listing is not automatically fine -- remote is always
      geographically workable, but a candidate who listed On-site and/or Hybrid and did NOT list
@@ -3636,11 +3904,21 @@ def _score_rank_batch(
     rank_temperature = 1 if MID_MODEL in _FIXED_TEMPERATURE_MODELS else 0
     rank_system = ("You estimate rough candidate-job fit scores. Spread scores out; "
                     "don't cluster everything near one value.")
+    # Prompt-cache routing key. Mirrors the gate_cache key's own scoping (profile
+    # signature + intent hash) because those are exactly the profile facets
+    # _rank_prompt interpolates ABOVE the listing block, i.e. what the shared
+    # ~2.5k-token prefix is made of. Recomputed per batch rather than threaded
+    # down from rank_gate: it's one small sha1 against several thousand tokens of
+    # prompt, and keeping it local means the two concurrent batch workers can't
+    # disagree about it.
+    rank_cache_key = (f"rank_v13:{_profile_signature(profile)}:"
+                      + hashlib.sha1((profile.get("intent_text") or "")
+                                     .strip().lower().encode()).hexdigest()[:8])
 
     raw = None
     try:
         raw = llm(prompt, require_json=True, temperature=rank_temperature, model=MID_MODEL,
-                  system=rank_system)
+                  system=rank_system, stage="rank", cache_key=rank_cache_key)
     except Exception as e:
         status = getattr(e, "status_code", None)
         resp = getattr(e, "response", None)
@@ -3661,14 +3939,15 @@ def _score_rank_batch(
         time.sleep(wait)
         try:
             raw = llm(prompt, require_json=True, temperature=rank_temperature, model=MID_MODEL,
-                      system=rank_system)
+                      system=rank_system, stage="rank", cache_key=rank_cache_key)
         except Exception as e2:
             status2 = getattr(e2, "status_code", None)
             emit(f"[gate:rank] {MID_MODEL} retry also failed (status={status2}): {e2}; "
                  f"falling back to {CHEAP_MODEL}.")
             try:
                 raw = llm(prompt, require_json=True, temperature=0, model=CHEAP_MODEL,
-                          system=rank_system)
+                          system=rank_system, stage="rank_fallback",
+                          cache_key=rank_cache_key)
             except Exception as e3:
                 emit(f"[gate:rank] {CHEAP_MODEL} fallback also failed ({e3}); "
                      f"no rank signal for this batch.")
@@ -3717,8 +3996,18 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     phrase, "" if none) in place and returns the full list unfiltered -- the
     caller applies its own cutoff (e.g. drop the bottom fraction, cap at N).
     Cached per (profile signature + intent hash, job id) in gate_cache under
-    gate="rank_v12.{intent_tag}"
-    (bumped from "rank_v11": HARD DOWNGRADE (d) was a pure FEASIBILITY test -- "clearly
+    gate="rank_v13.{intent_tag}"
+    bumped from "rank_v12": the GEOGRAPHY half of HARD DOWNGRADE (d) judged bare
+    distance between the candidate's stated place and the listing's, with no idea the
+    candidate's location_scope ("local"/"national"/"international") had already opted
+    them INTO a country-wide or worldwide search -- so a "national"-scope candidate's
+    in-country on-site/hybrid role could still be downgraded to <=15 for merely being a
+    distant city, exactly the scope national search exists to allow. The prompt now
+    carries a "Candidate location search scope" line (_location_scope_note) that
+    GEOGRAPHY must defer to instead of inferring from distance alone. A v12 score for
+    any non-remote listing may have been reached under a rule that could not tell
+    "far away" from "outside the candidate's declared scope" apart.
+    "rank_v12" (bumped from "rank_v11": HARD DOWNGRADE (d) was a pure FEASIBILITY test -- "clearly
     cannot work given the candidate's stated location" -- which a fully-remote listing
     always passes, so a candidate's stated On-site/Hybrid preference could never fire it.
     It is now split into a geography half and a stated-arrangement half, so a v11 score
@@ -3787,13 +4076,12 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    # "rank_v12" (not "rank_v11"): the gate name doubles as part of the cache key, and
+    # "rank_v13" (not "rank_v12"): the gate name doubles as part of the cache key, and
     # _gate_cache_key has no model field -- bumping it forces every previously
-    # scored job to be re-ranked under the reworded prompt (now with the shared-title
-    # carve-out, the candidate's own intent text, the training-scheme
-    # over-qualification downgrade, and HARD DOWNGRADE (d)'s stated-arrangement
-    # half, see the docstring) instead of
-    # serving a stale score forever. Bump again if the rank model/prompt changes again.
+    # scored job to be re-ranked under the reworded prompt (now GEOGRAPHY-vs-
+    # location_scope aware instead of judging bare distance, see the docstring)
+    # instead of serving a stale score forever. Bump again if the rank model/prompt
+    # changes again.
     #
     # The intent text is folded into the GATE NAME rather than into
     # _profile_signature, which is shared with screen_gate: screen_gate is
@@ -3805,7 +4093,7 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     intent_tag = hashlib.sha1(
         (profile.get("intent_text") or "").strip().lower().encode()
     ).hexdigest()[:8]
-    keys = [_gate_cache_key(f"rank_v12.{intent_tag}", sig, _gate_job_id(c)) for c in candidates]
+    keys = [_gate_cache_key(f"rank_v13.{intent_tag}", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -4426,19 +4714,35 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
+# 22 (from 21): DISQUALIFIER 2(a) GEOGRAPHY now defers to the profile's new "Location
+# search scope" CV line (snapshot.build_snapshot) instead of judging bare distance
+# between the candidate's stated place and the listing's. A "national"/"international"
+# scope means the candidate deliberately opted into a country-wide/worldwide search
+# (see location_scope in CLAUDE.md/snapshot.py), but v21 GEOGRAPHY had no access to
+# that and would still exclude an on-site/hybrid role for merely being a different,
+# distant city in the candidate's OWN country -- a live case rejected a Newcastle
+# hybrid role for a Southend candidate searching nationally as "geographically
+# impractical", when national scope exists precisely to allow that. A v21 verdict was
+# reached under a rule that could not tell "far away" from "outside the candidate's
+# declared scope" apart.
 # 21 (from 20): DISQUALIFIER 2 (LOCATION/VISA/RELOCATION) split into a geography
 # check and a stated-work-arrangement check. Under v20 the rule ended "If location is
 # remote ... do not raise a location objection", so a fully-remote listing was waved
 # through for every candidate, whatever they had stated -- and NO LOCATION COMMENTARY
 # forbade even mentioning it in "concerns", so the judge could neither reject nor flag
 # it. A v20 verdict was reached under a rule that could not fail a remote role.
-FINAL_EVAL_PROMPT_VERSION = 21
+FINAL_EVAL_PROMPT_VERSION = 23
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
 (stated as mandatory -- "must have", "required", "X+ years required", a named eligibility
 restriction) or SOFT (a preference or ideal-candidate sketch -- "would suit", "ideal for",
-"we'd love", "looking for someone with roughly", "a nice to have"). "Would suit X" / "ideal
+"we'd love", "looking for someone with roughly", "a nice to have"). THIS VOCABULARY IS ALWAYS
+SOFT, whatever follows it and however central the thing sounds: "ideally", "preferably",
+"desirable", "desired", "advantageous", "an advantage", "a plus", "a bonus", "beneficial",
+"welcome", "we'd like to see", "experience with X would be great", "familiarity with X is
+helpful", "X or Y a plus". A list of named tools introduced by any of those words (e.g.
+"ideally Databricks or Snowflake") is a wish-list, not a bar. "Would suit X" / "ideal
 candidate has X" / "would suit someone with roughly N months/years" is SOFT regardless of any
 number attached -- it describes who tends to apply, not a condition of hire. Only a HARD
 clause may disqualify a role; a SOFT one is judged as a normal fit signal instead (and noted
@@ -4478,7 +4782,14 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    (a) GEOGRAPHY -- can the candidate physically take it? If the role's location under that
    classification (or an explicit on-site/relocation/visa/work-authorization requirement in the text)
    clearly puts it outside where the candidate can realistically work, exclude it. A remote role, or
-   one plainly compatible with the candidate's location above, passes this check.
+   one plainly compatible with the candidate's location above, passes this check. If the profile
+   carries a "Location search scope" line, it defines what "outside where the candidate can
+   realistically work" means and OVERRIDES a bare distance/city/country reading -- a "national" or
+   "international" scope means an in-country (respectively, any-country) on-site/hybrid role is NOT
+   geographically impractical merely for being far from the candidate's stated place; per that line,
+   GEOGRAPHY then fails only for what it explicitly still allows (e.g. a different country under
+   "national" scope, or an unmet visa/right-to-work requirement under either). Never fail GEOGRAPHY
+   on distance alone when that line says the candidate opted into a country-wide or worldwide search.
    (b) STATED WORK ARRANGEMENT -- is it the arrangement they asked for? The candidate profile may
    carry a "Work arrangement" line listing the arrangements they want (On-site / Hybrid / Remote,
    any combination). If it does, the listing's classified arrangement must match at least ONE of
@@ -4601,7 +4912,7 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    exclude on that basis - keep the role and, if the point is material, note it as a concern for the
    candidate to verify. If the profile states no such hard filters, this rule does not apply."""
 
-_FINAL_EVAL_WORDING = """WORDING: When you reference the candidate's OWN background in "summary", "top_match_reason" or
+_FINAL_EVAL_WORDING = """WORDING: When you reference the candidate's OWN background in "summary", "highlight" or
 "concerns", never state a leadership or founder title (e.g. president, chair, founder, co-founder,
 cofounder, CEO, director, co-lead) on its own. If such a title came from a student club, society, campaign
 group, fellowship, or other informal/unpaid activity, name the SPECIFIC organisation or activity it belongs
@@ -4622,7 +4933,7 @@ translate it into what that actually means in practice. Do not let "summary" res
 different words - see reasoning step F for the no-overlap rule between them.
 
 NO LOCATION COMMENTARY: never mention location, remote/hybrid/on-site arrangement, relocation, or visa
-status in "summary", "role_type", "can_do_fit", "concerns", or "top_match_reason" - that's already shown
+status in "summary", "role_type", "can_do_fit", "concerns", or "highlight" - that's already shown
 to the candidate via the work_style fact and handled by the LOCATION/VISA/RELOCATION disqualifier above,
 so repeating it in prose is redundant noise, not a fit signal."""
 
@@ -4666,7 +4977,7 @@ _FINAL_EVAL_STRONG_RULES = """8. EVIDENCE STRENGTH: The candidate's background p
    soft-skill/reliability anecdote (e.g. safety-critical responsibility, leadership of an unrelated
    activity, an Informal-tagged role, or a Self-directed/Academic/AI-assisted-tagged skill), that is NOT
    evidence the requirement is met unless the connection to the requirement is direct and explicitly
-   stated - do not present it as satisfying the requirement in "can_do_fit" or "top_match_reason". Put
+   stated - do not present it as satisfying the requirement in "can_do_fit" or "highlight". Put
    any such gap in "concerns" instead, naming the specific origin/depth limitation (e.g. "Salesforce
    experience is self-directed/sandbox, not production or paid use").
    Also weigh CUMULATIVE nice-to-have gaps: several compounding smaller gaps (e.g. no fintech background
@@ -4691,7 +5002,7 @@ B. Assess WANT-FIT and CAN-DO-FIT SEPARATELY -- they are different questions:
      well-qualified for but clearly does NOT want (wrong function, a domain they've moved away from,
      something their own words rule out) is NOT a strong fit however well the skills line up. A strong
      can-do-fit must never paper over a weak want-fit. This assessment isn't reported in its own field --
-     it feeds the strong/backup decision and the synthesis in "top_match_reason" (step E below).
+     it feeds the strong/backup decision, and a want-fit mismatch worth flagging goes in "concerns".
    - can-do-fit: can the candidate actually DO the job to the REAL bar from A -- weighing evidence
      STRENGTH, not mere presence (see EVIDENCE STRENGTH). "Used professionally, 2 years" is strong
      evidence; "self-directed, one project" is weak evidence for the very same skill tag. Report this
@@ -4758,9 +5069,12 @@ D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the c
            the checklist as X itself with "met": false if there is no evidence of X (see the capacity
            rule above) -- but an employer who is budgeting to teach X is not screening on X, so it
            cannot be a core requirement.
-       (b) The JD explicitly labels it beneficial / desirable / advantageous / "a plus" / "highly
-           beneficial" / "not essential". The posting's own word for it governs, even where the skill
-           sounds central to you.
+       (b) The JD introduces it with any of the SOFT vocabulary in QUOTE-THEN-CLASSIFY above --
+           beneficial / desirable / advantageous / "a plus" / "a bonus" / "not essential", and
+           equally "ideally", "preferably", "welcome", "would be great". "Ideally Databricks or
+           Snowflake" is a secondary item, exactly like "Databricks desirable". The posting's own
+           word for it governs, even where the named tool sounds central to you, and this holds
+           whether the ask is one skill or a list of alternatives.
        (c) The JD states it as a preference while stating a DIFFERENT, weaker bar as the actual
            requirement (e.g. "degree in a quantitative subject preferred; 2:2 minimum required") -- the
            stated minimum is the core item, the preference is secondary.
@@ -4776,31 +5090,33 @@ D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the c
    that pass could not see (it read a truncated opening, you have the full posting), and only then judge
    "met" for each. Doing it in that order saves you re-deriving the JD side from scratch and keeps the
    list honest. Where the hint is absent, build the checklist yourself under the same three rules.
-E. Write "top_match_reason" as a short (2-4 sentence), first-person narrative in your own voice explaining
-   why you ranked this role the way you did, synthesizing the want-fit and can-do-fit reasoning from step
-   B into flowing prose a candidate can read standalone, not a restatement of "concerns" or a bare list of
-   keywords. If "sector_match" (step G) is false for this role, say so plainly here -- e.g. "this sits
-   outside the [sector] work you said you want, but ..." -- so that trade-off is visible rather than
-   silent.
-   WRITE THIS AFTER YOU HAVE DERIVED "fit_level", AND MATCH ITS STRENGTH WORDING TO THAT GRADE. This
-   paragraph is displayed on the same card as the grade badge, directly under it, so a paragraph calling a
-   role "a strong fit" under an "OK fit" badge reads as the system contradicting itself and quietly
-   destroys the grade's meaning -- an "ok" pick gets described as strong far more often than the reverse,
-   because the narrative gets drafted from the positive case for the role rather than from the verdict.
-   Use the grade's own register and do not reach for a higher one:
-   - "very_strong": "an excellent fit", "a very strong match".
-   - "strong": "a strong fit", "a strong match".
-   - "ok": "a reasonable fit", "a credible option", "a solid fit on paper but ...", "worth a look" -- NOT
-     "strong", in any construction ("a strong graduate fit", "a strong entry-level option", "strong on
-     paper" all violate this).
-   - "stretch": "a stretch", "an ambitious application", "a long shot but ...".
-   The qualifier does not launder the word: "strong FOR A GRADUATE", "strong ENTRY-LEVEL option",
-   "strong GIVEN your experience level" are all still "strong" to a reader, and are the specific phrasings
-   this rule exists to stop. If the role genuinely reads stronger than that vocabulary allows, the fix is
-   to re-check the step-D checklist and the rubric, not to upgrade the adjective here.
-   You may still describe an INDIVIDUAL element in its own strongest honest terms ("your SQL evidence is
-   strong here", "the tooling overlap is excellent") -- the rule constrains your verdict on the ROLE AS A
-   WHOLE, not every use of the word.
+E. APPLICATION GUIDANCE -- write "filters_on" and "highlight". This is the one part of the output whose
+   job is not to explain your verdict but to tell the candidate what to DO with this posting, so write it
+   as advice, not as a rationale. Do NOT restate the grade, do NOT argue the role is a good or bad fit,
+   and do NOT summarise "concerns" -- all three are already on the card.
+   - "filters_on": 2-4 items from your step-D checklist that this employer will actually screen this
+     application on AND that the candidate has some genuine evidence for. Take them from the "core" items
+     first, in the JD's own words and at the JD's own specificity ("Power BI", "advanced Excel", "SQL
+     against a production warehouse", "3+ years in a commercial analytics team") -- never a capacity or
+     an attitude, never a vague competency ("analytical thinking", "attention to detail"). Include an
+     item whose evidence is partial or indirect where it is clearly load-bearing for this posting, since
+     that is precisely the one the candidate has to argue for. EXCLUDE anything the candidate has NO
+     evidence for at all -- an item they cannot speak to is a gap, and gaps belong in "concerns"; this
+     field is only for what they can put on the page.
+   - "highlight": 2-3 sentences, SECOND PERSON, naming which of the candidate's OWN specific evidence to
+     lead with against those items -- the named project, tool, employer, dataset, report or result from
+     their profile, not a restatement of the skill tag. "Hence lead with the customer-churn pipeline you
+     built in Python and the Power BI dashboard you shipped for the ops team" is the register; "hence
+     highlight your data skills" is not. Where the strongest evidence for one of the "filters_on" items
+     is weak, self-directed, academic or AI-assisted, say how to frame it honestly rather than pretending
+     it is commercial (e.g. "your Salesforce work is self-directed, so pitch it as the reporting problem
+     you solved with it rather than as production experience"). Name at most one thing to leave out or
+     de-emphasise, and only when it would actively distract.
+   If "sector_match" (step G) is false for this role, do not put that here -- it belongs in "concerns"
+   (step C) alongside the other honest caveats. If the candidate's evidence is so thin that you cannot
+   name two real things for them to lead with, return the one or two you can and stop; do not invent
+   evidence that is not in their profile, and never name a project, employer or tool the profile does
+   not mention.
 F. Classify the FUNCTIONAL NATURE of the day-to-day work in "role_type" -- one short sentence naming the
    kind of role this is (e.g. "This is a programme delivery role featuring admin and facilitation tasks",
    "This is a technical individual-contributor engineering role", "This is a client-facing sales role").
@@ -4818,7 +5134,7 @@ G. SECTOR MATCH (a ranking signal, never a disqualifier -- see rule 5 above): fo
    candidate's stated sector interests or causes (their sector_target values and their own words), false
    if it doesn't. This never excludes a role or changes "fit_level" on its own -- it only orders roles
    within the same fit_level ("sector_match": true first) and, when you include a role despite
-   "sector_match": false, name that trade-off plainly in "top_match_reason" (step E) so it's visible to
+   "sector_match": false, name that trade-off plainly as a "concerns" item (step C) so it's visible to
    the candidate rather than silently absorbed into the verdict."""
 
 _FINAL_EVAL_SCHEMA = """Output ONLY a valid JSON object (no markdown), with two required lists and one
@@ -4831,7 +5147,8 @@ optional list, using this item shape for "strong"/"backup":
     "fit_level": "very_strong" | "strong" | "ok" | "stretch",
     "sector_match": true,
     "can_do_fit": "a direct, second-person qualification verdict -- see reasoning step B.",
-    "top_match_reason": "a short first-person narrative synthesizing why this role earned its verdict -- see reasoning step E.",
+    "filters_on": ["2-4 concrete things this employer will screen on that the candidate CAN evidence, in the JD's own words -- see reasoning step E"],
+    "highlight": "2-3 second-person sentences naming which of the candidate's own specific projects/tools/results to lead with against those -- see reasoning step E.",
     "requirements": [{"text": "a JD requirement, short and concrete", "category": "core" | "secondary", "met": true}],
     "concerns": ["each notable gap, one per item, most sink-worthy first -- see reasoning step C; [] if none"],
     "role_salary": "the salary or range THIS posting's own description states, verbatim and short (e.g. \\"GBP 35,000-42,000\\"); null if this posting states none -- even when other salary figures appear elsewhere in the supplied text (a \\"Similar jobs\\" list or salary histogram, see SCOPE OF EACH POSTING'S TEXT)",
@@ -4860,6 +5177,11 @@ requirement unmet: \\"3+ years in a commercial analytics team\\"", "function is 
 analysis", "weaker tooling overlap than the picks above"). Where a specific JD clause drove it, quote
 that clause verbatim inside the reason exactly as QUOTE-THEN-CLASSIFY requires; where the job was simply
 out-competed by better picks rather than failing anything, say that plainly instead of inventing a fault.
+The reason is held to the SAME discipline as "concerns" and the step-D checklist, not a looser one: an
+ask introduced by the SOFT vocabulary in QUOTE-THEN-CLASSIFY ("ideally Databricks or Snowflake",
+"Tableau desirable") is a secondary item and may NEVER be the stated reason a role was not selected, and
+neither may an ask the posting says it trains for. If the only things separating this job from the picks
+are nice-to-haves, the honest reason is that it was out-competed -- say that.
 These reasons are never shown to the candidate -- they exist so a later audit can tell a job that was
 beaten from one that was quietly misread, which a blank reject cannot distinguish.
 "scam_suspect" (on "strong"/"backup" items only): true if the SCAM/CV-FARMING rule's softer signals
@@ -4868,8 +5190,8 @@ otherwise. Omit or leave false when you saw none of those signals.
 
 "sector_match" (on "strong"/"backup" items only): see reasoning step G -- true if the role's core domain
 sits within one of the candidate's stated sector interests, false otherwise. Never changes "fit_level" or
-which list a role is in; only orders roles within a fit_level and is named in "top_match_reason" when
-false for an included role.
+which list a role is in; only orders roles within a fit_level and is named in "concerns" when false for
+an included role.
 
 "fit_level" is the grade the candidate actually SEES on this pick, so it must be earned, not
 inferred from the fact that you decided to include the role. Derive it mechanically from your
@@ -4899,9 +5221,11 @@ payload (see SCOPE OF EACH POSTING'S TEXT). For "work_style" apply the same clas
 LOCATION/VISA/RELOCATION rule -- a stated office location with no remote/hybrid/work-from-home
 wording anywhere is "On-site", not null and not "Remote".
 
-"can_do_fit" and "top_match_reason" are shown directly to the candidate as the headline "are you
-qualified" and "why this matched" for this pick -- both must stand alone as short, readable, plain-
-language text a candidate can understand without the rest of the analysis."""
+"can_do_fit", "filters_on" and "highlight" are shown directly to the candidate -- "can_do_fit" as the
+headline "are you qualified", and "filters_on"/"highlight" together as a "Highlight when applying"
+block reading "This role likely filters on: <filters_on>." followed by your "highlight" sentences. Write
+them to read that way: short, plain-language, standing alone without the rest of the analysis, and with
+"highlight" continuing naturally from the filters_on list rather than repeating it."""
 
 # Static system prefix -- identical across every cluster/call, so it's a stable
 # (prompt-cache-friendly) prefix instead of being rebuilt into each user prompt. It
@@ -4954,6 +5278,16 @@ Leave "backup" empty when "strong" already gives good coverage, or when every ro
 {_FINAL_EVAL_WORDING}
 
 {_FINAL_EVAL_SCHEMA}"""
+
+# Prompt-cache routing key for the judge. Deliberately a CONSTANT, not scoped to
+# the profile or the run: _FINAL_EVAL_SYSTEM interpolates nothing, so every judge
+# call ever made shares this ~12k-token prefix byte for byte -- the per-call
+# variation starts in the user message, at the CV. That makes it the one prefix
+# here worth `cache_retention="24h"`: the default few minutes of inactivity would
+# expire it between runs, and this pipeline's biggest fixed cost is paying for
+# those 12k tokens once per cluster per run. Versioned so a prompt edit routes to
+# a fresh entry instead of colliding with the old text's key.
+_FINAL_EVAL_CACHE_KEY = f"final_eval_v{FINAL_EVAL_PROMPT_VERSION}"
 
 
 def _final_eval_job_block(i: int, j: dict) -> str:
@@ -5012,6 +5346,21 @@ def _final_eval_job_block(i: int, j: dict) -> str:
     return (f"JOB {i+1}: {j['title']} at {j['company']}\n"
             f"Location: {j.get('location') or 'not stated'}\nURL: {j['url']}\n{hint}\n"
             f"{j.get('full_text','')[:FINAL_EVAL_JOB_TEXT_CHARS]}")
+
+
+def _sanitize_filters_on(raw) -> list[str]:
+    """Validate/cap the judge's "filters_on" list (reasoning step E) -- at most 4
+    short strings, so a malformed or runaway response can't corrupt the persisted
+    verdict or spill a paragraph into the card's one-line "This role likely filters
+    on: ..." lead."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for r in raw[:4]:
+        item = str(r).strip()
+        if item:
+            out.append(item[:80])
+    return out
 
 
 def _sanitize_requirements_checklist(raw) -> list[dict]:
@@ -5076,7 +5425,9 @@ Jobs Payload:
     # on every single Phase 6 call until this was added.
     temperature = 1 if EXP_MODEL in _FIXED_TEMPERATURE_MODELS else 0.2
     try:
-        raw = llm(prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL, require_json=True, temperature=temperature)
+        raw = llm(prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL, require_json=True,
+                  temperature=temperature, stage="judge",
+                  cache_key=_FINAL_EVAL_CACHE_KEY, cache_retention="24h")
     except Exception as e:
         status = getattr(e, "status_code", None)
         resp = getattr(e, "response", None)
@@ -5125,9 +5476,13 @@ Jobs Payload:
                 merged = jobs[idx].copy()
                 merged.update(entry)
                 merged["requirements"] = _sanitize_requirements_checklist(merged.get("requirements"))
-                # 700, not the old 300 -- top_match_reason is now a 2-4 sentence
-                # synthesized narrative (reasoning step E), not a single short phrase.
-                merged["top_match_reason"] = str(merged.get("top_match_reason") or "").strip()[:700]
+                # Application guidance (reasoning step E), which replaced the old
+                # first-person top_match_reason narrative in FINAL_EVAL_PROMPT_VERSION
+                # 23. Same 700-char runaway guard the narrative had; filters_on is
+                # capped at 4 short items to match what step E asks for and to keep
+                # the card's one-line "This role likely filters on: ..." readable.
+                merged["filters_on"] = _sanitize_filters_on(merged.get("filters_on"))
+                merged["highlight"] = str(merged.get("highlight") or "").strip()[:700]
                 # Default true (not "unknown mismatch") when the model omits it -- this
                 # is a ranking/display signal, never a gate, so a missing field should
                 # never read as a silent sector-mismatch flag.
@@ -5188,10 +5543,22 @@ def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None 
     if len(jobs) <= FINAL_EVAL_MAX_JOBS_PER_CALL:
         return _run_final_eval(jobs, cv_text)
 
-    chunks = [jobs[i:i + FINAL_EVAL_MAX_JOBS_PER_CALL]
-              for i in range(0, len(jobs), FINAL_EVAL_MAX_JOBS_PER_CALL)]
+    # Balanced, not greedy-fixed-size: a plain jobs[i:i+CAP] slice puts a lopsided
+    # remainder in the last chunk (27 jobs at CAP=20 -> one call judging 20, another
+    # judging only 7), so the two calls read the SAME cluster under very different
+    # amounts of cross-listing context to compare against. Splitting into the ceil
+    # number of chunks and dividing as evenly as possible instead gives 27 -> 14+13.
+    num_chunks = -(-len(jobs) // FINAL_EVAL_MAX_JOBS_PER_CALL)  # ceil division
+    base_size, remainder = divmod(len(jobs), num_chunks)
+    chunks: list[list[dict]] = []
+    start = 0
+    for i in range(num_chunks):
+        size = base_size + (1 if i < remainder else 0)
+        chunks.append(jobs[start:start + size])
+        start += size
     emit(f"[phase 6] {len(jobs)} jobs split into {len(chunks)} concurrent batches "
-         f"of <={FINAL_EVAL_MAX_JOBS_PER_CALL} (cluster exceeds single-call cap)")
+         f"of {sorted(set(len(c) for c in chunks))} (cluster exceeds single-call cap of "
+         f"{FINAL_EVAL_MAX_JOBS_PER_CALL})")
     strong: list[dict] = []
     backup: list[dict] = []
     disqualified: list[dict] = []
@@ -5232,8 +5599,10 @@ def save_and_display(results: list[dict]):
     conn = get_db()
     for i, job in enumerate(results, 1):
         emit(f"\n#{i}  {job['title']}\n    {job['company']}\n    {job['url']}\n\n    {job.get('summary', '')}")
-        if job.get("top_match_reason"):
-            emit(f"    ✓  {job['top_match_reason']}")
+        if job.get("filters_on"):
+            emit(f"    ✓  Likely filters on: {', '.join(job['filters_on'])}")
+        if job.get("highlight"):
+            emit(f"    ✓  {job['highlight']}")
         for c in job.get("concerns", []):
             emit(f"    ⚠  {c}")
         emit(f"\n{sep}")
@@ -5260,8 +5629,10 @@ def save_and_display(results: list[dict]):
         f.write(f"*Generated Pipeline Sync: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n")
         for i, job in enumerate(results, 1):
             f.write(f"## {i}. {job['title']} — {job['company']}\n\n**Link:** {job['url']}\n\n{job.get('summary', '')}\n\n")
-            if job.get("top_match_reason"):
-                f.write(f"- ✓ {job['top_match_reason']}\n")
+            if job.get("filters_on"):
+                f.write(f"- ✓ Likely filters on: {', '.join(job['filters_on'])}\n")
+            if job.get("highlight"):
+                f.write(f"- ✓ {job['highlight']}\n")
             for c in job.get("concerns", []):
                 f.write(f"- ⚠ {c}\n")
             f.write("\n---\n\n")

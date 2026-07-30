@@ -37,7 +37,9 @@ from ..config import CV_SHORT_WORD_THRESHOLD, CV_SUMMARY_RAW_MAX_CHARS
 from ..models import Profile, ProfileAttribute
 from .families import ensure_families, seed_families_from_groups
 from .parsing import CVParseFailed, extract_attributes, persist_attributes
-from .profile_intel import generate_families, generate_summary, store_seeded_intel
+from .profile_intel import (
+    clip_summary, generate_families, generate_summary, store_seeded_intel,
+)
 
 
 def _is_short_cv(text: str) -> bool:
@@ -111,7 +113,7 @@ def persist_formation(
         # a short one (compressing it would only lose concrete detail for no space
         # saved -- see CV_SHORT_WORD_THRESHOLD).
         if _is_short_cv(text):
-            profile.cv_summary = text.strip()[:CV_SUMMARY_RAW_MAX_CHARS]
+            profile.cv_summary = clip_summary(text, CV_SUMMARY_RAW_MAX_CHARS)
         else:
             profile.cv_summary = understand_data.get("cv_summary") or ""
 

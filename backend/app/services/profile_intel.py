@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -47,6 +48,39 @@ RESULT_KEY = "profile_intel_result"
 TARGET_ROLE_HARD_CAP = 20
 
 _BACKGROUND_TYPES = ["past_role", "skill", "qualification", "seniority", "sector_target", "custom"]
+
+# How far back from a hard character cap clip_summary will hunt for a sentence
+# end before giving up and cutting at a word boundary instead. Generous enough
+# to clear one long sentence of this kind of prose, small enough that it can
+# never swallow a whole section.
+_CLIP_SENTENCE_LOOKBACK = 400
+_SENTENCE_END_RE = re.compile(r"[.!?](?=[\s\"')\]]|$)")
+
+
+def clip_summary(text: str, limit: int) -> str:
+    """Bound a candidate brief to `limit` chars WITHOUT ever ending it mid-word.
+
+    profile.cv_summary is prose read by another model (the gates and the final
+    judge, via snapshot.candidate_brief), not a display string -- so a raw slice
+    is worse than it looks. A live parse hit CV_SUMMARY_MAX_CHARS mid-sentence
+    ("...the 14-attendee Model Climate Conference from 43 sign-up"), which reads
+    to the judge as a claim that trails off rather than as a document that was
+    cut, and there is no ellipsis or marker anywhere to tell it otherwise.
+
+    Prefer the last sentence end within _CLIP_SENTENCE_LOOKBACK of the cap, so
+    what survives is a complete thought; fall back to the last word boundary
+    when a single sentence runs longer than that. Under the cap, the text is
+    returned untouched -- which is the normal case now that the cap sits clear
+    of the length the prompt asks for (see CV_SUMMARY_MAX_CHARS)."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    ends = [m.end() for m in _SENTENCE_END_RE.finditer(head)]
+    if ends and ends[-1] >= limit - _CLIP_SENTENCE_LOOKBACK:
+        return head[:ends[-1]].rstrip()
+    cut = head.rfind(" ")
+    return (head[:cut] if cut > 0 else head).rstrip()
 
 # Titles must be board-queryable: they become literal search terms and the cosine
 # embedding anchor, so parenthetical asides / slashes / sector clauses inside a title
@@ -352,7 +386,7 @@ def generate_summary(text: str, intent_text: str | None) -> dict:
     if not isinstance(data, dict):
         return {}
     return {
-        "cv_summary": str(data.get("cv_summary") or "").strip()[:CV_SUMMARY_MAX_CHARS],
+        "cv_summary": clip_summary(str(data.get("cv_summary") or ""), CV_SUMMARY_MAX_CHARS),
         "header": str(data.get("header") or "").strip(),
     }
 

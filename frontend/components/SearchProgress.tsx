@@ -44,8 +44,8 @@ const STAGES = [
     key: "final",
     label: "Full AI review",
     detail: "the deep review that decides your final picks",
-    targetSeconds: 240,
-    targetLabel: "~4 min",
+    targetSeconds: 300,
+    targetLabel: "~5 min",
   },
 ] as const;
 

@@ -55,6 +55,24 @@ export interface RunFunnel {
   judge_pool_size: number;
   judge_dupes_suppressed: number;
   shown: number;
+  /** rank_scored — total examined by the cheap+mid gates. */
+  examined: number;
+  /** final_judge / examined — a coarse "how niche is this profile" gauge.
+   *  null when nothing was examined yet. */
+  filtering_ratio: number | null;
+  token_usage: RunTokenStage[];
+}
+
+/** One LLM stage's token spend for a run. Mirrors backend RunTokenStageOut. */
+export interface RunTokenStage {
+  stage: string;
+  calls: number;
+  prompt_tokens: number;
+  /** The part of prompt_tokens served from OpenAI's prompt cache. */
+  cached_tokens: number;
+  completion_tokens: number;
+  /** cached/prompt — null when nothing was sent. */
+  cache_hit_ratio: number | null;
 }
 
 export interface RunPhase {
@@ -86,6 +104,20 @@ export interface RunCluster {
   fallbacks: string[];
 }
 
+/** Today's live pipeline cap constants — mirrors backend RunCapsOut. Not
+ *  per-run; shown under the per-cluster table so a "stopped because:
+ *  absolute pool cap" row is checkable against the real number. */
+export interface RunCaps {
+  rank_examine_budget: number;
+  rank_target_pool: number;
+  judge_pool: number;
+  judge_pool_floor: number;
+  rank_reject_score_floor: number;
+  target_pool_per_round: number;
+  min_results_floor: number;
+  final_picks: number;
+}
+
 /** Per-phase wall time for the last finished search run — mirrors backend
  *  RunTimingsOut. The search-side counterpart to CvParseTiming below. */
 export interface RunTimings {
@@ -94,6 +126,7 @@ export interface RunTimings {
   total_seconds: number;
   phases: RunPhase[];
   clusters: RunCluster[];
+  caps: RunCaps;
 }
 
 export interface SnapshotJob {

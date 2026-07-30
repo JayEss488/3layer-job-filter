@@ -18,7 +18,7 @@ const TABS = [
   { href: "/my-roles", label: "My Roles" },
   { href: "/dashboard", label: "Profile" },
   { href: "/memory", label: "Memory" },
-  { href: "/settings", label: "Settings" },
+  { href: "/settings", label: "Analytics" },
 ];
 
 export function Nav() {

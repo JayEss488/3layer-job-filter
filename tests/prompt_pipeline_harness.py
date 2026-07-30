@@ -195,7 +195,11 @@ def _install_capture_hooks(engine, llm_calls, call_ctx):
 
     original_llm = engine.llm
 
-    def _logging_llm(prompt, system="", model=engine.CHEAP_MODEL, require_json=False, temperature=0.2):
+    # **kw so full_auto.llm's prompt-cache params (stage/cache_key/
+    # cache_retention) pass straight through -- an enumerated signature here
+    # TypeErrors the moment that function grows another keyword.
+    def _logging_llm(prompt, system="", model=engine.CHEAP_MODEL, require_json=False,
+                     temperature=0.2, **kw):
         start = time.monotonic()
         entry = {
             "stage": call_ctx.get("stage"), "cluster_idx": call_ctx.get("cluster_idx"),
@@ -205,7 +209,7 @@ def _install_capture_hooks(engine, llm_calls, call_ctx):
         }
         try:
             raw = original_llm(prompt, system=system, model=model,
-                                require_json=require_json, temperature=temperature)
+                                require_json=require_json, temperature=temperature, **kw)
         except Exception as e:
             entry.update(raw_response=None, error=str(e), latency_seconds=round(time.monotonic() - start, 3))
             llm_calls.append(entry)
@@ -469,7 +473,7 @@ def _process_cluster(engine, engine_svc, idx, cluster, role_clusters, eng_profil
             journey[key]["judge_detail"] = {
                 "summary": entry.get("summary"), "fit_level": entry.get("fit_level"),
                 "role_type": entry.get("role_type"), "can_do_fit": entry.get("can_do_fit"),
-                "top_match_reason": entry.get("top_match_reason"),
+                "filters_on": entry.get("filters_on"), "highlight": entry.get("highlight"),
                 "requirements": entry.get("requirements"), "concerns": entry.get("concerns"),
                 "role_salary": entry.get("role_salary"), "work_style": entry.get("work_style"),
                 "role_seniority": entry.get("role_seniority"), "deadline": entry.get("deadline"),
@@ -701,7 +705,8 @@ function jobDetailHtml(j) {
       html += '<div style="margin-top:6px"><b>Summary:</b> ' + esc(d.summary) + '</div>';
       html += '<div><b>Role type:</b> ' + esc(d.role_type) + '</div>';
       html += '<div><b>Can-do fit:</b> ' + esc(d.can_do_fit) + '</div>';
-      html += '<div><b>Top match reason:</b> ' + esc(d.top_match_reason) + '</div>';
+      html += '<div><b>Likely filters on:</b> ' + esc((d.filters_on || []).join(', ')) + '</div>';
+      html += '<div><b>Highlight when applying:</b> ' + esc(d.highlight) + '</div>';
       html += '<div><b>Facts:</b> salary=' + esc(d.role_salary) + ', work_style=' + esc(d.work_style) +
         ', seniority=' + esc(d.role_seniority) + ', deadline=' + esc(d.deadline) +
         ', scam_suspect=' + esc(d.scam_suspect) + '</div>';

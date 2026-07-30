@@ -143,7 +143,12 @@ RANK_TARGET_POOL = 80         # run-wide judge-eligible target for the gate+rank
 # 80 in total while a 1-cluster profile examined 80 as well, and a live 2-cluster
 # run left queues of 329 and 194 with only 40 examined each. A single run-wide
 # number is both the honest cost dial and the thing worth tuning.
-RANK_EXAMINE_BUDGET = 240
+# Raised 240 -> 320: a live single-cluster run against a 760-deep queue stopped
+# on "absolute pool cap" at 240 examined / 69 gated / 9 judged -- the budget
+# itself, not a thin queue or MIN_RESULTS/JUDGE_POOL, was the limiting factor,
+# with hundreds of unexamined above-floor candidates still sitting in that
+# cluster's queue.
+RANK_EXAMINE_BUDGET = 320
 # Symmetric FLOOR to the JUDGE_POOL ceiling: an absolute rank cutoff
 # (RANK_REJECT_SCORE_FLOOR) plus per-cluster examine caps can leave the judge with
 # far fewer than JUDGE_POOL candidates even when dozens of gate survivors exist
@@ -158,7 +163,7 @@ JUDGE_POOL_FLOOR = 25
 # GATE_FIRST_ROUND-sized batch) so a shortfall costs at most one more cheap
 # gate+rank call per needy cluster rather than re-running a full
 # per-cluster share of RANK_EXAMINE_BUDGET. Rarely fires now that the main
-# budget is 240 rather than 40-80, but kept as the safety net for a profile
+# budget is 320 rather than 40-80, but kept as the safety net for a profile
 # whose queues are genuinely thin.
 JUDGE_POOL_FLOOR_EXTRA_CAP = 20
 # How many of the judge pool's top-ranked candidates are persisted as
@@ -185,8 +190,8 @@ PROVISIONAL_STAGE_RANK = "rank"
 _PROVISIONAL_STAGES_AFTER_EMBED = (PROVISIONAL_STAGE_RANK,)
 # A candidate whose text is already rich enough to judge (ATS description, a
 # Reed/Adzuna full description fetched pre-gate by _enrich_pre_gate, a persisted full_text
-# from an earlier run, or a long-enough snippet -- i.e. _needs_full_scrape is
-# False) gets this added to its ORDERING score when the judge pool is filled.
+# from an earlier run, or a long-enough snippet -- i.e. _has_judgeable_text is
+# True) gets this added to its ORDERING score when the judge pool is filled.
 # Not to its rank score, and not to the floor test: a bad job stays rejected
 # (see _selection_score). Purely a tie-break, so among candidates the mid tier
 # rated the same, the judge pool fills with the ones it can actually read --
@@ -253,6 +258,25 @@ TEMPLATE_FACTORY_TITLE_THRESHOLD = 4
 SCAM_VERIFY_MAX_PER_RUN = 5
 
 
+def get_pipeline_caps() -> dict:
+    """Current pipeline cap constants, for the Settings/Analytics page's
+    per-role-track table -- lets a "stopped because: absolute pool cap" row be
+    checked against the actual number instead of the reader needing to know it
+    from memory. Not run-specific: these are just today's live constants, the
+    same for every run until this module (or full_auto.FINAL_PICKS) is edited."""
+    import full_auto as _fa  # lazy: see run_search_task
+    return {
+        "rank_examine_budget": RANK_EXAMINE_BUDGET,
+        "rank_target_pool": RANK_TARGET_POOL,
+        "judge_pool": JUDGE_POOL,
+        "judge_pool_floor": JUDGE_POOL_FLOOR,
+        "rank_reject_score_floor": RANK_REJECT_SCORE_FLOOR,
+        "target_pool_per_round": TARGET_POOL,
+        "min_results_floor": MIN_RESULTS,
+        "final_picks": _fa.FINAL_PICKS,
+    }
+
+
 def _external_id(engine, job: dict) -> str:
     return engine.make_job_id(job.get("board", ""), job.get("url", ""))
 
@@ -264,6 +288,27 @@ def _external_id(engine, job: dict) -> str:
 _KNOWN_DEAD_END_URL_RE = re.compile(r"/jobs/land/ad/")
 
 
+def _has_judgeable_text(job: dict) -> bool:
+    """Whether this candidate already carries enough real text for the final
+    judge to assess it -- a scraped/enriched full_text, an ATS description
+    (which arrives whole), or a snippet long enough to stand in for one.
+
+    Deliberately NOT the negation of _needs_full_scrape, which answers the
+    different question "would a phase-5 fetch help". Those two came apart on
+    exactly one case and it mattered: an un-enriched Adzuna row. Its URL is a
+    /jobs/land/ad/ interstitial, so a fetch cannot help and _needs_full_scrape
+    correctly returns False -- but the text it's stuck with is a 500-char
+    company blurb. Reading that False as "text is fine" handed those rows
+    RICH_TEXT_SELECTION_BONUS in _selection_score, i.e. the most text-starved
+    candidates in the store were being PREFERENTIALLY promoted into the judge
+    pool over candidates the judge could actually read."""
+    if job.get("_has_full_text"):
+        return True
+    if canonical_key(job.get("board")) in ATS_KEYS:
+        return True
+    return len((job.get("snippet") or "").strip()) >= SNIPPET_SUFFICIENT_CHARS
+
+
 def _needs_full_scrape(job: dict) -> bool:
     """Whether phase 5 should bother reading this job's real page before final
     evaluation. ATS-sourced snippets (greenhouse/lever/ashby/workable/
@@ -272,14 +317,15 @@ def _needs_full_scrape(job: dict) -> bool:
     it when its snippet is too short to judge seniority/requirements from,
     which is the actual cost driver: most of a run's full-page fetches (and
     the anti-bot blocking they trigger) buy nothing over what the API already
-    handed us."""
-    if job.get("_has_full_text"):
-        return False  # a real page was scraped and persisted on a prior run
-    if canonical_key(job.get("board")) in ATS_KEYS:
+    handed us.
+
+    A False here means "don't spend a fetch on this one", which is NOT the same
+    as "this one has enough to judge" -- see _has_judgeable_text."""
+    if _has_judgeable_text(job):
         return False
     if _KNOWN_DEAD_END_URL_RE.search(job.get("url") or ""):
         return False  # known-dead redirect stub -- skip straight to snippet fallback
-    return len((job.get("snippet") or "").strip()) < SNIPPET_SUFFICIENT_CHARS
+    return True
 
 
 def _selection_score(j: dict) -> float:
@@ -295,7 +341,7 @@ def _selection_score(j: dict) -> float:
     own number, so the bonus can be retuned without invalidating a single cached
     score. Only ORDER changes -- which of two acceptable candidates gets the
     judge slot."""
-    return j.get("_rank_score", 50.0) + (0.0 if _needs_full_scrape(j) else RICH_TEXT_SELECTION_BONUS)
+    return j.get("_rank_score", 50.0) + (RICH_TEXT_SELECTION_BONUS if _has_judgeable_text(j) else 0.0)
 
 
 # Free, high-confidence seniority pre-reject: a junior/graduate candidate will never
@@ -419,8 +465,19 @@ def _compose_analysis(entry: dict) -> str:
     model knowing they'll be displayed together, so `summary` adds new
     information rather than restating `role_type`). Behind the "Show more"
     toggle: `§qualification` (a direct qualified-or-not verdict, then a
-    concern count and its bullets) and `§ai-reasoning` (one synthesized
-    narrative paragraph).
+    concern count and its bullets) and `§apply-highlights` (what to put in
+    front of this specific employer).
+
+    `§apply-highlights` replaced `§ai-reasoning` at FINAL_EVAL_PROMPT_VERSION
+    23. The old block rendered `top_match_reason`, a narrative arguing why the
+    role fitted -- which restated what the badge, the headline and the
+    qualification verdict had already said three ways over, and gave the
+    candidate nothing to act on. The judge now spends those output tokens on
+    the one thing the rest of the card can't cover: which of the JD's asks
+    this employer will actually screen on, and which of the candidate's own
+    named projects/tools to lead with against them. Rows judged under 22 or
+    earlier still carry `§ai-reasoning` and keep rendering (RoleCard.tsx
+    parses both) until they're next re-judged.
 
     `role_type` used to render as its own always-visible `§role-type` block
     after the `summary` headline -- the two are independently-generated model
@@ -462,7 +519,22 @@ def _compose_analysis(entry: dict) -> str:
         parts.append("§qualification")
         parts.extend(qualification)
 
-    if entry.get("top_match_reason"):
+    # Two model fields rendered as one block: the screened-on list becomes the
+    # lead sentence, the guidance continues from it (the judge writes them
+    # knowing they display that way -- see _FINAL_EVAL_SCHEMA's closing note).
+    # Either may be absent on its own without suppressing the other.
+    highlights: list[str] = []
+    filters_on = [str(f).strip() for f in (entry.get("filters_on") or []) if str(f).strip()]
+    if filters_on:
+        highlights.append(f"This role likely filters on: {', '.join(filters_on)}.")
+    if entry.get("highlight"):
+        highlights.append(entry["highlight"].strip())
+    if highlights:
+        parts.append("§apply-highlights")
+        parts.extend(highlights)
+    elif entry.get("top_match_reason"):
+        # Pre-v23 verdict served from cache -- keep its narrative rather than
+        # dropping the only reasoning text such a row has.
         parts.append("§ai-reasoning")
         parts.append(entry["top_match_reason"].strip())
 
@@ -613,6 +685,47 @@ def _dup_key(j: dict) -> tuple | None:
     return ("", title, loc, text[:_DUP_TEXT_PREFIX_CHARS])
 
 
+# Cross-BOARD syndication: the same vacancy reached the judge twice because the two
+# copies' text is only near-identical, not prefix-identical. A live run judged
+# "BI Analyst / Erin Associates" as two separate jobs -- one from reed.co.uk, one from
+# jobs.womenforhire.com -- and the judge itself noticed, writing "Duplicate of Job 5"
+# as its reason for the second. _dup_key above cannot catch this by construction: the
+# two boards wrap the same description in different chrome, truncate it at different
+# lengths, and (once one copy has been enriched or scraped and the other hasn't) hold
+# very different amounts of it, so their 400-char prefixes never match.
+#
+# Compared as word-4-gram SETS by CONTAINMENT (shared / smaller side) rather than
+# Jaccard, because the two copies routinely differ enormously in length -- a 455-char
+# Reed teaser against a 4,000-char scraped page is the same vacancy with a Jaccard of
+# ~0.1. Containment asks the right question: is the shorter copy essentially wholly
+# inside the longer one.
+#
+# Kept narrow, since this is the check with the widest reach: same normalized company
+# AND same normalized title are both required first (so this only ever adjudicates
+# candidates _dup_key was already trying to tell apart), plus enough shingles on the
+# shorter side to be real evidence. A false merge costs one judge slot on a
+# near-identical listing and is recoverable -- the dropped copy keeps its cached rank
+# score and takes no verdict, so it can resurface on a later run if the kept copy dies.
+_DUP_SHINGLE_N = 4
+_DUP_CONTAINMENT = 0.65    # of the SHORTER text's shingles, how many the longer also has
+_DUP_MIN_SHINGLES = 25     # ~28 words of real content before containment means anything
+
+
+def _text_shingles(j: dict) -> frozenset:
+    words = re.findall(r"[a-z0-9]+", (j.get("full_text") or j.get("snippet") or "").lower())
+    if len(words) < _DUP_SHINGLE_N + _DUP_MIN_SHINGLES - 1:
+        return frozenset()
+    return frozenset(
+        tuple(words[i:i + _DUP_SHINGLE_N]) for i in range(len(words) - _DUP_SHINGLE_N + 1)
+    )
+
+
+def _same_vacancy(a: frozenset, b: frozenset) -> bool:
+    if len(a) < _DUP_MIN_SHINGLES or len(b) < _DUP_MIN_SHINGLES:
+        return False
+    return len(a & b) / min(len(a), len(b)) >= _DUP_CONTAINMENT
+
+
 def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
     """Drops near-duplicate postings from the per-cluster judge-eligible lists
     in place, keeping only the highest-rank_gate-scored copy of each (the lists
@@ -622,8 +735,15 @@ def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
     judge-pool-only: the dropped copy stays a gate survivor, keeps its cached
     rank score, and gets no persisted verdict -- if the kept copy disappears at
     source, the duplicate can still surface on a future run. Returns how many
-    were suppressed."""
+    were suppressed.
+
+    Two tests, in cost order: an exact normalized-prefix key (_dup_key, catches a
+    recruiter template reposted verbatim), then a near-identical-text check within
+    the same company+title (_same_vacancy, catches the same vacancy syndicated to a
+    second board with different chrome and truncation)."""
     seen: set[tuple] = set()
+    # (company, title) -> the shingle sets of the copies kept so far under it.
+    kept_texts: dict[tuple[str, str], list[frozenset]] = defaultdict(list)
     suppressed = 0
     for idx, jobs in rank_by_cluster.items():
         kept = []
@@ -632,8 +752,20 @@ def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
             if key is not None and key in seen:
                 suppressed += 1
                 continue
+            company, title = _norm_company(j.get("company", "")), _norm(j.get("title", ""))
+            # Blank company is deliberately excluded from the near-text check: with
+            # no employer to anchor on, two unrelated postings sharing a generic
+            # title and boilerplate could merge. _dup_key's own blank-company path
+            # (title + location + exact prefix) still covers aggregator reposts.
+            shingles = _text_shingles(j) if company and title else frozenset()
+            group = kept_texts[(company, title)] if shingles else None
+            if group is not None and any(_same_vacancy(shingles, s) for s in group):
+                suppressed += 1
+                continue
             if key is not None:
                 seen.add(key)
+            if group is not None:
+                group.append(shingles)
             kept.append(j)
         rank_by_cluster[idx] = kept
     return suppressed
@@ -1062,11 +1194,13 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             "role_type": src.get("role_type", ""),
             # The judge's explicit reasoning split (see full_auto's
             # _FINAL_EVAL_REASONING): can-do-fit is judged separately from
-            # want-fit, and top_match_reason synthesizes both into one
-            # candidate-facing narrative. Persisted alongside the rest so a
+            # want-fit. filters_on/highlight are reasoning step E's application
+            # guidance, which replaced the old top_match_reason narrative in
+            # FINAL_EVAL_PROMPT_VERSION 23. Persisted alongside the rest so a
             # cache-served verdict renders identically to a freshly-judged one.
             "can_do_fit": src.get("can_do_fit", ""),
-            "top_match_reason": src.get("top_match_reason", ""),
+            "filters_on": src.get("filters_on") or [],
+            "highlight": src.get("highlight", ""),
             "requirements": src.get("requirements") or [],
             "concerns": src.get("concerns", []),
             # The judge's finer verdict grade and the facts it read off the JD,
@@ -1105,7 +1239,7 @@ def _persist_scam_override(db: Session, profile_id: int, identity: str, reason: 
     real cross-site evidence post-hoc. Never resurfaces under this eval_sig,
     same as any other reject.
 
-    Preserves the judge's original eval_analysis (summary/concerns/top_match_reason/
+    Preserves the judge's original eval_analysis (summary/concerns/highlight/
     etc.) rather than replacing it outright -- an earlier version overwrote the
     whole blob with just the corroboration reason, which silently destroyed the
     judge's original "why this was strong" reasoning for every overridden pick,
@@ -1742,7 +1876,7 @@ def _is_location_scope_descriptor(location: str) -> bool:
 # an unsupported country). Aggregators (careerjet), organic (google_jobs), broad
 # APIs (jsearch/remotive) and company ATS boards can all carry cross-border rows,
 # so they still get the location check below.
-_COUNTRY_SCOPED_BOARDS = {"reed", "adzuna"}
+_COUNTRY_SCOPED_BOARDS = {"reed", "adzuna", "usajobs"}
 
 
 def _filter_by_country(engine, jobs: list[dict], country_codes: list[str]) -> list[dict]:
@@ -2189,7 +2323,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     emit(f"[pipeline] role clusters ({len(role_clusters)}): "
          + "; ".join(f"[{i}] {c.get('roles') or ['(none)']}" for i, c in enumerate(role_clusters)))
 
-    # DISCOVERY (cheap, tiered on first run) -> store. gather_jobs reads the flag.
+    # DISCOVERY (tiered, rotation included from first run) -> store. gather_jobs reads the flag.
     eng_profile["first_run"] = _is_first_run(db, profile_id)
     disabled = get_disabled(db)  # per-source toggle (workstream D)
     # The ~40-company ATS rotation batch is the single largest chunk of a run's
@@ -2651,6 +2785,15 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             emit(f"[pipeline] judge-pool floor: still {total_judge_eligible} judge-eligible after the "
                  f"extra round (floor={JUDGE_POOL_FLOOR}) -- no reject fallback, accepting the shortfall")
     funnel["judge_floor_extra_examined"] = judge_floor_extra_examined
+    # Own lap, split out from "rank" below: this block (when it runs at all) is
+    # a whole extra screen_gate + rank_gate round -- real LLM calls, not
+    # bookkeeping -- and was previously folded into the "rank" timing under the
+    # label "Fair-allocate to the judge pool", which made a single-cluster run
+    # that had to top up its judge pool look like fair-allocate itself (a pure
+    # Python reshuffle of a few dozen dicts) was taking tens of seconds. Zero
+    # candidates examined here still records a real (near-zero) lap rather than
+    # silently folding into the next one.
+    t0 = _lap("judge_floor_topup", t0)
 
     # Near-duplicate suppression before the expensive judge: same company, same
     # title, near-identical text (a recruiter template re-posted per city) keeps
@@ -2662,6 +2805,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
              f"(same company+title+text; top-ranked copy retained)")
 
     selected = _fair_allocate(rank_by_cluster, JUDGE_POOL)
+    # Now genuinely just dedup + fair-allocate -- the judge-floor top-up round
+    # above is timed separately. Expect this to read near-instant.
     t0 = _lap("rank", t0)
     funnel["gate_survivors_total"] = total_gate_survivors
     funnel["rank_scored"] = total_examined
@@ -2723,6 +2868,31 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # the judge weighs fit against ONE coherent role identity, returning both a
     # strict "strong" list and a lenient disqualifier-only "backup" list. Jobs
     # already judged under this exact CV are served from their stored verdict.
+    # Second chance at real text, for the judge pool only. The pre-gate enrichers
+    # above are capped (REED_ENRICH_PRE_GATE_CAP / ADZUNA_ENRICH_PRE_GATE_CAP) and
+    # ordered by embed score, because they sit in front of time-to-first-card -- so
+    # a candidate that climbs into the judge pool from outside that head slice
+    # reaches the expensive model still holding its ~500-char teaser.
+    #
+    # For Reed that merely wastes a phase-5 page fetch. For Adzuna it is terminal:
+    # the API's /jobs/land/ad/ URL is a JS interstitial, so _needs_full_scrape skips
+    # it and the judge grades the posting on a company blurb. A live run rejected an
+    # Adzuna "BI Analyst" with "the available description does not provide enough
+    # role requirements or seniority detail to establish a genuine fit" -- while the
+    # posting's own detail page carried a full responsibilities-and-Power-BI
+    # requirements section the pipeline never fetched.
+    #
+    # Neither cap's reason applies here: this runs AFTER the provisional cards are
+    # on screen (nothing is waiting on it), it is plain HTTP with no LLM and no
+    # browser, and it is bounded by JUDGE_POOL(40) rather than by an examine budget.
+    # It also SHRINKS phase 5, since anything enriched now skips the scrape.
+    n_judge_enriched = (_enrich_reed_full_text(engine, db, profile_id, selected)
+                        + _enrich_adzuna_full_text(engine, db, profile_id, selected))
+    funnel["judge_pool_enriched"] = n_judge_enriched
+    if n_judge_enriched:
+        emit(f"[pipeline] enriched {n_judge_enriched} judge-pool candidate(s) with their full "
+             f"description before final review (missed by the pre-gate caps)")
+
     scrape_enabled = get_full_scrape_enabled(db)
     if not scrape_enabled:
         emit("[pipeline] full-page scraping disabled in settings; evaluating on snippets")
@@ -3468,6 +3638,12 @@ def run_search_task(profile_id: int, run_id: int) -> None:
     try:
         import full_auto as engine  # lazy: pulls in crawl4ai only now
         engine.init_db()  # ensures gate_cache/jobs/profile_cache tables exist
+        # Per-run token accounting (see full_auto.llm / _record_llm_usage). Reset
+        # here rather than in the pipeline so the profile-intel calls above are
+        # excluded -- those are cached and usually don't fire, and folding them in
+        # would make the per-stage hit rates read differently on a run that
+        # happened to regenerate intel.
+        engine.reset_llm_usage()
 
         # Cached: only actually calls the LLM when the profile's inputs changed
         # since the last run (or never ran). regenerate_roles=False: this
@@ -3642,6 +3818,14 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         # (and its early returns) unchanged -- split back out here so
         # funnel_counts stays ints/bools only, as get_run_funnel expects.
         run.snapshot_samples = json.dumps(funnel.pop("samples", {}))
+        # Token accounting, flattened into funnel_counts' ints-only contract as
+        # tokens_{stage}_{prompt,cached,completion,calls}. Kept here rather than in
+        # the pipeline because the judge's backfill retry and the scam-verify call
+        # both land after _run_engine_pipeline builds `funnel`, and a rollup that
+        # misses those would understate the run's most expensive stage.
+        for stage, row in engine.emit_llm_usage_summary().items():
+            for k in ("calls", "prompt_tokens", "cached_tokens", "completion_tokens"):
+                funnel[f"tokens_{stage}_{k}"] = int(row.get(k, 0))
         run.funnel_counts = json.dumps(funnel)
         if warning:
             run.warning = warning

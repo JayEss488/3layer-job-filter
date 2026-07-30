@@ -311,6 +311,21 @@ never share a session — writes happen back on the request thread in one commit
    the judge/gates read) and the "Looking for…" `header` (told explicitly NOT to restate
    the summary — they used to overlap). For a short CV (`< CV_SHORT_WORD_THRESHOLD`)
    **this whole call is skipped** and the raw text is stored as the summary verbatim.
+   `CV_SUMMARY_MAX_CHARS` is a runaway-reply guard, **not** a length budget — the
+   length actually requested lives in `_SUMMARY_TASK` ("max 450 words"), and the cap
+   has to sit clear of it or it silently becomes the real limit. At 3000 it did
+   exactly that: a live parse was guillotined at 2,997 chars, mid-sentence, at word
+   432 of a compliant ~460-word reply ("…the 14-attendee Model Climate Conference
+   from 43 sign-up"). What that deletes is not random — `_SUMMARY_TASK` numbers its
+   sections, so the tail is always (4) leadership/extracurriculars, (5) writing and
+   communication work, (6) languages and other differentiators, and since skill/
+   qualification chips are no longer extracted, `cv_summary` is the *only* place that
+   evidence reaches the judge (`snapshot.candidate_brief`). So the cap was quietly
+   deleting a whole class of evidence from every long-CV profile, permanently. Now
+   4000, and both paths clip through `profile_intel.clip_summary`, which cuts at a
+   sentence boundary (falling back to a word boundary) so an overrunning reply can
+   never end mid-word again — a brief that trails off mid-claim reads to the judge as
+   a claim that trails off, with no marker anywhere to say the document was cut.
 
 Calls 2 and 3 were one "understand" call until the split. That call alone generated
 ~1300 output tokens and *was* the block's critical path (~11.2s of an 11.3s parse) while
@@ -500,8 +515,19 @@ of what the last finished run already recorded — see the search-pipeline secti
    salary floor, also a Soft-by-default type, is enforced (rule e). Flipping Dashboard →
    Preferences → Work style to **Hard** adds `_work_arrangement_ok` to `hard_axes` (an
    unconditional cheap-gate drop, no `MIN_RESULTS` backfill) and makes it a judge
-   disqualifier. The default was left Soft on purpose: the cheap gate reads a ~455-char
-   teaser, and this is the exact axis whose over-firing caused the 15/26 retention collapse.
+   disqualifier. The default was left Soft on purpose, for two reasons: the cheap gate
+   reads a ~455-char teaser, and this is the exact axis whose over-firing caused the
+   15/26 retention collapse; and a user who ticks these without much thought and then
+   searches should still see a strong role they'd probably take. **What Soft does NOT
+   have is any user-visible trace** — the judge is barred from mentioning arrangement in
+   prose (`NO LOCATION COMMENTARY`) and `work_style` renders as a bare fact chip, so a
+   Remote pick under an On-site/Hybrid profile reads as a bug rather than as the setting
+   working as designed. `WorkStylePicker` closes that with a note under the buttons
+   naming the arrangements that can still appear ("Soft filter: you may still be shown
+   **Remote** roles…"), shown only when the combination makes it meaningful: Soft, at
+   least one arrangement picked, at least one unpicked. Keep the note if the enforcement
+   semantics change — it is the only place in the UI that says a Soft work-style
+   preference does not exclude.
    `listing_ok` catches listings that clearly
    aren't one specific job posting at all — a job board's own search-results/category
    page or generic aggregator blurb that slipped past discovery-time filtering (e.g.
@@ -572,7 +598,8 @@ of what the last finished run already recorded — see the search-pipeline secti
    `JUDGE_POOL` (40), so a cluster that happens to score lower can't lose more than its
    own share before fair-allocate ever runs. **The mid tier is deliberately run wider
    than the judge**: it accumulates toward `RANK_TARGET_POOL` (80) judge-eligible
-   approvals out of a run-wide `RANK_EXAMINE_BUDGET` (240) examined, and the judge then
+   approvals out of a run-wide `RANK_EXAMINE_BUDGET` (240, later 320 — see below)
+   examined, and the judge then
    takes the best `JUDGE_POOL` (40) of those. Before this the accumulation target *was*
    `JUDGE_POOL`, which made the judge's input "whatever survived" rather than a curated
    best-of — a live run reached it with 35 candidates, 5 of them in one cluster, so the
@@ -601,7 +628,7 @@ of what the last finished run already recorded — see the search-pipeline secti
    never lift a genuinely poor job over the floor, and gate_cache still stores the
    model's own number so the bonus can be retuned without invalidating a single score.
    `rank_gate`'s
-   prompt (`_rank_prompt`, cache gate "rank_v12.{intent hash}") carries **the candidate's
+   prompt (`_rank_prompt`, cache gate "rank_v13.{intent hash}") carries **the candidate's
    own `intent_text`** — which used to reach only the final judge, leaving this stage
    scoring function fit against bare role TITLES with no access to what the candidate
    meant by them, precisely the signal needed to tell an ambiguous title's two
@@ -633,6 +660,24 @@ of what the last finished run already recorded — see the search-pipeline secti
    store rows because their locations differ) keeps only the top-ranked copy in the
    judge pool, so the freed slots go to real candidates; the dropped copy keeps its
    cached rank score and no verdict, so it can resurface if the kept copy dies.
+   That exact-prefix test only catches a *verbatim* repost, and cross-BOARD
+   syndication is not verbatim: a live run judged "BI Analyst / Erin Associates"
+   twice — once from reed.co.uk, once from jobs.womenforhire.com — and the judge
+   itself wrote "Duplicate of Job 5" as the second one's reject reason. The two
+   copies wrap the same description in different board chrome, truncate it at
+   different lengths, and (once one has been enriched/scraped and the other hasn't)
+   hold very different amounts of it, so their 400-char prefixes can never match.
+   A second test (`_same_vacancy`) covers it: word-4-gram sets compared by
+   **containment** (shared ÷ the *smaller* side), not Jaccard — a 455-char Reed
+   teaser against the same vacancy's 4,000-char scraped page has a Jaccard of ~0.1,
+   while containment asks the question that actually matters, "is the shorter copy
+   essentially wholly inside the longer one". Deliberately narrow: same normalized
+   company **and** title are required first (so it only ever adjudicates candidates
+   the prefix test was already trying to separate), blank-company rows are excluded
+   (nothing to anchor on — `_dup_key`'s own blank-company path still covers
+   aggregator reposts), and `_DUP_MIN_SHINGLES` demands real text on the shorter
+   side. A false merge is cheap and recoverable for the same reason the prefix test's
+   is — the dropped copy keeps its rank score and takes no verdict.
    Count lands in `funnel_counts.judge_dupes_suppressed` (rendered on the Settings
    run-funnel panel) → **provisional
    early display reconcile**: by this point in the pipeline, provisional Role rows
@@ -682,7 +727,7 @@ of what the last finished run already recorded — see the search-pipeline secti
    identically to a fresh one), and are rendered by `engine._compose_analysis`. There is
    still no separate JD-summarisation pass — the three-axis read happens inside this same
    call, on the `full_text` it already receives, deliberately avoiding an extra paid call
-   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 21)
+   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 23)
    or every already-persisted verdict is served stale forever.
    **`fit_level` is derived mechanically from the model's own step-D requirements
    checklist and `concerns`, not from an overall impression, and is decoupled from which
@@ -716,13 +761,38 @@ of what the last finished run already recorded — see the search-pipeline secti
    workplace analytics platform" for a posting whose own text promised a two-week
    training period on that platform. Step C carries the display half: such a gap must
    quote the JD's framing in the same breath and never be listed first. (b) Step E's
-   **wording lock** — `top_match_reason` is written AFTER `fit_level` and must match its
-   register, with an explicit per-grade vocabulary and an explicit ban on the
+   **wording lock** — `top_match_reason` was written AFTER `fit_level` and had to match
+   its register, with an explicit per-grade vocabulary and an explicit ban on the
    qualifier-laundered forms ("a strong graduate fit", "a strong entry-level option")
-   that a live run produced under an "OK fit" badge three times. The prose sits directly
-   under the badge on the card, so a mismatch reads as the system contradicting itself;
-   the failure is near-always in one direction (an `ok` pick narrated as strong) because
-   the paragraph gets drafted from the case FOR the role rather than from the verdict.
+   that a live run produced under an "OK fit" badge three times. *That whole rule went
+   away with the field in v23 (below) — if a narrative verdict field is ever
+   reintroduced, reintroduce the lock with it.*
+   **v23 replaced step E's `top_match_reason` with APPLICATION GUIDANCE** —
+   `filters_on` (2–4 of the step-D checklist items this employer will actually screen
+   on **and** the candidate can evidence, in the JD's own words) plus `highlight` (2–3
+   second-person sentences naming which of the candidate's own projects/tools/results to
+   lead with against them). The card renders both under a **"Highlight when applying"**
+   heading as `This role likely filters on: …` followed by the guidance
+   (`engine._compose_analysis` → `§apply-highlights`; the retired `§ai-reasoning` marker
+   is still parsed by `RoleCard.tsx` so pre-v23 rows keep rendering until re-judged).
+   The narrative was cut because it was the fourth thing on the same card arguing the
+   same verdict — after the grade badge, the `role_type`+`summary` headline and the
+   `can_do_fit` line — and the one output field that gave the candidate nothing to act
+   on. Two constraints carry the value: `filters_on` **excludes anything the candidate
+   has no evidence for at all** (that is a gap, and gaps belong in `concerns` — this
+   field is only what can go on the page), and `highlight` must name evidence that
+   actually appears in the profile, framing weak/self-directed evidence honestly rather
+   than dressing it as commercial. Two things step E used to own moved to `concerns`: a
+   false `sector_match` trade-off (step G) and a want-fit mismatch (step B).
+   v23 also closed a **nice-to-have vocabulary hole**: "ideally", "preferably",
+   "desirable", "a plus", "a bonus", "an advantage", "welcome", "would be great" were
+   absent from QUOTE-THEN-CLASSIFY's SOFT list and from step D's rule (b), so
+   "ideally Databricks or Snowflake" could be read as a bar — including a list of named
+   tools introduced by one of those words, which is the form that misled. And the
+   `not_selected` reason field carried none of the discipline steps C/D impose on
+   `concerns`: it is now explicitly held to the same bar, and may never cite a
+   nice-to-have or a trained-for ask as the reason a role was passed over ("out-competed"
+   is the honest answer there).
    **Tier hand-off — what the cheap/mid stages pass forward so the judge re-derives
    less** (`full_auto._final_eval_job_block`, all as bracketed notes in each job block;
    the judge's system prompt has a `WHAT THE BRACKETED HINTS IN A JOB BLOCK ARE`
@@ -773,7 +843,18 @@ of what the last finished run already recorded — see the search-pipeline secti
    (does it match one of the candidate's stated work types — a remote role passes only for
    a candidate who listed Remote). Keep those separate: collapsing them into the single
    feasibility test the rule used to be is exactly what let remote roles through, since the
-   rule then ended "if location is remote … do not raise a location objection". Whether the judge is actually
+   rule then ended "if location is remote … do not raise a location objection".
+   **GEOGRAPHY → v22 (+ `rank_v13`)**: judged bare distance between the candidate's stated
+   place and the listing's, with no awareness of `location_scope` — so a "national"-scope
+   candidate (deliberately searching country-wide, not narrowed to their city) still got an
+   in-country on-site/hybrid role downgraded/disqualified as "geographically impractical"
+   merely for being a different, distant city. A live case: a Newcastle hybrid role rejected
+   for a Southend candidate searching nationally. Both `rank_gate` (`_location_scope_note`)
+   and the final judge (`snapshot.build_snapshot`'s new "Location search scope" CV line) now
+   state what the candidate's scope actually means and instruct GEOGRAPHY to defer to it —
+   "national"/"international" scope means in-country/any-country distance is never itself a
+   GEOGRAPHY failure; only a different country (under "national") or an unmet visa/
+   right-to-work requirement (either scope) still fails it. Whether the judge is actually
    rejecting anything was hard to see from the console before — a per-cluster line now
    reports `N strong, N backup, N rejected (N with a disqualifier reason)` after every
    fresh judge call (`engine.py`'s `final_evaluation cluster[...] took Xs...` line), and
@@ -936,6 +1017,32 @@ of what the last finished run already recorded — see the search-pipeline secti
    browser-scraping was considered and rejected separately: ~4-5s/page would add
    minutes per run.
 
+   **Both enrichers run a SECOND time, on the judge pool.** The pre-gate caps above
+   are sized for latency (they sit in front of time-to-first-card) and are spent in
+   embed-score order, so a candidate that climbs into the judge pool from outside
+   that head slice reaches the expensive model still holding its teaser. For Reed
+   that only wastes a phase-5 fetch; for Adzuna it is terminal, because
+   `_needs_full_scrape` skips the `/jobs/land/ad/` interstitial and there is no other
+   route to text. A live run rejected an Adzuna "BI Analyst" with *"the available
+   description does not provide enough role requirements or seniority detail to
+   establish a genuine fit"* while that posting's own detail page carried a full
+   responsibilities-and-Power-BI-requirements section. None of the pre-gate caps'
+   reasoning applies at this point in the run: the provisional cards are already on
+   screen so nothing is waiting on it, it is plain HTTP with no LLM and no browser,
+   and it is bounded by `JUDGE_POOL`(40) rather than by an examine budget — and it
+   *shrinks* phase 5, since anything enriched here then skips the scrape. Count lands
+   in `funnel_counts.judge_pool_enriched`.
+
+   Relatedly, **`_needs_full_scrape` is not a proxy for "has enough text to judge"**
+   — `engine._has_judgeable_text` is, and `_selection_score` reads that one. The two
+   come apart on exactly one case and it was inverted: an un-enriched Adzuna row's
+   URL is an interstitial, so a fetch cannot help and `_needs_full_scrape` correctly
+   returns False — but the text it is stuck with is a 500-char blurb. Reading that
+   False as "text is fine" handed those rows `RICH_TEXT_SELECTION_BONUS`, i.e. the
+   most text-starved candidates in the store were being *preferentially promoted*
+   into the judge pool over candidates the judge could actually read. Keep the two
+   questions ("would a fetch help" vs "is there enough to judge") separate.
+
    Because of all this, `full_auto._gate_job_id` carries a **text-richness marker**.
    `_gate_cache_key` keys on (gate, profile signature, job id) and
    *not* on the text that was judged, so without the marker a verdict reached on the
@@ -988,6 +1095,44 @@ of what the last finished run already recorded — see the search-pipeline secti
    ever surfaces as an optional "Matched via: X track" clause in `ai_analysis` when more
    than one cluster exists.
 
+**Prompt caching — the pipeline's largest fixed cost, and why it's now measured.**
+Every prompt here is a long FIXED prefix followed by a short variable payload:
+`_screen_prompt` (~4.5k tokens of rules + profile, then the listings), `_rank_prompt`
+(~2.5k, then the listings), and `_FINAL_EVAL_SYSTEM` (~12k, with the CV + jobs in a
+separate user message). That is exactly the shape OpenAI's automatic prompt caching
+discounts, and the prefixes really are byte-identical across calls — `build_snapshot`
+runs once per run so `engine_profile` cannot drift between batches, and
+`_FINAL_EVAL_SYSTEM` interpolates nothing at all, so it is identical across every run
+and every user. Nothing read `usage` back, though, so whether the discount was landing
+was **unknowable** — on measured volumes that is ~110K tokens a run of luna+terra riding
+on an unverified assumption. Three things now:
+- `full_auto.llm()` records `prompt_tokens` / `cached_tokens` / `completion_tokens` per
+  `stage` (`_record_llm_usage`, mutex-guarded because gate/rank/judge calls all run on
+  pool threads). `run_search_task` resets it per run — deliberately *after*
+  `ensure_profile_intel`, so a run that happened to regenerate intel doesn't skew the
+  per-stage hit rates — and flattens the rollup into `funnel_counts` as
+  `tokens_{stage}_{metric}`, surfaced by `GET /settings/run-funnel` and the Settings
+  funnel panel. **Un-flatten by stripping affixes, never by splitting on `_`**: both the
+  stage names (`rank_fallback`) and the metric names (`prompt_tokens`) contain
+  underscores, so any `rsplit`-based parse silently mis-attributes one to the other.
+- `llm()` passes `prompt_cache_key`. This is a **routing** hint, not a correctness key —
+  the API still requires an exact prefix match, so a coarse or stale key costs at most a
+  miss and can never serve the wrong cache. It matters here because this pipeline is
+  aggressively concurrent (4-wide gate batches, all clusters at once, concurrent judge
+  chunks) and concurrent requests otherwise land on different machines, each missing a
+  prefix the others just wrote. Screen/rank key on `_profile_signature` (+ the intent
+  hash for rank), mirroring their `gate_cache` key's scoping because those are precisely
+  the profile facets interpolated ABOVE the listing block.
+- The judge additionally passes `cache_retention="24h"` against a **constant**
+  `_FINAL_EVAL_CACHE_KEY`. Worth it only because that prefix is identical across runs;
+  the default few minutes of inactivity would expire it between searches, and paying
+  12k tokens once per cluster per run is this stage's dominant cost. Note the arithmetic
+  that follows: a judge call costs ~13.3k tokens before it reads a single job, and each
+  job then costs ~770 — **jobs are ~17× cheaper than calls**, so merging two thin
+  clusters into one call saves far more than trimming `JUDGE_POOL`, and the thin-cluster
+  backfill retry (a whole second `final_evaluation_split`) is the single most expensive
+  optional thing the run does.
+
 Key cost/reliability guards layered into this pipeline (tune via env vars, see
 `config.py` / top of `full_auto.py`):
 - `MAX_SEARCHES_PER_DAY` (default 6) — daily search cap **per USER** (counted by
@@ -1028,12 +1173,15 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   primary) after a live `tests/gate_harness.py` run confirmed jobs scoring below ~0.39
   were reliably screened out later anyway — admitting them at all just burned gate/rank
   calls on jobs with no realistic path to a final pick.
-- `RANK_EXAMINE_BUDGET` (240) / `RANK_TARGET_POOL` (80) / `JUDGE_POOL` (40) /
+- `RANK_EXAMINE_BUDGET` (240, later **320**) / `RANK_TARGET_POOL` (80) / `JUDGE_POOL` (40) /
   `RANK_REJECT_SCORE_FLOOR` (50), all `engine.py` — the four numbers that set what the
   cheap+mid stages cost and what the judge gets to choose from, see pipeline step 2.
   `RANK_EXAMINE_BUDGET` is the honest cost dial: it is roughly a 3x increase on what the
   old per-cluster caps summed to, and screen (CHEAP) + rank (MID) calls scale directly
-  with it. `full_auto.rank_gate`'s fail-open path (its `llm()` call erroring,
+  with it. Raised 240 → 320 after a live single-cluster run stopped on "absolute pool
+  cap" at 240 examined / 69 gated / 9 judged against a 760-deep queue — the ceiling
+  itself, not `MIN_RESULTS`/`JUDGE_POOL`/a thin queue, was the limiting factor.
+  `full_auto.rank_gate`'s fail-open path (its `llm()` call erroring,
   e.g. an intermittent permission/rate error on `MID_MODEL`) retries once on the same
   model after a short backoff, then falls back to `CHEAP_MODEL`, before giving up; a
   job that still has no real score after all of that is tagged `_rank_gate_failed` and
@@ -1050,7 +1198,7 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   small on purpose and should not be raised**: `report()` only fires once a whole round
   has gated *and* ranked, so that first round alone sets time-to-first-"Verifying…"-card.
   For the same reason `REED_ENRICH_PRE_GATE_CAP` (100, run-wide) caps the pre-gate Reed
-  enrichment rather than letting it follow the examine budget out to 240 — it is
+  enrichment rather than letting it follow the examine budget out to 320 — it is
   blocking main-thread HTTP sitting directly in front of first paint (a live run
   enriched 45 in 4.1s), so it is sized to cover roughly the first two rounds and the
   deep tail rides its teaser. `_GATE_MAX_WORKERS` is the knob to turn back down if

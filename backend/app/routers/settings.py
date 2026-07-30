@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..models import SearchRun, Setting
 from ..services.diagnostics import TIMING_RESULT_KEY, time_cv_parse
+from ..services import engine as engine_svc
 from ..services.moderation import get_blocked_domains, set_blocked_domains
 from ..services.parsing import CVParseFailed
 from ..services.sources import (
@@ -55,6 +56,23 @@ class SourceStatOut(BaseModel):
     selected: int      # user saved or applied
 
 
+class RunTokenStageOut(BaseModel):
+    """One LLM stage's token spend for a run (full_auto's _record_llm_usage,
+    flattened into funnel_counts as tokens_{stage}_{...}).
+
+    `cached_tokens` is the part of `prompt_tokens` OpenAI served from its prompt
+    cache. Every prompt in this pipeline is a long fixed prefix (screen ~4.5k,
+    rank ~2.5k, judge ~12k tokens) followed by a short variable payload, so a low
+    hit rate here means that prefix is being re-billed in full on every call --
+    the single largest avoidable cost in a run, and invisible before this."""
+    stage: str
+    calls: int = 0
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    cache_hit_ratio: float | None = None   # cached/prompt; None when nothing sent
+
+
 class RunFunnelOut(BaseModel):
     """Cross-stage funnel for the most recent finished search run -- the
     all-together counterpart to SourceStatOut's per-source, all-time view."""
@@ -68,6 +86,14 @@ class RunFunnelOut(BaseModel):
     judge_pool_size: int = 0             # initial judge pool, capped at JUDGE_POOL (engine.py)
     judge_dupes_suppressed: int = 0      # near-duplicate postings dropped pre-judge (engine.py::_suppress_judge_duplicates)
     shown: int = 0                       # final_picks
+    examined: int = 0                    # rank_scored -- total examined by the cheap+mid gates
+    # final_judge / examined -- a coarse "how niche is this profile" gauge, not
+    # a pipeline health metric: a low ratio can equally mean the gates are too
+    # strict OR the profile is a genuinely thin niche (see
+    # tests/tier_analysis.py for telling those apart). None when nothing was
+    # examined yet, rather than a misleading 0%.
+    filtering_ratio: float | None = None
+    token_usage: list[RunTokenStageOut] = []
 
 
 class RunPhaseOut(BaseModel):
@@ -102,6 +128,21 @@ class RunClusterOut(BaseModel):
     fallbacks: list[str] = []
 
 
+class RunCapsOut(BaseModel):
+    """Today's live pipeline cap constants (engine.get_pipeline_caps) -- shown
+    under the per-cluster table so a "stopped because: absolute pool cap" row
+    can be checked against the actual number instead of the reader needing to
+    know it from memory. Not stored per-run: these are just today's config."""
+    rank_examine_budget: int = 0
+    rank_target_pool: int = 0
+    judge_pool: int = 0
+    judge_pool_floor: int = 0
+    rank_reject_score_floor: int = 0
+    target_pool_per_round: int = 0
+    min_results_floor: int = 0
+    final_picks: int = 0
+
+
 class RunTimingsOut(BaseModel):
     """Per-phase wall time for the most recent finished search run, plus each
     role cluster's own funnel. The counterpart to CvParseTimingOut for the search
@@ -113,6 +154,7 @@ class RunTimingsOut(BaseModel):
     total_seconds: float = 0.0
     phases: list[RunPhaseOut] = []
     clusters: list[RunClusterOut] = []
+    caps: RunCapsOut = RunCapsOut()
 
 
 # Human labels for engine.py's _lap() phase keys, in pipeline order. An unknown
@@ -126,7 +168,8 @@ _RUN_PHASE_LABELS = [
     ("score", "Cosine scoring against clusters"),
     ("enrich", "Fetching full descriptions (Reed)"),
     ("gate", "Cheap screen + rank gate (per cluster)"),
-    ("rank", "Fair-allocate to the judge pool"),
+    ("judge_floor_topup", "Judge-pool floor top-up (extra gate+rank round)"),
+    ("rank", "Duplicate suppression + fair-allocate to judge pool"),
     ("scrape", "Full-page scraping"),
     ("final_eval", "Final AI judge"),
     ("scrape+judge", "Full-page scrape + final AI judge (overlapped)"),
@@ -251,13 +294,37 @@ def get_run_funnel(db: Session = Depends(get_db)):
         counts = json.loads(run.funnel_counts or "{}")
     except (ValueError, TypeError):
         counts = {}
+    examined = counts.get("rank_scored", 0)
+    shown_to_judge = counts.get("final_strong", 0) + counts.get("final_backup", 0)
+    # Un-flatten the tokens_{stage}_{metric} keys engine.py wrote. Driven off the
+    # keys actually present rather than a fixed stage list, so a stage added or
+    # renamed in full_auto shows up here without a matching edit. Recovered by
+    # stripping the known affixes, NOT by splitting on "_": both the stage names
+    # ("rank_fallback") and the metric names ("prompt_tokens") contain
+    # underscores, so any split-based parse mis-attributes one to the other.
+    token_stages = sorted({
+        k[len("tokens_"):-len("_calls")]
+        for k in counts if k.startswith("tokens_") and k.endswith("_calls")
+    })
+    token_usage = []
+    for stage in token_stages:
+        prompt_tokens = counts.get(f"tokens_{stage}_prompt_tokens", 0)
+        cached = counts.get(f"tokens_{stage}_cached_tokens", 0)
+        token_usage.append(RunTokenStageOut(
+            stage=stage,
+            calls=counts.get(f"tokens_{stage}_calls", 0),
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached,
+            completion_tokens=counts.get(f"tokens_{stage}_completion_tokens", 0),
+            cache_hit_ratio=round(cached / prompt_tokens, 4) if prompt_tokens else None,
+        ))
     return RunFunnelOut(
         run_id=run.id,
         finished_at=run.finished_at,
         entering=counts.get("raw_discovered", 0),
         passed_heuristic_embedding=counts.get("candidate_queue_size", 0),
         passed_gates=counts.get("gate_survivors_total", 0),
-        final_judge=counts.get("final_strong", 0) + counts.get("final_backup", 0),
+        final_judge=shown_to_judge,
         final_judge_rejected=(
             counts.get("final_fresh_judged", 0) - counts.get("final_strong", 0)
             - counts.get("final_backup", 0)
@@ -265,6 +332,9 @@ def get_run_funnel(db: Session = Depends(get_db)):
         judge_pool_size=counts.get("judge_pool_size", 0),
         judge_dupes_suppressed=counts.get("judge_dupes_suppressed", 0),
         shown=counts.get("final_picks", 0),
+        examined=examined,
+        filtering_ratio=round(shown_to_judge / examined, 4) if examined else None,
+        token_usage=token_usage,
     )
 
 
@@ -308,6 +378,7 @@ def get_run_timings(db: Session = Depends(get_db)):
         total_seconds=round(sum(p.seconds for p in phases), 2),
         phases=phases,
         clusters=clusters,
+        caps=RunCapsOut(**engine_svc.get_pipeline_caps()),
     )
 
 

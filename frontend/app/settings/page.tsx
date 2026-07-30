@@ -154,7 +154,34 @@ export default function SettingsPage() {
     <div className="app">
       <Nav />
       <div className="page-body">
-        <div className="page-title">Settings</div>
+        <div className="page-title">Analytics</div>
+
+        {runFunnel && runFunnel.run_id && runFunnel.filtering_ratio != null && (
+          <div className="panel">
+            <div className="panel-b">
+              {(() => {
+                const pct = runFunnel.filtering_ratio! * 100;
+                const rounded = pct < 1 ? pct.toFixed(1) : Math.round(pct).toString();
+                const niche = pct < 5;
+                const broad = pct > 20;
+                const verdict = niche ? "niche" : broad ? "broad" : "moderately selective";
+                return (
+                  <div className="row" style={{ alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 22, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                      Filtering ratio: {rounded}%
+                    </span>
+                    <span className="annotation">
+                      ({runFunnel.final_judge} of {runFunnel.examined} examined candidates reached a
+                      strong/backup verdict) — this profile reads as <strong>{verdict}</strong>. Below
+                      5% is a niche profile, above 20% is a broad profile — this is why so few (or
+                      many) jobs come back, separate from whether the gates are calibrated well.
+                    </span>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        )}
 
         <div className="panel">
           <div className="panel-h">Search run timings</div>
@@ -276,6 +303,21 @@ export default function SettingsPage() {
                         </tbody>
                       </table>
                     </div>
+                    {runTimings.caps && (
+                      <div className="annotation" style={{ marginTop: 8 }}>
+                        Today&rsquo;s caps (run-wide, split evenly across active tracks): examine
+                        budget <strong>{runTimings.caps.rank_examine_budget}</strong> · judge-eligible
+                        target <strong>{runTimings.caps.rank_target_pool}</strong> · rank-score floor{" "}
+                        <strong>{runTimings.caps.rank_reject_score_floor}</strong> · judge pool{" "}
+                        <strong>{runTimings.caps.judge_pool}</strong> (floor{" "}
+                        {runTimings.caps.judge_pool_floor}) · gate round size{" "}
+                        {runTimings.caps.target_pool_per_round} · min results/track{" "}
+                        {runTimings.caps.min_results_floor} · final picks{" "}
+                        {runTimings.caps.final_picks}. A track&rsquo;s &ldquo;Examined&rdquo; column
+                        hitting the examine budget (rather than falling short) is what &ldquo;stopped
+                        because: absolute pool cap&rdquo; means.
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -647,6 +689,63 @@ export default function SettingsPage() {
                     );
                   })()}
                 </div>
+                {runFunnel.token_usage?.length > 0 && (
+                  <>
+                    <div className="annotation" style={{ marginTop: 14 }}>
+                      <b>Token spend, by AI stage.</b> Each stage sends a long fixed
+                      instruction block before the listings themselves, identical on every
+                      call — so OpenAI should serve most of it from its prompt cache at a
+                      steep discount. &ldquo;Cached&rdquo; is how much of it actually was. A
+                      low percentage on a stage with many calls means that block is being
+                      paid for in full every time.
+                    </div>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ borderCollapse: "collapse", fontSize: 13, minWidth: 420 }}>
+                        <thead>
+                          <tr style={{ textAlign: "right" }}>
+                            <th style={{ textAlign: "left", padding: "4px 10px 4px 0" }}>Stage</th>
+                            <th style={{ padding: "4px 10px" }}>Calls</th>
+                            <th style={{ padding: "4px 10px" }}>Prompt</th>
+                            <th style={{ padding: "4px 10px" }}>Cached</th>
+                            <th style={{ padding: "4px 0 4px 10px" }}>Output</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {runFunnel.token_usage.map((t) => (
+                            <tr
+                              key={t.stage}
+                              style={{
+                                textAlign: "right",
+                                fontVariantNumeric: "tabular-nums",
+                                borderTop: "1px solid rgba(127,127,127,.15)",
+                              }}
+                            >
+                              <td style={{ textAlign: "left", padding: "4px 10px 4px 0" }}>
+                                {t.stage}
+                              </td>
+                              <td style={{ padding: "4px 10px" }}>{t.calls}</td>
+                              <td style={{ padding: "4px 10px" }}>
+                                {t.prompt_tokens.toLocaleString()}
+                              </td>
+                              <td style={{ padding: "4px 10px" }}>
+                                {t.cached_tokens.toLocaleString()}
+                                {t.cache_hit_ratio != null && (
+                                  <span className="muted-text">
+                                    {" "}
+                                    ({Math.round(t.cache_hit_ratio * 100)}%)
+                                  </span>
+                                )}
+                              </td>
+                              <td style={{ padding: "4px 0 4px 10px" }}>
+                                {t.completion_tokens.toLocaleString()}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
               </>
             ) : (
               <div className="annotation" style={{ marginTop: 12 }}>

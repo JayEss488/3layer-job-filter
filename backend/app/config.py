@@ -142,11 +142,24 @@ CV_SHORT_WORD_THRESHOLD = 750
 # Storage caps for profile.cv_summary (a Text column -- these are app-level
 # sanity bounds, not DB limits). CV_SUMMARY_RAW_MAX_CHARS guards the verbatim
 # short-CV path above against a pathological document with almost no
-# whitespace; CV_SUMMARY_MAX_CHARS guards the long-CV, AI-compressed path,
-# raised from an old 1200 (which used to cut a reply off mid-word) to comfortably
-# fit the fuller ~400-word descriptive overview parsing.py now asks for.
+# whitespace; CV_SUMMARY_MAX_CHARS guards the long-CV, AI-compressed path.
+#
+# These are SAFETY bounds against a runaway reply, NOT a length budget -- the
+# length the model is actually asked for lives in profile_intel._SUMMARY_TASK
+# ("max 450 words"), and this must sit clear of it or it silently becomes the
+# real limit. 3000 did exactly that: a live parse was cut at 2997 chars, mid-
+# sentence, at word 432 of a compliant ~460-word reply. What gets lost is not
+# random -- _SUMMARY_TASK numbers its sections, so the tail is always (4)
+# leadership/extracurriculars, (5) writing/communication work and (6) languages
+# and other differentiators, and the candidate_brief the final judge reads
+# (snapshot.candidate_brief) is where that evidence now lives at all, since
+# skill/qualification chips are no longer extracted. So the cap was quietly
+# deleting a whole class of evidence from every long-CV profile, permanently.
+# 450 words of dense prose runs ~3100-3300 chars; 4000 leaves real headroom.
+# Truncation is also sentence-boundary-aware now (profile_intel.clip_summary),
+# so even a reply that does overrun can no longer end mid-word.
 CV_SUMMARY_RAW_MAX_CHARS = 6000
-CV_SUMMARY_MAX_CHARS = 3000
+CV_SUMMARY_MAX_CHARS = 4000
 
 # ── Hard/soft enforcement ───────────────────────────────────────────────────
 # How literally a constraint row is applied. "hard" = an unconditional drop the
