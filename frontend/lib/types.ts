@@ -11,7 +11,8 @@ export type AttributeType =
   | "location_scope"
   | "custom"
   | "avoid"
-  | "must_have";
+  | "must_have"
+  | "max_listing_age";
 
 export interface Profile {
   id: number;
@@ -54,6 +55,9 @@ export interface RunFunnel {
   final_judge_rejected: number;
   judge_pool_size: number;
   judge_dupes_suppressed: number;
+  decided_family_keys: number;
+  decided_family_suppressed: number;
+  decided_family_shadow: boolean;
   shown: number;
   /** rank_scored — total examined by the cheap+mid gates. */
   examined: number;
@@ -197,6 +201,7 @@ const ENFORCEMENT_DEFAULT: Partial<Record<AttributeType, Enforcement>> = {
   location: "hard",
   seniority: "soft",
   salary: "soft",
+  max_listing_age: "hard",
 };
 
 export function enforcementOf(attr: Attribute): Enforcement {

@@ -230,3 +230,26 @@ def set_application_status(
 def delete_role(role: Role = Depends(get_role_or_404), db: Session = Depends(get_db)):
     role.status = "deleted"  # hard-hide, keep the row for dedup history
     db.commit()
+
+
+@router.post("/profiles/{profile_id}/roles/clear-all")
+def clear_all_roles(
+    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
+):
+    """Bulk escape hatch for stale roles piling up in the Inbox/search view --
+    soft-deletes every role that isn't a real decision (saved/applied), same
+    "deleted" status the single-role delete uses (restorable from the Deleted
+    tab). Deliberately leaves saved/applied untouched: those are decisions,
+    not backlog. Skips provisional rows so this can't interfere with an
+    in-flight run's placeholder cards."""
+    n = (
+        db.query(Role)
+        .filter(
+            Role.profile_id == profile.id,
+            Role.status.in_(("new", "crossed")),
+            Role.provisional.isnot(True),
+        )
+        .update({Role.status: "deleted"}, synchronize_session=False)
+    )
+    db.commit()
+    return {"cleared": n}

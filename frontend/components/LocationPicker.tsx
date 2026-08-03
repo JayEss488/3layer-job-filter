@@ -111,18 +111,29 @@ export function LocationPicker({
     }
   }
 
+  // The city/region text only narrows the search at "Local" scope -- once the
+  // candidate has widened to National (country-wide) or International (no
+  // country filter), the specific city is no longer what the search is keying
+  // on, so showing it back to them just reads as a stale/contradictory value.
+  // The underlying attribute is untouched (still there for the fail-closed
+  // country inference at National scope, see COUNTRY_TOKENS above), so
+  // switching back to Local reveals it again exactly as left.
+  const showCity = scope === "local";
+
   return (
     <div className="location-row">
       <div className="location-line">
-        <input
-          className="input"
-          style={{ width: 170 }}
-          placeholder="City or region…"
-          value={city}
-          onChange={(e) => setCity(e.target.value)}
-          onBlur={persistCity}
-          onKeyDown={(e) => e.key === "Enter" && persistCity()}
-        />
+        {showCity && (
+          <input
+            className="input"
+            style={{ width: 170 }}
+            placeholder="City or region…"
+            value={city}
+            onChange={(e) => setCity(e.target.value)}
+            onBlur={persistCity}
+            onKeyDown={(e) => e.key === "Enter" && persistCity()}
+          />
+        )}
         <div className="choice-row">
           {SCOPE_CHOICES.map((s) => (
             <button

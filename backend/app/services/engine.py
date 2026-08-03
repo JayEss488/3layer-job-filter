@@ -606,6 +606,96 @@ def _norm_company(s: str) -> str:
     return _COMPANY_SUFFIX_RE.sub("", _norm(s)).strip()
 
 
+# Trailing "(...)"/"- ..."/", ..." segment on a job title. Used ONLY by
+# _norm_title_key, and only ever stripped when corroborated -- see below.
+_TITLE_TRAILING_SEGMENT_RE = re.compile(
+    r"\s*(?:[\(\[]([^)\]]{2,40})[\)\]]|[-–—,]\s*([^-–—,]{2,40}))\s*$"
+)
+# A requisition/reference number, which never distinguishes two real vacancies.
+# The negative lookahead exempts a plausible YEAR (1900-2099): an intake year
+# does distinguish two real vacancies -- "Data Engineering Intern (Fall 2026)"
+# and "(Fall 2027)" are different cohorts and the later one is still open to
+# apply for. Without it the \d{4,} branch ate the year and left a dangling
+# "(fall", collapsing both cohorts onto one key. Real req numbers in the live
+# store (6632, 1058, 6314, 1137503) are unaffected; a req number that happens to
+# fall in the year range simply isn't stripped, which only ever under-merges.
+_TITLE_REQ_NUMBER_RE = re.compile(
+    r"\s*[\(\[]?\s*(?:req|ref|requisition|job)?\s*[#:\-]?\s*(?:id|no\.?)?\s*"
+    r"(?!(?:19|20)\d{2}\b)\d{4,}\s*[\)\]]?\s*$",
+    re.I,
+)
+# Never strip a segment carrying one of these: a segment that names a level is
+# describing the ROLE, not the place, even if it also happens to contain a
+# place-name token (a company named after a city, "Analyst - London Lead").
+_TITLE_LEVEL_TOKENS = {
+    "senior", "junior", "lead", "principal", "graduate", "trainee", "head",
+    "director", "apprentice", "intern", "associate", "staff", "chief", "manager",
+}
+# Connectives and geographic qualifiers that may legitimately pad a location
+# suffix ("Cork City", "West Coast", "London or Antwerp based"). Allowed as
+# leftovers by the subset test below; on their own they are never evidence.
+_TITLE_LOCATION_FILLER = {
+    "city", "and", "the", "area", "areas", "region", "regional", "metro",
+    "greater", "county", "north", "south", "east", "west", "central", "wide",
+    "site", "field",
+}
+
+
+def _norm_title_key(title: str, location: str = "") -> str:
+    """Normalized title for CROSS-RUN family matching (_decided_role_keys): the
+    same vacancy advertised in several cities must collapse to one key.
+
+    The trailing-segment strip is CORROBORATED, never unconditional -- it fires
+    only when the segment shares a real place-name token with the row's OWN
+    location string, which is the only evidence available that the suffix names a
+    place rather than a specialisation. Measured over the live store's 6,569
+    rows, 3,934 titles carry a trailing segment and only 85 are locations; the
+    other 3,849 are things like "Data Engineer - AWS", "Principal Engineer
+    (Microsoft)" and "Senior DevSecOps Engineer - GCP". Stripping unconditionally
+    would merge AWS with Azure to catch those 85 -- so the location test is the
+    whole design, not a refinement of it.
+
+    Deliberately NOT stripped:
+    * Years. "Graduate Programme 2027" and "... 2026" are different intakes at
+      the same employer, and the candidate can still apply to the later one.
+    * Seniority, and anything mid-title. "Senior Data Analyst" must never
+      collapse into "Data Analyst".
+
+    Under-firing is the safe direction and is expected: a postcode-style location
+    ("CV32UN") shares no token with anything, so nothing is stripped, no family
+    matches, and no role is suppressed."""
+    base = _norm(title)
+    if not base:
+        return ""
+    base = _TITLE_REQ_NUMBER_RE.sub("", base).strip()
+    loc_tokens = _location_tokens(location)
+    # Loop so "Analyst - London (Hybrid)" peels both trailing segments. Bounded
+    # to keep a pathological title from spinning.
+    for _ in range(3):
+        if not loc_tokens:
+            break
+        m = _TITLE_TRAILING_SEGMENT_RE.search(base)
+        if not m:
+            break
+        segment = m.group(1) or m.group(2) or ""
+        seg_tokens = _location_tokens(segment)
+        # The segment must BE a location, not merely CONTAIN one. Requiring only
+        # an intersection strips "Non-CDL Driver Des Moines" down to "1st shift -
+        # non" for a Des Moines row -- the place name is embedded in a segment
+        # that also carries the job function, and the function is what's lost.
+        # So: it must overlap the row's location AND have nothing left over
+        # afterwards except geographic filler.
+        leftover = seg_tokens - loc_tokens - _TITLE_LOCATION_FILLER
+        if (not seg_tokens or not (seg_tokens & loc_tokens) or leftover
+                or (seg_tokens & _TITLE_LEVEL_TOKENS)):
+            break
+        base = base[:m.start()].strip()
+    base = base.strip(" -–—,:|").strip()
+    # A strip that ate the whole title means the heuristic misfired; the raw
+    # normalized title is always a safe fallback (it just matches less).
+    return base if len(base) >= 3 else _norm(title)
+
+
 def identity_hash(job: dict) -> str:
     canon = _canonical_url(job.get("url", ""))
     basis = canon or f"{_norm_company(job.get('company',''))}|{_norm(job.get('title',''))}|{_norm(job.get('location',''))}"
@@ -726,7 +816,10 @@ def _same_vacancy(a: frozenset, b: frozenset) -> bool:
     return len(a & b) / min(len(a), len(b)) >= _DUP_CONTAINMENT
 
 
-def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
+def _suppress_judge_duplicates(
+    rank_by_cluster: dict[int, list[dict]],
+    decided_keys: set[tuple[str, str]] | None = None,
+) -> tuple[int, int, dict[tuple[str, str], int]]:
     """Drops near-duplicate postings from the per-cluster judge-eligible lists
     in place, keeping only the highest-rank_gate-scored copy of each (the lists
     arrive _rank_score-sorted descending, so the first copy seen is the best).
@@ -734,20 +827,39 @@ def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
     candidate instead of just shrinking the judge pool. Suppression is
     judge-pool-only: the dropped copy stays a gate survivor, keeps its cached
     rank score, and gets no persisted verdict -- if the kept copy disappears at
-    source, the duplicate can still surface on a future run. Returns how many
-    were suppressed.
+    source, the duplicate can still surface on a future run.
 
-    Two tests, in cost order: an exact normalized-prefix key (_dup_key, catches a
-    recruiter template reposted verbatim), then a near-identical-text check within
-    the same company+title (_same_vacancy, catches the same vacancy syndicated to a
-    second board with different chrome and truncation)."""
+    Three tests, in cost order: an exact normalized-prefix key (_dup_key, catches
+    a recruiter template reposted verbatim), a near-identical-text check within
+    the same company+title (_same_vacancy, catches the same vacancy syndicated to
+    a second board with different chrome and truncation), and -- when
+    `decided_keys` is supplied -- a CROSS-RUN family check against roles the user
+    has already saved or applied to (see _decided_role_keys).
+
+    This is the placement that actually saves something: running before
+    _fair_allocate means a slot freed by a family match goes to a real candidate,
+    rather than the duplicate being judged and only then hidden.
+
+    Returns (within_run_suppressed, decided_family_suppressed, per_family_counts).
+    The two counts stay SEPARATE: folding them together would destroy the ability
+    to tell an aggregator repost from a family match, and would make the Settings
+    panel's "same employer, title & text" wording false."""
+    decided_keys = decided_keys or set()
     seen: set[tuple] = set()
     # (company, title) -> the shingle sets of the copies kept so far under it.
     kept_texts: dict[tuple[str, str], list[frozenset]] = defaultdict(list)
     suppressed = 0
+    decided_hits: dict[tuple[str, str], int] = defaultdict(int)
     for idx, jobs in rank_by_cluster.items():
         kept = []
         for j in jobs:
+            fam = _family_key(j.get("company", ""), j.get("title", ""), j.get("location", ""))
+            if (fam is not None and fam in decided_keys
+                    and decided_hits[fam] < DECIDED_FAMILY_SUPPRESS_MAX):
+                decided_hits[fam] += 1
+                if DECIDED_FAMILY_SUPPRESS_ENABLED:
+                    continue
+                # Shadow mode: counted above, but still judged and shown.
             key = _dup_key(j)
             if key is not None and key in seen:
                 suppressed += 1
@@ -768,7 +880,7 @@ def _suppress_judge_duplicates(rank_by_cluster: dict[int, list[dict]]) -> int:
                 group.append(shingles)
             kept.append(j)
         rank_by_cluster[idx] = kept
-    return suppressed
+    return suppressed, sum(decided_hits.values()), dict(decided_hits)
 
 
 def _parse_iso(s: str):
@@ -850,12 +962,22 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
                 url=job.get("url"), snippet=job.get("snippet", ""),
                 state="new", source_updated_at=upd_dt, first_seen=now, last_seen=now,
                 posted_at=posted_dt, expires_at=expires_dt,
+                posted_at_approx=bool(job.get("posted_at_approx")) if posted_dt else None,
+                seen_days=1,
             )
             db.add(row)
             seen_this_batch[h] = row
             batch_rows.append(row)
             inserted += 1
         else:
+            # ORDER MATTERS: this reads existing.last_seen to decide whether today
+            # has already been counted, so it must run BEFORE last_seen is
+            # overwritten below. The two lines look independent; reversing them
+            # turns seen_days into a per-RUN counter (MAX_SEARCHES_PER_DAY allows
+            # 6 a day), which measures how often the user searches rather than how
+            # long the employer has been advertising. See JobSeen.seen_days.
+            if existing.last_seen is None or existing.last_seen.date() != now.date():
+                existing.seen_days = (existing.seen_days or 1) + 1
             existing.last_seen = now
             # A soft-duplicate match means a different source described the same
             # posting -- prefer whichever source's snippet is more complete rather
@@ -871,8 +993,17 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             # launder itself fresh every time it's re-syndicated -- the precise
             # thing the staleness signal exists to catch. Expiry is the opposite:
             # an employer can genuinely extend a closing date, so the newest wins.
+            incoming_approx = bool(job.get("posted_at_approx"))
             if posted_dt and (existing.posted_at is None or posted_dt < existing.posted_at):
                 existing.posted_at = posted_dt
+                existing.posted_at_approx = incoming_approx
+            elif (posted_dt and not incoming_approx and existing.posted_at_approx
+                    and posted_dt == existing.posted_at):
+                # Same date, better provenance: a source that genuinely states a
+                # posting date supersedes an aliased updated_at, so the age tag can
+                # stop hedging. Earliest-wins above already handles a different
+                # date; this only upgrades what we know about an equal one.
+                existing.posted_at_approx = False
             if expires_dt and (existing.expires_at is None or expires_dt > existing.expires_at):
                 existing.expires_at = expires_dt
             if upd_dt and existing.source_updated_at and upd_dt > existing.source_updated_at:
@@ -892,6 +1023,18 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             batch_rows.append(existing)
     db.commit()
     return inserted, refreshed, requeued
+
+
+def _store_age_days(db: Session, profile_id: int) -> float:
+    """Days since the OLDEST row in this profile's discovery store. 0.0 when the
+    store is empty. See the call site in _run_engine_pipeline for why the age tag
+    needs this rather than judging each row on its own first_seen."""
+    oldest = db.execute(
+        select(func.min(JobSeen.first_seen)).where(JobSeen.profile_id == profile_id)
+    ).scalar()
+    if not oldest:
+        return 0.0
+    return max(0.0, (datetime.utcnow() - oldest).total_seconds() / 86400.0)
 
 
 def _new_rows(db: Session, profile_id: int, limit: int = STORE_SCORE_CAP) -> list[JobSeen]:
@@ -982,6 +1125,12 @@ def _rows_to_dicts(rows: list[JobSeen]) -> list[dict]:
         # JobSeen.posted_at on why an unknown date must stay unknown.
         "_posted_at": r.posted_at.isoformat() if r.posted_at else None,
         "_expires_at": r.expires_at.isoformat() if r.expires_at else None,
+        "_posted_at_approx": bool(r.posted_at_approx),
+        # Our OWN observation window, independent of anything a board claims --
+        # see JobSeen.first_seen/seen_days. A lower bound on the ad's true age,
+        # never an upper one, and never evidence that a listing is fresh.
+        "_first_seen": r.first_seen.isoformat() if r.first_seen else None,
+        "_seen_days": r.seen_days or 1,
         "_eval_verdict": r.eval_verdict,
         "_eval_signature": r.eval_signature,
         "_eval_analysis": r.eval_analysis,
@@ -1074,6 +1223,37 @@ def _enrich_adzuna_full_text(engine, db: Session, profile_id: int, jobs: list[di
                             lambda url: url or None, engine.fetch_adzuna_details)
 
 
+def _persist_enrich_dead(db: Session, profile_id: int, by_key: dict[str, list[dict]],
+                         dead_keys: set[str], board: str) -> int:
+    """Mark JobSeen rows whose detail fetch returned 404/410 as dead.
+
+    Same column and semantics as the Phase 5 scrape path (_persist_dead_scrapes):
+    a fact about the URL, independent of profile/verdict, and every subsequent row
+    selection filters on `dead_reason IS NULL`. Runs on the calling thread, which
+    is where _enrich_pre_gate already commits."""
+    if not dead_keys:
+        return 0
+    identities = {
+        j["_identity"] for key in dead_keys for j in by_key.get(key, []) if j.get("_identity")
+    }
+    if not identities:
+        return 0
+    rows = db.execute(
+        select(JobSeen).where(
+            JobSeen.profile_id == profile_id,
+            JobSeen.identity_hash.in_(list(identities)),
+            JobSeen.dead_reason.is_(None),
+        )
+    ).scalars().all()
+    for r in rows:
+        r.dead_reason = "status_404_detail"
+    if rows:
+        db.commit()
+        _safe_print(f"[{board}] {len(rows)} listing(s) returned 404/410 from the detail "
+                    f"endpoint -- marked dead, excluded from every future run")
+    return len(rows)
+
+
 def _enrich_pre_gate(engine, db: Session, profile_id: int, jobs: list[dict], board: str,
                      key_of, fetch) -> int:
     """Shared body of the per-source pre-gate enrichers above: group the candidates
@@ -1095,7 +1275,14 @@ def _enrich_pre_gate(engine, db: Session, profile_id: int, jobs: list[dict], boa
     if not by_key:
         return 0
 
-    texts = fetch(list(by_key))
+    # A 404/410 from the source's OWN per-job endpoint is a high-confidence "this
+    # listing is gone" -- the same bar _dead_listing_signal applies to a scrape,
+    # but reached for free on a call already being made. Worth wiring up because
+    # dead_reason had never once fired on a 6,569-row store: Phase 5 is the only
+    # other place that can set it and it only ever reaches ~4% of rows.
+    dead_keys: set[str] = set()
+    texts = fetch(list(by_key), dead_keys)
+    _persist_enrich_dead(db, profile_id, by_key, dead_keys, board)
     if not texts:
         return 0
 
@@ -1700,6 +1887,29 @@ def _gate_rank_refill_cluster(
         batch = queue[pos:pos + batch_size]
         pos += batch_size
         examined += len(batch)
+
+        # Deterministic, LLM-free hard filter: a listing whose DEFINITE (non-
+        # approximate) posted date is confirmed older than the candidate's own
+        # "Maximum listing age" preference, when enforced Hard (the default) --
+        # see snapshot.build_snapshot's engine_profile["max_listing_age_days"/
+        # "_hard"]. Dropped the same way as the candidate's avoid/must-have
+        # chips: before any LLM call is even made, since the fact is already
+        # known, and excluded from the floor backfill below the same way
+        # hard_gate_failed always has been (backfilling a listing this old
+        # would defeat the point of the preference). Anything that slips past
+        # this (an unknown or merely-approximate date, or the preference left
+        # Soft) still reaches screen_gate/rank_gate/the judge, which apply the
+        # softer downgrade-only treatment instead -- see full_auto.py's
+        # listing_over_max_age/_listing_age_tag.
+        max_age_days = cluster_profile.get("max_listing_age_days")
+        max_age_hard = cluster_profile.get("max_listing_age_hard", True)
+        if max_age_hard and max_age_days:
+            too_old, kept = [], []
+            for j in batch:
+                (too_old if engine.listing_over_max_age(j, max_age_days) else kept).append(j)
+            if too_old:
+                hard_gate_failed.extend(too_old)
+                batch = kept
 
         annotated = engine.screen_gate(batch, cluster_profile)
         # The candidate's OWN hard filters drop unconditionally, like off-sector.
@@ -2369,6 +2579,16 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     if ats_stale:
         mark_ats_batch_fetched(db, profile_id)
     funnel["raw_discovered"] = len(raw_jobs)
+    # How long this profile's discovery store has been accumulating. Gates the
+    # age tag's OBSERVATION clause: on a reset store (or a fresh deployment)
+    # every row looks newly-discovered, and a per-row threshold alone cannot
+    # tell that apart from a genuinely new listing. See
+    # full_auto.OBSERVATION_MIN_STORE_DAYS -- below it, the clause is suppressed
+    # entirely, which correctly makes the whole signal a no-op until it has had
+    # time to mean something.
+    store_age_days = _store_age_days(db, profile_id)
+    eng_profile["store_age_days"] = store_age_days
+    funnel["store_age_days"] = int(store_age_days)
     _snap("discovery", raw_jobs)
     raw_jobs, n_blocked = filter_blocked(raw_jobs, get_blocked_domains(db))
     funnel["blocklist_dropped"] = n_blocked
@@ -2798,11 +3018,24 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # Near-duplicate suppression before the expensive judge: same company, same
     # title, near-identical text (a recruiter template re-posted per city) keeps
     # only its top-ranked copy -- see _suppress_judge_duplicates.
-    n_dupes = _suppress_judge_duplicates(rank_by_cluster)
+    # Plus the CROSS-RUN family check: a role the user already saved/applied to,
+    # re-advertised by the same employer under a different city (the GRAYCE
+    # case). Keys are read here, on the main thread, once per run.
+    decided_keys = _decided_role_keys(db, profile_id)
+    n_dupes, n_decided, decided_hits = _suppress_judge_duplicates(rank_by_cluster, decided_keys)
     funnel["judge_dupes_suppressed"] = n_dupes
+    funnel["decided_family_keys"] = len(decided_keys)
+    funnel["decided_family_suppressed"] = n_decided
+    funnel["decided_family_shadow"] = not DECIDED_FAMILY_SUPPRESS_ENABLED
     if n_dupes:
         emit(f"[pipeline] suppressed {n_dupes} near-duplicate posting(s) before the judge pool "
              f"(same company+title+text; top-ranked copy retained)")
+    if n_decided:
+        mode = "suppressed" if DECIDED_FAMILY_SUPPRESS_ENABLED else "WOULD suppress (shadow mode)"
+        emit(f"[pipeline] {mode} {n_decided} listing(s) matching a role already "
+             f"saved/applied: " + "; ".join(
+                 f"{comp} / {title} x{n}" for (comp, title), n in
+                 sorted(decided_hits.items(), key=lambda kv: -kv[1])[:5]))
 
     selected = _fair_allocate(rank_by_cluster, JUDGE_POOL)
     # Now genuinely just dedup + fair-allocate -- the judge-floor top-up round
@@ -3318,6 +3551,74 @@ def _already_decided_ids(db: Session, profile_id: int, identities: list[str]) ->
     }
 
 
+# Cross-run family suppression (the GRAYCE case). _already_decided_ids above
+# matches an exact identity_hash, so the SAME grad scheme advertised in a second
+# city -- different URL, therefore different hash -- sailed straight past it and
+# was surfaced again after the user had already applied. Discovery deliberately
+# keeps those as separate JobSeen rows (_find_soft_duplicate REQUIRES a shared
+# location token), and _suppress_judge_duplicates only ever sees one run, so
+# nothing anywhere connected the two.
+#
+# Scope is deliberately narrow, on one criterion: suppress only on states that
+# are explicit, visible, user-initiated and individually reversible from
+# /my-roles. That admits 'saved' and 'applied' and excludes:
+#   * 'crossed'  -- _prune_previous_roles flips these to 'deleted' at the start of
+#                   every run, so cross-run there is nothing left to match anyway;
+#                   and "a cross resets each session" is a deliberate property,
+#                   which this would silently convert into a permanent blocklist.
+#   * 'ignored'  -- written automatically by _expire_stale_roles after
+#                   ROLE_STALE_DAYS with NO user involvement, so including it
+#                   would let the mere passage of time blocklist a whole family.
+#   * 'deleted'  -- terminal state of a cross and of a leftover-provisional reap.
+#
+# Nothing is persisted by the suppression itself: the JobSeen row keeps its
+# state, rank score and (absent) verdict, so un-saving the role brings the family
+# straight back on the next run.
+_DECIDED_FAMILY_STATUSES = ("saved", "applied")
+
+# Per-family cap, so a template employer advertising one title across 40 cities
+# (a real shape in the live store) cannot have an unbounded number of rows
+# suppressed by a single decision without it being obvious in the console.
+DECIDED_FAMILY_SUPPRESS_MAX = 3
+
+# Shadow mode. False = compute the keys and count what WOULD be suppressed, but
+# suppress nothing. Lets one ordinary run report the real blast radius, by name,
+# before any result is withheld from the user. Flipped to True after a shadow
+# run (2026-08-03, run 15) confirmed the matcher against real data -- it
+# correctly keyed "Pimlico Enterprises / Graduate Data Analyst" across its
+# Bolton/Doncaster/GB reposts to the saved Bolton copy's family -- and reported
+# 0 suppressions only because none of that run's live candidates happened to be
+# in a decided family (see funnel_counts.decided_family_*).
+DECIDED_FAMILY_SUPPRESS_ENABLED = True
+
+
+def _family_key(company: str, title: str, location: str = "") -> tuple[str, str] | None:
+    """(normalized company, normalized title family), or None when there is no
+    company to anchor on. A blank company is excluded for the same reason
+    _same_vacancy excludes it: aggregator rows arrive company-less and would
+    collapse unrelated postings that merely share a common title."""
+    comp = _norm_company(company or "")
+    if not comp:
+        return None
+    key = _norm_title_key(title or "", location or "")
+    return (comp, key) if key else None
+
+
+def _decided_role_keys(db: Session, profile_id: int) -> set[tuple[str, str]]:
+    """Family keys for roles this profile has already saved or applied to. Cheap
+    (a live profile holds tens of roles), computed once per run and threaded
+    through rather than re-queried per call site."""
+    rows = db.execute(
+        select(Role.company, Role.title, Role.location).where(
+            Role.profile_id == profile_id,
+            Role.status.in_(_DECIDED_FAMILY_STATUSES),
+        )
+    ).all()
+    keys = {_family_key(c, t, l) for c, t, l in rows}
+    keys.discard(None)
+    return keys  # type: ignore[return-value]
+
+
 def _top_n_across_clusters(cluster_accum: dict[int, list[dict]], n: int, key=None) -> list[dict]:
     """Flattens every cluster's currently-known snapshot and returns the top `n`
     by `key` (default _selection_score). A simple global sort, NOT fairness-
@@ -3387,7 +3688,19 @@ def _upsert_provisional_rows(db: Session, profile_id: int, run: SearchRun,
     # embedding-stage card would never be promoted out of the "not yet reviewed"
     # section even once the gate and rank stage had cleared it.
     decided = _already_decided_ids(db, profile_id, [j.get("_identity") for j in top])
-    top = [j for j in top if j.get("_identity") in existing or j.get("_identity") not in decided]
+    # Family-level twin of the same rule, so a different-city copy of an
+    # already-decided role doesn't flash as a "Verifying..." card for the whole
+    # run before vanishing at finalization. Same `in existing` escape for the same
+    # reason: a row this run already owns must keep being UPDATED.
+    decided_fams = (_decided_role_keys(db, profile_id)
+                    if DECIDED_FAMILY_SUPPRESS_ENABLED else set())
+    top = [
+        j for j in top
+        if j.get("_identity") in existing
+        or (j.get("_identity") not in decided
+            and _family_key(j.get("company", ""), j.get("title", ""),
+                            j.get("location", "")) not in decided_fams)
+    ]
     matched = inserted = 0
     for pos, j in enumerate(top, start=1):
         ident = j.get("_identity") or _external_id(engine, j)
@@ -3713,6 +4026,14 @@ def run_search_task(profile_id: int, run_id: int) -> None:
             db, profile_id,
             [entry.get("_identity") or _external_id(engine, entry) for entry in final],
         )
+        # Family-level guard. NOT merely belt-and-braces: a job whose stored
+        # verdict is still valid under the current eval_signature is served from
+        # cache (see cached_strong in _run_cluster_final_eval) and therefore never
+        # passes through _suppress_judge_duplicates at all, so this is the only
+        # site that catches a cache-served member of an already-decided family.
+        decided_fams = (_decided_role_keys(db, profile_id)
+                        if DECIDED_FAMILY_SUPPRESS_ENABLED else set())
+        n_fam_persist = 0
 
         for rank, entry in enumerate(final, start=1):
             ident = entry.get("_identity") or _external_id(engine, entry)
@@ -3747,7 +4068,14 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 # rank stage, and a stale value here would file a genuine pick
                 # into the trailing "quick-scored only" section on /search.
                 row.provisional_stage = None
-            elif ident not in decided_ids:
+            elif ident in decided_ids:
+                pass  # already saved/applied from an earlier run -- see decided_ids.
+            elif _family_key(entry.get("company", ""), entry.get("title", ""),
+                             entry.get("location", "")) in decided_fams:
+                # Same role family as something already saved/applied, reached via
+                # the cached-verdict path. See decided_fams above.
+                n_fam_persist += 1
+            else:
                 db.add(Role(
                     profile_id=profile_id,
                     search_run_id=run.id,
@@ -3755,7 +4083,9 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                     status="new",
                     **fields,
                 ))
-            # else: already saved/applied from an earlier run -- see decided_ids.
+        if n_fam_persist:
+            _safe_print(f"[pipeline] skipped persisting {n_fam_persist} pick(s) in a role "
+                        f"family already saved/applied to")
 
         # Provisional rows the judge did NOT pick. Three outcomes, in priority
         # order, all riding the same commit as the picks above so the whole

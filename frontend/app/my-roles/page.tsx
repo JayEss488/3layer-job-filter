@@ -38,6 +38,7 @@ export default function MyRolesPage() {
   const apply = useMutation({ mutationFn: api.apply, onSuccess: invalidate });
   const save = useMutation({ mutationFn: api.save, onSuccess: invalidate });
   const del = useMutation({ mutationFn: api.deleteRole, onSuccess: invalidate });
+  const clearAll = useMutation({ mutationFn: api.clearAllRoles, onSuccess: invalidate });
   const setStatus = useMutation({
     mutationFn: (v: { id: number; s: ApplicationStatus }) =>
       api.setApplicationStatus(v.id, v.s),
@@ -60,17 +61,38 @@ export default function MyRolesPage() {
     <div className="app">
       <Nav />
       <div className="page-body">
-        <div className="ptabs">
-          {(["saved", "inbox", "deleted", "applied"] as Tab[]).map((t) => (
-            <div
-              key={t}
-              className={`ptab ${tab === t ? "on" : "off"}`}
-              onClick={() => setTab(t)}
+        <div className="ptabs" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex" }}>
+            {(["saved", "inbox", "deleted", "applied"] as Tab[]).map((t) => (
+              <div
+                key={t}
+                className={`ptab ${tab === t ? "on" : "off"}`}
+                onClick={() => setTab(t)}
+              >
+                {t[0].toUpperCase() + t.slice(1)}
+                <span className="count">({lists[t].length})</span>
+              </div>
+            ))}
+          </div>
+          {tab === "inbox" && current.length > 0 && (
+            <button
+              className="btn btn-ghost sm"
+              onClick={() => {
+                if (
+                  activeId &&
+                  window.confirm(
+                    "Clear all roles from the Inbox? Saved and applied roles are kept — " +
+                      "everything else can be restored from the Deleted tab."
+                  )
+                ) {
+                  clearAll.mutate(activeId);
+                }
+              }}
+              disabled={clearAll.isPending}
             >
-              {t[0].toUpperCase() + t.slice(1)}
-              <span className="count">({lists[t].length})</span>
-            </div>
-          ))}
+              {clearAll.isPending ? "Clearing…" : "Clear all"}
+            </button>
+          )}
         </div>
 
         {current.length === 0 && (

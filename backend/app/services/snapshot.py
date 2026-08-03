@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import (
+    DEFAULT_MAX_LISTING_AGE_DAYS,
     MAX_ROLE_CLUSTERS,
     PINNED_ROLE_MULT,
     WORK_TYPE_VALUES,
@@ -31,6 +32,19 @@ def _parse_salary_floor(values: list[str]) -> int:
         if nums:
             return int(nums[0])
     return 0
+
+
+def _parse_max_listing_age_days(values: list[str]) -> int:
+    """First row's value as a whole number of days, or
+    DEFAULT_MAX_LISTING_AGE_DAYS when the candidate has never set the
+    preference. 0 is a real, meaningful value (the candidate's own "No limit"
+    choice) and must not be treated the same as "no row at all"."""
+    if not values:
+        return DEFAULT_MAX_LISTING_AGE_DAYS
+    try:
+        return max(0, int(str(values[0]).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_LISTING_AGE_DAYS
 
 
 def _grouped(db: Session, profile_id: int) -> dict[str, list[ProfileAttribute]]:
@@ -391,6 +405,17 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
     # 0 (the slider's default min) means "no floor" -> the filter is a no-op.
     salary_floor = _parse_salary_floor(_values(g.get("salary", [])))
 
+    # Maximum listing age (Dashboard "Maximum listing age" preference), single-
+    # value like location_scope/seniority. 0 = "No limit", the candidate's own
+    # opt-out -- the check is skipped entirely, same as an unset salary floor.
+    # Enforcement defaults to Hard (config.ENFORCEMENT_DEFAULT) when no row
+    # exists at all, matching "30 days, hard, by default".
+    max_age_group = g.get("max_listing_age", [])
+    max_listing_age_days = _parse_max_listing_age_days(_values(max_age_group))
+    max_listing_age_hard = (
+        _resolve_enforcement(max_age_group[0]) == "hard" if max_age_group else True
+    )
+
     # Role clusters: one per ACTIVE role family the candidate defined (usually
     # one, but a candidate targeting genuinely different fields gets several --
     # see services/families.py); inactive families contribute no cluster at all
@@ -445,6 +470,14 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # "and reject anything outside this one city".
         "local_place": loc_place if (scope == "local" and location_hard) else "",
         "salary_floor": salary_floor,     # 0 means no salary floor
+        # Candidate's own tolerance for an old listing (Dashboard "Maximum
+        # listing age" preference). 0 means "No limit" -- the check is skipped
+        # entirely, never a 0-day mismatch. When hard (the default), a listing
+        # DEFINITELY known to be older is dropped outright at the gate, before
+        # any LLM call; when soft it's only ever downgraded, at rank_gate/the
+        # judge. See full_auto.py's listing_over_max_age/_listing_age_tag.
+        "max_listing_age_days": max_listing_age_days,
+        "max_listing_age_hard": max_listing_age_hard,
         "search_terms": search_terms,
         "role_clusters": role_clusters,   # list[{"roles": [...], "weighted_text": "..."}]
         # value -> priority label, used by the cheap gate/rank prompts (full_auto.py's
@@ -589,6 +622,22 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         )
         cv_lines.append(
             f"Work arrangement wanted ({binding}): {', '.join(work_types)}"
+        )
+    # Threading the actual day count + Hard/Soft through the CV text, rather
+    # than the (cached, profile-independent) judge system prompt, is what lets
+    # this preference reach the judge at all -- see full_auto.py's
+    # _FINAL_EVAL_SYSTEM docstring on why it must stay identical across every
+    # profile/run to keep OpenAI's 24h prompt-cache retention worth paying for.
+    if max_listing_age_days:
+        binding = (
+            "a hard limit -- exclude a role CLEARLY older than this"
+            if max_listing_age_hard else
+            "a preference -- downgrade a role clearly older than this, never exclude it"
+        )
+        cv_lines.append(
+            f"Maximum listing age ({binding}): {max_listing_age_days} days. Only apply this to a "
+            "listing whose posting date is CLEARLY known -- an unknown or merely-approximate date "
+            "is never penalised on this basis."
         )
     if customs:
         cv_lines.append("Constraints: " + "; ".join(customs))

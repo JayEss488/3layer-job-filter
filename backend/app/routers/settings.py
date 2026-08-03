@@ -11,7 +11,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import SearchRun, Setting
+from ..deps import get_profile_or_404
+from ..models import Profile, SearchRun, Setting
 from ..services.diagnostics import TIMING_RESULT_KEY, time_cv_parse
 from ..services import engine as engine_svc
 from ..services.moderation import get_blocked_domains, set_blocked_domains
@@ -85,6 +86,12 @@ class RunFunnelOut(BaseModel):
     final_judge_rejected: int = 0        # final_fresh_judged - final_strong - final_backup
     judge_pool_size: int = 0             # initial judge pool, capped at JUDGE_POOL (engine.py)
     judge_dupes_suppressed: int = 0      # near-duplicate postings dropped pre-judge (engine.py::_suppress_judge_duplicates)
+    # Cross-run family suppression (engine.py::_decided_role_keys). Kept separate
+    # from judge_dupes_suppressed on purpose: that one means "same employer, title
+    # AND text", this one means "you already saved/applied to this role family".
+    decided_family_keys: int = 0         # saved/applied families this run checked against
+    decided_family_suppressed: int = 0   # listings matching one of them
+    decided_family_shadow: bool = True   # True = counted only, nothing withheld
     shown: int = 0                       # final_picks
     examined: int = 0                    # rank_scored -- total examined by the cheap+mid gates
     # final_judge / examined -- a coarse "how niche is this profile" gauge, not
@@ -276,15 +283,24 @@ def get_source_stats(db: Session = Depends(get_db)):
 
 
 @router.get("/settings/run-funnel", response_model=RunFunnelOut)
-def get_run_funnel(db: Session = Depends(get_db)):
+def get_run_funnel(
+    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
+):
     """Cross-stage funnel (entering -> heuristic/embedding -> gates -> final
-    judge -> shown) for the most recently finished search run, across any
-    profile -- single-user prototype, see CLAUDE.md. funnel_counts is written
-    every run (engine.py::_run_engine_pipeline) but wasn't previously exposed
-    to the frontend anywhere."""
+    judge -> shown) for the most recently finished search run OF THIS PROFILE.
+    funnel_counts is written every run (engine.py::_run_engine_pipeline).
+
+    Used to read the most recent run across ANY profile (single-user
+    prototype assumption) -- once a user has more than one profile that meant
+    switching profiles on /settings could show a different profile's run
+    (e.g. its own search never ran, but another profile's just had)."""
     run = db.execute(
         select(SearchRun)
-        .where(SearchRun.status == "done", SearchRun.funnel_counts.isnot(None))
+        .where(
+            SearchRun.profile_id == profile.id,
+            SearchRun.status == "done",
+            SearchRun.funnel_counts.isnot(None),
+        )
         .order_by(SearchRun.finished_at.desc())
         .limit(1)
     ).scalar_one_or_none()
@@ -331,6 +347,9 @@ def get_run_funnel(db: Session = Depends(get_db)):
         ),
         judge_pool_size=counts.get("judge_pool_size", 0),
         judge_dupes_suppressed=counts.get("judge_dupes_suppressed", 0),
+        decided_family_keys=counts.get("decided_family_keys", 0),
+        decided_family_suppressed=counts.get("decided_family_suppressed", 0),
+        decided_family_shadow=bool(counts.get("decided_family_shadow", True)),
         shown=counts.get("final_picks", 0),
         examined=examined,
         filtering_ratio=round(shown_to_judge / examined, 4) if examined else None,
@@ -339,14 +358,20 @@ def get_run_funnel(db: Session = Depends(get_db)):
 
 
 @router.get("/settings/run-timings", response_model=RunTimingsOut)
-def get_run_timings(db: Session = Depends(get_db)):
+def get_run_timings(
+    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
+):
     """Per-phase wall time + per-cluster funnel for the most recently finished
-    search run, across any profile -- same "last finished run" selection as
+    search run OF THIS PROFILE -- same profile-scoped selection as
     get_run_funnel above. Pure read of what the run already recorded: no LLM
     cost, nothing re-computed."""
     run = db.execute(
         select(SearchRun)
-        .where(SearchRun.status == "done", SearchRun.phase_timings.isnot(None))
+        .where(
+            SearchRun.profile_id == profile.id,
+            SearchRun.status == "done",
+            SearchRun.phase_timings.isnot(None),
+        )
         .order_by(SearchRun.finished_at.desc())
         .limit(1)
     ).scalar_one_or_none()
@@ -383,14 +408,19 @@ def get_run_timings(db: Session = Depends(get_db)):
 
 
 @router.get("/settings/snapshot", response_model=SnapshotOut)
-def get_run_snapshot(db: Session = Depends(get_db)):
-    """Sample roles per pipeline stage for the most recently finished run (any
-    profile -- single-user prototype, see CLAUDE.md). Written by engine.py's
-    _snap() into SearchRun.snapshot_samples as
-    {stage: {"count": N, "samples": [{title, company, url}]}}."""
+def get_run_snapshot(
+    profile: Profile = Depends(get_profile_or_404), db: Session = Depends(get_db)
+):
+    """Sample roles per pipeline stage for the most recently finished run OF
+    THIS PROFILE. Written by engine.py's _snap() into SearchRun.snapshot_samples
+    as {stage: {"count": N, "samples": [{title, company, url}]}}."""
     run = db.execute(
         select(SearchRun)
-        .where(SearchRun.status == "done", SearchRun.snapshot_samples.isnot(None))
+        .where(
+            SearchRun.profile_id == profile.id,
+            SearchRun.status == "done",
+            SearchRun.snapshot_samples.isnot(None),
+        )
         .order_by(SearchRun.finished_at.desc())
         .limit(1)
     ).scalar_one_or_none()

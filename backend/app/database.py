@@ -75,6 +75,8 @@ def _migrate_columns():
             ("posted_at", "DATETIME"),
             ("expires_at", "DATETIME"),
             ("gate_signature", "TEXT"),
+            ("posted_at_approx", "BOOLEAN"),
+            ("seen_days", "INTEGER"),
         ],
         "company_ats": [("keyword", "TEXT")],
         "search_runs": [("phase_timings", "TEXT"), ("funnel_counts", "TEXT"), ("cancel_requested", "BOOLEAN"),

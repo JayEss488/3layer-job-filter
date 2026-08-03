@@ -111,6 +111,14 @@ ATTRIBUTE_TYPES = [
     # CLEAR violation only) -- distinct from the softer LLM-derived "requirements".
     "avoid",
     "must_have",
+    # Single-value, like location_scope/seniority: how old a listing (by its own
+    # stated/discoverable posting date) the candidate will tolerate. Value is the
+    # number of days as a string, e.g. "30"; no row -> DEFAULT_MAX_LISTING_AGE_DAYS.
+    # Enforced Hard by default (see ENFORCEMENT_DEFAULT) -- a listing whose posting
+    # date is DEFINITELY known to be older is dropped outright; Soft downgrades it
+    # instead of dropping it. An unknown/uncertain date is never penalised either
+    # way -- see full_auto.py's listing_over_max_age/_listing_age_tag.
+    "max_listing_age",
 ]
 
 # Where a skill's depth was earned -- distinct from proficiency (which grades
@@ -184,7 +192,17 @@ ENFORCEMENT_DEFAULT = {
     "location": "hard",
     "seniority": "soft",
     "salary": "soft",
+    # Hard by default per the candidate's own request: a definitely-old listing
+    # is dropped outright unless the candidate explicitly softens it to a
+    # downgrade-only preference.
+    "max_listing_age": "hard",
 }
+
+# Fallback when the candidate has no max_listing_age row at all (never edited
+# the preference). Mirrors full_auto.py's own module-level fallback for the
+# standalone CLI path, which has no ProfileAttribute table to read from --
+# kept in sync manually since the two modules don't share config imports.
+DEFAULT_MAX_LISTING_AGE_DAYS = 30
 
 
 def enforcement_for(attr_type: str, value: str | None) -> str:
@@ -259,6 +277,7 @@ ATTRIBUTE_DIRECTION = {
     "custom": "constraint",
     "avoid": "constraint",
     "must_have": "constraint",
+    "max_listing_age": "constraint",
 }
 
 # How far the candidate's stated location/country should be trusted as a hard

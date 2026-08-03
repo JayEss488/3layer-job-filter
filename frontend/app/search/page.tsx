@@ -13,17 +13,6 @@ import { useRoles, useSearchStatus } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
 import type { Role } from "@/lib/types";
 
-function timeAgo(iso?: string | null) {
-  if (!iso) return "";
-  const secs = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
-  if (secs < 60) return "just now";
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins} min${mins > 1 ? "s" : ""} ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs} hr${hrs > 1 ? "s" : ""} ago`;
-  return `${Math.floor(hrs / 24)} day(s) ago`;
-}
-
 export default function SearchPage() {
   const { activeId } = useProfiles();
   const qc = useQueryClient();
@@ -43,6 +32,7 @@ export default function SearchPage() {
   const tick = useMutation({ mutationFn: api.tick, onSuccess: invalidate });
   const cross = useMutation({ mutationFn: api.cross, onSuccess: invalidate });
   const applyRole = useMutation({ mutationFn: api.apply, onSuccess: invalidate });
+  const clearAll = useMutation({ mutationFn: api.clearAllRoles, onSuccess: invalidate });
   const cancelSearch = useMutation({
     mutationFn: (id: number) => api.cancelSearch(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["searchStatus", activeId] }),
@@ -99,10 +89,17 @@ export default function SearchPage() {
   // stage "embed" or "rank" pinned as a leftover instead of being deleted).
   // Either way they carry no fit_rank, so they must be pulled out of `current`
   // before it's rendered as this run's ranked picks.
+  //
+  // Deliberately NOT scoped to latestRunId: this row's originating run is
+  // irrelevant to what the section means ("nothing has fully reviewed this
+  // yet"), and these rows carry no fit_rank so they can never collide with a
+  // ranked badge the way a stale SAVED role could. Scoping this to the latest
+  // run used to leave every earlier run's leftovers permanently invisible
+  // (still counted in "Showing N results" via `active`, but rendered nowhere)
+  // -- a real production case had 55 such rows inflating "64 results" down to
+  // 9 actually on screen.
   const isUnreviewed = (r: Role) => r.provisional_stage === "rank" || r.provisional_stage === "embed";
-  const unreviewed = active.filter(
-    (r) => isUnreviewed(r) && r.status === "new" && r.search_run_id === latestRunId
-  );
+  const unreviewed = active.filter((r) => isUnreviewed(r) && r.status === "new");
   // A role the user Kept (or marked applied) mid-run that the judge then picked
   // is upgraded IN PLACE at finalization -- same row, status untouched, but now
   // carrying this run's real fit_rank (engine.py's finalization loop). It is a
@@ -176,13 +173,36 @@ export default function SearchPage() {
 
         {!running && (
           <div className="meta-row">
-            {/* Quick-scored-only rows are shown but aren't results — counting them
-                here would inflate "N results" with roles nothing reviewed. */}
-            Showing{" "}
-            <span className="count">
-              {active.length - unreviewed.length + crossed.length} results
+            <span>
+              {/* Quick-scored-only rows are shown but aren't results — counting them
+                  here would inflate "N results" with roles nothing reviewed. Summed
+                  from the exact buckets rendered below rather than derived by
+                  subtraction, so this can never drift from what's actually on
+                  screen (see the `unreviewed` note above for how it drifted before). */}
+              Showing{" "}
+              <span className="count">
+                {current.length + previous.length + savedRoles.length + unreviewed.length + crossed.length} results
+              </span>
             </span>
-            {status?.finished_at && ` — last searched ${timeAgo(status.finished_at)}`}
+            {(current.length + previous.length + savedRoles.length + unreviewed.length + crossed.length) > 0 && (
+              <button
+                className="btn btn-ghost sm"
+                onClick={() => {
+                  if (
+                    activeId &&
+                    window.confirm(
+                      "Clear all roles from this list? Saved and applied roles are kept — " +
+                        "everything else can be restored from the Deleted tab in My Roles."
+                    )
+                  ) {
+                    clearAll.mutate(activeId);
+                  }
+                }}
+                disabled={clearAll.isPending}
+              >
+                {clearAll.isPending ? "Clearing…" : "Clear all"}
+              </button>
+            )}
           </div>
         )}
 

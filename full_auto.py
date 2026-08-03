@@ -193,7 +193,13 @@ if not os.path.exists(CV_PATH):
 # meaningfully cheaper still, and screen_gate's binary sector/seniority-style
 # check doesn't need Luna's extra reasoning power. This is the highest-volume
 # gate call, so keeping it on the cheapest viable model matters most here.
-CHEAP_MODEL         = "gpt-5.4-nano-2026-03-17"
+#
+# ENGINE_-prefixed on purpose. backend/app/services/llm.py already reads the BARE
+# names CHEAP_MODEL/MID_MODEL/STRONG_MODEL for the profile-formation calls (CV
+# extraction, families, summary). Sharing them would mean an A/B on this search
+# pipeline silently retuned CV parsing too -- two unrelated stages moving on one
+# knob, with the formation change invisible from any search diagnostic.
+CHEAP_MODEL         = os.getenv("ENGINE_CHEAP_MODEL", "gpt-5.4-nano-2026-03-17")
 # Middle tier, used only where the cheap tier's coarseness is the limiting factor
 # (currently just rank_gate's numeric fit scoring) -- screen_gate stays on
 # CHEAP_MODEL since its binary sector/seniority check doesn't need the extra
@@ -202,17 +208,38 @@ CHEAP_MODEL         = "gpt-5.4-nano-2026-03-17"
 # (engine.py), an absolute floor on its 0-100 fit score rather than just a
 # relative ranking -- that's a materially heavier ask of this tier than before,
 # so it's worth the step up from gpt-5.4-mini.
-MID_MODEL           = "gpt-5.6-luna"
+MID_MODEL           = os.getenv("ENGINE_MID_MODEL", "gpt-5.6-luna")
 # Phase 6 final judge only (1-3 calls per run, the only exp-tier call in a live
 # search), so a newer/stronger model here costs cents per run, not dollars --
 # the highest-leverage place to spend more. Upgraded to GPT-5.6 Terra.
-EXP_MODEL           = "gpt-5.6-terra"
-EMBED_MODEL         = "text-embedding-3-small"
+EXP_MODEL           = os.getenv("ENGINE_EXP_MODEL", "gpt-5.6-terra")
+EMBED_MODEL         = os.getenv("ENGINE_EMBED_MODEL", "text-embedding-3-small")
 # The whole gpt-5.6 family (Luna, Terra) rejects any non-default temperature
-# outright (400 Unsupported value) -- only the default (1) is accepted. Both
-# rank_gate (MID_MODEL) and the Phase 6 final judge (EXP_MODEL) pass an explicit
-# temperature and must check this rather than using their caller's default.
-_FIXED_TEMPERATURE_MODELS = ("gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra")
+# outright (400 Unsupported value) -- only the default (1) is accepted. Every
+# call site that passes an explicit temperature must check this rather than
+# using llm()'s default: llm() forwards `temperature` straight to the API with
+# no guard of its own.
+#
+# A PREFIX test, not the exact-membership tuple this used to be. Two reasons the
+# old form was a trap. (1) The model constants are now env-overridable, so a
+# perfectly reasonable value like "gpt-5.6-luna-2026-05-01" would miss the tuple
+# and get temperature=0 -> 400 -> the caller's fail-open path. (2) screen_gate
+# hardcodes temperature=0 and its except branch keeps the whole batch
+# ("fail-open"), so pointing ENGINE_CHEAP_MODEL at a 5.6 model would make every
+# listing pass every axis while the console showed only a parse-failure line --
+# the gate silently deleted, which is precisely how the rank_gate flat-50 and
+# the day-long judge-fallback bugs both happened.
+_FIXED_TEMPERATURE_PREFIXES = ("gpt-5.5", "gpt-5.6")
+
+
+def _fixed_temperature(model: str) -> bool:
+    """True when `model` accepts only its default temperature."""
+    return any((model or "").startswith(p) for p in _FIXED_TEMPERATURE_PREFIXES)
+
+
+def _safe_temperature(model: str, wanted: float) -> float:
+    """The temperature to actually send: `wanted`, or the model's forced default."""
+    return 1 if _fixed_temperature(model) else wanted
 
 PROFILE_CACHE_DAYS  = 7
 MAX_CONCURRENT      = 5       # Max general simultaneous crawl requests
@@ -678,7 +705,7 @@ def reed_job_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def fetch_reed_details(job_ids: List[str]) -> Dict[str, str]:
+def fetch_reed_details(job_ids: List[str], dead_out: set | None = None) -> Dict[str, str]:
     """jobId -> full plain-text job description, for the ids that resolved.
 
     Reed's search response truncates jobDescription to a ~455-char teaser; this
@@ -689,23 +716,34 @@ def fetch_reed_details(job_ids: List[str]) -> Dict[str, str]:
     Fails SOFT and per-id: a 404/410 (listing pulled), a timeout, or an empty
     description simply doesn't appear in the returned dict, and the caller keeps
     whatever text it already had. Enrichment that can't be done is never a reason
-    to lose a candidate."""
+    to lose a candidate.
+
+    `dead_out`, when given, additionally collects the ids that came back 404/410.
+    A 404 from Reed's OWN per-job endpoint, for an id Reed's OWN search API just
+    returned, is as strong a "this listing is gone" signal as _dead_listing_signal
+    gets from a scrape -- and this call is already being made ~100 times a run, so
+    the signal was being discarded for free. Same exclusions as
+    _dead_listing_signal: 403/429/5xx and timeouts mean blocked/erroring, never
+    gone, and must not land here."""
     ids = [j for j in dict.fromkeys(job_ids) if j][:REED_DETAIL_MAX_PER_RUN]
     if not ids or not REED_API_KEY or not REED_DETAIL_ENRICH_ENABLED:
         return {}
 
-    def _one(job_id: str) -> tuple[str, str]:
+    def _one(job_id: str) -> tuple[str, str, bool]:
         try:
             r = requests.get(f"https://www.reed.co.uk/api/1.0/jobs/{job_id}",
                              auth=HTTPBasicAuth(REED_API_KEY, ""), timeout=12)
             if r.status_code != 200:
-                return job_id, ""
-            return job_id, _strip_html(r.json().get("jobDescription") or "")
+                return job_id, "", r.status_code in (404, 410)
+            return job_id, _strip_html(r.json().get("jobDescription") or ""), False
         except Exception:
-            return job_id, ""
+            return job_id, "", False
 
     with ThreadPoolExecutor(max_workers=12) as ex:
-        out = {job_id: text for job_id, text in ex.map(_one, ids) if text}
+        results = list(ex.map(_one, ids))
+    out = {job_id: text for job_id, text, _dead in results if text}
+    if dead_out is not None:
+        dead_out.update(job_id for job_id, _t, dead in results if dead)
     emit(f"   [reed] full descriptions fetched for {len(out)}/{len(ids)} listing(s)")
     return out
 
@@ -756,7 +794,7 @@ def _adzuna_description_from_html(page: str) -> str:
     return ""
 
 
-def fetch_adzuna_details(urls: List[str]) -> Dict[str, str]:
+def fetch_adzuna_details(urls: List[str], dead_out: set | None = None) -> Dict[str, str]:
     """Adzuna listing URL -> full plain-text description, for the ones that resolved.
 
     The Adzuna counterpart to fetch_reed_details -- see ADZUNA_DETAIL_ENRICH_ENABLED
@@ -769,7 +807,12 @@ def fetch_adzuna_details(urls: List[str]) -> Dict[str, str]:
     caller keeps whatever text it had. On repeated 429s the whole remaining batch is
     abandoned rather than retried -- enrichment is an optimisation, and getting rate-
     limited out of DISCOVERY (which shares this host) would cost far more than the
-    text is worth."""
+    text is worth.
+
+    `dead_out`, when given, collects the URLs whose detail page came back 404/410 --
+    see fetch_reed_details for the reasoning. 429 is pointedly excluded here: this
+    host rate-limits aggressively and a throttled response says nothing whatever
+    about whether the posting still exists."""
     seen = list(dict.fromkeys(u for u in urls if u))[:ADZUNA_DETAIL_MAX_PER_RUN]
     targets = [(u, _adzuna_detail_url(u)) for u in seen]
     targets = [(u, d) for u, d in targets if d]
@@ -785,23 +828,26 @@ def fetch_adzuna_details(urls: List[str]) -> Dict[str, str]:
     throttled = [0]        # consecutive-ish 429 count, shared across workers
     _THROTTLE_GIVE_UP = 3
 
-    def _one(target: tuple[str, str]) -> tuple[str, str]:
+    def _one(target: tuple[str, str]) -> tuple[str, str, bool]:
         original, detail_url = target
         if throttled[0] >= _THROTTLE_GIVE_UP:
-            return original, ""
+            return original, "", False
         try:
             r = requests.get(detail_url, headers=headers, timeout=15)
             if r.status_code == 429:
                 throttled[0] += 1
-                return original, ""
+                return original, "", False
             if r.status_code != 200:
-                return original, ""
-            return original, _adzuna_description_from_html(r.text)
+                return original, "", r.status_code in (404, 410)
+            return original, _adzuna_description_from_html(r.text), False
         except Exception:
-            return original, ""
+            return original, "", False
 
     with ThreadPoolExecutor(max_workers=max(1, ADZUNA_DETAIL_MAX_WORKERS)) as ex:
-        out = {u: text for u, text in ex.map(_one, targets) if text}
+        results = list(ex.map(_one, targets))
+    out = {u: text for u, text, _dead in results if text}
+    if dead_out is not None:
+        dead_out.update(u for u, _t, dead in results if dead)
     note = " (rate-limited, batch cut short)" if throttled[0] >= _THROTTLE_GIVE_UP else ""
     emit(f"   [adzuna] full descriptions fetched for {len(out)}/{len(targets)} listing(s){note}")
     return out
@@ -1643,36 +1689,183 @@ def _loose_date_to_iso(v) -> str | None:
     return None
 
 
-# A listing this old is stated to the scoring tiers as a negative. Not a filter and
-# not a disqualifier: a live 4-month-old posting is still applicable-to, it is just
-# a materially worse use of the candidate's time than an equally-good fresh one
-# (most of the shortlist is long gone), so it belongs as a downgrade on an otherwise
-# equal role rather than a drop. Below this it isn't mentioned at all -- ordinary
-# board latency is not a signal and naming it would invite the model to penalise it.
-STALE_LISTING_DAYS = 45
+# Fallback threshold when a candidate's own profile carries no
+# max_listing_age_days at all -- the standalone CV_PATH profile dict `python
+# full_auto.py` builds has no ProfileAttribute table to read one from. The
+# backend always sets engine_profile["max_listing_age_days"] (default 30, see
+# backend/app/config.DEFAULT_MAX_LISTING_AGE_DAYS -- kept in sync manually,
+# the two modules share no config import) and ["max_listing_age_hard"], which
+# is what actually decides ELIMINATE-vs-downgrade below. Below the threshold a
+# listing isn't mentioned at all -- ordinary board latency is not a signal and
+# naming it would invite the model to penalise it.
+DEFAULT_MAX_LISTING_AGE_DAYS = 30
+
+# Our OWN observation clock (JobSeen.first_seen / seen_days), used alongside the
+# board's claimed date. It is a LOWER bound on the ad's true age and nothing else:
+# it can only ever RAISE the age, never certify a listing as fresh.
+#
+# Why it earns its place: only ~15% of the live store carries a posted_at at all,
+# aggregators reset that date on every re-syndication, and Greenhouse has no
+# creation date to give (see posted_at_approx). None of that touches how long WE
+# have been seeing the ad, which no source can launder.
+OBSERVED_MENTION_DAYS = 21      # below this, ordinary board latency -- say nothing
+# Distinct days of re-observation before an ad reads as a standing pipeline ad
+# rather than a vacancy. ~4 weeks is a normal UK time-to-hire, so an ad still
+# being re-advertised on this many SEPARATE days has outlived a normal req.
+EVERGREEN_SEEN_DAYS = 30
+# ...but only if it was present on most days since we first saw it. 30 days
+# scattered over six months is a genuine repost of a new req, not an evergreen ad.
+EVERGREEN_SEEN_DENSITY = 0.6
+# The observation clock is meaningless until the STORE itself is old enough to
+# have observed anything. A reset store (or a new deployment) makes every row look
+# newly-discovered, and a per-row threshold alone cannot tell that apart from a
+# genuinely new listing. Below this, the observation clause is suppressed
+# entirely -- which correctly makes all of this a no-op on first ship.
+OBSERVATION_MIN_STORE_DAYS = 30
 
 
-def _listing_age_tag(job: dict, now: datetime | None = None) -> str:
-    """Bracketed age/closing note for a listing block, or "" when the source stated
-    no date. Silence must stay silent: roughly a third of the store has no date at
-    all, and an absent date is not evidence of an old posting."""
+def _days_since(iso: str | None, now: datetime) -> int | None:
+    """Whole days since an ISO timestamp, or None if absent/unparseable."""
+    parsed = _loose_date_to_iso(iso)
+    if not parsed:
+        return None
+    try:
+        return (now - datetime.fromisoformat(parsed)).days
+    except (TypeError, ValueError):
+        return None
+
+
+def _humanise_days(days: int) -> str:
+    months = days // 30
+    return f"{months} month{'s' if months != 1 else ''}" if months >= 2 else f"{days} days"
+
+
+def _listing_definite_age_days(job: dict, now: datetime) -> int | None:
+    """Days since a DEFINITE (non-approximate) stated posting date, or None when
+    there is no posted date at all, or only an aliased updated_at (Greenhouse
+    etc -- see JobSeen.posted_at_approx / fetch_ats). Only a definite date is
+    solid enough to ELIMINATE a listing outright; an unknown or merely-
+    approximate one is downgrade evidence at most (see _listing_age_tag)."""
+    if job.get("_posted_at_approx"):
+        return None
+    return _days_since(job.get("_posted_at"), now)
+
+
+def listing_over_max_age(job: dict, max_age_days: int | None, now: datetime | None = None) -> bool:
+    """True only when the listing's OWN definite posted date clearly exceeds the
+    candidate's stated maximum listing age (the Dashboard "Maximum listing age"
+    preference; 0/None means the candidate hasn't capped it, so this always
+    returns False). Used by engine.py to hard-drop a listing before ever
+    spending a gate LLM call on it, when that preference is enforced Hard.
+
+    An unknown or merely-approximate date is NEVER eliminated on this basis --
+    only a downgrade (see _listing_age_tag) -- which is why this checks
+    _listing_definite_age_days rather than the more lenient effective age the
+    tag itself computes."""
+    if not max_age_days:
+        return False
+    days = _listing_definite_age_days(job, now or datetime.utcnow())
+    return days is not None and days > max_age_days
+
+
+def _listing_age_tag(job: dict, now: datetime | None = None,
+                     store_age_days: float | None = None,
+                     max_age_days: int | None = None, hard: bool = True) -> str:
+    """Bracketed age/closing note for a listing block, or "" when nothing is known.
+
+    Silence must stay silent: most of the store has no posting date at all, and an
+    absent date is not evidence of an old posting.
+
+    TWO CLOCKS, deliberately never merged into one number:
+      * what the BOARD claims ("posted N days ago") -- testimony about when it was
+        posted, and the only one that can say a listing is NEW;
+      * what WE have observed ("we have been seeing this for N days") -- evidence
+        that the ad is still standing, and a lower bound on its age.
+    They are different evidence with different strength, so they get different
+    words. Averaging them would destroy exactly the distinction the judge needs:
+    a fresh claimed date sitting on top of a long observation window is the
+    signature of a re-listed old posting, and it is only visible as two numbers.
+
+    `store_age_days` gates the observation clause -- see OBSERVATION_MIN_STORE_DAYS.
+    `max_age_days`/`hard` are the candidate's own "Maximum listing age" preference
+    (DEFAULT_MAX_LISTING_AGE_DAYS when unset). A DEFINITE date past that limit is
+    marked ELIMINATE when `hard` -- defense in depth for rank_gate/the judge, since
+    engine.py's gate-stage Python filter (listing_over_max_age) already drops these
+    before any LLM ever sees them under normal operation; a merely-approximate or
+    observed-only signal, or a Soft preference, only ever gets the STALE downgrade
+    wording, never ELIMINATE."""
     now = now or datetime.utcnow()
+    # None (unset -- a legacy/standalone caller that never learned about this
+    # preference) falls back to the default; an explicit 0 is the candidate's
+    # own "No limit" choice and must disable the staleness/ELIMINATE wording
+    # entirely, not silently become the default threshold instead.
+    if max_age_days is None:
+        max_age_days = DEFAULT_MAX_LISTING_AGE_DAYS
+    age_limit_disabled = max_age_days <= 0
     bits: List[str] = []
-    posted = _loose_date_to_iso(job.get("_posted_at"))
-    if posted:
-        days = (now - datetime.fromisoformat(posted)).days
-        if days >= STALE_LISTING_DAYS:
-            months = days // 30
-            age = f"{months} month{'s' if months != 1 else ''}" if months >= 2 else f"{days} days"
-            bits.append(f"posted ~{age} ago -- STALE, treat as a negative")
-        elif days >= 0:
-            bits.append(f"posted {days} day{'s' if days != 1 else ''} ago")
+
+    posted_days = _days_since(job.get("_posted_at"), now)
+    approx = bool(job.get("_posted_at_approx"))
+    observed_days = _days_since(job.get("_first_seen"), now)
+    seen_days = job.get("_seen_days") or 1
+    # Only trust our own clock once the store has been running long enough for it
+    # to mean anything.
+    observable = (store_age_days is not None
+                  and store_age_days >= OBSERVATION_MIN_STORE_DAYS
+                  and observed_days is not None)
+
+    effective_age = max([d for d in (posted_days, observed_days if observable else None)
+                         if d is not None] or [0])
+    stale = (not age_limit_disabled) and effective_age >= max_age_days
+    # A DEFINITE (non-approximate) date past the candidate's own limit -- the one
+    # case solid enough to eliminate, never merely downgrade. See
+    # listing_over_max_age, which engine.py uses to drop these before the gate.
+    # Same ">=" as `stale` above, so this subsumes every non-approx case that
+    # would otherwise read as "STALE" -- the plain-staleness wording below is
+    # left for the case `stale` is true ONLY via the observed clock (posted_days
+    # itself still under the limit), which must NOT be reported against
+    # posted_days (see the "refreshed" clause further down instead).
+    definite_over = ((not age_limit_disabled) and posted_days is not None
+                      and not approx and posted_days >= max_age_days)
+
+    if posted_days is not None and posted_days >= 0:
+        if definite_over:
+            verdict = "ELIMINATE" if hard else "well past the candidate's stated limit -- strong negative"
+            bits.append(f"posted ~{_humanise_days(posted_days)} ago -- past the candidate's stated "
+                        f"{max_age_days}-day maximum listing age -- {verdict}")
+        elif approx:
+            # Greenhouse gives no creation date, only updated_at. Saying "posted"
+            # would put a claim in the board's mouth it never made.
+            bits.append(f"the board last updated this listing ~{_humanise_days(posted_days)} ago"
+                        + (" -- STALE, treat as a negative" if stale else ""))
+        else:
+            bits.append(f"posted {posted_days} day{'s' if posted_days != 1 else ''} ago")
+
+    if observable and observed_days >= OBSERVED_MENTION_DAYS:
+        clause = (f"we have been finding this same listing in our own searches for "
+                  f"{observed_days} days (this is when we FIRST found it, not when it "
+                  f"was posted -- it may be older, never newer)")
+        # The laundering catch: a fresh claimed date on top of a long observation
+        # window means the posting date was refreshed, not that the role is new.
+        if posted_days is not None and posted_days + 14 < observed_days:
+            clause += " -- so the stated posting date appears to have been refreshed"
+        if stale and posted_days is None:
+            clause += " -- STALE, treat as a negative"
+        bits.append(clause)
+        density = seen_days / max(1, observed_days)
+        if seen_days >= EVERGREEN_SEEN_DAYS and density >= EVERGREEN_SEEN_DENSITY:
+            bits.append(f"it has been advertised on {seen_days} separate days, near-continuously "
+                        f"-- consistent with a standing/pipeline ad rather than one vacancy")
+
     expires = _loose_date_to_iso(job.get("_expires_at"))
     if expires:
-        left = (datetime.fromisoformat(expires) - now).days
-        if left < 0:
+        try:
+            left = (datetime.fromisoformat(expires) - now).days
+        except (TypeError, ValueError):
+            left = None
+        if left is not None and left < 0:
             bits.append("the stated closing date has PASSED")
-        elif left <= 7:
+        elif left is not None and left <= 7:
             bits.append(f"closes in {left} day{'s' if left != 1 else ''}")
     return f"[listing age: {'; '.join(bits)}] " if bits else ""
 
@@ -1806,7 +1999,17 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
                         "location": (j.get("location") or {}).get("name", ""),
                         "snippet": _ats_text(j.get("content", "")),
                         "updated_at": j.get("updated_at"),
-                        "posted_at": j.get("updated_at")})
+                        # Greenhouse's board API exposes no creation date, only
+                        # updated_at -- a MODIFICATION timestamp. Every other
+                        # vendor here supplies a genuine publication date
+                        # (lever createdAt, workable published_on, recruitee
+                        # published_at, ashby publishedAt), so this is the only
+                        # aliased one. Kept because an untouched-for-months req
+                        # is itself a ghost signal, but flagged so the age tag
+                        # never renders it as a "posted" date the source never
+                        # claimed. See JobSeen.posted_at_approx.
+                        "posted_at": j.get("updated_at"),
+                        "posted_at_approx": True})
         elif vendor == "lever":
             out.append({"board": f"lever:{token}", "title": j.get("text", ""),
                         "company": token, "url": j.get("hostedUrl", ""),
@@ -2716,6 +2919,19 @@ def _profile_signature(profile: dict) -> str:
     return hashlib.sha1(basis.encode()).hexdigest()[:12]
 
 
+def _rank_age_cache_tag(profile: dict) -> str:
+    """Short, human-readable cache-key component for rank_gate's own "Maximum
+    listing age" preference. Not folded into _profile_signature (shared with
+    screen_gate, which never sees this preference at all -- see
+    listing_over_max_age's gate-stage Python filter) for the same reason the
+    intent hash rides in the gate name instead: editing the preference must
+    re-score rank_gate without also re-running every cheap screen call for a
+    guaranteed identical answer. Small integers, not worth hashing."""
+    days = int(profile.get("max_listing_age_days") or 0)
+    hard = int(bool(profile.get("max_listing_age_hard", True)))
+    return f"age{days}h{hard}"
+
+
 def _gate_job_id(job: dict) -> str:
     """Stable per-job key. Prefer the backend's cross-source identity when present.
 
@@ -2816,7 +3032,8 @@ def _run_gate(gate: str, candidates: list[dict], profile: dict,
         prompt = build_prompt(profile, listing_block)
         decisions: dict[int, tuple[bool, str]] = {}
         try:
-            raw = llm(prompt, system=system, require_json=True, temperature=0)
+            raw = llm(prompt, system=system, require_json=True,
+                      temperature=_safe_temperature(CHEAP_MODEL, 0))
             for d in json.loads(clean_json(raw)).get("decisions", []):
                 n = d.get("n")
                 if isinstance(n, int):
@@ -3529,7 +3746,13 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
             got: dict[int, tuple[str, bool, bool, bool, str | None, bool, bool, bool, bool, str]] = {}
             reqs: dict[int, list[dict]] = {}
             try:
-                raw = llm(_screen_prompt(profile, listing_block), require_json=True, temperature=0,
+                # _safe_temperature, not a bare 0: this except branch keeps the
+                # WHOLE batch on any error, so a CHEAP_MODEL that rejects
+                # temperature=0 would not fail loudly here -- it would pass every
+                # listing on every axis and log one parse-failure line. Since
+                # CHEAP_MODEL is env-overridable, that is a config away.
+                raw = llm(_screen_prompt(profile, listing_block), require_json=True,
+                          temperature=_safe_temperature(CHEAP_MODEL, 0),
                           stage="screen", cache_key=f"screen_v14:{sig}",
                           system="You screen job listings for role-function fit (match/ambiguous/"
                                  "mismatch), the candidate's own hard filters, whether the text is even "
@@ -3738,6 +3961,22 @@ def _rank_prompt(profile: dict, listing_block: str) -> str:
         f"this):\n\"{intent}\"\n"
         if intent else ""
     )
+    # Only rendered when the candidate's own "Maximum listing age" preference is
+    # enforced Hard (config default) -- a Soft preference is downgrade-only, and
+    # that's already covered by SCORING component 3 (STALENESS) below, so adding
+    # this rule for a Soft candidate would just contradict it. See
+    # snapshot.build_snapshot's engine_profile["max_listing_age_days"/"_hard"].
+    max_age_days = profile.get("max_listing_age_days")
+    max_age_rule = (
+        f"""g. MAX LISTING AGE: the candidate has set a maximum listing age of {max_age_days} days. If the
+   "[listing age: ...]" tag marks this listing "ELIMINATE", or the listing's own text states an explicit
+   posting/opening date or unambiguous staleness that itself works out to more than {max_age_days} days ago,
+   treat it the same as CLOSED LISTING above -- cap the score at 15. Never apply this from a vague sense
+   that a listing "feels old", from silence, or from a closing/deadline date alone (that's a separate
+   concern, see STALENESS below) -- only a definite, confirmed age past the stated limit qualifies.
+"""
+        if max_age_days and profile.get("max_listing_age_hard", True) else ""
+    )
     return f"""You are estimating how well each job listing fits ONE candidate, as a rough numeric score.
 This score gates which listings proceed to detailed review -- a wrong score buries a job silently, so
 when genuinely unsure between two scores, prefer the higher one.
@@ -3811,8 +4050,8 @@ f. OVER-QUALIFIED FOR A TRAINING SCHEME: the listing is a formal apprenticeship,
    many carry an eligibility bar against applicants who already hold an equivalent qualification. A
    DEGREE apprenticeship or Level 7/master's-level scheme is not covered by this, nor is a graduate
    scheme or graduate programme -- those hire at the candidate's level and are normal listings.
-
-SCORING -- two components, in this order (for listings with no hard downgrade):
+{max_age_rule}
+SCORING -- four components, in this order (for listings with no hard downgrade):
 1. FUNCTION MATCH (the primary driver of the score): does the role's actual day-to-day work match the
    target roles above -- a same-function role in a different industry is a good match; a different-
    function role in the candidate's own industry is not. Within "analyst"-type titles specifically,
@@ -3836,10 +4075,28 @@ SCORING -- two components, in this order (for listings with no hard downgrade):
    a strong match on it. One tagged "deprioritize"/"lower priority" reflects past cross feedback -- nudge
    the score down a little if the listing leans heavily on it.
 3. STALENESS (a small adjustment, applied last): a listing whose "[listing age: ...]" tag marks it STALE
-   has been open for months -- usually still live, but most of its shortlist is already decided, so it is
-   a worse use of an application than an equally-good fresh role. Subtract roughly 10 points, more for a
-   very old one. This is a nudge, never a downgrade: a stale role that fits well still outscores a fresh
-   one that doesn't, and a listing with NO age tag has an unknown date and is never penalised for it.
+   has been open a while relative to the candidate's own stated tolerance -- usually still live, but most
+   of its shortlist is already decided, so it is a worse use of an application than an equally-good fresh
+   role. Subtract roughly 10 points, more for a very old one. This is a nudge, never a downgrade: a stale
+   role that fits well still outscores a fresh one that doesn't, and a listing with NO age tag has an
+   unknown date and is never penalised for it. A tag marked ELIMINATE instead of STALE is a stronger,
+   confirmed signal -- see HARD DOWNGRADE (g) above, which applies instead of this nudge whenever the
+   candidate's maximum listing age is enforced Hard; when it is a Soft preference (or the tag never reaches
+   ELIMINATE), this nudge is all that ever applies, however old the listing.
+   The age tag may report TWO different clocks and they mean different things: "posted N days ago" is
+   what the job board itself claims, while "we have been finding this same listing ... for N days" is
+   how long this system has been seeing it advertised -- a lower bound on its real age, never a sign it
+   is new. When the tag says the posting date "appears to have been refreshed", trust the longer clock:
+   that is an old advert re-dated, not a new vacancy.
+4. STANDING/PIPELINE AD (a small adjustment, applied last): a listing carrying a "[possible
+   standing/pipeline ad: ...]" tag, or whose age tag says it has been advertised near-continuously on
+   many separate days, may be an always-open talent-pool advert rather than one specific vacancy --
+   applications to those often go into a database rather than to a hiring manager for an open role.
+   Subtract roughly 15 points where the fuller text supports it. Check the text before applying it: if
+   the posting clearly describes one specific role with its own duties and requirements, the phrase was
+   just boilerplate in a careers-page footer and you should NOT penalise it. Like staleness this is a
+   nudge and never a downgrade -- it can lower a score but must never by itself push a well-matched role
+   below a poorly-matched one, and an untagged listing is never penalised for it.
 
 Give each listing a fit_score from 0 (clearly wrong fit) to 100 (excellent fit). Judge relatively across
 the whole batch -- spread scores out rather than clustering everything near one number.
@@ -3883,11 +4140,19 @@ def _score_rank_batch(
         req_text = _key_requirements_text(c)
         return f"[key requirements (extracted by an earlier pass): {req_text}] " if req_text else ""
 
+    def _age_tag(c: dict) -> str:
+        return _listing_age_tag(
+            c, store_age_days=profile.get("store_age_days"),
+            max_age_days=profile.get("max_listing_age_days"),
+            hard=profile.get("max_listing_age_hard", True),
+        )
+
     listing_block = "\n".join(
         f"{i+1}. {c['title']} @ {c.get('company','')} | "
         f"{(c.get('location') or 'location unknown')}{_listing_salary_suffix(c)} | "
         f"{_teaser_tag(c)}"
-        f"{_listing_age_tag(c)}"
+        f"{_age_tag(c)}"
+        f"{_listing_liveness_tag(c)}"
         f"{'[gate note: role-function fit vs target roles was ambiguous, not a confirmed match] ' if c.get('_sector_ambiguous') else ''}"
         f"{_req_tag(c)}"
         f"{(c.get('full_text') or c.get('snippet') or '')[:RANK_LISTING_TEXT_CHARS]}"
@@ -3896,12 +4161,12 @@ def _score_rank_batch(
     prompt = _rank_prompt(profile, listing_block)
     scores: dict[int, float] = {}
     notes: dict[int, str] = {}
-    # See _FIXED_TEMPERATURE_MODELS -- gpt-5.6-luna 400s on temperature=0 just
+    # See _safe_temperature -- gpt-5.6-luna 400s on temperature=0 just
     # like gpt-5.6-terra does on 0.2, which was silently tripping the
     # fail-open except branch below on every single rank_gate batch (every
     # job scored a flat neutral 50.0, i.e. no real ranking signal at all)
     # until this was added.
-    rank_temperature = 1 if MID_MODEL in _FIXED_TEMPERATURE_MODELS else 0
+    rank_temperature = _safe_temperature(MID_MODEL, 0)
     rank_system = ("You estimate rough candidate-job fit scores. Spread scores out; "
                     "don't cluster everything near one value.")
     # Prompt-cache routing key. Mirrors the gate_cache key's own scoping (profile
@@ -3911,9 +4176,10 @@ def _score_rank_batch(
     # down from rank_gate: it's one small sha1 against several thousand tokens of
     # prompt, and keeping it local means the two concurrent batch workers can't
     # disagree about it.
-    rank_cache_key = (f"rank_v13:{_profile_signature(profile)}:"
+    rank_cache_key = (f"rank_v15:{_profile_signature(profile)}:"
                       + hashlib.sha1((profile.get("intent_text") or "")
-                                     .strip().lower().encode()).hexdigest()[:8])
+                                     .strip().lower().encode()).hexdigest()[:8]
+                      + f":{_rank_age_cache_tag(profile)}")
 
     raw = None
     try:
@@ -3945,7 +4211,8 @@ def _score_rank_batch(
             emit(f"[gate:rank] {MID_MODEL} retry also failed (status={status2}): {e2}; "
                  f"falling back to {CHEAP_MODEL}.")
             try:
-                raw = llm(prompt, require_json=True, temperature=0, model=CHEAP_MODEL,
+                raw = llm(prompt, require_json=True,
+                          temperature=_safe_temperature(CHEAP_MODEL, 0), model=CHEAP_MODEL,
                           system=rank_system, stage="rank_fallback",
                           cache_key=rank_cache_key)
             except Exception as e3:
@@ -3995,8 +4262,22 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     with `_rank_score` (0-100, higher is better) and `_rank_note` (short audit
     phrase, "" if none) in place and returns the full list unfiltered -- the
     caller applies its own cutoff (e.g. drop the bottom fraction, cap at N).
-    Cached per (profile signature + intent hash, job id) in gate_cache under
-    gate="rank_v13.{intent_tag}"
+    Cached per (profile signature + intent hash + max-listing-age tag, job id) in
+    gate_cache under gate="rank_v15.{intent_tag}.{age_tag}"
+    bumped from "rank_v14": new HARD DOWNGRADE (g), MAX LISTING AGE -- replaces the
+    old fixed STALE_LISTING_DAYS=45 downgrade-only mechanism with the candidate's own
+    configurable "Maximum listing age" preference (default 30 days), and caps the
+    score at 15 (like CLOSED LISTING) instead of only ever nudging it down, whenever
+    that preference is enforced Hard. The max-listing-age tag folded into the gate
+    name (_rank_age_cache_tag, alongside the existing intent hash) means editing the
+    preference re-scores without a global cache-version bump; a v14 score was reached
+    under a rule that could never cap a listing for this regardless of confirmed age,
+    and cannot be reused. "rank_v14" was
+    bumped from "rank_v13": SCORING gained component 4 (STANDING/PIPELINE AD, ~-15)
+    and component 3 (STALENESS) now explains the age tag's TWO clocks -- the board's
+    claimed posting date and our own observation window -- including what to do when
+    they disagree, which is the signature of a re-dated old advert. A v13 score was
+    reached without either signal and cannot be reused. "rank_v13" was
     bumped from "rank_v12": the GEOGRAPHY half of HARD DOWNGRADE (d) judged bare
     distance between the candidate's stated place and the listing's, with no idea the
     candidate's location_scope ("local"/"national"/"international") had already opted
@@ -4076,12 +4357,11 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     if not candidates:
         return []
     sig = _profile_signature(profile)
-    # "rank_v13" (not "rank_v12"): the gate name doubles as part of the cache key, and
+    # "rank_v15" (not "rank_v14"): the gate name doubles as part of the cache key, and
     # _gate_cache_key has no model field -- bumping it forces every previously
-    # scored job to be re-ranked under the reworded prompt (now GEOGRAPHY-vs-
-    # location_scope aware instead of judging bare distance, see the docstring)
-    # instead of serving a stale score forever. Bump again if the rank model/prompt
-    # changes again.
+    # scored job to be re-ranked under the reworded prompt (new HARD DOWNGRADE (g),
+    # MAX LISTING AGE, see the docstring) instead of serving a stale score forever.
+    # Bump again if the rank model/prompt changes again.
     #
     # The intent text is folded into the GATE NAME rather than into
     # _profile_signature, which is shared with screen_gate: screen_gate is
@@ -4093,7 +4373,11 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     intent_tag = hashlib.sha1(
         (profile.get("intent_text") or "").strip().lower().encode()
     ).hexdigest()[:8]
-    keys = [_gate_cache_key(f"rank_v13.{intent_tag}", sig, _gate_job_id(c)) for c in candidates]
+    # The max-listing-age preference rides in the gate name for the same reason
+    # intent does -- see _rank_age_cache_tag -- so editing it re-scores without
+    # re-running screen_gate, which never sees this preference at all.
+    age_tag = _rank_age_cache_tag(profile)
+    keys = [_gate_cache_key(f"rank_v15.{intent_tag}.{age_tag}", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -4224,6 +4508,53 @@ _EXPIRED_LISTING_RE = re.compile(
 )
 
 
+_EXPIRED_LISTING_MAX_CHARS = 6000    # ~p90 of scraped pages in the live store
+_EXPIRED_LISTING_HEAD_CHARS = 1500   # a real closure notice replaces the posting
+
+
+# Standing/pipeline ("ghost") advertising: an ad that collects applications
+# without a specific open vacancy behind it. Distinct from _EXPIRED_LISTING_RE,
+# which is about a posting that HAS closed -- this is about one that was never a
+# single vacancy to begin with, and it is a DOWNGRADE signal, never a drop.
+_EVERGREEN_LISTING_RE = re.compile(
+    r"we(?:'re| are) always (?:looking|recruiting|hiring|interested)|"
+    r"always on the lookout|"
+    r"join our talent (?:pool|community|network|bank)|"
+    r"talent (?:pool|pipeline|bank|community)|"
+    r"register your interest|expressions? of interest|"
+    r"speculative applications?|"
+    r"(?:applications?|candidates?) (?:are )?(?:reviewed|considered) on a rolling basis|"
+    r"future opportunit(?:y|ies)|"
+    r"no specific (?:vacancy|opening|role) at (?:this|the) (?:time|moment)|"
+    r"we accept applications year[- ]round",
+    re.I,
+)
+
+
+def _listing_liveness_tag(job: dict) -> str:
+    """Bracketed note when the listing's own text reads as a standing/pipeline ad
+    rather than one specific vacancy.
+
+    Reads job["full_text"] directly at tag-render time rather than being plumbed
+    through the store, so it automatically picks up text an enricher supplied
+    mid-run. Deliberately NOT run at discovery on the snippet: 96% of rows carry
+    only a ~500-char API teaser, which is the opening marketing blurb, and this
+    boilerplate lives in the closing paragraph -- so a discovery-time check would
+    both miss nearly everything and, being a drop, violate the downgrade-only
+    rule this signal is bound by.
+
+    Unlike the age tag, this IS an earlier pass's reading of text the model can
+    see for itself, so it carries no special standing -- the model's own reading
+    of the fuller text always wins."""
+    text = job.get("full_text") or job.get("snippet") or ""
+    m = _EVERGREEN_LISTING_RE.search(text)
+    if not m:
+        return ""
+    quote = " ".join(text[m.start():m.start() + 90].split())
+    return (f'[possible standing/pipeline ad: the text says "{quote}..." -- check whether this '
+            f'is one specific open vacancy or an always-open talent-pool advert] ')
+
+
 def _looks_like_expired_listing(markdown: str) -> bool:
     """True if the rendered page reads as a notice that the listing itself has
     closed/expired/been filled/removed, on an otherwise-normal 200 OK page --
@@ -4234,28 +4565,106 @@ def _looks_like_expired_listing(markdown: str) -> bool:
     by Friday"), which real, live postings use routinely and must never trip
     this. Length-gated like _looks_like_redirect_stub, sized larger: a genuine
     closure notice page usually still carries site nav/related-jobs
-    boilerplate around it, unlike a bare redirect stub."""
-    return len(markdown) < 3000 and bool(_EXPIRED_LISTING_RE.search(markdown))
+    boilerplate around it, unlike a bare redirect stub.
+
+    The length gate is paired with a POSITION gate rather than simply widened.
+    Length alone was the only defence against a long, live page that mentions
+    "this vacancy has closed" inside a related-jobs sidebar or a cookie/archive
+    footer -- but at 3000 chars it also missed genuinely-dead pages, since the
+    live store's scraped pages run to a p75 of 4592 and a p90 of 6079. A real
+    closure notice REPLACES the posting and therefore appears at the top, so
+    requiring the match to start within the first _EXPIRED_LISTING_HEAD_CHARS is
+    strictly narrowing (fewer false positives than the old rule) while letting
+    the length ceiling double. dead_reason is unrecoverable, so this must only
+    ever move in the conservative direction."""
+    if len(markdown) >= _EXPIRED_LISTING_MAX_CHARS:
+        return False
+    m = _EXPIRED_LISTING_RE.search(markdown)
+    return bool(m) and m.start() < _EXPIRED_LISTING_HEAD_CHARS
 
 
-def _dead_listing_signal(result, markdown: str) -> str | None:
+# Some ATS/company career pages 301-redirect a closed/removed requisition's URL
+# straight to the employer's general careers/jobs-index page instead of a 404 --
+# a normal 200 OK, well past the redirect-stub length gate, so neither
+# _looks_like_redirect_stub nor _looks_like_expired_listing (which needs an
+# explicit closure PHRASE, not just "this isn't the job you asked for") catches
+# it. A live case: a scrape for CFC's "Associate Data Scientist" landed on CFC's
+# general careers material, and the final judge could only note the mismatch as
+# a concern ("the supplied page contains CFC's general careers material rather
+# than the ... specific duties") rather than disqualify, because nothing marked
+# the listing as unverifiable/likely-closed -- it graded "Ok fit" off a page
+# that was never actually about this role.
+_GENERIC_CAREERS_HUB_RE = re.compile(
+    r"(?:browse|view|explore|search) (?:all )?(?:our )?(?:current |open |available )?"
+        r"(?:job|role|vacanc|career|position)|"
+    r"current (?:job )?(?:vacancies|openings|opportunities)|"
+    r"no (?:current |open )?vacanc(?:y|ies) (?:match|found)|"
+    r"join our (?:talent|team)\b|"
+    r"see all (?:our )?(?:jobs|vacancies|roles|openings)",
+    re.I,
+)
+_GENERIC_CAREERS_HUB_MAX_CHARS = 6000    # mirrors _EXPIRED_LISTING_MAX_CHARS
+_GENERIC_CAREERS_HUB_HEAD_CHARS = 1500   # a careers-index page leads with its own nav, same as a closure notice
+
+
+def _title_present(markdown: str, title: str) -> bool:
+    """Whether the job's OWN title (or a close paraphrase) appears anywhere in
+    the scraped text. A genuine job-detail page almost always names its own
+    role at least once (H1/breadcrumb/opening line, however much site chrome
+    surrounds it) -- its complete absence is the distinguishing signal a
+    generic careers-index page doesn't share. Requires all but one significant
+    title word to appear (order-independent), so a minor paraphrase ("Associate
+    Data Scientist" vs "Data Scientist, Associate") doesn't trip a false
+    positive. An empty/degenerate title has nothing to check, so it never
+    counts as "absent" -- that would make the generic-hub check fire on
+    title-less rows for an unrelated reason."""
+    sig_words = [w for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 2]
+    if not sig_words:
+        return True
+    text = markdown.lower()
+    hits = sum(1 for w in sig_words if w in text)
+    return hits >= max(1, len(sig_words) - 1)
+
+
+def _looks_like_generic_careers_hub(markdown: str, title: str) -> bool:
+    """True if the page reads as the employer's general careers/jobs-index
+    rather than this specific job's own listing. Gated on BOTH conditions to
+    stay conservative (dead_reason is unrecoverable, same as the checks above):
+    generic careers-index boilerplate near the top of the page, AND the job's
+    own title never mentioned anywhere at all. Either alone is too weak --
+    plenty of genuine JD pages carry a "browse our other roles" footer, and a
+    title can legitimately be paraphrased -- but the combination (index
+    language up front, and the specific role never named even once) is not
+    something a real single-vacancy page produces."""
+    if len(markdown) >= _GENERIC_CAREERS_HUB_MAX_CHARS:
+        return False
+    m = _GENERIC_CAREERS_HUB_RE.search(markdown)
+    if not m or m.start() >= _GENERIC_CAREERS_HUB_HEAD_CHARS:
+        return False
+    return not _title_present(markdown, title)
+
+
+def _dead_listing_signal(result, markdown: str, title: str = "") -> str | None:
     """A short machine-readable reason ('status_404'/'status_410'/
-    'expired_phrase') ONLY when this fetch is a HIGH-CONFIDENCE signal the
-    listing itself is gone -- as opposed to an ambiguous failure (anti-bot
-    block, rate-limit, timeout, generic 4xx/5xx, empty shell) that must stay
-    on the existing fail-open snippet-fallback path. 403/429/5xx are
+    'expired_phrase'/'generic_hub') ONLY when this fetch is a HIGH-CONFIDENCE
+    signal the listing itself is gone -- as opposed to an ambiguous failure
+    (anti-bot block, rate-limit, timeout, generic 4xx/5xx, empty shell) that
+    must stay on the existing fail-open snippet-fallback path. 403/429/5xx are
     deliberately excluded: those mean "blocked/rate-limited/erroring", not
-    "gone". Only 404/410 (HTTP-spec "not found"/"permanently gone") and an
-    explicit closure-phrase match count."""
+    "gone". Only 404/410 (HTTP-spec "not found"/"permanently gone"), an
+    explicit closure-phrase match, or landing on the employer's general
+    careers hub instead of this job's own page, count."""
     status = _effective_status_code(result)
     if status in (404, 410):
         return f"status_{status}"
     if markdown and _looks_like_expired_listing(markdown):
         return "expired_phrase"
+    if markdown and _looks_like_generic_careers_hub(markdown, title):
+        return "generic_hub"
     return None
 
 
-def _scrape_succeeded(result, markdown: str) -> bool:
+def _scrape_succeeded(result, markdown: str, title: str = "") -> bool:
     """Whether this fetch counts as a real-posting scrape success. A >=400
     status is NEVER a success regardless of markdown length or content --
     crawl4ai has no way to know an anti-bot/soft-404 error page's rendered
@@ -4265,7 +4674,8 @@ def _scrape_succeeded(result, markdown: str) -> bool:
         return False
     return bool(result.success and markdown and len(markdown) > 150
                 and not _looks_like_redirect_stub(markdown)
-                and not _looks_like_expired_listing(markdown))
+                and not _looks_like_expired_listing(markdown)
+                and not _looks_like_generic_careers_hub(markdown, title))
 
 
 def _scrape_worth_retrying(e: Exception) -> bool:
@@ -4392,7 +4802,7 @@ async def _find_alternate_posting(
             )
             result = await crawler.arun(url=link, config=run_config)
             markdown = _best_markdown(result)
-            if _scrape_succeeded(result, markdown):
+            if _scrape_succeeded(result, markdown, job.get("title", "")):
                 return markdown[:8000]
         except Exception:
             continue
@@ -4534,9 +4944,9 @@ async def scrape_full_details(
 
                     result = await crawler.arun(url=url, config=run_config)
                     markdown = _best_markdown(result)
-                    dead_signal = _dead_listing_signal(result, markdown)
+                    dead_signal = _dead_listing_signal(result, markdown, job.get("title", ""))
 
-                    if _scrape_succeeded(result, markdown):
+                    if _scrape_succeeded(result, markdown, job.get("title", "")):
                         job["full_text"] = markdown[:8000]
                         if attempt > 1:
                             emit(f"   [RETRY SUCCESS] Bypassed script wall for {job['company']} on attempt #{attempt}")
@@ -4601,8 +5011,9 @@ async def scrape_full_details(
     if alt_found:
         emit(f"   [phase 5] recovered {alt_found} otherwise-failed page(s) via alternate-source search")
     if dead_confirmed:
-        emit(f"   [phase 5] confirmed {dead_confirmed} listing(s) dead/expired (404/410 or explicit "
-             f"closure notice, no alternate posting found) -- excluded before the final judge")
+        emit(f"   [phase 5] confirmed {dead_confirmed} listing(s) dead/expired (404/410, an explicit "
+             f"closure notice, or a redirect to the employer's general careers hub, no alternate "
+             f"posting found) -- excluded before the final judge")
     return jobs
 
 
@@ -4714,6 +5125,29 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
+# 25 (from 24): new DISQUALIFIER 8, MAX LISTING AGE -- replaces the old fixed
+# STALE_LISTING_DAYS=45 downgrade-only mechanism with the candidate's own configurable
+# "Maximum listing age" preference (default 30 days, see
+# backend/app/config.DEFAULT_MAX_LISTING_AGE_DAYS), enforced Hard by default: a listing
+# DEFINITELY known to be older is now excluded outright rather than merely nudged down a
+# few points, mirroring how CLOSED LISTING/LOCATION are hard rules elsewhere. The
+# WHAT THE BRACKETED HINTS ARE paragraph now distinguishes the tag's "ELIMINATE"
+# severity (a confirmed fact, feeds this new disqualifier) from plain "STALE" (unchanged,
+# downgrade-only) -- deliberately worded profile-independently (naming no specific day
+# count or Hard/Soft state) since this system prompt is shared byte-for-byte across every
+# profile/run to keep its 24h prompt-cache retention paying off; the actual threshold and
+# Hard/Soft state ride in the per-run CV text (snapshot.build_snapshot's "Maximum listing
+# age" line) and the per-job age tag instead. A v24 verdict was reached under a rule that
+# could never exclude a role for this no matter how old it definitely was, and cannot be
+# reused. This also naturally re-opens the whole store once, since the age-tag threshold
+# itself moved (45 -> each candidate's own setting, default 30).
+# 24 (from 23): the WHAT THE BRACKETED HINTS ARE paragraph now explains the age tag's
+# TWO clocks (the board's claimed posting date vs how long this system has been
+# finding the ad) and what a "refreshed" posting date means, and adds the new
+# "[possible standing/pipeline ad: ...]" hint as a verify-in-the-text concern -- a
+# talent-pool advert with no vacancy behind it. Both are grade-nudging concerns and
+# neither is a disqualifier, deliberately: the ghost signals are downgrade-only. A v23
+# verdict was reached with neither hint in the prompt and cannot be reused.
 # 22 (from 21): DISQUALIFIER 2(a) GEOGRAPHY now defers to the profile's new "Location
 # search scope" CV line (snapshot.build_snapshot) instead of judging bare distance
 # between the candidate's stated place and the listing's. A "national"/"international"
@@ -4731,7 +5165,7 @@ async def expand_category_pages(
 # through for every candidate, whatever they had stated -- and NO LOCATION COMMENTARY
 # forbade even mentioning it in "concerns", so the judge could neither reject nor flag
 # it. A v20 verdict was reached under a rule that could not fail a remote role.
-FINAL_EVAL_PROMPT_VERSION = 23
+FINAL_EVAL_PROMPT_VERSION = 25
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -4910,7 +5344,19 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    that clearly contradicts / cannot satisfy one of the hard requirements. Apply the same clear-violation
    bar as the rules above: when the listing is silent on the point or it is genuinely ambiguous, do NOT
    exclude on that basis - keep the role and, if the point is material, note it as a concern for the
-   candidate to verify. If the profile states no such hard filters, this rule does not apply."""
+   candidate to verify. If the profile states no such hard filters, this rule does not apply.
+
+8. MAX LISTING AGE: The candidate's profile may state a "Maximum listing age" as either a hard limit or a
+   preference (see the profile above for which, and the number of days). This rule applies ONLY when it is
+   stated as a HARD limit - a preference is never a disqualifier, see the age-tag guidance above instead
+   (STALE vs ELIMINATE). Exclude a role under this rule only when you have CLEAR evidence it is definitely
+   older than that many days: either the job's "[listing age: ...]" tag explicitly marks it "ELIMINATE" (a
+   fact from this system's own data, not something to re-derive), or the posting's own text states an
+   explicit posting/opening date, or unambiguous staleness ("originally posted", a dated "last updated"
+   notice, a specific month/date long past) that itself works out to more than that many days ago. Silence,
+   a vague sense that a posting "feels old", or a closing/deadline date alone (a different concern - see the
+   age-tag guidance above) never trigger this rule on their own. If the profile states no maximum listing
+   age at all, or the tag/text gives you nothing definite to go on, this rule does not apply."""
 
 _FINAL_EVAL_WORDING = """WORDING: When you reference the candidate's OWN background in "summary", "highlight" or
 "concerns", never state a leadership or founder title (e.g. president, chair, founder, co-founder,
@@ -5244,12 +5690,30 @@ soften a "fit_level" the rubric doesn't support. In particular, "[earlier screen
 one cheap model's one-line impression -- treat it as a claim to verify, never as evidence of fit.
 "[listing age: ...]" is the one exception to all of the above: it is not an earlier pass's opinion but a
 FACT from the job board's own API, which the posting text itself usually does not state, so you cannot
-check it and must take it as given. A listing marked STALE has been open for months. It is normally still
-live, so this is not a disqualifier and never on its own a reason to reject -- but most of its shortlist is
-already decided, so it is a materially worse use of an application than an equally-good fresh role. Treat it
-as a real concern: name it in "concerns" and let it push a borderline grade down one step, and prefer the
-fresher role when choosing between two comparable picks. A block with NO age tag has an unknown posting
-date: say nothing about its age and never assume it is old.
+check it and must take it as given. It carries two different severities, and they mean different things.
+A listing marked STALE has been open for months. It is normally still live, so this is not a disqualifier
+and never on its own a reason to reject -- but most of its shortlist is already decided, so it is a
+materially worse use of an application than an equally-good fresh role. Treat it as a real concern: name it
+in "concerns" and let it push a borderline grade down one step, and prefer the fresher role when choosing
+between two comparable picks. A listing marked ELIMINATE is different in kind, not just degree: it means
+this system's own data has CONFIRMED the posting is older than the maximum listing age the candidate
+themselves set in their profile -- that is what DISQUALIFIER 8 (MAX LISTING AGE) below is for, and only
+this ELIMINATE wording (or your own reading of an explicit date/staleness in the text) carries that weight;
+STALE alone never does, and never treat the two as the same thing. A block with NO age tag has an unknown
+posting date: say nothing about its age and never assume it is old.
+The age tag may cite TWO different clocks, and only the first is the board's own claim. "posted N days ago"
+is what the board states. "we have been finding this same listing ... for N days" is how long this system
+has been seeing it advertised -- a LOWER bound on its real age, never evidence that it is new. When both
+appear and the tag says the posting date "appears to have been refreshed", believe the longer one: that is
+an old advert re-dated rather than a new vacancy, and it is the shortlist-already-decided concern above.
+"[possible standing/pipeline ad: ...]" is NOT in this exception -- it quotes wording from the posting text
+you can read yourself, so verify it. Some employers run an always-open advert to collect CVs into a talent
+pool with no single vacancy behind it, and an application there often reaches a database rather than a
+hiring manager. If the fuller text confirms it (no specific role, duties or requirements of its own; asks
+only to "register interest" or join a pool), name it in "concerns" and let it push a borderline grade down
+one step -- same weight as staleness. If the posting does describe one specific role with its own duties
+and requirements, the phrase was careers-page boilerplate: say nothing about it. It is never a
+disqualifier on its own.
 
 SCOPE OF EACH POSTING'S TEXT -- read first. Each posting's text is scraped from a web page and may contain
 unrelated boilerplate wrapped around the actual job description: site navigation, page footers, a "Similar jobs"
@@ -5290,7 +5754,8 @@ Leave "backup" empty when "strong" already gives good coverage, or when every ro
 _FINAL_EVAL_CACHE_KEY = f"final_eval_v{FINAL_EVAL_PROMPT_VERSION}"
 
 
-def _final_eval_job_block(i: int, j: dict) -> str:
+def _final_eval_job_block(i: int, j: dict, store_age_days: float | None = None,
+                          max_age_days: int | None = None, hard: bool = True) -> str:
     """One job's payload block. A non-trivial screen note (the merged gate's seniority
     verdict, already computed upstream) is surfaced as a hint so the model focuses its
     seniority re-check rather than re-deriving it from scratch. This same mechanism
@@ -5340,9 +5805,13 @@ def _final_eval_job_block(i: int, j: dict) -> str:
     rank_note = (j.get("_rank_note") or "").strip()
     if rank_note:
         hint += f"[earlier screening pass thought: {rank_note}]\n"
-    age_tag = _listing_age_tag(j).strip()
+    age_tag = _listing_age_tag(j, store_age_days=store_age_days,
+                               max_age_days=max_age_days, hard=hard).strip()
     if age_tag:
         hint += f"{age_tag}\n"
+    liveness_tag = _listing_liveness_tag(j).strip()
+    if liveness_tag:
+        hint += f"{liveness_tag}\n"
     return (f"JOB {i+1}: {j['title']} at {j['company']}\n"
             f"Location: {j.get('location') or 'not stated'}\nURL: {j['url']}\n{hint}\n"
             f"{j.get('full_text','')[:FINAL_EVAL_JOB_TEXT_CHARS]}")
@@ -5386,7 +5855,9 @@ def _sanitize_requirements_checklist(raw) -> list[dict]:
     return out
 
 
-def _run_final_eval(jobs: list[dict], cv_text: str | None
+def _run_final_eval(jobs: list[dict], cv_text: str | None,
+                    store_age_days: float | None = None,
+                    max_age_days: int | None = None, hard: bool = True,
                     ) -> tuple[list[dict], list[dict], list[dict]]:
     """One expensive-model call returning (strong, backup, disqualified) lists of merged
     job dicts. Replaces the old strict-then-relaxed two-call pattern: the single prompt
@@ -5403,7 +5874,8 @@ def _run_final_eval(jobs: list[dict], cv_text: str | None
         cv_text = open(CV_PATH, encoding="utf-8").read()
     cv_text = cv_text[:5000]
 
-    jobs_block = "\n\n---\n\n".join(_final_eval_job_block(i, j) for i, j in enumerate(jobs))
+    jobs_block = "\n\n---\n\n".join(
+        _final_eval_job_block(i, j, store_age_days, max_age_days, hard) for i, j in enumerate(jobs))
     prompt = f"""Candidate Background Profile:
 {cv_text}
 
@@ -5416,14 +5888,14 @@ three lists into "not_selected" with a short reason -- all {len(jobs)} job numbe
 Jobs Payload:
 {jobs_block}"""
 
-    # See _FIXED_TEMPERATURE_MODELS -- gpt-5.5/gpt-5.6-terra 400 on any
+    # See _safe_temperature -- gpt-5.5/gpt-5.6-terra 400 on any
     # non-default temperature. Keyed off EXP_MODEL so switching models can't
     # silently 400 into the unverified-fallback path again without anyone
     # noticing (see 691cf89 -- that's exactly how this was missed for a full
     # day: the 400 was swallowed by the except branch below). Confirmed
     # gpt-5.6-terra also 400s on 0.2 -- it was silently hitting this fallback
     # on every single Phase 6 call until this was added.
-    temperature = 1 if EXP_MODEL in _FIXED_TEMPERATURE_MODELS else 0.2
+    temperature = _safe_temperature(EXP_MODEL, 0.2)
     try:
         raw = llm(prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL, require_json=True,
                   temperature=temperature, stage="judge",
@@ -5451,8 +5923,15 @@ Jobs Payload:
              f"retry_after={retry_after}): {e}; retrying same model after {wait}s.")
         time.sleep(wait)
         try:
+            # Same stage/cache_key/cache_retention as the primary call above.
+            # Without them this retry paid the full ~12k-token _FINAL_EVAL_SYSTEM
+            # prefix uncached on the most expensive model, AND was invisible to
+            # _record_llm_usage -- so the judge stage's recorded cache-hit ratio
+            # was computed over a denominator that systematically excluded the
+            # calls most likely to miss.
             raw = llm(prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL, require_json=True,
-                      temperature=temperature)
+                      temperature=temperature, stage="judge",
+                      cache_key=_FINAL_EVAL_CACHE_KEY, cache_retention="24h")
         except Exception as e2:
             emit(f"[phase 6] {EXP_MODEL} retry also failed: {e2}")
             # None,None,None (not [],[],[]) -- a failed call must be distinguishable from a
@@ -5540,8 +6019,11 @@ def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None 
     end to end. A chunk that fails simply contributes nothing (its jobs get no verdict
     this run, retried next run) rather than failing the whole cluster, as long as at
     least one other chunk succeeded."""
+    store_age_days = (profile or {}).get("store_age_days")
+    max_age_days = (profile or {}).get("max_listing_age_days")
+    age_hard = (profile or {}).get("max_listing_age_hard", True)
     if len(jobs) <= FINAL_EVAL_MAX_JOBS_PER_CALL:
-        return _run_final_eval(jobs, cv_text)
+        return _run_final_eval(jobs, cv_text, store_age_days, max_age_days, age_hard)
 
     # Balanced, not greedy-fixed-size: a plain jobs[i:i+CAP] slice puts a lopsided
     # remainder in the last chunk (27 jobs at CAP=20 -> one call judging 20, another
@@ -5564,7 +6046,8 @@ def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None 
     disqualified: list[dict] = []
     any_succeeded = False
     with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
-        futures = [pool.submit(_run_final_eval, chunk, cv_text) for chunk in chunks]
+        futures = [pool.submit(_run_final_eval, chunk, cv_text, store_age_days, max_age_days, age_hard)
+                   for chunk in chunks]
         for fut in futures:
             c_strong, c_backup, c_disqualified = fut.result()
             if c_strong is None:
@@ -5585,7 +6068,9 @@ def final_evaluation(jobs: list[dict], profile: dict, cv_text: str | None = None
     """Judge `jobs`; return the best flat list -- strong fits, or the least-bad backups
     when nothing is strong. Standalone/CLI callers use this; `cv_text`, when given,
     overrides reading CV_PATH (the backend passes a role-cluster-scoped bio)."""
-    strong, backup, _disqualified = _run_final_eval(jobs, cv_text)
+    strong, backup, _disqualified = _run_final_eval(
+        jobs, cv_text, (profile or {}).get("store_age_days"),
+        (profile or {}).get("max_listing_age_days"), (profile or {}).get("max_listing_age_hard", True))
     return (strong or backup) or []
 
 

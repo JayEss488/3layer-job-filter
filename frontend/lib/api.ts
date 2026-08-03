@@ -222,13 +222,18 @@ export const api = {
     }),
   deleteRole: (roleId: number) =>
     req<void>(`/roles/${roleId}`, { method: "DELETE" }),
+  clearAllRoles: (profileId: number) =>
+    req<{ cleared: number }>(`/profiles/${profileId}/roles/clear-all`, { method: "POST" }),
 
   // settings
   sources: () => req<SourceInfo[]>("/settings/sources"),
   sourceStats: () => req<SourceStat[]>("/settings/source-stats"),
-  runFunnel: () => req<RunFunnel>("/settings/run-funnel"),
-  runTimings: () => req<RunTimings>("/settings/run-timings"),
-  snapshot: () => req<Snapshot>("/settings/snapshot"),
+  runFunnel: (profileId: number) =>
+    req<RunFunnel>(`/settings/run-funnel?profile_id=${profileId}`),
+  runTimings: (profileId: number) =>
+    req<RunTimings>(`/settings/run-timings?profile_id=${profileId}`),
+  snapshot: (profileId: number) =>
+    req<Snapshot>(`/settings/snapshot?profile_id=${profileId}`),
   setSources: (disabled: string[]) =>
     req<SourceInfo[]>("/settings/sources", {
       method: "PUT",

@@ -291,6 +291,28 @@ class JobSeen(Base):
     # "unknown" as "no penalty". See full_auto.py's posting-date normalisation.
     posted_at = Column(DateTime)
     expires_at = Column(DateTime)
+    # True when posted_at was ALIASED from the source's updated/published field
+    # rather than being a real "first posted" date -- Greenhouse, Workable,
+    # Recruitee and Ashby all supply only the former (see full_auto.fetch_ats).
+    # Kept rather than discarded, because an ad nobody has touched in four months
+    # is a stronger ghost signal than one posted four months ago and edited last
+    # week -- but it must not be RENDERED as "posted N ago", which is a claim the
+    # source never made. Lever's createdAt is a genuine creation date and is not
+    # marked. NULL = unknown provenance (rows predating this column).
+    posted_at_approx = Column(Boolean)
+    # Distinct UTC days on which discovery has re-observed this identity. The one
+    # age signal a source cannot launder by re-listing: an aggregator can reset
+    # posted_at on every re-syndication, but it cannot change how long WE have
+    # been seeing the ad. Counts DAYS, not runs -- MAX_SEARCHES_PER_DAY allows 6
+    # runs a day, and a run counter would measure how often the user searches
+    # rather than how long the employer has been advertising.
+    #
+    # A LOWER BOUND, and only ever that: discovery returns a listing only when
+    # this run's search terms happen to surface it, so a gap means "not seen",
+    # never "not live". Must never be phrased to any model as "open for N days".
+    # NULL = discovered before this column existed; coalesce to 1 and never let
+    # NULL suppress anything.
+    seen_days = Column(Integer)
     # Cross-run reuse of the two most expensive artifacts, so a job that resurfaces
     # (backlog top-up, re-queue) skips re-scraping and re-judging. Cleared when a
     # source-updated row is re-queued so a changed posting is re-scraped/re-judged.
@@ -313,8 +335,10 @@ class JobSeen(Base):
     # never re-gates the same row twice. NULL = retired before this existed.
     gate_signature = Column(Text)
     # Set only on a HIGH-CONFIDENCE dead/expired-listing signal from Phase 5
-    # scraping (status_404/status_410/expired_phrase, see full_auto.py's
-    # _dead_listing_signal) with no alternate posting found. Deliberately its
+    # scraping (status_404/status_410/expired_phrase/generic_hub -- the last
+    # being a redirect to the employer's general careers page instead of this
+    # job's own, see full_auto.py's _dead_listing_signal) with no alternate
+    # posting found. Deliberately its
     # own field, not a `state` value or `eval_verdict='reject'`: it's a fact
     # about the URL, independent of pipeline-progress state and of the
     # profile/CV (must survive an eval_signature change, unlike a real verdict).

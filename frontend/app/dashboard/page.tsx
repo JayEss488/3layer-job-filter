@@ -7,6 +7,7 @@ import { useRef, useState } from "react";
 import { HardSoftToggle } from "@/components/HardSoftToggle";
 import { IntentEditor } from "@/components/IntentEditor";
 import { LocationPicker, WORK_SET } from "@/components/LocationPicker";
+import { MaxListingAgePicker } from "@/components/MaxListingAgePicker";
 import { Nav } from "@/components/Nav";
 import { ProfileTabs } from "@/components/ProfileTabs";
 import { RequirementRows } from "@/components/RequirementRows";
@@ -74,6 +75,7 @@ function ProfileBody({ profileId }: { profileId: number }) {
   const workTypeAttrs = locationAttrs.filter((a) => WORK_SET.has(a.value.toLowerCase()));
   const seniorityAttrs = g?.seniority ?? [];
   const salaryAttr = g?.salary?.[0];
+  const maxListingAgeAttrs = g?.max_listing_age ?? [];
 
   /**
    * Hard/Soft for a preference is stored per attribute row, but the UI shows one
@@ -292,6 +294,19 @@ function ProfileBody({ profileId }: { profileId: number }) {
               onChange={(v) => setGroupEnforcement(workTypeAttrs, v)}
               disabled={workTypeAttrs.length === 0}
               disabledReason="Pick a work style first — there's nothing to enforce yet."
+            />
+          </div>
+
+          <div className="pref-card">
+            <div className="pref-label">Maximum listing age</div>
+            <div className="pref-field">
+              <MaxListingAgePicker profileId={profileId} attributes={maxListingAgeAttrs} />
+            </div>
+            <HardSoftToggle
+              value={groupEnforcement(maxListingAgeAttrs, "hard")}
+              onChange={(v) => setGroupEnforcement(maxListingAgeAttrs, v)}
+              disabled={maxListingAgeAttrs.length === 0}
+              disabledReason="Hard by default at 30 days — pick a different limit first to change enforcement."
             />
           </div>
         </div>

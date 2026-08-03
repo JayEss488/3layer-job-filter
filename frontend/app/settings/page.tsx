@@ -39,13 +39,15 @@ export default function SettingsPage() {
   });
 
   const { data: runFunnel } = useQuery({
-    queryKey: ["runFunnel"],
-    queryFn: () => api.runFunnel(),
+    queryKey: ["runFunnel", activeId],
+    queryFn: () => api.runFunnel(activeId!),
+    enabled: !!activeId,
   });
 
   const { data: snapshot } = useQuery({
-    queryKey: ["snapshot"],
-    queryFn: () => api.snapshot(),
+    queryKey: ["snapshot", activeId],
+    queryFn: () => api.snapshot(activeId!),
+    enabled: !!activeId,
   });
 
   const { data: timing } = useQuery({
@@ -54,8 +56,9 @@ export default function SettingsPage() {
   });
 
   const { data: runTimings } = useQuery({
-    queryKey: ["runTimings"],
-    queryFn: () => api.runTimings(),
+    queryKey: ["runTimings", activeId],
+    queryFn: () => api.runTimings(activeId!),
+    enabled: !!activeId,
   });
 
   const total = (sources ?? []).reduce((n, s) => n + s.last_count, 0);
@@ -683,6 +686,17 @@ export default function SettingsPage() {
                             {" "}{runFunnel.judge_dupes_suppressed} near-duplicate posting
                             {runFunnel.judge_dupes_suppressed === 1 ? "" : "s"} suppressed before
                             the judge (same employer, title &amp; text).
+                          </>
+                        )}
+                        {runFunnel.decided_family_suppressed > 0 && (
+                          <>
+                            {" "}{runFunnel.decided_family_suppressed} listing
+                            {runFunnel.decided_family_suppressed === 1 ? "" : "s"}{" "}
+                            {runFunnel.decided_family_shadow ? "would have been hidden" : "hidden"}
+                            {" "}as another location of a role you already saved or applied to
+                            (checked against {runFunnel.decided_family_keys} role
+                            {runFunnel.decided_family_keys === 1 ? "" : "s"})
+                            {runFunnel.decided_family_shadow && " -- shadow mode, nothing withheld"}.
                           </>
                         )}
                       </>
