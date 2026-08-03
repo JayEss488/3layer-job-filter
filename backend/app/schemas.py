@@ -39,6 +39,13 @@ class ProfileUpdate(BaseModel):
     cv_summary: Optional[str] = None
 
 
+class CommentIn(BaseModel):
+    """Free-form product feedback from a beta tester -- bugs, confusing bits,
+    feature ideas -- as opposed to ProfileUpdate.search_feedback, which tunes
+    the judge for this profile's own search results."""
+    text: str
+
+
 class ProfileOut(ORMModel):
     id: int
     name: str

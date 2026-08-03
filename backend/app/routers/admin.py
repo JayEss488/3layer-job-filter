@@ -3,6 +3,7 @@ var, sent as the `X-Admin-Token` header), NOT by user login -- there is no admin
 user account in the beta. Reads the EventLog stream (services/analytics.py) and
 rolls it up per user. If ADMIN_TOKEN is unset the endpoint is locked (403)."""
 import hmac
+import json
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -25,6 +26,7 @@ _EVENT_FIELDS = {
     "role_ignore": "ignores",
     "role_apply": "applies",
     "profile_created": "profiles_created",
+    "beta_comment": "comments",
 }
 
 
@@ -78,6 +80,7 @@ def analytics(_: None = Depends(_check_admin), db: Session = Depends(get_db)):
             "ignores": c.get("ignores", 0),
             "applies": c.get("applies", 0),
             "profiles_created": c.get("profiles_created", 0),
+            "comments": c.get("comments", 0),
         }
         per_user.append(row)
         for k in ("logins", "searches", "ticks", "crosses", "ignores", "applies"):
@@ -87,6 +90,31 @@ def analytics(_: None = Depends(_check_admin), db: Session = Depends(get_db)):
 
     # never-logged-in users are the most useful signal at the top
     per_user.sort(key=lambda r: (r["last_active"] is not None, r["last_active"] or "", r["user_id"]))
+
+    # Beta-tester product feedback (bugs/suggestions about the app, see
+    # routers/profiles.py::submit_comment) -- newest first, with the actual
+    # text so the owner can just read them here rather than digging through
+    # the raw event_log table. Username joined in directly since this list is
+    # small (a beta's worth of comments, not the full event stream).
+    usernames = {u.id: u.username for u in users}
+    comment_rows = db.execute(
+        select(EventLog.user_id, EventLog.profile_id, EventLog.payload, EventLog.created_at)
+        .where(EventLog.event_type == "beta_comment")
+        .order_by(EventLog.created_at.desc())
+    ).all()
+    comments = []
+    for user_id, profile_id, payload, created_at in comment_rows:
+        try:
+            text = json.loads(payload).get("text", "") if payload else ""
+        except (TypeError, ValueError):
+            text = ""
+        comments.append({
+            "user_id": user_id,
+            "username": usernames.get(user_id, f"user #{user_id}"),
+            "profile_id": profile_id,
+            "text": text,
+            "created_at": created_at.isoformat() if created_at else None,
+        })
 
     return {
         "generated_at": datetime.utcnow().isoformat(),
@@ -98,6 +126,8 @@ def analytics(_: None = Depends(_check_admin), db: Session = Depends(get_db)):
             "crosses": totals["crosses"],
             "applies": totals["applies"],
             "logins": totals["logins"],
+            "comments": len(comments),
         },
         "users": per_user,
+        "comments": comments,
     }

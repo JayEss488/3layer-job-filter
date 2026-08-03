@@ -12,6 +12,11 @@ import { useProfiles } from "@/lib/ProfileContext";
  * WANTS, which drives target-role generation). Persists to
  * profile.search_feedback and is read by the final judge on the next run --
  * see snapshot.build_snapshot.
+ *
+ * Also carries a second, visually distinct box for general beta feedback
+ * about the APP (bugs/confusing bits/ideas) -- posts to POST
+ * /profiles/{id}/comment and is read back by the owner-only GET
+ * /admin/analytics, not by the search pipeline.
  */
 export function SearchFeedbackBox({ profileId }: { profileId: number }) {
   const qc = useQueryClient();
@@ -21,6 +26,31 @@ export function SearchFeedbackBox({ profileId }: { profileId: number }) {
   const [text, setText] = useState(profile?.search_feedback ?? "");
   const [savedText, setSavedText] = useState(profile?.search_feedback ?? "");
   const [status, setStatus] = useState("");
+
+  // Product feedback about the APP itself (bugs, confusing bits, feature
+  // ideas) -- deliberately a separate field from search_feedback above, which
+  // gets read by the final judge on the next run. Mixing the two would leak a
+  // beta tester's comment about a confusing button into the LLM prompt as if
+  // it were a job-search preference.
+  const [comment, setComment] = useState("");
+  const [commentStatus, setCommentStatus] = useState("");
+  const [sending, setSending] = useState(false);
+
+  async function sendComment() {
+    const v = comment.trim();
+    if (!v || sending) return;
+    setSending(true);
+    setCommentStatus("");
+    try {
+      await api.submitComment(profileId, v);
+      setComment("");
+      setCommentStatus("Thanks — the team will see this.");
+    } catch (e) {
+      setCommentStatus((e as Error).message);
+    } finally {
+      setSending(false);
+    }
+  }
 
   useEffect(() => {
     setText(profile?.search_feedback ?? "");
@@ -78,6 +108,40 @@ export function SearchFeedbackBox({ profileId }: { profileId: number }) {
             {dirty ? "Unsaved — click away to save." : status}
           </span>
         )}
+      </div>
+      <div
+        className="row"
+        style={{
+          flexDirection: "column",
+          alignItems: "stretch",
+          gap: 6,
+          marginTop: 10,
+          paddingTop: 10,
+          borderTop: "1px solid var(--line)",
+        }}
+      >
+        <div className="label" style={{ width: "auto" }}>
+          Got a bug or an idea for the app? Tell us — it goes straight to the team
+        </div>
+        <textarea
+          className="textarea-input"
+          style={{ minHeight: 40 }}
+          placeholder="Anything about the app itself — bugs, confusing bits, features you'd want…"
+          value={comment}
+          onChange={(e) => setComment(e.target.value)}
+        />
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button
+            className="btn btn-secondary sm"
+            onClick={sendComment}
+            disabled={!comment.trim() || sending}
+          >
+            {sending ? "Sending…" : "Send feedback"}
+          </button>
+          {commentStatus && (
+            <span style={{ fontSize: 12, opacity: 0.7 }}>{commentStatus}</span>
+          )}
+        </div>
       </div>
     </div>
   );

@@ -188,6 +188,11 @@ export const api = {
     }),
   regenerateTargetRoles: (id: number) =>
     req<Attribute[]>(`/profiles/${id}/regenerate-target-roles`, { method: "POST" }),
+  submitComment: (id: number, text: string) =>
+    req<{ status: string }>(`/profiles/${id}/comment`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    }),
   contextHeader: (id: number) => req<ContextHeader>(`/profiles/${id}/context-header`),
   updateContextHeader: (id: number, header: string) =>
     req<ContextHeader>(`/profiles/${id}/context-header`, {

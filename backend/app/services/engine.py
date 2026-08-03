@@ -13,6 +13,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import queue
 import random
 import re
@@ -112,15 +113,34 @@ BACKLOG_TOPUP     = 40     # enriched rows pulled in when fresh discovery is thi
 STORE_SCORE_CAP   = 6000   # max 'new' rows relevance-scored per run (whole store)
 # Fresh-row embedding fetch (_ensure_embeddings): texts are capped at ~2000
 # chars (~500 tokens) each, so 250/chunk is ~125k tokens/request -- well
-# inside OpenAI's per-request limits -- while cutting round trips for a large
-# new-row batch (e.g. a measured 651-new-row run went from 7 chunks/2
-# sequential rounds at chunk=100 to 3 chunks/1 round at chunk=250). Worker
-# count raised from 4: the embeddings endpoint's rate limits run well above
-# the chat-completion endpoints gate/rank's "cap at 3-4" was calibrated
-# against; kept at 6 rather than higher since a burst still risks a
-# short-window rate cap.
+# inside OpenAI's per-request limits. This is now a CEILING on chunk size, not
+# the chunk size itself -- see _embed_chunk_size. A fixed 250 was tuned
+# against one measured 651-new-row run (7 chunks/2 sequential rounds at
+# chunk=100 -> 3 chunks/1 round at chunk=250), but a fixed size ignores batch
+# count entirely: as the shared JobEmbedding cache has matured, most runs now
+# discover well under 250 new jobs, which used to mean the WHOLE batch landed
+# in a single chunk on a single worker thread -- zero use of the other 5
+# workers, and the phase's wall time became just one OpenAI call's latency
+# regardless of how few items were in it. Measured across this store's run
+# history: batches that split into >=4 chunks ran at ~0.007-0.05 sec/embed,
+# while single-chunk batches (run 17: 121 new embeds, one chunk) ran at
+# ~0.24 sec/embed -- 4-30x worse per item, not because the API got slower but
+# because nothing was left to parallelize. Worker count raised from 4: the
+# embeddings endpoint's rate limits run well above the chat-completion
+# endpoints gate/rank's "cap at 3-4" was calibrated against; kept at 6 rather
+# than higher since a burst still risks a short-window rate cap.
 EMBED_CHUNK_SIZE  = 250
 EMBED_MAX_WORKERS = 6
+
+
+def _embed_chunk_size(n: int) -> int:
+    """Chunk size that spreads `n` texts over (up to) EMBED_MAX_WORKERS
+    chunks, capped at EMBED_CHUNK_SIZE so a huge batch still respects the
+    per-request token budget above. For n <= EMBED_CHUNK_SIZE * workers (the
+    common case now -- see the comment above), this always yields exactly
+    min(n, EMBED_MAX_WORKERS) chunks, so every available worker gets used
+    instead of leaving 5 of 6 idle on a batch that happens to be under 250."""
+    return min(EMBED_CHUNK_SIZE, max(1, math.ceil(n / EMBED_MAX_WORKERS)))
 # Cheap numeric-ranking stage (rank_gate), between the sector/seniority gate and
 # the expensive full-text judge: an extra cheap-model pass that scores gate
 # survivors 0-100 on fit instead of a boolean pass/fail, so the expensive judge
@@ -1558,8 +1578,9 @@ def _ensure_embeddings(engine, db: Session, rows: list[JobSeen]) -> tuple[int, i
     if to_compute:
         c_hashes = list(to_compute)
         c_texts = [to_compute[h] for h in c_hashes]
-        hash_chunks = [c_hashes[i:i+EMBED_CHUNK_SIZE] for i in range(0, len(c_hashes), EMBED_CHUNK_SIZE)]
-        chunks = [c_texts[i:i+EMBED_CHUNK_SIZE] for i in range(0, len(c_texts), EMBED_CHUNK_SIZE)]
+        chunk_size = _embed_chunk_size(len(c_hashes))
+        hash_chunks = [c_hashes[i:i+chunk_size] for i in range(0, len(c_hashes), chunk_size)]
+        chunks = [c_texts[i:i+chunk_size] for i in range(0, len(c_texts), chunk_size)]
         # Each chunk's result is applied independently (rather than the previous
         # all-or-nothing ex.map, where one chunk raising -- e.g. a 429 -- lost every
         # OTHER chunk's already-successful vectors too, including chunks that ran
