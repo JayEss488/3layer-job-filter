@@ -228,6 +228,7 @@ export default function OnboardingPage() {
                     attributes={g?.location ?? []}
                     countryAttributes={g?.country ?? []}
                     scopeAttributes={g?.location_scope ?? []}
+                    commuteAttributes={g?.commute_miles ?? []}
                   />
                 </div>
               </div>

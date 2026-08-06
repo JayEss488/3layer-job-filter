@@ -41,6 +41,56 @@ npm run lint
 Convenience launcher: `start.bat` / `start.ps1` opens backend + frontend each in their
 own PowerShell window.
 
+Regenerate the UK geo reference data (rarely — the committed
+`backend/app/uk_geo_gen.py` is the runtime artifact; see the commute-distance section):
+```
+venv/Scripts/python scripts/gen_uk_geo.py
+```
+
+Regenerate the UK charity employer seed list (rarely — the committed
+`backend/app/uk_charity_gen.py` is the runtime artifact; needs the gitignored
+Charity Commission extract in `txt non code/`, see the direct-employer section):
+```
+venv/Scripts/python scripts/gen_uk_charity_seed.py
+```
+
+Run a pass of the direct-employer ATS-detection crawl (plain HTTP, no API credits, no
+LLM; resumable, and a no-op if everything was probed inside the recheck window):
+```
+venv/Scripts/python scripts/crawl_direct_employers.py --limit 200
+```
+```
+venv/Scripts/python scripts/crawl_direct_employers.py --status
+```
+```
+venv/Scripts/python scripts/crawl_direct_employers.py --misses
+```
+
+Backfill the distance / place-name / normalised-salary columns onto roles that predate
+them (pure, offline, idempotent — no API, no LLM):
+```
+venv/Scripts/python scripts/backfill_role_geo_salary.py --dry-run
+```
+
+Regenerate the UK licensed visa-sponsor list (rarely — the committed
+`backend/app/uk_sponsor_gen.py` is the runtime artifact; needs the gitignored Home Office
+register CSV in `txt non code/`, see the visa-sponsorship section):
+```
+venv/Scripts/python scripts/gen_uk_sponsors.py
+```
+
+Measure the sponsor matcher against the live job store (read-only, offline — the
+regression bar for any matcher change, see the visa-sponsorship section):
+```
+venv/Scripts/python scripts/audit_sponsor_match.py
+```
+
+Measure how many already-surfaced roles are still live (read-only, offline, writes
+nothing; `--browser` escalates the rows a plain GET can't answer for):
+```
+venv/Scripts/python scripts/audit_listing_liveness.py --limit 45 --browser
+```
+
 Seed the ATS company-board store (optional, runs automatically once on first boot if
 `company_ats` is empty — see `backend/app/services/seed.py`):
 ```
@@ -188,7 +238,13 @@ than expecting structured logs.
   got to judge it at all, or the run was interrupted before finishing; untouched `new` →
   retained as "quick-scored only" if it qualifies (rank stage, top
   `UNREVIEWED_RETAIN_MAX`, not judge-rejected — see the progressive-paint note above),
-  otherwise hard-deleted; crossed → soft-deleted (keeps the FeedbackLog referent).
+  otherwise hard-deleted; crossed → soft-deleted (keeps the FeedbackLog referent) **and
+  `fit_rank` cleared**. Every branch of `_resolve_leftover_provisional` must clear
+  `fit_rank`; the crossed branch used not to, and that was a real user-visible bug. A
+  provisional card's rank comes from its position in the interim top-N, which is
+  numbered independently of the final picks' 1..N, so a leftover keeping a stale rank
+  collides with a genuine pick — a live run showed two different cards both badged "3",
+  one of them a listing the judge had actually REJECTED.
   A user action always wins: `saved`/`applied` take the rules above, never the
   quick-scored retention. Cancel/failure/
   restart all run `engine._cleanup_provisional_roles` (four call sites incl.
@@ -201,6 +257,20 @@ than expecting structured logs.
   cleanup commit. `/search` and the `/my-roles` "Inbox" tab both also expose a "Mark as
   applied" action directly on each role card (`POST /roles/{id}/apply`, pre-existing
   endpoint) — no need to Save first or navigate to `/my-roles`' Saved tab.
+  `_find_soft_duplicate` (same company + title + an agreeing location) treats two
+  locations as agreeing either by a shared word token **or by being the identical
+  string**. The string half matters more than it sounds: `_location_tokens` keeps
+  only alphabetic runs longer than two characters, so a bare UK postcode yields
+  NOTHING (`"GU98AD"` → `{}`, both runs too short) and the function used to bail
+  out and declare every such listing un-duplicatable however exactly it matched.
+  Reed routinely gives a bare postcode as the whole location field: that was 243
+  of 1,200 sampled store rows, and it stored Plum Personnel's "Junior Application
+  Developer" twice (Reed ids 57177686/57177687), identical in company, title,
+  location and text. Two identical location strings are strictly stronger evidence
+  than the single shared token the original branch accepted, so this can only
+  tighten what already counted as agreement. Measured old-vs-new over 1,200 real
+  rows: **0 regressions, 11 duplicates the old code missed, 0 left unmatched**
+  (was 243).
 - **`JobSeen`**: the *persistent discovery store* — every listing ever seen for a
   profile, separate from `Role` (which is just what got shown). Discovery upserts here
   (deduped by `identity_hash`); scoring/backlog top-up reads from here across runs so a
@@ -245,11 +315,59 @@ than expecting structured logs.
   the **earliest** claimed `posted_at` wins (an aggregator re-listing an old posting must
   not launder it fresh) and the **latest** `expires_at` (an employer can genuinely
   extend a closing date).
+  `soft_dup_key` is the normalised `"<company>|<title>"` (`engine._soft_dup_key`) that
+  the discovery upsert's soft-duplicate lookup keys on, written at insert and backfilled
+  by `database._migrate_soft_dup_key`. It exists for speed and correctness both. The
+  lookup used to pre-filter on a `lower(company)` equality-or-LIKE-prefix and hydrate
+  FULL `JobSeen` entities for every match — on a real store ~818 rows per call, each
+  dragging an 8KB embedding, once per newly-discovered identity (992 in a measured run).
+  **This, not the OpenAI call, is what the "embed" phase timing actually measures**: the
+  embedding API for that run's entire 686-text batch takes 1.55s of a 48.62s phase (3%),
+  and cross-run evidence is decisive — run 7 computed **2,597** embeddings inside a 19.3s
+  phase while run 19 computed **235** inside a 60.3s one. Phase time tracks store size,
+  not `embedded_new`. Keying on an indexed column took `_upsert_discovered` from **81.4s
+  to 3.7s (22x)** at run-20 volume; a plain index on `lower(company)` is NOT a substitute
+  (81.4s to 77.8s), because the cost is the VOLUME of rows a common company prefix
+  returns, not scan time. The remaining win came from bucketing the in-batch candidates
+  by the same key — that check was O(n^2) over the discovery batch (815k `_norm()`
+  calls). It is also strictly MORE correct: `_norm_company` strips leading whitespace on
+  the incoming side but SQL could not strip it on the stored side, so a company stored
+  with a leading tab never matched its own earlier row. Head-to-head on 1,200 real rows:
+  **0 regressions, 3 duplicates the old query missed**, and the 243 non-matches were
+  identical under both (rows whose location yields no usable tokens, which
+  `_find_soft_duplicate` has always declined to match on). Kept distinct from
+  `repost_key`, which is the same shape but answers a different question — see that
+  field. **Local embeddings would not help this phase**; the API is 3% of it.
 - **`CompanyATS`**: cached vendor/token registry for the ATS discovery tier (Greenhouse,
-  Lever, Ashby, Workable, Recruitee, Personio), populated by `seed_ats.py` (curated,
-  live-validated) and grown by `harvest.py`'s occasional `site:`-search harvest — this
+  Lever, Ashby, Workable, Recruitee, Personio, SmartRecruiters), populated by
+  `seed_ats.py` (curated,
+  live-validated) and grown by `harvest.py`'s occasional `site:`-search harvest and by
+  the direct-employer crawl (see below) — this
   list itself is cached fine; it's the *job data fetched from* these companies each run
   that needed a TTL guard (see below).
+  **SmartRecruiters is the one vendor whose listing endpoint carries no description
+  at all** (`/v1/companies/{token}/postings` returns metadata only), so one company
+  costs 1 + N HTTP calls rather than 1 — hence `SMARTRECRUITERS_MAX_POSTINGS`/
+  `_DETAIL_WORKERS`, which exist because this fan-out happens *inside* a slot of
+  `gather_jobs`' 12-wide pool. Its detail payload splits into
+  `companyDescription`/`jobDescription`/**`qualifications`**/`additionalInformation`,
+  i.e. exactly the multi-field shape `_ats_text` exists to merge — taking
+  `jobDescription` alone would drop the requirements section, the same bug already
+  fixed for Lever/Recruitee/Workable. A posting whose detail call fails is **dropped,
+  not emitted text-less**: `smartrecruiters` is an ATS key, so
+  `_has_judgeable_text` would treat a text-less row as text-complete, skip phase 5,
+  hand it `RICH_TEXT_SELECTION_BONUS` and send it to the judge on its title alone —
+  the same inversion documented for un-enriched Adzuna rows.
+  **Teamtailor was evaluated and rejected**: `api.teamtailor.com` requires a
+  per-company `X-Api-Key`, and there is no no-auth per-company feed, so it cannot be
+  reached at registry scale the way the seven above can.
+- **`DirectEmployerProbe`**: one row per employer domain the direct-employer crawl has
+  looked at — see the direct-employer section below. The seed list is NOT stored here
+  (it lives in the generated `uk_charity_gen` module); this records only what a probe
+  found, so it doubles as the crawl's cursor. **Keeping the misses is the point**:
+  without them the crawl can't tell "not yet looked at" from "looked at, nothing
+  there", would re-spend its budget on the same dead domains every pass, and would
+  report a 100% hit rate by construction.
 - **`FeedbackLog`**: append-only tick/cross/ignore/apply audit trail.
 - **`SearchRun`**: one row per kicked-off search; drives `/search/status` polling and the
   daily search cap. Also the per-run diagnostics store, all written at the end of
@@ -390,11 +508,21 @@ of what the last finished run already recorded — see the search-pipeline secti
    the legacy standalone path — because one whole-source task used to hold up to
    TERMS_PER_RUN sequential per-term calls in a single 12-wide-pool slot (Reed at 3
    pages/term = 18 sequential HTTP calls, the measured long pole of a 55s discovery
-   phase). Reed/Adzuna page depth is capped by `REED_PAGES_PER_TERM`/
-   `ADZUNA_PAGES_PER_TERM` (env, default 1 — still 100/50 results per term; the
-   fetchers' own `pages=3` defaults are the legacy path's behavior): a measured live run
-   discovered 7,800 raw listings of which only ~100 were ever examined past the
-   embedding stage, so pages 2–3 were pure latency. The fetchers emit a
+   phase). Reed/Adzuna page depth is set by `REED_PAGES_PER_TERM`/
+   `ADZUNA_PAGES_PER_TERM` (env, **default 3**, 100/50 results per page), with
+   `*_PAGES_PER_TERM_SPONSOR` (5) used instead when the licensed-sponsor filter is on
+   — that filter keeps ~10% of rows, so the pool behind it has to be deeper.
+   These were **cut to 1** on the measurement that a live run discovered 7,800 raw
+   listings of which only ~100 were ever examined past the embedding stage, making
+   pages 2–3 pure latency in front of first paint; they are back at 3 because two
+   things changed — `RANK_EXAMINE_BUDGET` is now 320 rather than 40–80, so the deeper
+   pages have somewhere to go, and across runs Reed and Adzuna are where most
+   strongly-ranked picks actually come from. The cost is real and lands in the worst
+   place (discovery precedes the first "early matches" paint); what bounds it is that
+   `gather_jobs` fans out one task per (source, term), so 3 pages is 3 sequential HTTP
+   calls inside ONE pool slot, not 3× wall clock. If time-to-first-card regresses,
+   these two env vars are the knob, not the examine budget. `USAJOBS_PAGES_PER_TERM`
+   stays 1 — it self-gates to nothing outside the US. The fetchers emit a
    "page cap hit … more results likely available" note whenever the last page came back
    full, and every discovery task emits its elapsed time plus a per-source
    "slowest term" aggregate, so both the coverage trade-off and any slow source stay
@@ -411,9 +539,8 @@ of what the last finished run already recorded — see the search-pipeline secti
    embedded in `EMBED_CHUNK_SIZE` chunks fanned over an `EMBED_MAX_WORKERS`-worker pool,
    order-preserving via `ex.map`, DB writes staying on the calling thread) &
    cosine-score every candidate against **every** cluster embedding, assigning each job
-   to its single best-scoring cluster → free heuristic prescreen (`_heuristic_prescreen`:
-   title-regex drops obvious seniority mismatches — Director/VP for a junior, Intern for
-   a senior — before any LLM spends a token) → adaptive strict/broadened pool per cluster
+   to its single best-scoring cluster → **two free, LLM-free prescreens** (see the
+   pool-quality note below) → adaptive strict/broadened pool per cluster
    (`TARGET_POOL` = 90) → **Reed full-description enrichment**
    (`engine._enrich_reed_full_text` → `full_auto.fetch_reed_details`, see the
    text-supply note at the end of this section) → **one merged eight-axis screen per
@@ -678,6 +805,45 @@ of what the last finished run already recorded — see the search-pipeline secti
    aggregator reposts), and `_DUP_MIN_SHINGLES` demands real text on the shorter
    side. A false merge is cheap and recoverable for the same reason the prefix test's
    is — the dropped copy keeps its rank score and takes no verdict.
+   **Both of those tests keyed on the TITLE, which is the field a recruiter
+   varies.** A live run showed "Junior Application Developer" and "Junior
+   Software Developer" (Plum Personnel, same GU98AD, same "Circa 30,000",
+   word-for-word identical body text apart from the title) graded Strong fit and
+   shown at ranks 1 AND 2. Nothing could catch it: `identity_hash` differs
+   (different Reed ids), and `_find_soft_duplicate`, `_dup_key` and
+   `_same_vacancy` all require an exact title match. The near-text bucket is now
+   keyed by `_canonical_title_key` — the title reduced to a SET of tokens with
+   noise words dropped and a small explicit synonym map applied
+   (developer/engineer/programmer, software/application/app, jr/junior, sr/senior)
+   — so word order and near-synonyms agree while seniority stays significant.
+   **Do not widen this to company-only**, however tempting: over this store's
+   44,654 same-company/different-title pairs, 7.9% reach ≥0.80 text containment
+   and the high end is dominated by genuinely DIFFERENT vacancies sharing a
+   template — Wise's "Senior Data Analyst - Growth" vs "- FinCrime Operations"
+   (500-char Adzuna teasers that are pure company boilerplate and never mention
+   the role, containment **1.000**), TransPerfect's "Croatian language trainer" vs
+   "Slovenian language trainer", "Back End" vs "Front End". Those are one template
+   with one word swapped, i.e. mechanically the same shape as the Plum case, so
+   TEXT CANNOT SEPARATE THEM — only the titles can. Measured over the 4,656
+   different-title pairs whose text already passes `_same_vacancy`: **28 merge,
+   4,628 are left alone**, and every merge was hand-checked as one vacancy
+   ("Director of Finance"/"Finance Director", "Data & Research Analyst"/"Research
+   & Data Analyst", "Certified Nursing Assistant - CNA"/"CNA - …"). Extend
+   `_TITLE_SYNONYMS` only with words naming the same JOB; a specialism, product,
+   region, language or seniority belongs nowhere near it.
+   Widening the match made WHICH COPY SURVIVES matter, which it previously didn't:
+   the two copies can now differ enormously in text (the Plum pair was a 453-char
+   teaser against the same vacancy's 4,299-char description). The pool is
+   `_selection_score`-sorted so the best-SCORING copy takes the slot, but score
+   says nothing about text, and suppressing on score alone would have sent the
+   judge the teaser and discarded the full description — worse than not
+   deduplicating at all, since before this both copies at least reached the judge.
+   `_keep_richer_copy` therefore substitutes the better-read copy into the
+   winner's slot, carrying the winner's score over so ordering is untouched
+   (`RICH_TEXT_SELECTION_BONUS` is only 3.0 points and can't be relied on to
+   decide a pairing). Note the slot is recorded as `(that cluster's kept list,
+   index)`, never a bare index: the dedupe maps are shared across clusters while
+   `kept` is per-cluster.
    Count lands in `funnel_counts.judge_dupes_suppressed` (rendered on the Settings
    run-funnel panel) → **provisional
    early display reconcile**: by this point in the pipeline, provisional Role rows
@@ -1189,20 +1355,42 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   rather than being compared against it — the fallback neutral score (50) is now exactly
   AT the floor rather than below it, but the bypass stays: it must not depend on those
   two numbers happening to coincide.
-- `GATE_FIRST_ROUND` (20) / `GATE_ROUND_SIZE` (80) / `full_auto._GATE_MAX_WORKERS` (4) —
-  the latency side of that budget. Round COUNT, not batch size, is what costs wall time:
-  a round is a blocking `screen_gate` call then a blocking `rank_gate` call, each of
-  which fans its own `_GATE_BATCH`(20)-sized sub-calls over a `_GATE_MAX_WORKERS` pool.
-  At 80/round an 80-candidate round is exactly 4 sub-calls in ONE wave, so tripling the
-  intake costs roughly one extra round rather than three. **`GATE_FIRST_ROUND` stays
-  small on purpose and should not be raised**: `report()` only fires once a whole round
-  has gated *and* ranked, so that first round alone sets time-to-first-"Verifying…"-card.
-  For the same reason `REED_ENRICH_PRE_GATE_CAP` (100, run-wide) caps the pre-gate Reed
-  enrichment rather than letting it follow the examine budget out to 320 — it is
-  blocking main-thread HTTP sitting directly in front of first paint (a live run
-  enriched 45 in 4.1s), so it is sized to cover roughly the first two rounds and the
-  deep tail rides its teaser. `_GATE_MAX_WORKERS` is the knob to turn back down if
-  429s/401s appear.
+- `GATE_ROUND_SIZE` (80) / `full_auto._GATE_MAX_WORKERS` (4) — the latency side of that
+  budget. **The gate no longer examines its budget in incremental rounds.** It used to:
+  a small `GATE_FIRST_ROUND` then `GATE_ROUND_SIZE`-sized ones, each a blocking
+  `screen_gate` call followed by a blocking `rank_gate` call, so that
+  `_gate_rank_refill_cluster` could stop early once `judge_target`
+  (`RANK_TARGET_POOL`/clusters = 40) judge-eligible candidates had accumulated.
+  **That early exit never once fired.** Across every run that recorded a per-cluster
+  `stop_reason` (17 cluster-runs) the tally is `absolute_pool_cap` 16, `pool_exhausted`
+  1 (a queue of only 114), `target_reached` **0** — `judge_eligible` lands at 5–12 per
+  cluster against a target of 40. So the rounds bought no LLM calls at all and cost 2
+  serial latencies each: 3 rounds × 2 = 6 waves for a 160-candidate cluster, measured
+  at ~10.3s per wave (`gate` = 61.93s).
+  The whole budget is now screened in ONE `screen_gate` call and ranked in ONE
+  `rank_gate` call. That is the *same* number of `_GATE_BATCH`(20)-sized sub-calls over
+  the same `_GATE_MAX_WORKERS` pool — 160 candidates = 8 screen batches = 2 waves, plus
+  one rank wave — so it costs identical tokens and lands ~3 waves instead of 6.
+  Three things this rests on, all of which must stay true:
+  * `judge_target` survives as a **post-hoc trim** (`stats["judge_target_trimmed"]`),
+    not a loop break, so the bound still exists; it now trims the WORST by
+    `_selection_score` rather than keeping whatever arrived first.
+  * It must **not** overwrite `stop_reason`. That field is the only evidence that the
+    early exit never fired, i.e. the only way to re-check this decision later.
+  * `GATE_ROUND_SIZE` still exists, but now only as the SLICE over which
+    `dynamic_hard_drop_threshold` is computed. That threshold asks "is this stretch of
+    the queue thin on real mismatches?", and the queue is embed-score ordered, so
+    pooling one fraction over all 160 would average a strong head into a weak tail and
+    change gate strictness as an accidental side effect of a latency change.
+  The visible cost is that rank-stage "Verifying…" cards now appear at the END of the
+  gate phase rather than after a 20-candidate first round. The embed-stage paint
+  (`EMBED_PAINT_MAX`, ~7s in) is unaffected and is what actually fills the early screen.
+  `REED_ENRICH_PRE_GATE_CAP` (100, run-wide) still caps pre-gate Reed enrichment rather
+  than following the examine budget out to 320 — it is blocking main-thread HTTP in
+  front of first paint (a live run enriched 45 in 4.1s), so it covers the head of the
+  budget and the deep tail rides its teaser. `_GATE_MAX_WORKERS` is the knob to turn
+  back down if 429s/401s appear, and the knob to raise (4 → 8) if the remaining 2 screen
+  waves are worth collapsing to 1.
 - `CATEGORY_EXPAND_ENABLED` (default false) — see the category-page-expansion note
   above; off by default since it currently recovers ~0 jobs on JS-hydrated category
   pages while still paying full crawl cost.
@@ -1256,6 +1444,222 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   cheapest run is a *repeat* run: unchanged jobs are re-embedded/re-scraped/re-judged by
   nothing. Editing a profile attribute changes the gate/eval signatures and re-opens
   everything, which is the intended invalidation.
+
+### Pool quality — what is allowed to spend an examine slot
+
+`engine._heuristic_prescreen` + `engine._pool_quality_prescreen`, both run at pool
+admission, both free (no LLM, no network, no DB).
+
+**The measurement that motivated them.** An audit of one run's 320-candidate examine
+budget graded every examined candidate by hand. The ranking was fine: of 8 roles shown
+the user applied to 2, and a random 26 of the gate-DROPPED candidates were **26/26
+correctly dropped — zero false negatives**. The problem was upstream. Of 282 examined
+rows, **28% could not have become a pick under any ranking**: 12% located outside the
+candidate's country (spacex Redmond WA, dadavidson Irvine CA, gallup Omaha, pmx
+Birmingham *Alabama*), 17% carrying a plainly senior title, plus board category pages
+with no posting underneath — two of which survived all the way to the **expensive
+judge**, which spent a full slot each to report that the page contained search results
+rather than a job description. A single ATS board (`workable:tiger-analytics`) supplied
+34 of the 282.
+
+So the low examined→strong rate was never a ranking failure. It is what the examine
+budget is being spent ON.
+
+Each check is a FACT about the listing, checkable for free, and wrong to pay an LLM to
+discover. That is the same bar `_heuristic_prescreen` already set. They are deliberately
+NOT left to `screen_gate`'s `listing_ok` / work-arrangement axes — those are the backstop
+for *ambiguous* cases, not the place to catch a Texas listing for a UK candidate.
+
+- **Seniority** (`_SENIOR_TITLE_RE`, extended). The pattern carried only the most formal
+  words, so "Lead Data Scientist", "Staff Applied Scientist", "ML Ops Architect", "Sr.
+  Business Analyst" and "Engineering Manager" all reached the gate for a Junior profile.
+  `staff`/`architect`/`manager`/`sr.`/`lead` were added, each needing its own guard:
+  `lead` is matched only when not followed by "generation" (the pre-existing "Lead
+  Generation Specialist" collision), and — the load-bearing one — a title matching
+  `_JUNIOR_MARKER_RE` (junior/graduate/trainee/assistant/associate/intern/…) is **exempt
+  from the senior reject entirely**. That exemption is what makes broad tokens like
+  `manager` safe, and it applies only in the junior-profile direction (the senior
+  direction rejects ON that marker, so exempting it there would disable the check).
+- **Placement year** (`_PLACEMENT_YEAR_RE`). A sandwich-year/industrial-placement role
+  exists for someone still part-way through a degree, reads as a near-perfect match on
+  every other axis, and therefore survives all three LLM tiers — a live run put a
+  "12month/placement year" internship at rank 5. The body text is consulted **only for a
+  title that already announces an intern/placement/student role**
+  (`_INTERNSHIP_TITLE_RE`): scanning every body outright was validated against the live
+  store and wrongly flagged ".NET Developer, Graduate / Junior", "Junior Data Analyst"
+  and "Junior Sales Analyst", whose recruiter boilerplate merely *mentions* placements.
+  A bare "internship" is deliberately NOT matched — for a finished graduate that can be a
+  real entry route.
+- **Foreign location** (`_is_positively_foreign`). A narrow supplement to
+  `_filter_by_country`, **not** a replacement, and the distinction matters: that filter
+  keeps anything it cannot positively resolve *on purpose*, because the worldwide token
+  set carries only ~20 UK cities and most genuinely-UK postings ("Gloucester, GB",
+  "Potters Bar, GB", "SE19EQ") resolve to `None` and MUST be kept. The measured
+  consequence is that US rows resolve to `None` on the same rule — `country_of` returns
+  `None` for "Redmond, WA", "Bastrop, TX", "Irvine, CA" and "Remote/US" alike — so a live
+  run's candidate-stage country filter dropped **0 of 6,642** rows while 12% of what it
+  passed was American. This also repairs a false POSITIVE in the other direction:
+  `country_of` resolves "Birmingham, Alabama" to `gb` on the city token, and the
+  state-name test runs first. Scope is the **US only**, deliberately: it is 90%+ of the
+  observed leakage (where the ATS vendor registry is headquartered) and the one country
+  whose location strings are regular enough to match without guessing. State
+  ABBREVIATIONS are matched only as `", XX"` at end-of-string or before a ZIP, because
+  many collide with UK postcode areas (CA Carlisle, NE Newcastle, LA Lancaster, WA
+  Warrington, TN Tonbridge) — a loose match here would recreate the exact failure the
+  country filter was loosened to avoid. "Washington" and "Georgia" are excluded from the
+  full-name list for the same reason (Washington, Tyne and Wear; the country Georgia).
+- **Junk listings** (`_JUNK_TITLE_RE` + `_JUNK_MIN_TEXT_CHARS` = 220). A board's own
+  search-results/category/alerts page. Requires the title pattern AND thin text: a real
+  posting could legitimately be titled "Jobs at Acme" if it then has a description, and a
+  short posting with an ordinary title is thin evidence rather than junk. A live run
+  examined rows of 23, 114, 152, 159 and 163 characters, several of which **passed** the
+  cheap gate's `listing_ok` axis precisely because there was too little text to look wrong.
+
+**Validated against the live store before shipping**, which is the bar any change here
+should meet — the risk of a free filter is a silent false positive, so measure that, not
+the hit count. Over 7,867 stored rows the four checks remove 65.1% (2,784 seniority/
+placement + 2,306 foreign + 34 junk), leaving queues still far above the 320 budget
+(run 20's were 887 and 1,835). Against the 93 roles ever SHOWN to the user, exactly one
+would now be dropped: the placement-year internship, which is the intended catch. Against
+the 6 roles the user has ever APPLIED to, **zero**.
+
+Counts land in `funnel_counts` broken out by reason
+(`pool_quality_dropped_foreign_location`, `_junk_listing`,
+`heuristic_prescreen_dropped`) and render on the Settings run-funnel panel as "Free
+pre-filters". Keep them separate: a filter that removes candidates before any model sees
+them is only safe to keep while its cost stays attributable to a specific rule.
+
+**Post-hoc auditing of a run is harder than it should be.** `engine._sample_stage`
+retains only **3** samples per stage and nothing persists which rows were examined, so
+the audit above had to be reconstructed from `gate_cache` keys and store state.
+`JobSeen.gate_signature` cannot stand in for it: `_mark` skips `state='shown'` rows, so a
+role shown in run 12 still carries run 12's signature. Raising that cap is the cheapest
+way to make this repeatable.
+
+### Listing liveness verification (expired-listing suppression)
+
+`engine._verify_listings_alive`, run immediately before the expensive judge (between
+`_suppress_judge_duplicates` and the `_fair_allocate` into `JUDGE_POOL`).
+
+**The problem.** The dead-listing machinery (`full_auto._dead_listing_signal`,
+`_looks_like_expired_listing`, `_looks_like_generic_careers_hub`, `dead_reason`/`dead_at`)
+was good and almost never RAN. It hangs off Phase 5 scraping — skipped for anything whose
+snippet clears `SNIPPET_SUFFICIENT_CHARS` — and off the Reed/Adzuna detail endpoints, the
+only sources with a revalidation path (`LISTING_REVALIDATE_AFTER_DAYS`). JSearch, Google
+Jobs, Careerjet and ATS rows were never verified at any stage. Measured on a live store:
+`last_verified_at` set on **17 of 9,042 rows (0.2%)**, `dead_reason` on **2**, and **100%
+of surfaced rows had never been directly verified**. Re-fetching every surfaced role found
+**26% already dead**. The listing that prompted this reached the judge, was graded
+`strong` and shown at rank 6 with 0 chars of `full_text`, no `posted_at`, no `expires_at`
+and no verification — judged entirely on a 1,802-char aggregator teaser.
+
+**What it does.** One plain HTTP GET (no browser, no LLM) per judge-pool candidate that
+has no `full_text`, sits on a re-posting mirror, or is past
+`LISTING_REVALIDATE_AFTER_DAYS`; capped at `VERIFY_MAX_PER_RUN`, 8-wide, ordered
+best-first by `_selection_score`. It runs against `rank_by_cluster` rather than the
+allocated pool **on purpose**: dropping a dead row lets the following `_fair_allocate`
+backfill that slot from the same cluster, so no cluster loses a slot to a corpse.
+Dead rows get `dead_reason`/`dead_at`, after which the pipeline's existing
+`dead_reason IS NULL` selection filters exclude them from every future run for free —
+no new suppression path — and `_auto_hide_dead_roles` retires any already-shown card.
+
+**The pass above does NOT guarantee the results page, and `_verify_final_picks` is what
+does.** `_needs_liveness_check` is a *budget* heuristic — right for rationing ~40 fetches
+across a rank pool, wrong for the dozen listings actually shown to a user who reasonably
+reads "here are your matches" as "these exist". It skips anything carrying `full_text`
+that isn't on a mirror and was verified inside `LISTING_REVALIDATE_AFTER_DAYS` (2), and an
+ATS row with `full_text` from an earlier run hits every one of those: it skips this pass,
+skips Phase 5 (`_needs_full_scrape` excludes ATS rows), and reaches the card checked by
+nothing. So after the judge and **before any Role row is written**, every final pick is
+verified unconditionally — ~12 plain GETs at the end of a ~4 minute run. The only picks
+skipped are ones a fetch already read this run, tracked by `_verified_at` stamped on the
+job dict by `_verify_listings_alive` and `_persist_scrape` (the same dicts flow all the
+way to the persist site, so no extra plumbing was needed).
+
+Three routes to an answer, strongest first:
+- **ATS rows → re-read the vendor feed** (`_verify_ats_picks`). Strictly better than
+  fetching the posting and cheaper: a vendor board lists exactly the reqs that are open, so
+  a URL absent from the feed is *definitively* closed, where an HTML fetch gives at best an
+  inferred answer (several vendors serve a soft-200 "no longer available" page). Cost is
+  one call per distinct BOARD among the picks, 2-4 in practice. An **empty or failed feed
+  yields no verdict at all** — it is indistinguishable from a board that closed every req
+  at once, and `dead_reason` is unrecoverable.
+- **Adzuna `/jobs/land/ad/` → `fetch_adzuna_details`**, for the reason `_needs_liveness_
+  check` already skips those: the interstitial answers every request with a stub, so a
+  direct fetch can only ever return "unverifiable".
+- **everything else → `_classify_listing`**, unchanged.
+
+A dropped pick's slot is refilled from the graded picks that lost the `FINAL_PICKS` cut,
+and the refills are verified too — **once**. One extra round, never recursion: the point is
+not to show a corpse, not to guarantee a full dozen.
+
+**Browser escalation** (`_verify_via_browser`) covers the ~20% of checks where the host
+declines to answer a plain request. It is a second `AsyncWebCrawler` launch (Phase 5's has
+closed by then), bounded by `VERIFY_BROWSER_MAX` and `VERIFY_BROWSER_BUDGET_SECONDS`, and
+**fail-open** — anything it also can't answer for is KEPT, because unknown is not dead.
+Measured over 45 surfaced roles with `scripts/audit_listing_liveness.py`: plain HTTP gave
+66.7% alive / 11.1% dead / **22.2% unverifiable**; with the browser, 80.0% / 15.6% /
+**4.4%** — i.e. it converted 8 of 10 shrugs into a definite answer and found 2 more dead
+listings. Three of the 5 dead found on the plain pass were `status="new"`, sitting in the
+inbox at the time.
+
+**Deliberately NOT built: post-run re-checking.** No endpoint re-verifies a role after its
+run, and a saved role is never re-checked. The guarantee is "live when shown", not "live
+forever". This is why `verifiedChip` stops rendering after 24h rather than ageing into
+"checked 3 days ago" — with no re-check, an old timestamp reports when the app last looked,
+not anything about the vacancy.
+
+**Check order, and the trap in it.** 404/410 first (the workhorse — every genuine death
+in a 45-row live sample was a hard 404, nothing else contributed one), then a schema.org
+`validThrough` already in the past, then `_dead_listing_signal`. **Never call
+`_EXPIRED_LISTING_RE` raw here.** A LIVE bebee posting matches that bare regex on its own
+page furniture; only the guarded `_looks_like_expired_listing`, with its length and
+head-position gates, correctly declines. Using the raw pattern turned 5 live listings into
+"dead" in an early measurement, and `dead_reason` cannot be undone.
+
+**Mirror hosts are not a drop list, and there is no host-level dead rate.** An earlier
+reading of the data appeared to show bebee/glassdoor at a 100% dead rate — that was an
+artefact of sampling old STORE rows, i.e. it measured **listing age, not host health**.
+Re-measured against live URLs the split is bebee 1 dead/3 alive, glassdoor 1/2,
+jobviewtrack 8/26, prosple 2 alive, and a live bebee posting serves a full JSON-LD
+`JobPosting` with a 4.3k-char description. The platforms work; individual listings die.
+`MIRROR_BRANDS`/`MIRROR_HOSTS` therefore do exactly two narrow things: prioritise which
+rows get a fetch, and decide that an **unverifiable** row with no readable text isn't
+worth a judge call. `ListingHostStat` records per-host outcomes for **observability only**
+and nothing reads it to decide anything.
+
+**Unverifiable ≠ dead.** A 202/403/429/empty response means the host refused to answer
+(Cloudflare), not that the vacancy closed — prosple does exactly this. Those rows are
+never marked dead. They're dropped only when they are *both* a mirror *and* have no
+readable text (nothing to judge, no way to check); otherwise they take
+`UNVERIFIED_RANK_PENALTY` on `_selection_score` **only**, never `_rank_score`, so the
+card's "Fit estimate" chip and `RANK_REJECT_SCORE_FLOOR` keep showing the model's own
+number — the same separation `RICH_TEXT_SELECTION_BONUS` respects.
+
+**`_needs_liveness_check` skips known dead-end URLs first.** Adzuna's `/jobs/land/ad/`
+interstitial (`_KNOWN_DEAD_END_URL_RE`) answers every request with a stub, so fetching it
+can only return "unverifiable" — spending a request to learn nothing *and* penalising the
+row for a property of the URL scheme rather than of the vacancy. Those rows verify through
+`fetch_adzuna_details` against `/details/{id}` instead.
+
+**The fetch pays for itself twice.** Because a whole HTML page has already been retrieved,
+`_persist_verified_alive` harvests the JSON-LD `description`/`datePosted`/`validThrough`
+from it for any row still lacking text — 43% of surfaced rows carry a parseable
+`JobPosting`. That fixes the other half of the bug: rows that were being judged blind
+become judgeable at no extra cost. It reuses the enrichment rules exactly (only text that
+BEATS the snippet is stored, `_has_full_text` must be set or the gate cache-key richness
+marker goes stale, dates through `_merge_posted_expires`). The loop is driven by the
+verification RESULTS, not by the rows the `SELECT` returned — keying it off the DB meant a
+candidate with no matching `JobSeen` row silently kept its teaser.
+
+Separately, `_drop_expired_candidates` now drops a candidate whose **stated** `expires_at`
+has passed, at pool admission. Previously a passed closing date produced only prose
+(`_listing_age_tag`) and a `rank_gate` score cap, so a definitively-closed listing could
+still consume gate/rank/judge budget and still be shown. Unknown stays unknown — ~90% of
+the store has no expiry date and is never penalised for it.
+
+`full_auto._adzuna_description_from_html` was renamed `_jobposting_from_html` (thin alias
+kept) — it was never Adzuna-specific, just a schema.org `JobPosting` reader.
 
 ### Location scope & country filtering
 
@@ -1316,6 +1720,314 @@ attribute rows too (same attribute type as the free-text city — `LocationPicke
 `WORK_TYPES` buttons), split apart from the place name in `snapshot.build_snapshot` and
 exposed to the engine as `engine_profile["work_types"]`. See the search-pipeline section
 above for how this now actually reaches `screen_gate`'s work-arrangement axis.
+
+### Visa sponsorship filter (`backend/app/services/sponsors.py`)
+
+A single-value boolean preference (`visa_sponsor_only`, default **off**, bottom of
+Dashboard → Preferences) restricting results to employers on the Home Office register of
+licensed sponsors. Same dev-time-generator / committed-plain-data-module posture as
+`uk_geo_gen` and `uk_charity_gen`: `scripts/gen_uk_sponsors.py` reads the gitignored
+register CSV from `txt non code/` and writes `backend/app/uk_sponsor_gen.py`. No API and
+no LLM at runtime — every lookup is a set/dict hit.
+
+**This is the only filter in the pipeline that DROPS ON UNKNOWN**, and that inversion is
+deliberate. Everywhere else (country, listing age, salary floor, liveness) unknown means
+no penalty, because wrongly dropping a good role costs more than carrying a doubtful one.
+Sponsorship reverses that: a candidate who needs a visa cannot act on a role they can't
+confirm sponsors. Off by default, so a candidate who doesn't need it never meets the
+behaviour. Don't "fix" this to match the rest of the pipeline without re-reading this
+paragraph.
+
+**Storage shape.** 142,694 CSV rows → **127,227 unique organisations** → 147,361
+normalised keys (trading-as aliases are expanded on the REGISTER side too, which is what
+makes `Canada Life` an exact hit via `CLFIS (UK ) Ltd - Canada Life`). Held as ONE
+newline-joined string literal, not 127k separate literals — measured import 0.046s, index
+build 0.198s, both lazy so a profile with the preference off pays neither. All routes are
+kept: Skilled Worker alone is 121,891 of the 127,227, so filtering by route changes
+nothing and would risk dropping the Charity Worker route the charity vertical cares about.
+
+**Matching, and what it can't do.** Exact normalised match, else a **guarded prefix** match
+requiring ≥2 shared leading tokens. That guard is the false-positive control, not a tuning
+knob: unguarded, a company named `Futures` matches `Wild Futures`. It costs real hits
+(a listing saying only `Kaplan` never reaches `Kaplan Financial Limited`) and that is the
+right trade under a hard filter. Measured on a live 9,042-row store (1,244 unique
+companies): **20.6% exact + 3.2% prefix = 23.8% of unique companies, 10.0% of rows.**
+Re-measure with `scripts/audit_sponsor_match.py` — it prints the per-source table, the
+prefix-only hits (where a false positive surfaces first) and the misses.
+
+Two limitations are **structural** and no matcher tuning fixes them: **recruitment
+agencies** (the listing names the agency, not the licence holder — `Hays Specialist
+Recruitment` misses even though `Hays PLC` is registered) and **blank-company** aggregator
+rows. Both are dropped under the strict setting, and the funnel counts blank-company drops
+separately so the cost stays visible. `VisaSponsorToggle`'s note under the buttons is the
+only place the UI says this; keep it if the semantics change.
+
+**`fetch_ats` now carries the employer name**, threaded from `select_ats_batch_for_run`'s
+`(company, vendor, token)` through `gather_jobs`, which used to discard it. Without it
+every ATS row identifies its employer by an opaque token (`tiger-analytics`) — that is
+what the card renders and what every company-keyed consumer sees. **Note the ceiling this
+runs into**: `seed_ats.py` writes `(token, vendor, token)`, so `CompanyATS.company` IS the
+token for 1,818 of the 1,820 registry rows and only direct-employer-crawled rows carry a
+real name. So this fix delivers no measurable lift *today* (ATS rows stay at 4.7%); it is
+correct, it fixes the card, and it grows with the crawl. The real unlock would be
+backfilling `CompanyATS.company` from each vendor's own board metadata (Greenhouse and
+SmartRecruiters both expose a company name). Safe for identity: `identity_hash` uses the
+canonical-URL branch for ATS rows, so no store row is orphaned — but `_family_key`/
+`_dup_key` change shape, so decided-family suppression briefly misses against Role rows
+saved under the old token form.
+
+`Role.sponsor_licensed` is **three-state and the NULL matters**: True/False once checked,
+NULL when the listing named no employer. The card badges only a positive match — "not on
+the register" is not the same as "does not sponsor" for an agency posting, and an absent
+badge reads correctly as "unknown" where a "Not a sponsor" badge would not. Stamped on
+every run, not only when the filter is on.
+
+Discovery adapts when the filter is on (see the discovery section): a sponsor-priority
+tier ahead of all three existing tiers in `select_ats_batch_for_run` (measured: sponsors in
+the first 10 boards go 3 → 10), deeper Reed/Adzuna paging, and `SPONSOR_TERMS_PER_RUN`
+employer-scoped search terms (`"<role> <employer>"`) drawn from sponsors that have already
+surfaced for this profile, deduped by normalised key so two slots don't both go to
+"Davies" and "Davies Group".
+
+**Not doing: a sponsor-seeded domain crawl.** The register carries no domains, so it would
+have to guess them. The charity crawl finds a supported ATS on 1.3% of *known-good*
+domains; guessed domains would be materially worse.
+
+### Commute distance (`backend/app/services/geo.py`)
+
+Until this existed the app had exactly **two** location concepts — "same country" and
+"the candidate's city name appears as a substring" (`_filter_by_local_place`) — and
+nothing between them. Commute distance is the first filter a real seeker applies and
+was the one thing the app could not express: a Newcastle role and a next-street role
+were indistinguishable at every stage. It also fixes the display side of the same gap
+— board location fields routinely carry a bare postcode (`B706AW`, `LS101EY`,
+`GU98AD`) which rendered verbatim on a card and simply read as broken.
+
+`backend/app/uk_geo_gen.py` is a committed plain-data module (2,917 outward codes,
+~10k place names) generated by `scripts/gen_uk_geo.py` from ONS postcode centroids via
+api.postcodes.io — the same dev-time-generator / plain-data-module posture as
+`scripts/gen_countries.py`. **No API and no LLM at runtime**: every lookup is a dict
+hit and the distance is haversine. Outward-code precision only (the `B70` of
+`B70 6AW`); a commute radius is chosen in tens of miles, so centroid error is inside
+the noise, and the full 1.8M-row ONSPD is neither committable nor needed.
+
+Two things in the generator are load-bearing and easy to reintroduce as bugs.
+(1) The crawl walks `/outcodes/{oc}/nearest`, whose **default** radius is a few km —
+at the default the breadth-first walk closes over a subset of the country and
+terminates at 1,005 of ~3,000 outcodes; `radius=25000` is what makes it spread.
+(2) Place names repeat across the UK and **averaging their points is wrong**: a first
+cut took the mean of every outcode naming "Farnham" and landed 34 miles from the
+Surrey town, in a field, because Essex/Dorset/North Yorkshire each have one. Names are
+therefore single-link **clustered** (`_cluster`); a name with one cluster goes in
+`PLACE_COORDS`, a name with several goes in `PLACE_VARIANTS` with the county/district a
+listing would write after it, and `geo._pick_variant` disambiguates on that qualifier,
+falling back to the largest variant only on a **strict plurality** and returning None
+on a tie rather than coin-flipping a listing tens of miles.
+
+**Unresolved is a first-class answer and the common one.** "UK", "Remote" and every
+non-UK location resolve to None, and None always means *no distance information*,
+never *far*. Scope is UK-only (it is the ONS dataset); a profile based elsewhere gets
+no chip and no distance filter rather than wrong answers.
+
+Wiring:
+- `commute_miles` is a single-value attribute (miles as a string, `"0"` = no limit,
+  `config.DEFAULT_COMMUTE_MILES` = 30 when unset). It **rides the Location row's own
+  Hard/Soft** rather than carrying its own, since it answers the same question, and is
+  only ENFORCED at `location_scope="local"` — National/International have explicitly
+  opted out of narrowing by place. `LocationPicker` shows it only at Local scope.
+- `engine._filter_by_local_place` gained a radius argument and now has **two ways in**,
+  either of which keeps a job: the original name match, or within the radius. Distance
+  is only ever an additional way IN — radius 0 or an unresolvable location on either
+  side leaves the original behaviour exactly as it was, so **no job that passes today
+  can be dropped by this**. Note the local asymmetry: an unresolvable listing location
+  is dropped here (that is what "Local" already did), whereas everywhere else in the
+  pipeline unknown means no penalty.
+- `engine._annotate_geo` stamps `_distance_miles`/`_location_label` onto the candidate
+  dicts **once**, after the filters, and `_role_location_fields` copies them at both
+  Role-persist sites exactly as `_role_date_fields` copies the listing dates. Done this
+  way because neither persist site has the profile in scope. It runs at **every** scope,
+  not just local: a distance is worth showing on a card even when it isn't filtering.
+- `Role.distance_miles` / `Role.location_label` are nullable and usually null.
+  `location_label` sits *alongside* `location` rather than overwriting it, so what the
+  board actually said is never lost. The card renders `location_label || location`, and
+  0 miles renders as "Nearby" — outcode centroids can't tell same-town from
+  same-street and shouldn't pretend to.
+- Deliberately NOT wired into any prompt. `rank_gate`'s GEOGRAPHY rule and the judge's
+  LOCATION disqualifier are unchanged, so no cache version needed bumping.
+
+### Salary normalisation (`backend/app/services/salary.py`)
+
+Pay reached the app as free text and stayed that way — `"£28,505 to £34,613"`,
+`"£30,000 (rising to £45,000)"`, `"up to 70k"`, `"£200 per day"`, `"GBP 28800 - 48000
+per year"` — so nothing could compare two listings, and the candidate's salary floor
+was enforced against a raw `salary_max` from a source that may have meant *per hour*.
+JSearch alone returns HOUR/DAY/WEEK/MONTH/YEAR, so a £25/hour role (≈£48,750 a year)
+was hard-dropped at discovery for a candidate with a £30,000 floor.
+
+`parse_salary` returns `{min, max, period, currency}` in the **stated period's own
+units, never annualised** — `to_annual` (1950 h/yr, 260 d/yr) is applied only for
+coarse comparison and the card's toggle, and a converted figure is always rendered
+with `~` and "(stated a year)" because the conversion assumes full-time hours the
+listing never stated. Currency is recorded but **never converted** (an FX rate is not
+something to fetch per search); that coarseness is pre-existing and now the only unit
+assumption left.
+
+**The single most important rule: `text` must be a salary FIELD, never a job
+description.** Run over the snippets of a live 8,050-row store the parser "found" pay
+in 4,389 of them, and a 15-listing audit found 12 wrong — employee counts ("270+
+locations and 4,000+ employees" → £4,000/yr), requisition numbers ("Requisition
+Number: 51630" → £51,630/yr), years of experience ("5 years … at least 3 years" →
+£3–6/hr), signing bonuses ("$1,000 new hire bonus" → $1,000/day). The plausibility
+bounds cannot save you: they reject impossible *salaries* and cannot tell a salary
+from any other number of similar size. So `_jobseen_salary_fields` and
+`_filter_by_salary` pass structured source figures **only**, and
+`scripts/backfill_role_geo_salary.py` deliberately does not backfill `jobs_seen`.
+Percentages are stripped before any number is read, or "up to 12% bonus" parses as £12.
+
+Persistence, and a latent bug it fixed: `salary_min/max/period/currency` are now
+stored on **both** `Role` and `JobSeen`. The store side matters more than it looks —
+the pipeline's candidates come from `jobs_seen`, not from the fresh-discovery dicts,
+so the structured salary every board API returns was read once by the discovery-time
+filter and then thrown away. `full_auto._listing_salary_suffix`, which feeds
+`screen_gate`'s salary axis and `rank_gate`'s HARD DOWNGRADE (e), was therefore
+rendering **empty for effectively every candidate ever gated**. It now also states the
+period, without which "Salary: 25-32" from an hourly listing reads as catastrophically
+underpaid. Sources gained the fields they already had and were dropping:
+`salary_currency` (Reed=GBP, USAJobs=USD), `salary_period` (Adzuna="year" — its
+figures are documented as annualised; JSearch/USAJobs pass theirs through). Note this
+changes prompt CONTENT without a `screen_v`/`rank_v` bump — `gate_cache` keys on job
+id + profile signature, not on the listing block, so already-cached rows keep their
+old verdicts and only new/changed ones see the better prompt.
+
+The card renders the normalised figure in the user's chosen unit, falling back to
+`salary_text` verbatim whenever the parse found nothing ("Competitive", "Negotiable",
+"National Minimum Wage" state no figure and showing what the employer wrote beats
+showing nothing). `SalaryPeriodToggle` (Yearly/Hourly) is shared by `/search` and
+`/my-roles` through a module-level store in `lib/salary.ts` read via
+`useSyncExternalStore` — not a context, which would have to be threaded through two
+page trees to move one enum — and is hidden unless something on screen actually has a
+parsed salary. **`lib/salary.ts`'s `ANNUAL_MULTIPLIER` must stay in sync with
+`services/salary.py`'s**, same as `WORK_TYPE_VALUES` is mirrored in `LocationPicker`.
+
+### Direct-employer discovery (UK charity vertical)
+
+`backend/app/services/direct_employer.py` + `scripts/gen_uk_charity_seed.py` +
+`scripts/crawl_direct_employers.py`.
+
+**The problem it was built for.** The ATS registry is ~1,800 companies and
+overwhelmingly US-headquartered: on a measured live run it produced 4 of 85 surfaced
+roles (4.7%) while the term-based board APIs produced 79 (93%), and the single largest
+entry in the store is `gh:spacex` at 1,943 rows that the country filter then discards.
+More ATS *vendors* does not fix that — vendor coverage isn't what's missing, UK employer
+coverage is.
+
+**The seed list is the easy half and it's real.** The Charity Commission register
+(`txt non code/publicextract.charity.json`, 507MB, gitignored) yields **8,191 unique UK
+charity domains** at £1m+ income after filtering to Registered + non-linked + usable
+website. `scripts/gen_uk_charity_seed.py` streams it line-by-line (the extract is a JSON
+array formatted one object per line; `json.load` would need several GB) and writes the
+committed plain-data module `backend/app/uk_charity_gen.py` — same dev-time-generator /
+committed-artifact posture as `gen_uk_geo.py` and `gen_countries.py`. The income floor is
+the load-bearing filter: 103,155 registered charities have a website but only 8,437 report
+over £1m, and income is the dataset's only proxy for "employs anyone".
+
+**The crawl deliberately does not parse jobs.** The obvious reading — a bespoke HTML job
+parser per site — is thousands of layouts, permanently breaking, and produces exactly the
+text-starved rows the pipeline spent months fixing. Most employers don't host vacancies
+themselves; they link out to a hosted ATS. So the crawl reads a careers page, works out
+*which ATS the employer uses*, live-validates the token, and writes `(company, vendor,
+token, keyword="charity nonprofit voluntary")` into `company_ats`. From there nothing
+changes: `fetch_ats` returns clean, text-complete postings on every run. One crawl
+converts an employer into a permanent discovery source rather than into one scrape that
+rots. Token extraction is shared with `harvest_ats_tokens` via
+`full_auto.ATS_TOKEN_PATTERNS`/`ats_tokens_in`, so the two can't drift on what a valid
+token looks like.
+
+**The measured result, which does not support the original strategic framing.** Over 150
+top-income domains: **2 boards found (1.3%)**, 124 `no_ats`, 23 `unreachable`, 1
+robots-blocked. A random sample across the income range found **0 of 72**. Extrapolated,
+the whole 8,191-domain list is worth roughly **~110 boards** — worth having (it is
+UK-relevant where the current registry is not, and it costs no API credits and no
+search-time latency) but it is not the path that fixes the 4.7% problem. Two reasons it
+lands where it does: big charities' careers pages are JS-rendered, so there is no link to
+follow without a browser; and the ones that do use a hosted ATS mostly use enterprise
+platforms we can't read. Note one of the two hits, **Marie Curie, is a SmartRecruiters
+board — reachable only because of the vendor added alongside this**.
+
+**The misses are the more durable output.** A `no_ats` row records *which* unsupported
+platform it saw (`_FOREIGN_ATS_HOSTS`), so the failures accumulate into a ranked,
+measured case for which vendor to integrate next instead of an undifferentiated pile —
+read it with `scripts/crawl_direct_employers.py --misses`. First 150 domains:
+Workday 5, current-vacancies 2, Pinpoint 2, then a tail of singletons (SuccessFactors,
+iCIMS, Jobtrain, Teamtailor, PeopleHR…). **There is no single vendor that unlocks
+meaningful UK charity coverage** — that is the finding, and it is the thing to re-check
+before anyone proposes "add more ATS vendors" again.
+
+**A crawled board was nearly unreachable until `select_ats_batch_for_run` grew a third
+tier.** That function used to split the registry into "keyword matches the profile" and
+"everything else", where the match was one boolean over search terms *and* sectors
+merged — so a board tagged `data analyst` and one tagged `charity nonprofit` were
+equally preferred for a charity-sector data analyst. The tier is then rotated in
+insertion order, and crawled rows are the newest, so they sat at the back: measured on
+the live store, a freshly-crawled charity board landed at **index 283 of a 285-row
+preferred list**, ~7 runs of rotation before the 40-slot batch would reach it, ranked
+behind 283 boards matching only the generic word "data". A SECTOR word is much stronger
+evidence that a company is in the candidate's field than a role-shape word like
+"data"/"analyst", which matches employers in every industry — so sector matches now get
+their own tier ahead of term-only matches, each still rotating independently so nothing
+is starved. Without this the crawl's output is real but effectively invisible, which is
+worth remembering before judging the yield numbers above.
+
+**Board count is not the metric; `crawl_status()["yield"]` is.** A board contributing 400
+listings that all die at the embedding pre-filter is worth less than one contributing 3
+that get surfaced, so the status output joins the charity-tagged tokens back onto
+`jobs_seen`/`Role` and reports discovered → gated → shown → saved/applied. Deliberately a
+read-side join over existing columns rather than a new funnel counter: it costs the
+search path nothing, which is the right trade for a feature with this measured yield.
+
+**Politeness and scheduling.** This is the only part of the app that fetches arbitrary
+third-party sites that never asked to be crawled, so it honours `robots.txt` (fails open
+on a missing one, records `blocked_by_robots` rather than proceeding) and sends an honest,
+identifiable User-Agent. The ~14% `unreachable` rate is mostly Cloudflare returning
+403/202 to that UA; it is left as-is on purpose rather than disguised. There is **no
+in-process scheduler**: the recheck window is 120 days, so a timer thread inside the
+single-instance box whose SQLite file is the app's only store is infrastructure risk with
+no matching payoff. The schedulable units are `scripts/crawl_direct_employers.py --limit N`
+(resumable; re-running picks up where it stopped) and `POST /admin/crawl` for an external
+scheduler. Scheduled discovery/embed *pre-runs* were considered and not built — they save
+~1.5 min off a ~4 min run whose perceived wait is already solved by progressive paint
+(first cards at ~7s), and the crawler turned out not to need the scheduler that would have
+justified them.
+
+### Ghost-listing evidence (recording only)
+
+`JobSeen.seen_dates` / `dead_at` / `repost_key` exist to be **written now and analysed
+later**, and nothing in the pipeline reads any of them — that is the intended state,
+not an oversight. A ghost listing (up for months, or taken down and reposted verbatim,
+with no real vacancy behind it) can only be identified from a history of observations,
+and **that history cannot be reconstructed after the fact**: every week it isn't
+recorded is permanently lost, while the scoring and the UI can be built whenever.
+
+- `seen_dates` — the distinct UTC dates this identity has been observed, as
+  days-since-epoch integers, comma-separated. `seen_days` is the *count* of exactly
+  these and remains the fast path; this is the observation window's **shape**, which
+  the count destroys. Text on the existing row rather than a sightings table on
+  purpose: a row per observation is ~3,000 inserts per run (six runs a day are
+  allowed) for data whose whole value is longitudinal. Written via `_append_sighting`,
+  which is idempotent per day, so unlike the `seen_days` increment beside it (whose
+  ORDER MATTERS trap is still there) it doesn't depend on being sequenced against
+  `last_seen`. A gap means "not seen", never "not live" — same lower-bound caveat as
+  `seen_days`.
+- `dead_at` — when we first confirmed the listing gone, closing the bracket
+  `first_seen` opens. `dead_reason` already recorded *that* it died; without a
+  timestamp there was no way to ask how long any listing actually stayed up, which is
+  the central question. Stamped once at both death-detection sites
+  (`_persist_dead_scrapes`, `_persist_enrich_dead`), never overwritten.
+- `repost_key` — normalised company+title via `_family_key`, so "the same vacancy
+  re-advertised" means what it already means elsewhere in the module. **Not** a dedupe
+  key: a repost is a distinct listing with its own dates, and the signal is precisely
+  how many there are and how far apart. A live store already shows one recruiter's
+  ".NET Developer" 34 times.
 
 ### Feedback / weight system
 

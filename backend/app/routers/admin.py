@@ -7,7 +7,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -35,6 +35,40 @@ def _check_admin(x_admin_token: str | None = Header(None)) -> None:
         raise HTTPException(status_code=403, detail="Analytics endpoint is disabled (ADMIN_TOKEN not set).")
     if not x_admin_token or not hmac.compare_digest(x_admin_token, ADMIN_TOKEN):
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@router.post("/crawl")
+def run_direct_employer_crawl(
+    limit: int = 200,
+    _: None = Depends(_check_admin),
+    background: BackgroundTasks = None,  # type: ignore[assignment]
+):
+    """Kick off one pass of the direct-employer ATS-detection crawl.
+
+    Owner-triggered (or driven by an EXTERNAL scheduler against this endpoint --
+    see scripts/crawl_direct_employers.py for why there is no in-process timer).
+    Returns immediately: a 200-domain pass is minutes of network wall time, far
+    past any sane request timeout, so it runs as a BackgroundTask and progress
+    is read back from GET /admin/crawl."""
+    from ..services.direct_employer import crawl_uk_charities
+
+    def _run() -> None:
+        try:
+            summary = crawl_uk_charities(limit=limit)
+            print(f"[crawl] direct-employer pass done: {summary}")
+        except Exception as e:  # never let a background crawl kill the process
+            print(f"[crawl] direct-employer pass failed: {e!r}")
+
+    background.add_task(_run)
+    return {"started": True, "limit": limit}
+
+
+@router.get("/crawl")
+def direct_employer_crawl_status(_: None = Depends(_check_admin)):
+    """Progress and hit rate for the direct-employer crawl."""
+    from ..services.direct_employer import crawl_status
+
+    return crawl_status()
 
 
 @router.get("/analytics")

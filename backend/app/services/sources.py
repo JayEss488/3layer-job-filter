@@ -33,6 +33,8 @@ SOURCES: list[dict] = [
     {"key": "workable",    "label": "Workable (ATS)",   "kind": "ats", "board_prefix": "workable"},
     {"key": "recruitee",   "label": "Recruitee (ATS)",  "kind": "ats", "board_prefix": "recruitee"},
     {"key": "personio",    "label": "Personio (ATS)",   "kind": "ats", "board_prefix": "personio"},
+    {"key": "smartrecruiters", "label": "SmartRecruiters (ATS)", "kind": "ats",
+     "board_prefix": "smartrecruiters"},
 ]
 
 _PREFIX_TO_KEY = {s["board_prefix"]: s["key"] for s in SOURCES}

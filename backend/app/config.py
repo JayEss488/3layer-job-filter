@@ -119,6 +119,27 @@ ATTRIBUTE_TYPES = [
     # instead of dropping it. An unknown/uncertain date is never penalised either
     # way -- see full_auto.py's listing_over_max_age/_listing_age_tag.
     "max_listing_age",
+    # Single-value, like location_scope/max_listing_age: how far the candidate
+    # will travel from their stated location, in miles as a string (e.g. "30").
+    # "0" is a real value meaning "no distance limit". Only bites at
+    # location_scope="local" -- National/International have deliberately opted
+    # out of narrowing by place at all -- and rides the Location row's own
+    # Hard/Soft rather than carrying its own, since it answers the same question
+    # ("does where I am constrain results"). No row -> DEFAULT_COMMUTE_MILES.
+    "commute_miles",
+    # Single-value boolean: show only employers on the Home Office register of
+    # licensed visa sponsors. Value "true"; no row at all -> off, which is the
+    # default, because it is a strict filter that most candidates don't need.
+    # Unlike every other constraint here this one is inherently HARD -- there is
+    # no useful "soft" reading of "I need a visa" -- so it carries no Hard/Soft
+    # control and ENFORCEMENT_DEFAULT is irrelevant to it.
+    #
+    # The match is on company NAME against a 127k-organisation register with no
+    # domains and no company numbers, so a miss conflates "not a sponsor" with
+    # "the listing didn't name the employer well enough to tell" -- agency
+    # postings and blank-company aggregator rows are the two structural cases.
+    # See services/sponsors.py for the measured match rate and both limitations.
+    "visa_sponsor_only",
 ]
 
 # Where a skill's depth was earned -- distinct from proficiency (which grades
@@ -204,6 +225,16 @@ ENFORCEMENT_DEFAULT = {
 # kept in sync manually since the two modules don't share config imports.
 DEFAULT_MAX_LISTING_AGE_DAYS = 30
 
+# Fallback commute radius, in miles, when the candidate has picked "Local" scope
+# but never touched the distance control. Only ever consulted at local scope.
+# 30 miles is roughly the upper end of a routine UK commute -- generous enough
+# that turning Local on doesn't silently empty the results page, tight enough
+# that it means something. Note this is straight-line distance between postcode
+# centroids (services/geo.py), not drive time: it is a coarse "is this even in
+# reach" test, and every stage downstream still reasons about the location text
+# itself.
+DEFAULT_COMMUTE_MILES = 30
+
 
 def enforcement_for(attr_type: str, value: str | None) -> str:
     """The stored enforcement, or the type's pre-enforcement default.
@@ -278,6 +309,8 @@ ATTRIBUTE_DIRECTION = {
     "avoid": "constraint",
     "must_have": "constraint",
     "max_listing_age": "constraint",
+    "commute_miles": "constraint",
+    "visa_sponsor_only": "constraint",
 }
 
 # How far the candidate's stated location/country should be trusted as a hard

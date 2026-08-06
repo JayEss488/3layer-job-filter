@@ -8,6 +8,7 @@ import { HardSoftToggle } from "@/components/HardSoftToggle";
 import { IntentEditor } from "@/components/IntentEditor";
 import { LocationPicker, WORK_SET } from "@/components/LocationPicker";
 import { MaxListingAgePicker } from "@/components/MaxListingAgePicker";
+import { VisaSponsorToggle } from "@/components/VisaSponsorToggle";
 import { Nav } from "@/components/Nav";
 import { ProfileTabs } from "@/components/ProfileTabs";
 import { RequirementRows } from "@/components/RequirementRows";
@@ -76,6 +77,7 @@ function ProfileBody({ profileId }: { profileId: number }) {
   const seniorityAttrs = g?.seniority ?? [];
   const salaryAttr = g?.salary?.[0];
   const maxListingAgeAttrs = g?.max_listing_age ?? [];
+  const visaSponsorAttrs = g?.visa_sponsor_only ?? [];
 
   /**
    * Hard/Soft for a preference is stored per attribute row, but the UI shows one
@@ -270,6 +272,7 @@ function ProfileBody({ profileId }: { profileId: number }) {
                 attributes={locationAttrs}
                 countryAttributes={g?.country ?? []}
                 scopeAttributes={g?.location_scope ?? []}
+                commuteAttributes={g?.commute_miles ?? []}
               />
             </div>
             <HardSoftToggle
@@ -308,6 +311,15 @@ function ProfileBody({ profileId }: { profileId: number }) {
               disabled={maxListingAgeAttrs.length === 0}
               disabledReason="Hard by default at 30 days — pick a different limit first to change enforcement."
             />
+          </div>
+
+          {/* No HardSoftToggle: this filter is inherently hard, so the card
+              renders a two-column field instead of the usual three. */}
+          <div className="pref-card">
+            <div className="pref-label">Visa sponsorship</div>
+            <div className="pref-field">
+              <VisaSponsorToggle profileId={profileId} attributes={visaSponsorAttrs} />
+            </div>
           </div>
         </div>
 

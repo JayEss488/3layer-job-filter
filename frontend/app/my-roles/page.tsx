@@ -5,6 +5,7 @@ import { useState } from "react";
 
 import { Nav } from "@/components/Nav";
 import { RoleCard } from "@/components/RoleCard";
+import { SalaryPeriodToggle } from "@/components/SalaryPeriodToggle";
 import { api } from "@/lib/api";
 import { useRoles } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
@@ -28,7 +29,12 @@ export default function MyRolesPage() {
 
   const saved = useRoles(activeId ?? null, "saved");
   const inbox = useRoles(activeId ?? null, "new");
-  const deleted = useRoles(activeId ?? null, "crossed,deleted");
+  // "ignored" is folded in here: the only way a role reaches that status is the
+  // pipeline auto-hiding an already-shown role it just confirmed dead/expired
+  // (see engine._auto_hide_dead_roles) -- there's no dedicated Ignored tab, so
+  // without this a role the app itself caught as dead would simply vanish with
+  // no visible trace anywhere.
+  const deleted = useRoles(activeId ?? null, "crossed,deleted,ignored");
   const applied = useRoles(activeId ?? null, "applied");
 
   const invalidate = () => {
@@ -49,11 +55,17 @@ export default function MyRolesPage() {
     return <div className="app"><Nav /><div className="center-pad">Loading…</div></div>;
   }
 
+  const byDateDesc = (a: string, b: string) => new Date(b).getTime() - new Date(a).getTime();
+
   const lists: Record<Tab, Role[]> = {
     saved: saved.data ?? [],
     inbox: inbox.data ?? [],
-    deleted: deleted.data ?? [],
-    applied: applied.data ?? [],
+    // Newest-removed first (crossed/deleted both just bump updated_at).
+    deleted: [...(deleted.data ?? [])].sort((a, b) => byDateDesc(a.updated_at, b.updated_at)),
+    // Newest-applied first.
+    applied: [...(applied.data ?? [])].sort((a, b) =>
+      byDateDesc(a.applied_at ?? a.updated_at, b.applied_at ?? b.updated_at)
+    ),
   };
   const current = lists[tab];
 
@@ -74,6 +86,10 @@ export default function MyRolesPage() {
               </div>
             ))}
           </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {/* Only offered when something on this tab actually has a parsed
+                salary — see SalaryPeriodToggle. */}
+            <SalaryPeriodToggle show={current.some((r) => r.salary_period)} />
           {tab === "inbox" && current.length > 0 && (
             <button
               className="btn btn-ghost sm"
@@ -93,6 +109,7 @@ export default function MyRolesPage() {
               {clearAll.isPending ? "Clearing…" : "Clear all"}
             </button>
           )}
+          </div>
         </div>
 
         {current.length === 0 && (

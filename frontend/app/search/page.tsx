@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react";
 
 import { Nav } from "@/components/Nav";
 import { RoleCard } from "@/components/RoleCard";
+import { SalaryPeriodToggle } from "@/components/SalaryPeriodToggle";
 import { SearchFeedbackBox } from "@/components/SearchFeedbackBox";
 import { SearchProgress } from "@/components/SearchProgress";
 import { TrainingBanner } from "@/components/TrainingBanner";
@@ -184,6 +185,10 @@ export default function SearchPage() {
                 {current.length + previous.length + savedRoles.length + unreviewed.length + crossed.length} results
               </span>
             </span>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              {/* Only offered when something on screen actually has a parsed
+                  salary — see SalaryPeriodToggle. */}
+              <SalaryPeriodToggle show={(roles ?? []).some((r) => r.salary_period)} />
             {(current.length + previous.length + savedRoles.length + unreviewed.length + crossed.length) > 0 && (
               <button
                 className="btn btn-ghost sm"
@@ -203,6 +208,7 @@ export default function SearchPage() {
                 {clearAll.isPending ? "Clearing…" : "Clear all"}
               </button>
             )}
+            </div>
           </div>
         )}
 

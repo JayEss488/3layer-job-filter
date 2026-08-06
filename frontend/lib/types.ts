@@ -12,7 +12,13 @@ export type AttributeType =
   | "custom"
   | "avoid"
   | "must_have"
-  | "max_listing_age";
+  | "max_listing_age"
+  // Commute radius in miles as a string ("30"); "0" means no distance limit.
+  // Only enforced at location_scope="local" — see LocationPicker.
+  | "commute_miles"
+  // Single-value boolean, value "true"; no row at all means off (the default).
+  // Inherently hard, so it carries no Hard/Soft — see VisaSponsorToggle.
+  | "visa_sponsor_only";
 
 export interface Profile {
   id: number;
@@ -58,6 +64,29 @@ export interface RunFunnel {
   decided_family_keys: number;
   decided_family_suppressed: number;
   decided_family_shadow: boolean;
+  /** Pre-judge liveness sample (rationed across the rank pool). */
+  verify_checked: number;
+  verify_dead: number;
+  verify_unverifiable: number;
+  /** Final-pick liveness — every shown pick, checked unconditionally. */
+  final_verify_checked: number;
+  final_verify_dead: number;
+  final_verify_unverifiable: number;
+  final_verify_browser: number;
+  final_verify_backfilled: number;
+  /** Licensed visa-sponsor filter; all zero unless the preference is on. */
+  sponsor_filter_raw_before: number;
+  sponsor_filter_raw_after: number;
+  sponsor_filter_raw_blank_company: number;
+  sponsor_filter_scored_before: number;
+  sponsor_filter_scored_after: number;
+  sponsor_filter_scored_blank_company: number;
+  /** Free, LLM-free drops made at pool admission, broken out by reason so the
+   *  cost of filtering before any model sees a candidate stays attributable. */
+  heuristic_prescreen_dropped: number;
+  pool_quality_dropped: number;
+  pool_quality_dropped_foreign_location: number;
+  pool_quality_dropped_junk_listing: number;
   shown: number;
   /** rank_scored — total examined by the cheap+mid gates. */
   examined: number;
@@ -270,6 +299,9 @@ export type RoleStatus =
 
 export type ApplicationStatus = "pending" | "interview" | "rejected";
 
+/** Pay period — mirrors backend/app/services/salary.py's vocabulary. */
+export type SalaryPeriod = "year" | "month" | "week" | "day" | "hour";
+
 /** The final judge's fit grade — mirrors full_auto's _FINAL_EVAL_SCHEMA. */
 export type RoleVerdict = "very_strong" | "strong" | "ok" | "stretch";
 
@@ -290,7 +322,29 @@ export interface Role {
   location?: string | null;
   url?: string | null;
   tags?: string[] | null;
+  /** Readable stand-in for `location` when the source gave a raw postcode
+   *  ("B706AW" -> "Sandwell"). Null when `location` needs no fixing. */
+  location_label?: string | null;
+  /** Straight-line miles from the candidate's stated place, from ONS postcode
+   *  centroids. Null whenever either end couldn't be resolved — which is the
+   *  common case, and must render as no chip rather than as 0. */
+  distance_miles?: number | null;
+  /** Whether the employer is on the Home Office licensed-sponsor register.
+   *  THREE-STATE: true/false once checked, null when the listing named no
+   *  employer to check — never render null as "not a sponsor". */
+  sponsor_licensed?: boolean | null;
+  /** When this listing was last directly confirmed to still exist. Null on
+   *  provisional cards (nothing has been checked yet) and on rows from runs
+   *  that predate the check. */
+  last_verified_at?: string | null;
   salary_text?: string | null;
+  /** salary_text parsed into comparable numbers, in `salary_period`'s own units
+   *  (NOT annualised). All null together when nothing parseable was stated, in
+   *  which case salary_text is what gets shown. */
+  salary_min?: number | null;
+  salary_max?: number | null;
+  salary_period?: SalaryPeriod | null;
+  salary_currency?: string | null;
   source?: string | null;
   fit_rank?: number | null;
   /** The cheap rank stage's 0-100 fit estimate; shown only while provisional. */
@@ -314,10 +368,19 @@ export interface Role {
   work_style?: string | null;
   seniority_level?: string | null;
   deadline_text?: string | null;
+  /** When the employer posted/closes the listing, as stated by the source.
+   *  Null when unknown -- never render that as "old", it just isn't claimed. */
+  posted_at?: string | null;
+  expires_at?: string | null;
+  /** True when posted_at was aliased from a source's updated/modified field
+   *  rather than a genuine "first posted" date (e.g. Greenhouse) -- render as
+   *  "updated"/"~", never "posted", when this is set. */
+  posted_at_approx?: boolean | null;
   status: RoleStatus;
   application_status?: ApplicationStatus | null;
   applied_at?: string | null;
   created_at: string;
+  updated_at: string;
 }
 
 export interface SearchStatus {

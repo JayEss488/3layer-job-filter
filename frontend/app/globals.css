@@ -256,6 +256,9 @@ a { color: inherit; }
 .country.on { background: var(--accent); color: #fff; border-color: var(--accent); }
 .country.detected { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: var(--accent-tint); }
 .hint-detected { font-size: 11.5px; color: var(--muted); }
+/* Inline label sitting before a choice-row on the same line (e.g. "Within" in
+   front of the commute-radius buttons). */
+.hint-inline { font-size: 12px; color: var(--muted); }
 .hint-detected strong { color: var(--ink-2); font-weight: 600; }
 .location-row { display: flex; flex-direction: column; gap: 8px; }
 .location-line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }

@@ -177,8 +177,58 @@ class Role(Base):
     location = Column(Text)
     url = Column(Text)
     tags = Column(JSON)  # ["React","Python","Senior"] - display only
+    # What the source/judge said about pay, verbatim. Kept as the display
+    # fallback and as the audit trail for the parsed columns below -- the
+    # formats are genuinely chaotic ("£30,000 (rising to £45,000)", "up to 70k",
+    # "£32,000 - £35,000 per annum, inc benefits") and a parse that comes back
+    # None must still be able to show the candidate what the employer wrote.
     salary_text = Column(Text)
+    # salary_text (or the board's own structured figures) parsed into comparable
+    # numbers by services/salary.py, in salary_period's units rather than
+    # annualised. All four are null together when nothing was parseable, which
+    # is the common case. See engine._role_salary_fields.
+    salary_min = Column(Float)
+    salary_max = Column(Float)
+    salary_period = Column(Text)       # year|month|week|day|hour
+    salary_currency = Column(Text)     # ISO code (GBP/USD/...), null when unstated
     source = Column(Text)  # board this role was discovered on (see JobSeen.source)
+    # Copied straight from JobSeen.posted_at/expires_at/posted_at_approx at every
+    # Role-creation/upgrade site (see engine._role_date_fields) -- a display gap,
+    # not a data gap: the pipeline has carried these since the listing-age work,
+    # but only JobSeen ever exposed them, so /search and /my-roles (which render
+    # Role, never JobSeen) had no age to show regardless of what the source gave.
+    # Nullable and often null, same as on JobSeen -- an unknown date must render
+    # as no chip, never a guessed one. posted_at_approx mirrors JobSeen's own
+    # flag so a Greenhouse-aliased updated_at is never rendered as "posted".
+    posted_at = Column(DateTime)
+    expires_at = Column(DateTime)
+    posted_at_approx = Column(Boolean)
+    # Straight-line miles from the candidate's stated place to this listing's,
+    # computed once per run from ONS postcode centroids (services/geo.py) and
+    # copied here by engine._role_location_fields. NULL whenever either side
+    # couldn't be resolved -- which is the common case, and must render as no
+    # chip rather than as 0. Not a drive time and not accurate below a few
+    # miles: outcode-centroid precision, see geo.py.
+    distance_miles = Column(Integer)
+    # A human-readable version of `location` when the source gave a raw postcode
+    # ("B706AW" -> "Sandwell"). NULL when `location` needs no fixing, which is
+    # most rows -- the card falls back to `location` itself. Kept alongside
+    # rather than overwriting `location`, so what the board actually said is
+    # never lost.
+    location_label = Column(Text)
+    # Whether this listing's employer is on the Home Office register of licensed
+    # visa sponsors (services/sponsors.py). THREE-STATE and the NULL matters:
+    # True/False mean we had a company name and checked it, NULL means the
+    # listing named no employer to check -- so a blank-company aggregator row
+    # never renders as a confirmed non-sponsor. Stamped on every run, not only
+    # when the visa_sponsor_only filter is on.
+    sponsor_licensed = Column(Boolean)
+    # When this exact listing was last confirmed to still exist, by a direct
+    # fetch of its own URL (or, for an ATS row, by its continued presence in the
+    # vendor feed). Every non-provisional row surfaced by a run carries one --
+    # engine._verify_final_picks checks the picks before they are persisted. Its
+    # twin on JobSeen is the cross-run store; this copy is what the card renders.
+    last_verified_at = Column(DateTime)
     fit_rank = Column(Integer)  # 1..N within a search batch
     # The cheap rank_gate's 0-100 fit estimate, written when this row is first
     # persisted provisionally (mid-run, before the expensive judge). Kept after
@@ -279,6 +329,22 @@ class JobSeen(Base):
     location = Column(Text)
     url = Column(Text)
     snippet = Column(Text)             # doubles as evaluation text (see 4.3)
+    # Normalised pay, in `salary_period`'s own units (services/salary.py) -- NOT
+    # annualised, so a source's own figure is never silently rewritten. Nullable
+    # and usually null: most listings state no salary, and "Competitive" must
+    # stay unknown rather than become a number.
+    #
+    # These exist because the pipeline's candidates come from THIS table, not
+    # from the fresh-discovery dicts: without them the structured salary every
+    # board API returns was read once by the discovery-time filter and then
+    # thrown away, so a listing resurfacing from the backlog reached the gates
+    # with no pay information at all, and full_auto._listing_salary_suffix --
+    # which feeds screen_gate's salary axis and rank_gate's HARD DOWNGRADE (e)
+    # -- rendered empty for effectively every candidate ever gated.
+    salary_min = Column(Float)
+    salary_max = Column(Float)
+    salary_period = Column(Text)       # year|month|week|day|hour
+    salary_currency = Column(Text)     # ISO code (GBP/USD/...), null when unstated
     embedding = Column(Text)           # JSON-encoded vector, cached once per job
     state = Column(Text, nullable=False, default="new")       # new|enriched|shown
     source_updated_at = Column(DateTime)                      # ATS updated_at when present
@@ -313,6 +379,55 @@ class JobSeen(Base):
     # NULL = discovered before this column existed; coalesce to 1 and never let
     # NULL suppress anything.
     seen_days = Column(Integer)
+    # ── Ghost-listing evidence (recording only) ─────────────────────────────
+    # These three exist to be WRITTEN now and analysed later. A "ghost" listing
+    # -- one that stays up for months, or is taken down and reposted verbatim,
+    # without a real vacancy behind it -- can only be identified from a history
+    # of observations, and that history CANNOT BE RECONSTRUCTED AFTER THE FACT.
+    # Every week these aren't recorded is permanently lost, while the scoring
+    # and the UI that read them can be built whenever. Nothing in the pipeline
+    # currently reads any of them, and that is the intended state.
+    #
+    # The distinct UTC dates this identity has been observed, as days-since-
+    # epoch integers, comma-separated and ascending ("20304,20305,20309").
+    # seen_days above is the COUNT of exactly these and stays the fast path;
+    # this is the shape of the observation window, which the count destroys.
+    # A gap means "not seen on that day", never "not live" -- discovery only
+    # returns a listing when a run's search terms happen to surface it, so this
+    # is a lower bound on how long the ad ran, in the same way seen_days is.
+    # Text rather than a sightings TABLE on purpose: a row per observation would
+    # be ~3,000 inserts per run (6 runs a day are allowed) for data whose whole
+    # value is longitudinal, where this is a few hundred bytes on a row that is
+    # already being written.
+    seen_dates = Column(Text)
+    # When we FIRST confirmed this listing was gone -- the closing bracket
+    # around an ad's life that first_seen opens. dead_reason records that it
+    # died and why; without a timestamp there is no way to ask how long any
+    # listing actually stayed up, which is the central ghost-listing question.
+    # Stamped once, never overwritten.
+    dead_at = Column(DateTime)
+    # Normalised company+title, shared by every listing that is arguably the
+    # same vacancy re-advertised. NOT a dedupe key (identity_hash is that, and
+    # these rows are deliberately kept separate): a repost is a distinct listing
+    # with its own dates, and the signal is precisely how MANY of them there
+    # are and how far apart. A live store already shows one recruiter's
+    # ".NET Developer" 34 times. Written at discovery, read by nothing yet.
+    repost_key = Column(Text, index=True)
+    # Normalised "<company>|<title>" (engine._soft_dup_key), written at discovery
+    # so the soft-duplicate lookup in _upsert_discovered is an indexed equality
+    # instead of a `lower(company) LIKE x%` pre-filter that hydrated ~818 full
+    # rows per call -- see database._migrate_soft_dup_key for the measurements
+    # and for why this is also MORE correct than the SQL it replaced.
+    #
+    # Deliberately distinct from repost_key above, which is the same shape but a
+    # different question: repost_key groups re-advertisements of one vacancy for
+    # later ghost-listing analysis and is read by nothing, while this one decides,
+    # at write time, whether an incoming listing IS a row we already hold. Keeping
+    # them separate means a change to either normalisation can't silently move the
+    # other's meaning. The index is created in _migrate_soft_dup_key rather than
+    # with index=True here because the same migration has to backfill existing
+    # rows anyway, and a NULL key must never be treated as "no duplicate".
+    soft_dup_key = Column(Text)
     # Cross-run reuse of the two most expensive artifacts, so a job that resurfaces
     # (backlog top-up, re-queue) skips re-scraping and re-judging. Cleared when a
     # source-updated row is re-queued so a changed posting is re-scraped/re-judged.
@@ -343,6 +458,17 @@ class JobSeen(Base):
     # about the URL, independent of pipeline-progress state and of the
     # profile/CV (must survive an eval_signature change, unlike a real verdict).
     dead_reason = Column(Text)
+    # The last time this SPECIFIC listing's liveness was directly confirmed --
+    # a Phase-5 scrape, or a Reed/Adzuna per-job detail fetch (whether it found
+    # the listing alive or dead) -- as opposed to first_seen/last_seen, which
+    # track discovery re-observing the identity via a board's SEARCH api and
+    # say nothing about whether anyone has looked at the listing's own page
+    # since. NULL = never directly verified (discovery-only, e.g. every ATS
+    # row, or a Reed/Adzuna row before this column existed). Read by
+    # engine._enrich_pre_gate's revalidate pass: a judge-pool candidate whose
+    # listing hasn't been reverified in LISTING_REVALIDATE_AFTER_DAYS gets one
+    # more cheap detail-endpoint check before the judge trusts its cached text.
+    last_verified_at = Column(DateTime)
     first_seen = Column(DateTime, default=_now)
     last_seen = Column(DateTime, default=_now, onupdate=_now)
 
@@ -384,14 +510,71 @@ class CompanyATS(Base):
 
     id = Column(Integer, primary_key=True)
     company = Column(Text, nullable=False)
-    vendor = Column(Text, nullable=False)  # greenhouse|lever|ashby|workable|recruitee|personio
+    vendor = Column(Text, nullable=False)  # see full_auto.ATS_FEEDS for the live set
     token = Column(Text, nullable=False)
-    keyword = Column(Text)  # harvest phrase that found it ("curated" for the seed)
+    keyword = Column(Text)  # harvest phrase that found it ("curated" for the seed,
+                            # "charity:*" for a direct_employer.py crawl hit)
     created_at = Column(DateTime, default=_now)
 
     __table_args__ = (
         UniqueConstraint("vendor", "token", name="uq_companyats_vendor_token"),
     )
+
+
+class DirectEmployerProbe(Base):
+    """One row per employer domain the direct-employer crawl has looked at.
+
+    The SEED list is not stored here -- it lives in the generated
+    `uk_charity_gen` module, which stays the source of truth for who exists.
+    This table records only what a probe FOUND, so it grows with work actually
+    done and doubles as the crawl's cursor: a domain with a row inside the
+    recheck window is skipped.
+
+    Keeping the misses (`no_ats`, `unreachable`) matters as much as the hits.
+    Without them the crawl has no way to distinguish "not yet looked at" from
+    "looked at, nothing there", and would re-spend its whole budget on the same
+    dead domains on every pass. They are also the only way to measure the
+    strategy: the hit RATE is what says whether this vertical is worth the
+    crawl, and a table of hits alone silently reports 100%."""
+
+    __tablename__ = "direct_employer_probes"
+
+    id = Column(Integer, primary_key=True)
+    domain = Column(Text, nullable=False, unique=True, index=True)
+    company = Column(Text)
+    source_list = Column(Text)   # which seed list it came from, e.g. "uk_charity"
+    status = Column(Text, nullable=False)  # ats_found|no_ats|unreachable|blocked_by_robots
+    vendor = Column(Text)        # set when status == "ats_found"
+    token = Column(Text)
+    careers_url = Column(Text)   # the page the board link was found on
+    note = Column(Text)          # short failure detail, for triage
+    probed_at = Column(DateTime, default=_now, index=True)
+
+
+class ListingHostStat(Base):
+    """Rolling per-host tally of liveness-check outcomes (see
+    engine._verify_listings_alive).
+
+    OBSERVABILITY ONLY -- deliberately not wired to any automatic drop, and no
+    code reads it to make a decision. It exists because the opposite design was
+    tried and was wrong: an apparent 100% dead rate for two mirror hosts turned
+    out to be an artefact of sampling old STORE rows, i.e. it measured listing
+    age rather than host health, and re-measuring against live URLs showed those
+    same hosts serving perfectly good postings. Deadness is a property of the
+    LISTING, so that is the only level acted on.
+
+    What this is for is the one thing per-run funnel counts can't show: a
+    platform genuinely degrading over time (an `unverifiable` share climbing
+    toward 100% would mean we can no longer check that host at all)."""
+
+    __tablename__ = "listing_host_stats"
+
+    id = Column(Integer, primary_key=True)
+    host = Column(Text, nullable=False, unique=True, index=True)
+    checked = Column(Integer, nullable=False, default=0)
+    dead = Column(Integer, nullable=False, default=0)
+    unverifiable = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=_now)
 
 
 class SearchRun(Base):

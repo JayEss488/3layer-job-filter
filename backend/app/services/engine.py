@@ -14,6 +14,7 @@ import base64
 import hashlib
 import json
 import math
+import os
 import queue
 import random
 import re
@@ -22,17 +23,20 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import numpy as np
+import requests
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import CATEGORY_EXPAND_ENABLED, DISCOVERY_ATS_CACHE_TTL_HOURS, ROLE_STALE_DAYS
 from ..database import SessionLocal
-from ..models import Role, SearchRun, JobSeen, JobEmbedding
+from ..models import ListingHostStat, Role, SearchRun, JobSeen, JobEmbedding
+from . import geo, salary
 from .families import ensure_families
 from .profile_intel import ensure_profile_intel
 from .snapshot import build_snapshot, cv_text_for_cluster
@@ -63,20 +67,25 @@ TARGET_POOL       = 90     # gate-survivor checkpoint per cluster per refill rou
 # one batch and only THEN reports its judge-eligible snapshot for provisional
 # "Verifying…" cards, so the size of the FIRST round is what gates time-to-first-
 # card. A small first round (20) paints cards ~4x sooner than the old effectively-
-# single round of examine_cap (80); later rounds are larger (40) to keep the total
-# round count -- and thus the per-round screen_gate/rank_gate orchestration
-# overhead -- low. (These cap the round; TARGET_POOL still bounds it from above.)
-GATE_FIRST_ROUND  = 20     # small first examine round -> earliest provisional cards
-# Later rounds raised 40 -> 80 alongside the RANK_EXAMINE_BUDGET increase below.
-# Round count, not batch size, is what costs wall time here: a round is a blocking
-# screen_gate call followed by a blocking rank_gate call, and each of those already
-# fans its own _GATE_BATCH(=20)-sized sub-calls out over a 3-worker pool -- so an
-# 80-candidate round is 4 sub-calls across 3 workers (~2 waves) rather than 4
-# sequential round-trips. At the old 40, a 240-candidate budget would have meant
-# ~7 sequential rounds per cluster; at 80 it is 4 (20 + 80 + 80 + 60). The FIRST
-# round is deliberately left at 20: it alone sets time-to-first-provisional-card,
-# since report() only fires once a whole round has gated AND ranked.
-GATE_ROUND_SIZE   = 80     # subsequent examine rounds
+# GATE_ROUND_SIZE no longer sets an LLM round-trip boundary. The gate stage used
+# to examine its budget in incremental rounds (a small GATE_FIRST_ROUND, then
+# GATE_ROUND_SIZE-sized ones), each a blocking screen_gate call followed by a
+# blocking rank_gate call, so that the loop could stop early once judge_target
+# judge-eligible candidates had accumulated. Measured over every run that ever
+# recorded a per-cluster stop_reason, that early exit fired ZERO times out of 17
+# -- so the rounds bought no LLM calls and cost 2 serial latencies each. The whole
+# budget is now screened in one call and ranked in one call (see
+# _gate_rank_refill_cluster), which is the same number of _GATE_BATCH-sized
+# sub-calls fanned over the same _GATE_MAX_WORKERS pool, in a third of the waves.
+#
+# What the constant still does is set the SLICE over which
+# dynamic_hard_drop_threshold is computed. That threshold asks "is this stretch of
+# the queue thin on real mismatches?", and since the queue is embed-score ordered,
+# pooling one fraction over the whole budget would average a strong head into a
+# weak tail and change gate strictness as an accidental side effect of the latency
+# work. Keeping the slice at 80 keeps that calibration byte-identical to the
+# round-based loop.
+GATE_ROUND_SIZE   = 80     # strictness-calibration slice (was: examine round size)
 MIN_RESULTS       = 3      # below this many strong matches, broaden the threshold
 # Below this many characters, a job's discovery-time snippet is assumed too
 # thin (e.g. a short Google-organic blurb) to judge fit against without
@@ -180,7 +189,7 @@ RANK_EXAMINE_BUDGET = 320
 # have anything fresh to examine; see the call site in _run_engine_pipeline).
 JUDGE_POOL_FLOOR = 25
 # Per-cluster examine cap for that extra round -- deliberately small (one
-# GATE_FIRST_ROUND-sized batch) so a shortfall costs at most one more cheap
+# _GATE_BATCH-sized batch) so a shortfall costs at most one more cheap
 # gate+rank call per needy cluster rather than re-running a full
 # per-cluster share of RANK_EXAMINE_BUDGET. Rarely fires now that the main
 # budget is 320 rather than 40-80, but kept as the safety net for a profile
@@ -226,8 +235,10 @@ RICH_TEXT_SELECTION_BONUS = 3.0
 # ~12 ids resolve per wave, and a live run enriched 45 in 4.1s. Handing it the
 # whole RANK_EXAMINE_BUDGET slice would have made that ~12s of dead air before
 # the first "Verifying…" card could possibly appear. Sized instead to cover
-# roughly the first two examine rounds (GATE_FIRST_ROUND + GATE_ROUND_SIZE), so
-# the candidates the gate reaches SOONEST get real text and the deep tail --
+# roughly the head of the examine budget (the gate now screens the whole budget
+# in one call, but still in embed-score order, so the first ~100 candidates are
+# the ones a screen batch reads first), so the best-scoring candidates get real
+# text and the deep tail --
 # lower embed-score by construction, and re-scraped by phase 5 anyway if it
 # survives to the judge -- rides its teaser.
 REED_ENRICH_PRE_GATE_CAP = 100
@@ -236,9 +247,27 @@ REED_ENRICH_PRE_GATE_CAP = 100
 # small JSON body and the host 429s after a handful of rapid requests, so it runs at
 # ADZUNA_DETAIL_MAX_WORKERS(3) rather than Reed's 12 -- roughly a quarter of the
 # throughput per wave. 40 keeps its worst case comparable to Reed's measured 4.1s
-# while still covering the whole first examine round (GATE_FIRST_ROUND=20) plus
-# headroom, which is the slice that actually decides what the user sees first.
+# while still covering the head of the examine budget plus headroom, which is
+# the slice that actually decides what the user sees first.
 ADZUNA_ENRICH_PRE_GATE_CAP = 40
+# A Reed/Adzuna row that already carries full_text (from a prior run, or this
+# run's own pre-gate enrichment above) is normally never re-fetched -- once
+# _has_full_text is set, nothing looks at that URL again, ever. That's a real
+# gap: a listing genuinely live when first enriched can expire before the user
+# gets around to reviewing it, and nothing notices (see CLAUDE.md's dead-jobs
+# writeup). The judge-pool enrichment pass below (_enrich_reed_full_text /
+# _enrich_adzuna_full_text called with revalidate=True) closes it narrowly --
+# re-running the SAME cheap per-job detail fetch (no LLM, no browser) for a
+# judge-pool candidate whose listing hasn't been directly verified in this
+# many days, right before the judge would otherwise read stale cached text.
+# Bounded twice over on purpose (the compromise the alternative -- re-checking
+# on every run, or never -- doesn't offer): only JUDGE_POOL-sized candidates
+# are ever in scope, and only those old enough to plausibly have changed.
+# Deliberately NOT extended to Phase-5-scraped (non-Reed/Adzuna) rows: that
+# would mean a second real browser render per stale candidate, the single
+# costliest and most anti-bot-exposed step in the whole pipeline, for a
+# same-order-of-magnitude benefit -- see engine.py's _enrich_pre_gate.
+LISTING_REVALIDATE_AFTER_DAYS = 2
 # Absolute cutoff on rank_gate's 0-100 fit score, replacing the old relative
 # bottom-20%-of-whatever-batch trim (RANK_AUTOREJECT_FRACTION). MID_MODEL is a
 # materially stronger model now (see full_auto.py's model tier comments), so
@@ -276,6 +305,95 @@ TEMPLATE_FACTORY_TITLE_THRESHOLD = 4
 # run will spend confirming a judge-flagged "scam_suspect" pick, regardless
 # of how many are flagged.
 SCAM_VERIFY_MAX_PER_RUN = 5
+
+# ── Listing liveness verification (see _verify_listings_alive) ───────────────
+# The pipeline had excellent dead-listing machinery (full_auto._dead_listing_signal
+# and friends) that almost never RAN: it hangs off Phase 5 scraping, which is
+# skipped for anything whose snippet clears SNIPPET_SUFFICIENT_CHARS, and off the
+# Reed/Adzuna detail endpoints, the only sources with a revalidation path. So
+# JSearch / Google Jobs / Careerjet / ATS rows were never checked at all --
+# measured on a live store, last_verified_at was set on 17 of 9,042 rows (0.2%)
+# and 100% of SURFACED rows had never been verified. A sample of aggregator-mirror
+# rows about to reach the judge found 22% already dead.
+VERIFY_LISTINGS_ENABLED = os.getenv("VERIFY_LISTINGS_ENABLED", "true").lower() == "true"
+VERIFY_MAX_PER_RUN = int(os.getenv("VERIFY_MAX_PER_RUN", "40"))   # ~JUDGE_POOL
+VERIFY_MAX_WORKERS = int(os.getenv("VERIFY_MAX_WORKERS", "8"))
+VERIFY_TIMEOUT = float(os.getenv("VERIFY_TIMEOUT", "10"))
+# Applied to _selection_score ONLY, never to _rank_score -- same separation
+# RICH_TEXT_SELECTION_BONUS respects, so the card's "Fit estimate" chip and
+# RANK_REJECT_SCORE_FLOOR keep showing the model's own unmodified number.
+UNVERIFIED_RANK_PENALTY = float(os.getenv("UNVERIFIED_RANK_PENALTY", "8"))
+
+# ── Final-pick verification (see _verify_final_picks) ────────────────────────
+# The pass above is a BUDGET heuristic over ~40 rank candidates: _needs_liveness_
+# check deliberately skips anything that already has full_text, isn't on a mirror
+# host and was verified inside LISTING_REVALIDATE_AFTER_DAYS. That is right for a
+# pre-judge pool and wrong for the dozen listings actually shown to the user, who
+# reasonably reads "here are your matches" as "these exist". An ATS row carrying
+# full_text from a previous run is the common case: it skips the pass above, skips
+# Phase 5, and reaches the results page having had no direct check this run.
+#
+# So the final picks are verified unconditionally, after the judge and before the
+# Role rows are written. It is ~12 plain HTTP GETs at the end of a ~4 minute run.
+VERIFY_FINAL_PICKS_ENABLED = os.getenv("VERIFY_FINAL_PICKS_ENABLED", "true").lower() == "true"
+# Browser escalation for picks a plain GET couldn't answer for (Cloudflare 403/
+# 202). Bounded hard: this is a second browser launch after Phase 5's has closed,
+# and it sits between the judge finishing and the user seeing results.
+VERIFY_BROWSER_MAX = int(os.getenv("VERIFY_BROWSER_MAX", "12"))
+VERIFY_BROWSER_BUDGET_SECONDS = float(os.getenv("VERIFY_BROWSER_BUDGET_SECONDS", "45"))
+# Ordinary browser UA. These are public job adverts the boards want indexed, and
+# several serve a stub to an unrecognised client -- which would read here as
+# "unverifiable" and lose the check rather than gain anything.
+_VERIFY_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+# Job boards that MIRROR someone else's posting rather than hosting the
+# employer's own. Used for exactly two narrow purposes: prioritising which rows
+# to spend a verification fetch on, and deciding that an UNVERIFIABLE row with no
+# readable text is not worth sending to the judge.
+#
+# It is deliberately NOT a drop list, and no host-level dead rate is computed
+# from it. An earlier read of this data appeared to show bebee/glassdoor at a
+# 100% dead rate, which was an artefact of sampling old STORE rows -- it measured
+# listing age, not host health. Re-measured against live URLs the split is bebee
+# 1 dead / 3 alive, glassdoor 1/2, jobviewtrack 8/26, prosple 2 alive, and a live
+# bebee posting serves a full JSON-LD JobPosting with a 4.3k-char description.
+# The platforms work; individual listings die. Deadness is a property of the
+# LISTING, and that is the only level this module acts on.
+#
+# Two forms, because these boards spread across both subdomains and TLDs.
+# MIRROR_BRANDS matches a whole DNS label, so it catches uk.prosple.com,
+# glassdoor.co.in and careerjet.ae without needing every variant listed -- but
+# because it matches a full label it can't fire on an unrelated host that merely
+# contains the word (a substring test would match "talent" inside
+# "talentcorp.example.org").
+MIRROR_BRANDS = frozenset({
+    "bebee", "prosple", "jobviewtrack", "jooble", "whatjobs", "jobrapido",
+    "glassdoor", "simplyhired", "jobsora", "gulftalent", "expertini",
+    "grabjobs", "neuvoo", "trabajo", "joblookup", "jobtome", "learn4good",
+    "mindmatch", "jobleads", "adview", "careerjet",
+})
+MIRROR_HOSTS = frozenset({
+    "talent.com", "recruit.net", "tarta.ai",
+})
+
+
+def _listing_host(url: str | None) -> str:
+    """Registrable-ish host for a listing URL, lowercased, no leading www."""
+    try:
+        return urlsplit(url or "").netloc.lower().removeprefix("www.")
+    except ValueError:
+        return ""
+
+
+def _is_mirror_host(url: str | None) -> bool:
+    """Whether this URL is on a known re-posting aggregator."""
+    host = _listing_host(url)
+    if not host:
+        return False
+    if host in MIRROR_HOSTS or any(host.endswith("." + m) for m in MIRROR_HOSTS):
+        return True
+    return bool(set(host.split(".")) & MIRROR_BRANDS)
 
 
 def get_pipeline_caps() -> dict:
@@ -332,8 +450,11 @@ def _has_judgeable_text(job: dict) -> bool:
 def _needs_full_scrape(job: dict) -> bool:
     """Whether phase 5 should bother reading this job's real page before final
     evaluation. ATS-sourced snippets (greenhouse/lever/ashby/workable/
-    recruitee/personio) already carry the full posting description -- they
-    never need it. Everything else (Reed/Adzuna/Google Jobs/etc.) only needs
+    recruitee/personio/smartrecruiters) already carry the full posting
+    description -- they never need it. Note SmartRecruiters only holds that
+    invariant because _fetch_smartrecruiters DROPS any posting whose detail
+    call returned no text, rather than emitting a text-less ATS-keyed row.
+    Everything else (Reed/Adzuna/Google Jobs/etc.) only needs
     it when its snippet is too short to judge seniority/requirements from,
     which is the actual cost driver: most of a run's full-page fetches (and
     the anti-bot blocking they trigger) buy nothing over what the API already
@@ -360,8 +481,15 @@ def _selection_score(j: dict) -> float:
     genuinely poor job over the floor; and gate_cache still stores the model's
     own number, so the bonus can be retuned without invalidating a single cached
     score. Only ORDER changes -- which of two acceptable candidates gets the
-    judge slot."""
-    return j.get("_rank_score", 50.0) + (RICH_TEXT_SELECTION_BONUS if _has_judgeable_text(j) else 0.0)
+    judge slot.
+
+    _unverified_penalty rides here for the same reason and under the same rule:
+    a listing whose host refused to answer the liveness check is not known to be
+    dead, so it must still be able to surface -- it just loses to anything we
+    could actually confirm."""
+    return (j.get("_rank_score", 50.0)
+            + (RICH_TEXT_SELECTION_BONUS if _has_judgeable_text(j) else 0.0)
+            - j.get("_unverified_penalty", 0.0))
 
 
 # Free, high-confidence seniority pre-reject: a junior/graduate candidate will never
@@ -373,10 +501,57 @@ def _selection_score(j: dict) -> float:
 # _SENIOR_BAND above already carries "lead" for _heuristic_prescreen's OWN
 # seniority-label check, which is a different, safer use (matched against the
 # candidate's stated seniority text, not every job title in the feed).
+#
+# Extended after a live audit found 48 of 282 examined candidates carrying a
+# plainly senior title for a Junior profile -- "Lead Data Scientist", "Staff
+# Applied Scientist", "ML Ops Architect", "Databricks Architect", "Sr. Business
+# Analyst", "Engineering Manager", "Technical Program Manager". None of them were
+# reachable by this candidate and every one consumed a screen call, a rank call,
+# and a slot out of the 320-candidate examine budget. They were missed because
+# the pattern carried only the most formal seniority words.
+#
+# The three additions each needed their own guard, which is why they weren't
+# simply appended:
+#   * `lead` collides with "Lead Generation Specialist" (a real junior job), so
+#     it is matched only when NOT followed by "generation"/"gen".
+#   * `manager`/`architect` are the ones that would over-fire on a genuine
+#     graduate posting ("Graduate Manager Trainee", "Solutions Architect
+#     Graduate Scheme"), which is what _JUNIOR_MARKER_RE below exists for: a
+#     title carrying its own junior marker is exempt from the senior reject
+#     entirely, so the two patterns can't fight over the same title.
+#   * `sr` needs the optional dot and must be a whole token, or it matches
+#     inside ordinary words.
 _SENIOR_TITLE_RE = re.compile(
-    r"\b(senior|director|vice[- ]president|vp|head of|principal|chief|c[tefo]o|partner)\b", re.I)
+    r"\b(senior|sr\.?|director|vice[- ]president|vp|head of|principal|chief|c[tefo]o"
+    r"|partner|staff|architect|manager|lead(?!\s+gen))\b", re.I)
 _JUNIOR_TITLE_RE = re.compile(
     r"\b(junior|intern(ship)?|graduate|placement|apprentice(ship)?|trainee|entry[- ]level)\b", re.I)
+# A title that advertises itself as junior/early-career is never rejected as too
+# senior, however senior a word it also contains. This is what makes it safe to
+# put broad tokens like "manager" and "architect" in _SENIOR_TITLE_RE above.
+_JUNIOR_MARKER_RE = re.compile(
+    r"\b(junior|jr\.?|graduate|grad|entry[- ]level|trainee|apprentice(ship)?"
+    r"|assistant|associate|intern(ship)?|placement|student|early[- ]careers?)\b", re.I)
+
+# A student PLACEMENT or industrial year: a role that exists for someone still
+# part-way through a degree, and which a finished graduate is usually ineligible
+# for. It reads as a near-perfect match to every other stage -- entry-level,
+# right function, right tools -- so nothing downstream catches it, and a live run
+# showed one at rank 5. Same category as the seniority pre-reject: a fact about
+# the posting that costs nothing to check and needs no LLM.
+#
+# Deliberately NOT matched: a bare "internship" or "intern", which for a finished
+# graduate can be a real (if junior) entry route, and "summer internship", which
+# is at least explicit about its window. Only the sandwich-year forms are here.
+_PLACEMENT_YEAR_RE = re.compile(
+    r"\b(placement\s+year|year[- ]?long\s+placement|industrial\s+placement"
+    r"|sandwich\s+(year|placement)|12[- ]month\s+(placement|internship)"
+    r"|(12|6)\s*month\s+industrial|undergraduate\s+placement"
+    r"|placement\s+student|year\s+in\s+industry)\b", re.I)
+# The titles for which the placement-year BODY check is allowed to fire. Keeping
+# this narrow is what stops "placement year" appearing in a recruiter's
+# boilerplate from disqualifying an ordinary graduate job.
+_INTERNSHIP_TITLE_RE = re.compile(r"\b(intern(ship)?|placement|student)\b", re.I)
 _JUNIOR_BAND = ("intern", "graduate", "entry", "junior", "student", "trainee", "apprentice", "placement")
 _SENIOR_BAND = ("senior", "lead", "principal", "head", "director", "manager",
                 "staff", "vp", "chief", "executive", "president")
@@ -386,7 +561,12 @@ def _heuristic_prescreen(scored: list[dict], eng_profile: dict) -> tuple[list[di
     """Drop obvious seniority mismatches by title before any LLM gate spends a token
     on them. Only fires when the profile's seniority is unambiguously junior OR senior
     (mid-level profiles are left untouched), and only on unambiguous title tokens --
-    everything else passes through to the soft gate. Returns (kept, dropped_count)."""
+    everything else passes through to the soft gate. Returns (kept, dropped_count).
+
+    For a junior/graduate profile this also drops student PLACEMENT-year postings
+    (_PLACEMENT_YEAR_RE): a sandwich-year role is for someone mid-degree, reads as
+    an excellent match on every other axis, and so survives all three LLM tiers --
+    a live run put a "12month/placement year" internship at rank 5."""
     seniority = (eng_profile.get("seniority") or "").lower()
     is_junior = any(b in seniority for b in _JUNIOR_BAND)
     is_senior = (not is_junior) and any(b in seniority for b in _SENIOR_BAND)
@@ -395,10 +575,146 @@ def _heuristic_prescreen(scored: list[dict], eng_profile: dict) -> tuple[list[di
     reject_re = _SENIOR_TITLE_RE if is_junior else _JUNIOR_TITLE_RE
     kept, dropped = [], 0
     for j in scored:
-        if reject_re.search(j.get("title") or ""):
+        title = j.get("title") or ""
+        # A title that advertises itself as junior is never "too senior",
+        # whatever else it contains -- see _JUNIOR_MARKER_RE. Applies only to the
+        # junior-profile direction; the senior-profile direction rejects ON that
+        # same marker, so exempting it there would disable the check entirely.
+        if is_junior and _JUNIOR_MARKER_RE.search(title):
+            drop = False
+        else:
+            drop = bool(reject_re.search(title))
+        if not drop and is_junior:
+            # The body text is consulted only for a title that already announces
+            # an intern/placement/student role. Boards do routinely bury the
+            # sandwich year in the body ("Data & Analytics Intern" whose text
+            # says "12month/placement year"), but scanning every body outright
+            # produced false positives on real graduate jobs whose boilerplate
+            # merely MENTIONS placements -- validated against the live store, it
+            # wrongly flagged ".NET Developer, Graduate / Junior", "Junior Data
+            # Analyst" and "Junior Sales Analyst". Gating on the title keeps both
+            # genuine hits and drops all three false ones.
+            drop = bool(_PLACEMENT_YEAR_RE.search(title))
+            if not drop and _INTERNSHIP_TITLE_RE.search(title):
+                body = (j.get("full_text") or j.get("snippet") or "")[:1200]
+                drop = bool(_PLACEMENT_YEAR_RE.search(body))
+        if drop:
             dropped += 1
         else:
             kept.append(j)
+    return kept, dropped
+
+
+# ── Pool-quality prescreen ───────────────────────────────────────────────────
+#
+# A live audit of one run's 320-candidate examine budget found 28% of it spent on
+# candidates that could not have become a pick under ANY ranking: 12% located
+# outside the candidate's country, 17% carrying a senior title (now handled by
+# _heuristic_prescreen above), and a tail of board category pages with no job
+# posting underneath. Two of those category pages survived all the way to the
+# expensive judge, which spent a full slot each to say "this page contains search
+# results, not a job description".
+#
+# Everything here is a FACT about the listing, checkable for free, and wrong to
+# spend an LLM call on. That is the same bar _heuristic_prescreen sets, and the
+# reason these run at pool admission rather than being left to screen_gate's
+# listing_ok / work-arrangement axes -- those axes are the backstop for the
+# ambiguous cases, not the place to catch a Texas listing for a UK candidate.
+
+# A board's own search-results / category / alerts page rather than one posting.
+_JUNK_TITLE_RE = re.compile(
+    r"(\bjobs?\s+in\b|\bjob\s+vacancies\b|\bvacancies\s+in\b|\bjobs?\s+near\b"
+    r"|\broles?\s+in\b|\bcareers?\s+in\b|\b\d+\s+jobs?\b|\bjobs?\s+at\b"
+    r"|^\s*(browse|search|all)\b|\bjob\s+alerts?\b|\bjobs?$)", re.I)
+# Below this there is no posting to judge -- a live run examined rows of 23, 114,
+# 152, 159 and 163 characters, several of which PASSED the cheap gate's
+# listing_ok axis because there was too little text to look wrong.
+_JUNK_MIN_TEXT_CHARS = 220
+
+# US states, for the positively-foreign check below. Full names are safe to match
+# anywhere in the string EXCEPT the two that collide with real places elsewhere:
+# "Washington" (Washington, Tyne and Wear) and "Georgia" (the country). Both keep
+# their abbreviations, which are only ever matched in the strict positional form.
+_US_STATE_NAMES = (
+    "alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida"
+    "|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maryland"
+    "|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada"
+    "|new hampshire|new jersey|new mexico|north carolina|north dakota|ohio|oklahoma"
+    "|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas"
+    "|utah|vermont|virginia|west virginia|wisconsin|wyoming")
+_US_STATE_NAME_RE = re.compile(rf"\b({_US_STATE_NAMES})\b", re.I)
+# Abbreviations are matched ONLY as ", XX" at end-of-string or before a ZIP.
+# Many US state codes collide with UK postcode areas (CA Carlisle, NE Newcastle,
+# LA Lancaster, WA Warrington, TN Tonbridge...), so a loose match here would drop
+# real UK rows -- the exact failure mode the country filter was loosened to avoid.
+# UK boards write "Warrington, Cheshire" or a full postcode, never ", WA".
+_US_STATE_ABBR_RE = re.compile(
+    r",\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS"
+    r"|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI"
+    r"|WY|DC)\s*(\d{5}(-\d{4})?)?\s*$")
+_US_MARKER_RE = re.compile(
+    r"\b(united states|u\.?s\.?a\.?)\b|\bremote\s*[-/(]\s*(us|usa|united states)"
+    r"|\b(us|usa)\s*[-/]\s*remote\b", re.I)
+
+
+def _is_positively_foreign(location: str, allowed: set[str]) -> bool:
+    """True only when a location NAMES a country outside `allowed`, with no
+    inference from what it fails to match.
+
+    This is a narrow supplement to _filter_by_country, not a replacement. That
+    filter keeps anything it cannot positively resolve, deliberately: the
+    worldwide token set carries only ~20 UK cities, so most genuinely-UK postings
+    ("Gloucester, GB", "Potters Bar, GB", "SE19EQ") resolve to None and MUST be
+    kept. The measured consequence is that US ATS rows resolve to None too and
+    are kept on the same rule -- `country_of` returns None for "Redmond, WA",
+    "Bastrop, TX", "Irvine, CA", "Omaha Riverfront" and "Remote/US" alike, so a
+    live run's candidate-stage country filter dropped 0 of 6,642 rows while 12%
+    of what it passed was American.
+
+    It also repairs a false POSITIVE in the other direction: `country_of`
+    resolves "Birmingham, Alabama" to `gb` on the city token. The state-name test
+    runs first, so that row is now correctly foreign rather than confidently UK.
+
+    Scope is deliberately the US only. That is 90%+ of the observed leakage (it
+    is where the ATS vendor registry is headquartered) and it is the one country
+    whose location strings have a form regular enough to match without guessing.
+    Everything else stays with the existing keep-unless-resolved behaviour."""
+    if "us" in allowed or not location:
+        return False
+    if _US_MARKER_RE.search(location):
+        return True
+    if _US_STATE_NAME_RE.search(location):
+        return True
+    return bool(_US_STATE_ABBR_RE.search(location.strip()))
+
+
+def _pool_quality_prescreen(
+    scored: list[dict], eng_profile: dict,
+) -> tuple[list[dict], dict[str, int]]:
+    """Drop candidates that are facts-on-their-face unusable, before they can win
+    an examine slot. Returns (kept, {reason: count}).
+
+    Ordered cheapest-first and each reason counted separately, so the funnel panel
+    shows WHICH check is doing the work -- a filter of this kind is only safe to
+    keep if its cost stays visible and attributable."""
+    allowed = set(eng_profile.get("country_codes") or [])
+    dropped = {"foreign_location": 0, "junk_listing": 0}
+    kept: list[dict] = []
+    for j in scored:
+        title = (j.get("title") or "").strip()
+        text = j.get("full_text") or j.get("snippet") or ""
+        # A board category page. Requires the title pattern AND thin text: a real
+        # posting can legitimately be titled "Jobs at Acme" only if it then has a
+        # real description, and a genuinely short posting with an ordinary title
+        # is thin evidence, not junk.
+        if len(text) < _JUNK_MIN_TEXT_CHARS and (
+                _JUNK_TITLE_RE.search(title) or not title):
+            dropped["junk_listing"] += 1
+            continue
+        if allowed and _is_positively_foreign(j.get("location") or "", allowed):
+            dropped["foreign_location"] += 1
+            continue
+        kept.append(j)
     return kept, dropped
 
 
@@ -415,6 +731,40 @@ def _salary_text(job: dict) -> str | None:
     text = job.get("full_text", "") or job.get("snippet", "")
     m = re.search(r"[£$€]\s?\d[\d,]*\s?(?:k|,\d{3})?\s?(?:-|to|–)\s?[£$€]?\s?\d[\d,]*\s?k?", text)
     return m.group(0).strip() if m else None
+
+
+def _parsed_salary(job: dict, text: str | None) -> dict | None:
+    """Normalised pay for a candidate, structured source figures first.
+
+    The board's own salary_min/salary_max are its own fields; `text` is either a
+    regex's reading of the description or the judge's paraphrase of it. So the
+    structured pair wins when present, and the text is still passed in so the
+    parser can pick up a PERIOD or CURRENCY the source omitted -- Reed, for one,
+    returns numbers with no period at all."""
+    return salary.parse_salary(
+        text,
+        minimum=job.get("salary_min"),
+        maximum=job.get("salary_max"),
+        period=job.get("salary_period"),
+        currency=job.get("salary_currency"),
+    )
+
+
+def _role_salary_fields(job: dict, text: str | None) -> dict:
+    """salary_text + the four parsed salary columns for a Role row.
+
+    All four parsed columns are null together when nothing parseable was stated
+    ("Competitive", "Negotiable", "National Minimum Wage") -- the free text is
+    still stored and still shown, because what the employer actually wrote beats
+    a blank."""
+    parsed = _parsed_salary(job, text)
+    return {
+        "salary_text": text,
+        "salary_min": parsed["min"] if parsed else None,
+        "salary_max": parsed["max"] if parsed else None,
+        "salary_period": parsed["period"] if parsed else None,
+        "salary_currency": parsed["currency"] if parsed else None,
+    }
 
 
 SNAPSHOT_SAMPLE_SIZE = 3  # sample roles kept per pipeline stage (see _sample_stage)
@@ -626,6 +976,23 @@ def _norm_company(s: str) -> str:
     return _COMPANY_SUFFIX_RE.sub("", _norm(s)).strip()
 
 
+def _soft_dup_key(company: str | None, title: str | None) -> str:
+    """The persisted JobSeen.soft_dup_key: normalized company + title, the pair
+    _find_soft_duplicate requires before it even looks at location.
+
+    Both halves go through the SAME normalisers the in-Python comparison uses, so
+    an indexed equality on this column is exactly the pre-filter that comparison
+    wants -- no widening, and no `LIKE` prefix standing in for a normalisation SQL
+    cannot perform. Returns "" when either half is empty, which callers must treat
+    as "never matches": _find_soft_duplicate already bails on a blank title or
+    company, so a keyless row has no soft-duplicate semantics to preserve.
+
+    See database._migrate_soft_dup_key for why this replaced a company-prefix
+    query and what it measured."""
+    c, t = _norm_company(company or ""), _norm(title or "")
+    return f"{c}|{t}" if c and t else ""
+
+
 # Trailing "(...)"/"- ..."/", ..." segment on a job title. Used ONLY by
 # _norm_title_key, and only ever stripped when corroborated -- see below.
 _TITLE_TRAILING_SEGMENT_RE = re.compile(
@@ -743,16 +1110,50 @@ def _location_tokens(location: str) -> set[str]:
             if len(t) > 2 and t not in _LOCATION_STOPWORDS}
 
 
-def _find_soft_duplicate(job: dict, candidates: list["JobSeen"]) -> "JobSeen | None":
+class _SoftDupCandidate:
+    """The three fields _find_soft_duplicate actually reads, so the DB pre-filter
+    can select columns instead of hydrating whole JobSeen entities (each of which
+    drags an 8KB embedding along). Duck-types a JobSeen for that function only --
+    the winner is re-fetched by `id` at the call site before anything mutates it."""
+    __slots__ = ("id", "title", "company", "location")
+
+    def __init__(self, id, title, company, location):
+        self.id, self.title, self.company, self.location = id, title, company, location
+
+
+def _find_soft_duplicate(job: dict, candidates) -> "JobSeen | None":
+    """Same company + same title + a location that agrees. A location AGREES
+    either by sharing a word token, or by being the identical string.
+
+    The string-equality half exists because `_location_tokens` keeps only
+    alphabetic runs longer than two characters, so a bare UK postcode yields
+    NOTHING: "GU98AD" -> {} (the "gu"/"ad" runs are both too short). The function
+    then bailed at the `if not job_tokens` guard and declared every such listing
+    un-duplicatable, no matter how exactly it matched. That is not a rare shape --
+    Reed routinely gives a bare outward+inward postcode as the whole location
+    field, and it accounted for 243 of 1,200 sampled store rows being unmatchable.
+    A live example: Plum Personnel's "Junior Application Developer" was stored
+    TWICE (Reed ids 57177686 and 57177687), identical in company, title, location
+    and text, purely because "GU98AD" tokenized to nothing; the same recruiter had
+    two more such pairs in the same store.
+
+    Two identical location strings are stronger evidence than a single shared
+    token (which is all the original branch ever required), so this only tightens
+    what already counted as agreement -- it cannot merge anything the token path
+    would have refused on location grounds."""
     title, company = _norm(job.get("title", "")), _norm_company(job.get("company", ""))
     if not title or not company:
         return None
+    raw_location = _norm(job.get("location", ""))
     job_tokens = _location_tokens(job.get("location", ""))
-    if not job_tokens:
+    if not job_tokens and not raw_location:
         return None
     for cand in candidates:
-        if _norm(cand.title) == title and _norm_company(cand.company or "") == company \
-                and job_tokens & _location_tokens(cand.location or ""):
+        if _norm(cand.title) != title or _norm_company(cand.company or "") != company:
+            continue
+        cand_location = _norm(cand.location or "")
+        if (job_tokens & _location_tokens(cand.location or "")
+                or (raw_location and raw_location == cand_location)):
             return cand
     return None
 
@@ -821,6 +1222,72 @@ _DUP_CONTAINMENT = 0.65    # of the SHORTER text's shingles, how many the longer
 _DUP_MIN_SHINGLES = 25     # ~28 words of real content before containment means anything
 
 
+# ── Title equivalence, for the cross-title duplicate case ────────────────────
+#
+# A recruiter advertising ONE vacancy under several near-synonymous titles. A live
+# run showed "Junior Application Developer" and "Junior Software Developer" (Plum
+# Personnel, same GU98AD, same "Circa 30,000", word-for-word identical body text
+# apart from the title itself) graded Strong fit and shown at ranks 1 AND 2. No
+# existing check could catch it: `identity_hash` differs (different Reed ids),
+# `_find_soft_duplicate` requires an exact title match, `_dup_key` requires an
+# exact title match, and `_same_vacancy` was scoped to (company, EXACT title). All
+# four keyed on the one field the recruiter had varied.
+#
+# The obvious widening -- compare text across ALL of a company's postings -- is
+# unsafe, and measurably so. Over this store's 44,654 same-company/different-title
+# pairs, 7.9% reach >=0.80 text containment, and the high end is dominated by
+# genuinely DIFFERENT vacancies sharing a template: Wise's "Senior Data Analyst -
+# Growth" vs "- FinCrime Operations" (500-char Adzuna teasers that are pure company
+# boilerplate and never mention the role at all, containment 1.000), TransPerfect's
+# "Croatian language trainer" vs "Slovenian language trainer", "Commerce and Content
+# Back End" vs "Front End". Those are one template with one word swapped -- exactly
+# the same shape as the Plum case -- so TEXT CANNOT SEPARATE THEM.
+#
+# The titles can. Only the true-duplicate pairs differ solely by words that name the
+# same job. So equivalence is decided by an explicit, conservative synonym map, and
+# the text check is kept as the second half rather than replaced: a pair must be
+# BOTH title-equivalent AND near-identical in text.
+#
+# Measured on the live store, over the 4,656 different-title pairs whose text
+# already passes _same_vacancy: 28 merge, 4,628 are left alone. Every merge was
+# hand-checked as genuinely one vacancy ("Director of Finance"/"Finance Director",
+# "Data & Research Analyst"/"Research & Data Analyst", "Backend Python Developer"/
+# "Backend Developer - Python", "Certified Nursing Assistant - CNA"/"CNA - ...",
+# plus the Plum case). "Senior QC Analyst"/"QC Analyst" and "Graduate .NET
+# Developer"/".NET Developer" are correctly left separate -- seniority words are
+# NOT synonyms of each other or of nothing.
+#
+# Extend _TITLE_SYNONYMS only with words that name the same JOB. Anything that
+# names a different specialism, product, region, language or seniority belongs
+# nowhere near it -- that is precisely what separates Plum from TransPerfect.
+_TITLE_NOISE = {
+    "and", "the", "for", "with", "of", "in", "to", "a", "an", "or",
+    "new", "role", "job", "jobs", "vacancy", "permanent", "contract",
+    "hybrid", "remote", "onsite", "site", "based", "uk", "fulltime", "parttime",
+}
+_TITLE_SYNONYMS = {
+    "developer": "dev", "dev": "dev", "programmer": "dev", "engineer": "dev",
+    "software": "app", "application": "app", "applications": "app", "app": "app",
+    "jr": "junior", "sr": "senior", "grad": "graduate",
+}
+
+
+def _canonical_title_key(title: str) -> frozenset:
+    """Title reduced to a set of canonical tokens: punctuation and word ORDER
+    dropped, noise words removed, synonyms folded. Two titles are treated as the
+    same role iff these sets are equal.
+
+    A SET, so "Backend Python Developer" and "Backend Developer - Python" agree,
+    and "Director of Finance" and "Finance Director" agree. Seniority words are
+    deliberately kept as significant tokens (only spelling variants fold), so
+    "Senior QC Analyst" never collapses onto "QC Analyst"."""
+    return frozenset(
+        _TITLE_SYNONYMS.get(w, w)
+        for w in re.findall(r"[a-z0-9]+", (title or "").lower())
+        if w not in _TITLE_NOISE
+    )
+
+
 def _text_shingles(j: dict) -> frozenset:
     words = re.findall(r"[a-z0-9]+", (j.get("full_text") or j.get("snippet") or "").lower())
     if len(words) < _DUP_SHINGLE_N + _DUP_MIN_SHINGLES - 1:
@@ -834,6 +1301,43 @@ def _same_vacancy(a: frozenset, b: frozenset) -> bool:
     if len(a) < _DUP_MIN_SHINGLES or len(b) < _DUP_MIN_SHINGLES:
         return False
     return len(a & b) / min(len(a), len(b)) >= _DUP_CONTAINMENT
+
+
+def _judgeable_text_len(j: dict) -> int:
+    return len(j.get("full_text") or j.get("snippet") or "")
+
+
+def _keep_richer_copy(kept: list[dict], pos: int, challenger: dict) -> None:
+    """When two copies of one vacancy collide, keep the better-READ one in the
+    winner's slot.
+
+    The pool arrives `_selection_score`-sorted, so the copy encountered first is
+    the best-scoring one and takes the slot -- that part is unchanged. But score
+    order says nothing about how much TEXT a copy carries, and once duplicates are
+    matched across differing titles the two copies routinely differ enormously:
+    the live Plum Personnel case paired a 453-char Reed teaser against the same
+    vacancy's 4,299-char full description. Suppressing on score alone would have
+    sent the expensive judge the teaser and thrown the full description away --
+    making the results worse than not deduplicating at all, since before this both
+    copies at least reached the judge and one of them could be read.
+
+    `RICH_TEXT_SELECTION_BONUS` already nudges score ordering this way, but it is
+    only 3.0 points and cannot be relied on to decide a pairing.
+
+    Substitution is in place, so the slot keeps the winner's ORDER while gaining
+    the loser's text and URL -- both point at the same vacancy, and the one worth
+    sending the user to is the one that actually describes the job. The score is
+    carried over from the copy that earned the slot, so ordering downstream is
+    untouched."""
+    incumbent = kept[pos]
+    if _judgeable_text_len(challenger) <= _judgeable_text_len(incumbent):
+        return
+    merged = dict(challenger)
+    for field in ("_rank_score", "_rank_note", "_selection_score", "_cluster",
+                  "embed_score", "_unverified_penalty"):
+        if field in incumbent:
+            merged[field] = incumbent[field]
+    kept[pos] = merged
 
 
 def _suppress_judge_duplicates(
@@ -851,8 +1355,10 @@ def _suppress_judge_duplicates(
 
     Three tests, in cost order: an exact normalized-prefix key (_dup_key, catches
     a recruiter template reposted verbatim), a near-identical-text check within
-    the same company+title (_same_vacancy, catches the same vacancy syndicated to
-    a second board with different chrome and truncation), and -- when
+    the same company and EQUIVALENT title (_same_vacancy + _canonical_title_key,
+    catching both the same vacancy syndicated to a second board with different
+    chrome and truncation, and one vacancy advertised under several
+    near-synonymous titles), and -- when
     `decided_keys` is supplied -- a CROSS-RUN family check against roles the user
     has already saved or applied to (see _decided_role_keys).
 
@@ -865,13 +1371,17 @@ def _suppress_judge_duplicates(
     to tell an aggregator repost from a family match, and would make the Settings
     panel's "same employer, title & text" wording false."""
     decided_keys = decided_keys or set()
-    seen: set[tuple] = set()
-    # (company, title) -> the shingle sets of the copies kept so far under it.
-    kept_texts: dict[tuple[str, str], list[frozenset]] = defaultdict(list)
+    # Both maps are shared across clusters (a duplicate must be caught wherever
+    # its twin landed), but `kept` is PER-cluster -- so each slot is recorded as
+    # (that cluster's kept list, index into it), never a bare index. A bare index
+    # would be interpreted against whichever cluster happened to be in scope and
+    # could substitute into an unrelated row, or run off the end.
+    seen: dict[tuple, tuple[list, int]] = {}
+    kept_texts: dict[tuple[str, frozenset], list[tuple[frozenset, list, int]]] = defaultdict(list)
     suppressed = 0
     decided_hits: dict[tuple[str, str], int] = defaultdict(int)
     for idx, jobs in rank_by_cluster.items():
-        kept = []
+        kept: list[dict] = []
         for j in jobs:
             fam = _family_key(j.get("company", ""), j.get("title", ""), j.get("location", ""))
             if (fam is not None and fam in decided_keys
@@ -883,21 +1393,31 @@ def _suppress_judge_duplicates(
             key = _dup_key(j)
             if key is not None and key in seen:
                 suppressed += 1
+                _keep_richer_copy(*seen[key], j)
                 continue
-            company, title = _norm_company(j.get("company", "")), _norm(j.get("title", ""))
+            company = _norm_company(j.get("company", ""))
+            # Bucketed by EQUIVALENT title, not exact title -- see
+            # _canonical_title_key for the failure this fixes and for the measured
+            # reason the bucket is not widened all the way to company-only.
+            title = _canonical_title_key(j.get("title", ""))
             # Blank company is deliberately excluded from the near-text check: with
             # no employer to anchor on, two unrelated postings sharing a generic
             # title and boilerplate could merge. _dup_key's own blank-company path
             # (title + location + exact prefix) still covers aggregator reposts.
             shingles = _text_shingles(j) if company and title else frozenset()
             group = kept_texts[(company, title)] if shingles else None
-            if group is not None and any(_same_vacancy(shingles, s) for s in group):
-                suppressed += 1
-                continue
-            if key is not None:
-                seen.add(key)
             if group is not None:
-                group.append(shingles)
+                hit = next(((lst, pos) for s, lst, pos in group
+                            if _same_vacancy(shingles, s)), None)
+                if hit is not None:
+                    suppressed += 1
+                    _keep_richer_copy(*hit, j)
+                    continue
+            pos = len(kept)
+            if key is not None:
+                seen[key] = (kept, pos)
+            if group is not None:
+                group.append((shingles, kept, pos))
             kept.append(j)
         rank_by_cluster[idx] = kept
     return suppressed, sum(decided_hits.values()), dict(decided_hits)
@@ -910,7 +1430,127 @@ def _parse_iso(s: str):
         return None
 
 
+def _role_date_fields(j: dict) -> dict:
+    """posted_at/expires_at/posted_at_approx for a Role row, straight off the
+    job dict's own _posted_at/_expires_at/_posted_at_approx (see _rows_to_dicts)
+    -- a display gap, not a data gap: JobSeen has carried these since the
+    listing-age work, but Role (what /search and /my-roles actually render)
+    never did, so the age was computed for the AI's prompts and then thrown
+    away before it could reach a card. Pure copy, no derivation: an unknown
+    date stays unknown here exactly as it does on JobSeen, never guessed."""
+    return {
+        "posted_at": _parse_iso(j["_posted_at"]) if j.get("_posted_at") else None,
+        "expires_at": _parse_iso(j["_expires_at"]) if j.get("_expires_at") else None,
+        "posted_at_approx": bool(j.get("_posted_at_approx")),
+    }
+
+
 # ── Discovery store: upsert + selection helpers ─────────────────────────────
+
+# ── Ghost-listing evidence: recording only, nothing reads it yet ────────────
+# See JobSeen.seen_dates/dead_at/repost_key for why these are being written
+# ahead of anything that consumes them: the observation history they build is
+# the one part of a ghost-listing signal that cannot be reconstructed later.
+
+_SIGHTING_EPOCH = date(1970, 1, 1)
+# Roughly two years of daily sightings. A listing genuinely lives for weeks, so
+# this is a runaway guard rather than a budget. When it bites, the OLDEST days
+# are dropped -- first_seen still records the true start of the window, so what
+# is lost is interior detail of an ad already far past any plausible honesty.
+_SIGHTING_MAX_DAYS = 730
+
+
+def _parse_sighting_days(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.append(int(part))
+    return out
+
+
+def _append_sighting(raw: str | None, when: datetime) -> str:
+    """Today's UTC date folded into a seen_dates string, ascending and distinct.
+
+    Idempotent: several runs on one day (MAX_SEARCHES_PER_DAY allows six) record
+    one date, so this measures how long an employer has been advertising rather
+    than how often the candidate searched -- the same distinction seen_days
+    exists to preserve."""
+    day = (when.date() - _SIGHTING_EPOCH).days
+    days = _parse_sighting_days(raw)
+    if days and days[-1] == day:
+        return raw          # much the commonest case: same day, already recorded
+    if day in days:
+        return raw
+    days.append(day)
+    days.sort()
+    return ",".join(str(d) for d in days[-_SIGHTING_MAX_DAYS:])
+
+
+def _repost_key(job: dict) -> str | None:
+    """The company+title group a listing belongs to, for repost analysis later.
+
+    Reuses _family_key so "the same vacancy re-advertised" means exactly what it
+    already means elsewhere in this module, rather than becoming a third,
+    subtly-different notion of sameness. None for a blank company (aggregator
+    rows), for the same reason _family_key returns None there."""
+    key = _family_key(job.get("company", ""), job.get("title", ""), job.get("location", ""))
+    return "|".join(key) if key else None
+
+
+def _jobseen_salary_fields(job: dict) -> dict:
+    """Normalised pay columns for a JobSeen row, from a fresh-discovery dict.
+
+    Persisting this is what lets a listing resurfacing from the backlog carry
+    pay at all: everything downstream reads the store, not this run's raw
+    discovery batch.
+
+    STRUCTURED FIELDS ONLY -- `text` is deliberately not passed. A discovery
+    dict has no salary field other than salary_min/salary_max; the only other
+    text available is the description, and parsing pay out of a description
+    produces overwhelmingly false figures (a 15-listing audit of the 4,389
+    "salaries" it found in a live store's snippets got 12 wrong -- see
+    services/salary.py's module docstring). A missing period is left to
+    magnitude inference, which is safe on a dedicated numeric field."""
+    parsed = _parsed_salary(job, None)
+    return {
+        "salary_min": parsed["min"] if parsed else None,
+        "salary_max": parsed["max"] if parsed else None,
+        "salary_period": parsed["period"] if parsed else None,
+        "salary_currency": parsed["currency"] if parsed else None,
+    }
+
+
+def _merge_posted_expires(row: JobSeen, posted_dt, expires_dt, incoming_approx: bool) -> None:
+    """Fold a freshly-learned posted_at/expires_at into an existing JobSeen row.
+
+    Keep the EARLIEST posting date any source has claimed, and backfill when we
+    hold none. Earliest rather than latest because a job reached from two
+    sources (or re-verified later, see engine._enrich_pre_gate's revalidate
+    pass) is usually one posting an aggregator has re-listed, and taking the
+    newer date would let a months-old listing launder itself fresh every time
+    it's re-syndicated -- the precise thing the staleness signal exists to
+    catch. Expiry is the opposite: an employer can genuinely extend a closing
+    date, so the newest wins.
+
+    Shared by discovery's upsert and the Reed/Adzuna detail-fetch enrichers
+    (initial and revalidation passes alike) so this subtle asymmetric rule
+    lives in exactly one place."""
+    if posted_dt and (row.posted_at is None or posted_dt < row.posted_at):
+        row.posted_at = posted_dt
+        row.posted_at_approx = incoming_approx
+    elif (posted_dt and not incoming_approx and row.posted_at_approx
+            and posted_dt == row.posted_at):
+        # Same date, better provenance: a source that genuinely states a
+        # posting date supersedes an aliased updated_at, so the age tag can
+        # stop hedging. Earliest-wins above already handles a different
+        # date; this only upgrades what we know about an equal one.
+        row.posted_at_approx = False
+    if expires_dt and (row.expires_at is None or expires_dt > row.expires_at):
+        row.expires_at = expires_dt
+
 
 def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tuple[int, int, int]:
     """Discovery is cheap and runs fully every time. New identities get
@@ -928,7 +1568,14 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
     # to a SELECT yet (autoflush is off), so the same-run duplicate this was built
     # for (two sources surfacing one real posting in one discovery pass) would
     # otherwise slip past the DB-backed soft-match query entirely.
-    batch_rows: list[JobSeen] = []
+    # Bucketed by _soft_dup_key rather than kept as one flat list. The flat list
+    # meant every new job re-scanned every row touched so far, i.e. O(n^2) in the
+    # discovery batch -- profiled at 815k _norm() calls and 3.1s of a 4.8s upsert
+    # for a 1,607-job batch. _find_soft_duplicate requires an exact
+    # normalized-company AND normalized-title match before it even looks at
+    # location, so bucketing on exactly that pair is not an approximation: a row
+    # in any other bucket could never have matched anyway.
+    batch_by_key: dict[str, list[JobSeen]] = defaultdict(list)
     inserted = refreshed = requeued = 0
     for job in raw_jobs:
         title = job.get("title", "")
@@ -954,26 +1601,36 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             # Check in-batch candidates first, then the persisted store (coarse
             # SQL company pre-filter, refined by the exact normalized comparison
             # inside _find_soft_duplicate).
-            existing = _find_soft_duplicate(job, batch_rows)
+            key = _soft_dup_key(job.get("company"), title)
+            existing = _find_soft_duplicate(job, batch_by_key.get(key, ())) if key else None
             if existing is None:
-                company_norm = _norm_company(job.get("company", ""))
-                # Exact match covers "DB already has the stripped/short form,
-                # incoming has the suffix" (company_norm strips down to it);
-                # the LIKE prefix covers the reverse (DB has the longer
-                # suffixed form, incoming is already short) -- SQL can't apply
-                # _norm_company to the stored value, so a prefix match stands
-                # in for it here. Still just a coarse pre-filter: the exact
-                # decision happens in _find_soft_duplicate below.
-                db_candidates = db.execute(
-                    select(JobSeen).where(
-                        JobSeen.profile_id == profile_id,
-                        or_(
-                            func.lower(JobSeen.company) == company_norm,
-                            func.lower(JobSeen.company).like(company_norm + "%"),
-                        ),
-                    )
-                ).scalars().all() if company_norm else []
-                existing = _find_soft_duplicate(job, db_candidates)
+                # Indexed equality on the normalized company+title key both sides
+                # were written with (see _soft_dup_key). This replaced a
+                # `lower(company) = x OR lower(company) LIKE x || '%'` pre-filter
+                # that hydrated FULL JobSeen entities -- ~818 rows per call on a
+                # real store, each carrying an 8KB embedding, once per new
+                # identity. Two things to keep if this is touched again:
+                #
+                #  * select COLUMNS, not the entity. _find_soft_duplicate only
+                #    reads title/company/location, and hydrating the rest is what
+                #    made the old query expensive. The winning row is re-fetched
+                #    by primary key below, so the caller still gets a real,
+                #    mutable JobSeen -- but only for the ~1 row that actually won.
+                #  * a blank key means "no soft-duplicate semantics" (blank title
+                #    or company), NOT "match every keyless row" -- skip the query
+                #    entirely rather than searching for "" (`key` is computed
+                #    above, shared with the in-batch bucket lookup).
+                if key:
+                    rows = db.execute(
+                        select(JobSeen.id, JobSeen.title, JobSeen.company,
+                               JobSeen.location)
+                        .where(JobSeen.profile_id == profile_id,
+                               JobSeen.soft_dup_key == key)
+                    ).all()
+                    match = _find_soft_duplicate(
+                        job, [_SoftDupCandidate(*r) for r in rows])
+                    if match is not None:
+                        existing = db.get(JobSeen, match.id)
 
         if existing is None:
             row = JobSeen(
@@ -984,10 +1641,14 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
                 posted_at=posted_dt, expires_at=expires_dt,
                 posted_at_approx=bool(job.get("posted_at_approx")) if posted_dt else None,
                 seen_days=1,
+                seen_dates=_append_sighting(None, now),
+                repost_key=_repost_key(job),
+                soft_dup_key=_soft_dup_key(job.get("company"), title),
+                **_jobseen_salary_fields(job),
             )
             db.add(row)
             seen_this_batch[h] = row
-            batch_rows.append(row)
+            batch_by_key[row.soft_dup_key or ""].append(row)
             inserted += 1
         else:
             # ORDER MATTERS: this reads existing.last_seen to decide whether today
@@ -999,6 +1660,21 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             if existing.last_seen is None or existing.last_seen.date() != now.date():
                 existing.seen_days = (existing.seen_days or 1) + 1
             existing.last_seen = now
+            # Deliberately NOT inside the branch above: _append_sighting is
+            # idempotent per day on its own, so it stays correct regardless of
+            # the last_seen ordering trap next to it, and it also backfills a
+            # row that predates the column. See JobSeen.seen_dates.
+            existing.seen_dates = _append_sighting(existing.seen_dates, now)
+            if not existing.repost_key:
+                existing.repost_key = _repost_key(job)
+            # Backfill only. A row predating the column (or one whose title was
+            # blank when first stored) must acquire a key or it stays invisible
+            # to every future soft-duplicate lookup; but a row that already has
+            # one keeps it, so a re-listing under a slightly different company
+            # string can't silently re-key an existing row out from under the
+            # rows already matched against it.
+            if not existing.soft_dup_key:
+                existing.soft_dup_key = _soft_dup_key(existing.company, existing.title)
             # A soft-duplicate match means a different source described the same
             # posting -- prefer whichever source's snippet is more complete rather
             # than freezing on whichever was seen first (a mangled/truncated
@@ -1007,25 +1683,16 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             if len(new_snippet) > len(existing.snippet or ""):
                 existing.snippet = new_snippet
             # Keep the EARLIEST posting date any source has claimed, and backfill
-            # when we hold none. Earliest rather than latest because a job that
-            # reaches us from two sources is usually one posting an aggregator has
-            # re-listed, and taking the newer date would let a months-old listing
-            # launder itself fresh every time it's re-syndicated -- the precise
-            # thing the staleness signal exists to catch. Expiry is the opposite:
-            # an employer can genuinely extend a closing date, so the newest wins.
-            incoming_approx = bool(job.get("posted_at_approx"))
-            if posted_dt and (existing.posted_at is None or posted_dt < existing.posted_at):
-                existing.posted_at = posted_dt
-                existing.posted_at_approx = incoming_approx
-            elif (posted_dt and not incoming_approx and existing.posted_at_approx
-                    and posted_dt == existing.posted_at):
-                # Same date, better provenance: a source that genuinely states a
-                # posting date supersedes an aliased updated_at, so the age tag can
-                # stop hedging. Earliest-wins above already handles a different
-                # date; this only upgrades what we know about an equal one.
-                existing.posted_at_approx = False
-            if expires_dt and (existing.expires_at is None or expires_dt > existing.expires_at):
-                existing.expires_at = expires_dt
+            # when we hold none, newest-wins for expiry -- see _merge_posted_expires.
+            _merge_posted_expires(existing, posted_dt, expires_dt, bool(job.get("posted_at_approx")))
+            # Backfill only: a source that states pay fills a gap left by one
+            # that didn't, but a re-listing must not be able to overwrite a
+            # figure we already hold with a vaguer one (or with nothing).
+            fresh_salary = _jobseen_salary_fields(job)
+            if fresh_salary["salary_min"] is not None or fresh_salary["salary_max"] is not None:
+                if existing.salary_min is None and existing.salary_max is None:
+                    for field, value in fresh_salary.items():
+                        setattr(existing, field, value)
             if upd_dt and existing.source_updated_at and upd_dt > existing.source_updated_at:
                 existing.state = "new"
                 existing.source_updated_at = upd_dt
@@ -1040,7 +1707,7 @@ def _upsert_discovered(db: Session, profile_id: int, raw_jobs: list[dict]) -> tu
             else:
                 refreshed += 1
             seen_this_batch[h] = existing
-            batch_rows.append(existing)
+            batch_by_key[existing.soft_dup_key or ""].append(existing)
     db.commit()
     return inserted, refreshed, requeued
 
@@ -1140,12 +1807,22 @@ def _rows_to_dicts(rows: list[JobSeen]) -> list[dict]:
         "snippet": r.snippet or "", "full_text": r.full_text or r.snippet or "",
         "_identity": r.identity_hash,
         "_has_full_text": bool(r.full_text),
+        # Un-prefixed, because these are the same keys the fresh-discovery dicts
+        # use and full_auto._listing_salary_suffix reads them by those names --
+        # this is the read-back half of persisting salary on the store, and
+        # without it every gated candidate reached the cheap tiers with a blank
+        # salary line. See JobSeen.salary_min.
+        "salary_min": r.salary_min,
+        "salary_max": r.salary_max,
+        "salary_period": r.salary_period,
+        "salary_currency": r.salary_currency,
         # ISO strings rather than datetimes: these ride into full_auto, which is
         # DB-agnostic and formats them via _listing_age_tag. Often None -- see
         # JobSeen.posted_at on why an unknown date must stay unknown.
         "_posted_at": r.posted_at.isoformat() if r.posted_at else None,
         "_expires_at": r.expires_at.isoformat() if r.expires_at else None,
         "_posted_at_approx": bool(r.posted_at_approx),
+        "_last_verified_at": r.last_verified_at.isoformat() if r.last_verified_at else None,
         # Our OWN observation window, independent of anything a board claims --
         # see JobSeen.first_seen/seen_days. A lower bound on the ad's true age,
         # never an upper one, and never evidence that a listing is fresh.
@@ -1179,13 +1856,20 @@ def _mark(db: Session, profile_id: int, identities: list[str], state: str,
 def _persist_scrape(db: Session, profile_id: int, jobs: list[dict]) -> None:
     """Persist freshly-scraped page text so a resurfacing job isn't re-scraped. Only
     stores text that actually beats the snippet (a real fetch succeeded), so a blocked
-    page that fell back to its snippet is retried next run rather than frozen."""
+    page that fell back to its snippet is retried next run rather than frozen.
+    Also stamps last_verified_at -- a successful scrape IS a liveness check, the
+    same as the Reed/Adzuna detail-fetch path (see _enrich_pre_gate)."""
     by_id: dict[str, str] = {}
+    now = datetime.utcnow()
     for j in jobs:
         ident = j.get("_identity")
         ft = j.get("full_text") or ""
         if ident and len(ft) > len(j.get("snippet") or ""):
             by_id[ident] = ft[:8000]
+            # Also on the in-memory dict, not just the store row: this is the
+            # same dict that reaches the final picks, and _verify_final_picks
+            # reads it to avoid re-fetching a page this run already read.
+            j["_verified_at"] = now.isoformat()
     if not by_id:
         return
     rows = db.execute(
@@ -1195,10 +1879,12 @@ def _persist_scrape(db: Session, profile_id: int, jobs: list[dict]) -> None:
     ).scalars().all()
     for r in rows:
         r.full_text = by_id.get(r.identity_hash)
+        r.last_verified_at = now
     db.commit()
 
 
-def _enrich_reed_full_text(engine, db: Session, profile_id: int, jobs: list[dict]) -> int:
+def _enrich_reed_full_text(engine, db: Session, profile_id: int, jobs: list[dict],
+                           revalidate: bool = False) -> int:
     """Fetch the REAL description for Reed candidates about to be gated, and
     persist it as their full_text.
 
@@ -1220,12 +1906,18 @@ def _enrich_reed_full_text(engine, db: Session, profile_id: int, jobs: list[dict
 
     Mutates the passed dicts in place (full_text + _has_full_text, the latter
     being what _needs_full_scrape and full_auto._gate_job_id's cache-key
-    richness marker both read). Returns how many were enriched."""
+    richness marker both read). Returns how many were enriched.
+
+    `revalidate`: see _enrich_pre_gate -- passed True for the judge-pool second
+    call so a stale already-enriched candidate gets re-checked rather than
+    skipped outright."""
     return _enrich_pre_gate(engine, db, profile_id, jobs, "reed",
-                            engine.reed_job_id, engine.fetch_reed_details)
+                            engine.reed_job_id, engine.fetch_reed_details,
+                            revalidate=revalidate)
 
 
-def _enrich_adzuna_full_text(engine, db: Session, profile_id: int, jobs: list[dict]) -> int:
+def _enrich_adzuna_full_text(engine, db: Session, profile_id: int, jobs: list[dict],
+                             revalidate: bool = False) -> int:
     """The Adzuna twin of _enrich_reed_full_text -- see full_auto's
     ADZUNA_DETAIL_ENRICH_ENABLED for the measurements behind it.
 
@@ -1238,19 +1930,50 @@ def _enrich_adzuna_full_text(engine, db: Session, profile_id: int, jobs: list[di
     plain GET, which closes it the same cheap way Reed's detail endpoint did.
 
     Keyed on the listing URL rather than an extracted id (see fetch_adzuna_details)
-    because the ad id alone doesn't say which of Adzuna's country TLDs to ask."""
+    because the ad id alone doesn't say which of Adzuna's country TLDs to ask.
+
+    `revalidate`: see _enrich_pre_gate."""
     return _enrich_pre_gate(engine, db, profile_id, jobs, "adzuna",
-                            lambda url: url or None, engine.fetch_adzuna_details)
+                            lambda url: url or None, engine.fetch_adzuna_details,
+                            revalidate=revalidate)
+
+
+def _auto_hide_dead_roles(db: Session, profile_id: int, identities: list[str]) -> int:
+    """Auto-hide any already-shown, still-unreviewed ('new') Role for a listing
+    just confirmed dead (matched via Role.external_id == JobSeen.identity_hash,
+    see where Role rows get created).
+
+    Shared by every dead-detection path (Phase 5 scrape, and the Reed/Adzuna
+    detail-fetch path including its judge-pool revalidation pass) so a listing
+    caught dead any of those ways gets the same treatment. Previously only the
+    Phase 5 path did this: a Reed/Adzuna 404 (or, now, an Adzuna validThrough/
+    expired-phrase hit) blocked the listing from ever resurfacing in a FUTURE
+    run but left an already-shown Role sitting untouched in the inbox forever
+    -- the exact "only found out by following the link" gap this closes.
+
+    Moved to "ignored" rather than "deleted": reversible via re-save, in case
+    the dead-detection was a false positive. saved/applied/crossed roles are
+    left untouched -- the user has already acted on those."""
+    if not identities:
+        return 0
+    return db.query(Role).filter(
+        Role.profile_id == profile_id,
+        Role.status == "new",
+        Role.external_id.in_(identities),
+    ).update({Role.status: "ignored"}, synchronize_session=False)
 
 
 def _persist_enrich_dead(db: Session, profile_id: int, by_key: dict[str, list[dict]],
                          dead_keys: set[str], board: str) -> int:
-    """Mark JobSeen rows whose detail fetch returned 404/410 as dead.
+    """Mark JobSeen rows a Reed/Adzuna detail fetch confirmed dead (404/410 from
+    Reed's endpoint; for Adzuna, also a passed validThrough or the page's own
+    expired-listing text -- see full_auto.fetch_adzuna_details).
 
     Same column and semantics as the Phase 5 scrape path (_persist_dead_scrapes):
     a fact about the URL, independent of profile/verdict, and every subsequent row
     selection filters on `dead_reason IS NULL`. Runs on the calling thread, which
-    is where _enrich_pre_gate already commits."""
+    is where _enrich_pre_gate already commits. last_verified_at is stamped by the
+    caller (_enrich_pre_gate), which already visits every row touched this pass."""
     if not dead_keys:
         return 0
     identities = {
@@ -1265,17 +1988,41 @@ def _persist_enrich_dead(db: Session, profile_id: int, by_key: dict[str, list[di
             JobSeen.dead_reason.is_(None),
         )
     ).scalars().all()
+    reason = "status_404_detail" if board == "reed" else "adzuna_detail_dead"
+    now = datetime.utcnow()
     for r in rows:
-        r.dead_reason = "status_404_detail"
-    if rows:
+        r.dead_reason = reason
+        # Closes the bracket first_seen opened -- see JobSeen.dead_at. Only ever
+        # stamped on rows the query above already filtered to dead_reason IS
+        # NULL, so a listing's first confirmed death is never overwritten by a
+        # later re-confirmation.
+        r.dead_at = now
+    n_hidden = _auto_hide_dead_roles(db, profile_id, list(identities))
+    if rows or n_hidden:
         db.commit()
-        _safe_print(f"[{board}] {len(rows)} listing(s) returned 404/410 from the detail "
-                    f"endpoint -- marked dead, excluded from every future run")
+        _safe_print(f"[{board}] {len(rows)} listing(s) confirmed dead from the detail "
+                    f"endpoint -- marked dead, excluded from every future run"
+                    + (f"; {n_hidden} already-shown role(s) hidden" if n_hidden else ""))
     return len(rows)
 
 
+def _is_enrichment_stale(j: dict) -> bool:
+    """Whether a Reed/Adzuna candidate that already carries full_text is old
+    enough to be worth re-verifying (see LISTING_REVALIDATE_AFTER_DAYS). Never
+    directly verified at all counts as stale -- worth a check the first time a
+    revalidation pass sees it, same as anything else that's genuinely old."""
+    ref = j.get("_last_verified_at") or j.get("_first_seen")
+    if not ref:
+        return True
+    try:
+        dt = datetime.fromisoformat(ref)
+    except (TypeError, ValueError):
+        return True
+    return (datetime.utcnow() - dt).days >= LISTING_REVALIDATE_AFTER_DAYS
+
+
 def _enrich_pre_gate(engine, db: Session, profile_id: int, jobs: list[dict], board: str,
-                     key_of, fetch) -> int:
+                     key_of, fetch, revalidate: bool = False) -> int:
     """Shared body of the per-source pre-gate enrichers above: group the candidates
     of one board by whatever key its detail fetcher is keyed on, fetch, then write
     the winners back to both the in-memory dicts and JobSeen.
@@ -1284,10 +2031,20 @@ def _enrich_pre_gate(engine, db: Session, profile_id: int, jobs: list[dict], boa
     subtle rules live -- only text that BEATS the snippet is stored (so a degenerate
     detail response can't overwrite a better teaser), `_has_full_text` must be set or
     the gate cache-key richness marker goes stale, and the DB write is one indexed
-    SELECT + commit like _persist_scrape. A second copy of that would drift."""
+    SELECT + commit like _persist_scrape. A second copy of that would drift.
+
+    `revalidate` (the judge-pool second pass): a candidate that already carries
+    full_text is normally skipped outright -- with this set, it's still skipped
+    UNLESS it hasn't been directly verified in LISTING_REVALIDATE_AFTER_DAYS, in
+    which case it's re-fetched exactly like a brand-new candidate. Re-uses every
+    existing rule above (beats-the-snippet, dead detection, date merge) unchanged
+    -- a stale listing that turns out to have expired is caught the same way a
+    never-seen-before dead one is."""
     by_key: dict[str, list[dict]] = defaultdict(list)
     for j in jobs:
-        if j.get("_has_full_text") or canonical_key(j.get("board")) != board:
+        if canonical_key(j.get("board")) != board:
+            continue
+        if j.get("_has_full_text") and not (revalidate and _is_enrichment_stale(j)):
             continue
         key = key_of(j.get("url") or "")
         if key:
@@ -1301,30 +2058,57 @@ def _enrich_pre_gate(engine, db: Session, profile_id: int, jobs: list[dict], boa
     # dead_reason had never once fired on a 6,569-row store: Phase 5 is the only
     # other place that can set it and it only ever reaches ~4% of rows.
     dead_keys: set[str] = set()
-    texts = fetch(list(by_key), dead_keys)
+    raw = fetch(list(by_key), dead_keys)
     _persist_enrich_dead(db, profile_id, by_key, dead_keys, board)
-    if not texts:
-        return 0
 
+    # identity -> (posted_dt, expires_dt); populated for EVERY identity this pass
+    # got a definitive answer for (dead or alive), so `verified` doubles as the
+    # last_verified_at stamp list below. A transient failure (timeout/429/
+    # exception) appears in neither dead_keys nor raw, so it's simply absent here
+    # and stays exactly as stale as it was -- nothing learned, nothing stamped.
+    verified: dict[str, tuple] = {
+        j["_identity"]: (None, None)
+        for key in dead_keys for j in by_key.get(key, []) if j.get("_identity")
+    }
     by_identity: dict[str, str] = {}
     enriched = 0
-    for key, text in texts.items():
+    for key, val in (raw or {}).items():
+        if isinstance(val, dict):
+            text = val.get("text") or ""
+            posted_dt = _parse_iso(val["posted_at"]) if val.get("posted_at") else None
+            expires_dt = _parse_iso(val["expires_at"]) if val.get("expires_at") else None
+        else:
+            text, posted_dt, expires_dt = (val or ""), None, None
         for j in by_key.get(key, []):
+            ident = j.get("_identity")
+            if ident:
+                verified[ident] = (posted_dt, expires_dt)
             if len(text) <= len(j.get("snippet") or ""):
                 continue
             j["full_text"] = text
             j["_has_full_text"] = True
+            if posted_dt:
+                j["_posted_at"], j["_posted_at_approx"] = posted_dt.isoformat(), False
+            if expires_dt:
+                j["_expires_at"] = expires_dt.isoformat()
             enriched += 1
-            if j.get("_identity"):
-                by_identity[j["_identity"]] = text[:8000]
-    if by_identity:
+            if ident:
+                by_identity[ident] = text[:8000]
+
+    if verified:
+        now = datetime.utcnow()
         rows = db.execute(
             select(JobSeen).where(
-                JobSeen.profile_id == profile_id, JobSeen.identity_hash.in_(list(by_identity))
+                JobSeen.profile_id == profile_id, JobSeen.identity_hash.in_(list(verified))
             )
         ).scalars().all()
         for r in rows:
-            r.full_text = by_identity.get(r.identity_hash)
+            r.last_verified_at = now
+            if r.identity_hash in by_identity:
+                r.full_text = by_identity[r.identity_hash]
+            posted_dt, expires_dt = verified[r.identity_hash]
+            if posted_dt or expires_dt:
+                _merge_posted_expires(r, posted_dt, expires_dt, incoming_approx=False)
         db.commit()
     return enriched
 
@@ -1334,16 +2118,9 @@ def _persist_dead_scrapes(db: Session, profile_id: int, jobs: list[dict]) -> Non
     _dead_listing_signal) so _run_engine_pipeline's rows-assembly filter can
     exclude it on every future run without re-scraping or re-judging it --
     dead-ness is a fact about the URL, independent of profile/CV changes.
-
-    Also auto-hides any already-shown, still-unreviewed Role for the same
-    listing (matched via Role.external_id == JobSeen.identity_hash, see
-    where Role rows get created). This is the only point where a
-    previously-surfaced role ever gets checked against reality post-hoc --
-    Phase 5 only ever scrapes a given job once, so without this an expired
-    listing the user hasn't acted on would sit in the inbox forever. Moved to
-    "ignored" rather than "deleted": reversible via the Ignored tab's
-    re-save, in case the dead-detection was a false positive. saved/applied/
-    crossed roles are left untouched -- the user has already acted on those."""
+    Also stamps last_verified_at (a scrape IS a verification, dead or alive)
+    and auto-hides any already-shown 'new' Role for the same listing -- see
+    _auto_hide_dead_roles."""
     by_id = {j["_identity"]: j["_dead_reason"] for j in jobs
              if j.get("_identity") and j.get("_dead_reason")}
     if not by_id:
@@ -1353,14 +2130,476 @@ def _persist_dead_scrapes(db: Session, profile_id: int, jobs: list[dict]) -> Non
             JobSeen.profile_id == profile_id, JobSeen.identity_hash.in_(list(by_id))
         )
     ).scalars().all()
+    now = datetime.utcnow()
     for r in rows:
         r.dead_reason = by_id.get(r.identity_hash)
-    db.query(Role).filter(
-        Role.profile_id == profile_id,
-        Role.status == "new",
-        Role.external_id.in_(list(by_id)),
-    ).update({Role.status: "ignored"}, synchronize_session=False)
+        r.last_verified_at = now
+        # First confirmed death only -- see JobSeen.dead_at. Unlike the enrich
+        # path this query isn't pre-filtered to dead_reason IS NULL, so the
+        # not-already-set check has to be made here.
+        if r.dead_at is None:
+            r.dead_at = now
+    _auto_hide_dead_roles(db, profile_id, list(by_id))
     db.commit()
+
+
+def _needs_liveness_check(j: dict) -> bool:
+    """Whether this candidate is worth spending one HTTP GET on before the judge.
+
+    Three reasons, any of which qualifies: we have never read its real page (so
+    the judge would be grading a source teaser), it lives on a re-posting
+    aggregator (2.6% of the store but 8% of surfaced roles, and 22% of them
+    already dead), or its last direct verification has gone stale.
+
+    A known dead-end URL is excluded first and deliberately. Adzuna's
+    /jobs/land/ad/ click-tracking interstitial answers every request with a
+    stub, so fetching it can only ever return "unverifiable" -- which would
+    spend a request to learn nothing AND then hand the row an
+    UNVERIFIED_RANK_PENALTY for a property of the URL scheme rather than of the
+    vacancy. Those rows have their own verification route already
+    (fetch_adzuna_details against /details/{id}, which is where their dead
+    detection actually lives)."""
+    if _KNOWN_DEAD_END_URL_RE.search(j.get("url") or ""):
+        return False
+    if not j.get("_has_full_text"):
+        return True
+    if _is_mirror_host(j.get("url")):
+        return True
+    return _is_enrichment_stale(j)
+
+
+def _classify_listing(engine, job: dict) -> tuple[str, str, dict]:
+    """One plain HTTP GET -> (state, detail, jsonld). NO DB access: this runs on
+    a worker thread, and every write happens back on the calling thread.
+
+    state is "dead" | "alive" | "unverifiable". The order of the checks is the
+    point, and it is strongest-signal-first because dead_reason is unrecoverable:
+
+      1. 404/410 -- the workhorse. Every genuine death in a 45-row live sample
+         was a hard 404; nothing else contributed one.
+      2. A schema.org validThrough already in the past. Structured, published by
+         the board itself, and the only FORWARD-looking expiry signal available.
+      3. full_auto._dead_listing_signal, which adds the guarded closure-phrase
+         and generic-careers-hub checks.
+
+    Note (3) is called through _dead_listing_signal deliberately, and the raw
+    _EXPIRED_LISTING_RE must NEVER be used here. A LIVE bebee posting matches
+    that bare regex on its own page furniture; only the guarded
+    _looks_like_expired_listing, with its length and head-position gates,
+    correctly declines to fire. Using the raw pattern turned 5 live listings
+    into "dead" in an early measurement, and dead_reason cannot be undone."""
+    url = job.get("url") or ""
+    try:
+        resp = requests.get(url, timeout=VERIFY_TIMEOUT, allow_redirects=True,
+                            headers={"User-Agent": _VERIFY_UA,
+                                     "Accept": "text/html,application/xhtml+xml"})
+    except Exception as e:
+        return "unverifiable", type(e).__name__, {}
+
+    status = resp.status_code
+    if status in (404, 410):
+        return "dead", f"status_{status}", {}
+    body = resp.text or ""
+    # A 202/403/429, or a 200 with essentially no body, means the host declined
+    # to answer (Cloudflare and friends) -- NOT that the vacancy is gone.
+    if status >= 400 or status in (202, 429) or len(body) < 400:
+        return "unverifiable", f"status_{status}", {}
+
+    jsonld = engine._jobposting_from_html(body)
+    expires = jsonld.get("expires_at") if jsonld else None
+    if expires and expires < datetime.utcnow().isoformat():
+        return "dead", "validThrough_passed", jsonld
+
+    text = engine._strip_html(body)
+    shim = SimpleNamespace(status_code=status, redirected_status_code=status, success=True)
+    signal = engine._dead_listing_signal(shim, text, job.get("title") or "")
+    if signal:
+        return "dead", signal, jsonld
+    return "alive", f"status_{status}", jsonld
+
+
+def _persist_verified_alive(db: Session, profile_id: int, results: list[tuple]) -> int:
+    """Stamp last_verified_at, and fold in anything the page told us for free.
+
+    The verification fetch has already landed a whole HTML page, so where a row
+    still has no full_text the JSON-LD description is pure profit -- it is the
+    other half of the bug this stage exists for. The listing that prompted all
+    this reached the expensive judge with 0 chars of text and no dates at all;
+    a live page of the same shape carries a 4.3k-char description plus both
+    dates. Rows that were being judged blind become judgeable at no extra cost.
+
+    Reuses the enrichment rules exactly: only text that BEATS the snippet is
+    stored (a degenerate JSON-LD blurb must not overwrite a better teaser),
+    _has_full_text is set so the gate cache-key richness marker doesn't go
+    stale, and dates go through _merge_posted_expires' earliest-posted /
+    latest-expiry asymmetry."""
+    by_ident = {j["_identity"]: (j, ld) for j, _state, _detail, ld in results
+                if j.get("_identity")}
+    rows = {
+        r.identity_hash: r for r in db.execute(
+            select(JobSeen).where(JobSeen.profile_id == profile_id,
+                                  JobSeen.identity_hash.in_(list(by_ident)))
+        ).scalars().all()
+    } if by_ident else {}
+
+    now = datetime.utcnow()
+    enriched = 0
+    # Driven by the RESULTS, not by the rows the SELECT happened to return. The
+    # in-memory dict is what the judge reads this run, so it must be updated
+    # whether or not a JobSeen row was found -- keying the whole loop off the DB
+    # meant a candidate with no matching row silently kept its teaser.
+    for job, _state, _detail, jsonld in results:
+        row = rows.get(job.get("_identity"))
+        if row is not None:
+            row.last_verified_at = now
+        if not jsonld:
+            continue
+        text = jsonld.get("description") or ""
+        if text and len(text) > len(job.get("snippet") or ""):
+            job["full_text"] = text
+            job["_has_full_text"] = True
+            enriched += 1
+            if row is not None:
+                row.full_text = text[:8000]
+        posted_dt = _parse_iso(jsonld["posted_at"]) if jsonld.get("posted_at") else None
+        expires_dt = _parse_iso(jsonld["expires_at"]) if jsonld.get("expires_at") else None
+        if posted_dt:
+            job["_posted_at"], job["_posted_at_approx"] = posted_dt.isoformat(), False
+        if expires_dt:
+            job["_expires_at"] = expires_dt.isoformat()
+        if row is not None and (posted_dt or expires_dt):
+            _merge_posted_expires(row, posted_dt, expires_dt, incoming_approx=False)
+    db.commit()
+    return enriched
+
+
+def _record_host_stats(db: Session, results: list[tuple]) -> None:
+    """Fold this pass's outcomes into the per-host tally. See ListingHostStat --
+    this is recorded for visibility only and nothing reads it to decide
+    anything, least of all whether to drop a host."""
+    tally: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])  # checked, dead, unverifiable
+    for job, state, _detail, _ld in results:
+        host = _listing_host(job.get("url"))
+        if not host:
+            continue
+        tally[host][0] += 1
+        if state == "dead":
+            tally[host][1] += 1
+        elif state == "unverifiable":
+            tally[host][2] += 1
+    if not tally:
+        return
+    rows = {
+        r.host: r for r in db.execute(
+            select(ListingHostStat).where(ListingHostStat.host.in_(list(tally)))
+        ).scalars().all()
+    }
+    now = datetime.utcnow()
+    for host, (checked, dead, unver) in tally.items():
+        row = rows.get(host)
+        if row is None:
+            row = ListingHostStat(host=host, checked=0, dead=0, unverifiable=0)
+            db.add(row)
+        row.checked = (row.checked or 0) + checked
+        row.dead = (row.dead or 0) + dead
+        row.unverifiable = (row.unverifiable or 0) + unver
+        row.updated_at = now
+    db.commit()
+
+
+def _verify_listings_alive(engine, db: Session, profile_id: int,
+                           rank_by_cluster: dict[int, list[dict]]) -> dict:
+    """Confirm the judge pool's listings still exist, immediately before the
+    expensive model reads them. Plain HTTP, no browser, no LLM call.
+
+    Mutates rank_by_cluster in place: a confirmed-dead listing is removed, so
+    the _fair_allocate that follows backfills its slot from the same cluster's
+    remaining candidates for free -- which is why this runs against the
+    per-cluster lists rather than against the already-allocated judge pool. No
+    cluster loses a slot to a dead row.
+
+    Dead rows get dead_reason/dead_at, after which the pipeline's existing
+    `dead_reason IS NULL` selection filters exclude them from every future run
+    with no new suppression path.
+
+    An UNVERIFIABLE row (host refused to answer) is not dead and is not treated
+    as such. It is dropped only when it is BOTH on a re-posting mirror AND has
+    no readable text -- nothing for the judge to read and no way to check it.
+    Otherwise it only takes a _selection_score penalty, so it can still surface
+    when nothing better exists."""
+    if not VERIFY_LISTINGS_ENABLED:
+        return {}
+    candidates = [j for jobs in rank_by_cluster.values() for j in jobs
+                  if j.get("url") and _needs_liveness_check(j)]
+    if not candidates:
+        return {"verify_checked": 0}
+    # Best-first, so a capped run spends its fetches on the rows most likely to
+    # actually reach the judge.
+    candidates.sort(key=_selection_score, reverse=True)
+    candidates = candidates[:VERIFY_MAX_PER_RUN]
+
+    with ThreadPoolExecutor(max_workers=max(1, VERIFY_MAX_WORKERS)) as ex:
+        states = list(ex.map(lambda j: _classify_listing(engine, j), candidates))
+    results = [(j, s, d, ld) for j, (s, d, ld) in zip(candidates, states)]
+
+    dead = [(j, d) for j, s, d, _ld in results if s == "dead"]
+    alive = [(j, s, d, ld) for j, s, d, ld in results if s == "alive"]
+    unverifiable = [j for j, s, _d, _ld in results if s == "unverifiable"]
+
+    for job, reason in dead:
+        job["_dead_reason"] = reason
+    # Stamped on the dict as well as the store row: these are the same dicts
+    # that flow through to the final picks, and _verify_final_picks uses this to
+    # avoid spending a second fetch on a listing already confirmed this run.
+    _verified_now = datetime.utcnow().isoformat()
+    for job, _s, _d, _ld in alive:
+        job["_verified_at"] = _verified_now
+    _persist_dead_scrapes(db, profile_id, [j for j, _r in dead])
+    n_enriched = _persist_verified_alive(db, profile_id, alive)
+
+    dead_ids = {id(j) for j, _r in dead}
+    drop_ids = set(dead_ids)
+    n_unverifiable_dropped = 0
+    for job in unverifiable:
+        if _is_mirror_host(job.get("url")) and not job.get("_has_full_text"):
+            drop_ids.add(id(job))
+            n_unverifiable_dropped += 1
+        else:
+            # Demote only. Kept off _rank_score on purpose -- see
+            # UNVERIFIED_RANK_PENALTY.
+            job["_unverified_penalty"] = UNVERIFIED_RANK_PENALTY
+
+    for idx, jobs in rank_by_cluster.items():
+        rank_by_cluster[idx] = [j for j in jobs if id(j) not in drop_ids]
+
+    _record_host_stats(db, results)
+
+    by_host: dict[str, int] = defaultdict(int)
+    for job, _r in dead:
+        by_host[_listing_host(job.get("url"))] += 1
+    if dead or n_unverifiable_dropped:
+        detail = ", ".join(f"{h} x{n}" for h, n in
+                           sorted(by_host.items(), key=lambda kv: -kv[1])[:5])
+        engine.emit(
+            f"[pipeline] liveness check: {len(dead)} dead listing(s) dropped before the "
+            f"judge{' (' + detail + ')' if detail else ''}"
+            + (f"; {n_unverifiable_dropped} unverifiable mirror row(s) with no text dropped"
+               if n_unverifiable_dropped else ""))
+    return {
+        "verify_checked": len(results),
+        "verify_dead": len(dead),
+        "verify_unverifiable": len(unverifiable),
+        "verify_unverifiable_dropped": n_unverifiable_dropped,
+        "verify_enriched": n_enriched,
+    }
+
+
+def _verify_ats_picks(engine, picks: list[dict]) -> dict[int, tuple[str, str]]:
+    """Liveness for ATS-sourced picks, by re-reading the vendor feed.
+
+    Strictly better than fetching the posting's own URL, and cheaper: a vendor
+    board lists exactly the reqs that are open, so a URL that has left the feed
+    is CLOSED -- a definite answer where an HTML fetch gives at best an inferred
+    one (several ATS vendors serve a soft 200 "this job is no longer available"
+    page that no phrase-matching heuristic reliably catches). Cost is one call
+    per distinct BOARD among the picks, not per pick: 2-4 in practice.
+
+    Only ever returns a verdict when the feed came back with something. An empty
+    or failed feed is indistinguishable from a board that closed every req at
+    once, so those picks are left for the HTTP path rather than mass-marked
+    dead -- dead_reason is unrecoverable."""
+    by_board: dict[str, list[dict]] = defaultdict(list)
+    for j in picks:
+        board = j.get("board") or ""
+        if canonical_key(board) in ATS_KEYS and ":" in board:
+            by_board[board].append(j)
+    if not by_board:
+        return {}
+
+    out: dict[int, tuple[str, str]] = {}
+    for board, jobs in by_board.items():
+        prefix, token = board.split(":", 1)
+        vendor = canonical_key(board)
+        try:
+            live = engine.fetch_ats(vendor, token) or []
+        except Exception:
+            continue
+        if not live:
+            continue  # see the docstring -- silence is not a death certificate
+        urls = {_canonical_url(r.get("url", "")) for r in live if r.get("url")}
+        for j in jobs:
+            canon = _canonical_url(j.get("url", ""))
+            out[id(j)] = (("alive", f"in_{vendor}_feed") if canon in urls
+                          else ("dead", f"absent_from_{vendor}_feed"))
+    return out
+
+
+async def _verify_via_browser(engine, jobs: list[dict]) -> dict[int, tuple[str, str]]:
+    """Second opinion for picks a plain GET couldn't answer for.
+
+    Cloudflare and friends answer an unrecognised client with a 202/403 and no
+    body, which is "the host declined", not "the vacancy closed" -- roughly a
+    fifth of checks. The headless browser gets a real page where requests
+    cannot, so it converts those into a definite answer instead of leaving the
+    most protective check in the pipeline shrugging.
+
+    Bounded twice over (VERIFY_BROWSER_MAX, VERIFY_BROWSER_BUDGET_SECONDS) and
+    fail-open: anything the browser also can't answer for stays unverifiable and
+    is KEPT. Unknown is not dead -- the same invariant the HTTP path holds."""
+    jobs = jobs[:VERIFY_BROWSER_MAX]
+    if not jobs:
+        return {}
+    browser_config = engine.BrowserConfig(
+        headless=True, verbose=False, viewport_width=1280, viewport_height=800,
+        user_agent_mode="random",
+    )
+    out: dict[int, tuple[str, str]] = {}
+
+    async def _one(crawler, job: dict) -> None:
+        try:
+            result = await crawler.arun(
+                url=job.get("url", ""),
+                config=engine.CrawlerRunConfig(
+                    cache_mode=engine.CacheMode.BYPASS,
+                    wait_until="networkidle",
+                    page_timeout=engine.SCRAPE_PAGE_TIMEOUT_MS,
+                ),
+            )
+        except Exception:
+            return
+        markdown = str(getattr(result, "markdown", "") or "")
+        if not markdown.strip():
+            return
+        # Exactly the checks _classify_listing runs, in the same order and via
+        # the same guarded helpers. _EXPIRED_LISTING_RE must never be called raw
+        # here either -- a live posting matches it on its own page furniture.
+        signal = engine._dead_listing_signal(result, markdown, job.get("title") or "")
+        out[id(job)] = ("dead", signal) if signal else ("alive", "browser_ok")
+
+    try:
+        async with engine.AsyncWebCrawler(config=browser_config) as crawler:
+            await asyncio.wait_for(
+                asyncio.gather(*[_one(crawler, j) for j in jobs],
+                               return_exceptions=True),
+                timeout=VERIFY_BROWSER_BUDGET_SECONDS)
+    except (asyncio.TimeoutError, Exception):
+        pass  # whatever resolved before the budget ran out still counts
+    return out
+
+
+async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[dict],
+                              reserves: list[dict]) -> tuple[list[dict], dict]:
+    """Confirm every pick about to be shown still exists. Returns (picks, funnel).
+
+    This is the guarantee behind the results page, and it is deliberately NOT
+    _needs_liveness_check-gated: that predicate exists to ration ~40 fetches
+    across a rank pool, and applying it here would reproduce the exact hole this
+    closes -- an ATS row carrying full_text from an earlier run skips the
+    pre-judge pass, skips Phase 5, and would be shown having been checked by
+    nothing. The only picks skipped are those a fetch ALREADY read this run
+    (_verified_at, stamped by _verify_listings_alive and _persist_scrape).
+
+    Three routes to an answer, strongest first -- see _verify_ats_picks for why
+    the vendor feed beats fetching the posting, and _needs_liveness_check for
+    why Adzuna's /jobs/land/ad/ interstitial must go via fetch_adzuna_details
+    rather than being fetched directly.
+
+    A dropped pick's slot is refilled from `reserves` (the graded picks that lost
+    the FINAL_PICKS cut) and the refills are verified too -- once. One extra
+    round, never recursion: the point is to not show a corpse, not to guarantee
+    a full dozen."""
+    funnel = {"final_verify_checked": 0, "final_verify_dead": 0,
+              "final_verify_unverifiable": 0, "final_verify_browser": 0,
+              "final_verify_backfilled": 0}
+    if not (VERIFY_LISTINGS_ENABLED and VERIFY_FINAL_PICKS_ENABLED) or not final:
+        return final, funnel
+
+    # Identity, not equality: `j not in final` compares dicts field-by-field,
+    # which is both O(n*m) deep compares and wrong -- two distinct listings that
+    # happen to agree on every key would collapse into one.
+    final_ids = {id(j) for j in final}
+    reserve_pool = [j for j in reserves if id(j) not in final_ids]
+    dead_all: list[dict] = []
+    checked_ids: set[int] = set()
+
+    async def _verify(batch: list[dict]) -> list[dict]:
+        """One round. Returns the survivors, appends deaths to dead_all."""
+        todo = [j for j in batch if j.get("url") and not j.get("_verified_at")
+                and id(j) not in checked_ids]
+        for j in todo:
+            checked_ids.add(id(j))
+        if not todo:
+            return list(batch)
+
+        verdicts = _verify_ats_picks(engine, todo)
+        http_todo = [j for j in todo if id(j) not in verdicts]
+
+        # Adzuna's tracking interstitial can only ever answer "unverifiable";
+        # its real detail page is the route, and carries its own dead detection.
+        adzuna = [j for j in http_todo if _KNOWN_DEAD_END_URL_RE.search(j.get("url") or "")]
+        if adzuna:
+            adzuna_dead: set = set()
+            try:
+                got = engine.fetch_adzuna_details([j["url"] for j in adzuna],
+                                                  dead_out=adzuna_dead) or {}
+            except Exception:
+                got = {}
+            for j in adzuna:
+                if j["url"] in adzuna_dead:
+                    verdicts[id(j)] = ("dead", "adzuna_detail_dead")
+                elif j["url"] in got:
+                    verdicts[id(j)] = ("alive", "adzuna_detail_ok")
+            http_todo = [j for j in http_todo if id(j) not in verdicts]
+
+        if http_todo:
+            with ThreadPoolExecutor(max_workers=max(1, VERIFY_MAX_WORKERS)) as ex:
+                states = list(ex.map(lambda j: _classify_listing(engine, j), http_todo))
+            for j, (state, detail, _ld) in zip(http_todo, states):
+                verdicts[id(j)] = (state, detail)
+
+        unresolved = [j for j in todo if verdicts.get(id(j), ("", ""))[0] == "unverifiable"]
+        if unresolved:
+            funnel["final_verify_unverifiable"] += len(unresolved)
+            try:
+                verdicts.update(await _verify_via_browser(engine, unresolved))
+                funnel["final_verify_browser"] += len(unresolved[:VERIFY_BROWSER_MAX])
+            except Exception:
+                pass
+
+        funnel["final_verify_checked"] += len(todo)
+        now = datetime.utcnow().isoformat()
+        survivors = []
+        for j in batch:
+            state, detail = verdicts.get(id(j), ("", ""))
+            if state == "dead":
+                j["_dead_reason"] = detail
+                dead_all.append(j)
+                continue
+            if state == "alive":
+                j["_verified_at"] = now
+            survivors.append(j)
+        return survivors
+
+    picks = await _verify(final)
+    n_dropped = len(final) - len(picks)
+    if n_dropped and reserve_pool:
+        backfill = await _verify(reserve_pool[:n_dropped])
+        picks += backfill
+        funnel["final_verify_backfilled"] = len(backfill)
+
+    funnel["final_verify_dead"] = len(dead_all)
+    if dead_all:
+        _persist_dead_scrapes(db, profile_id, dead_all)
+        # n_dropped is what the user would have seen; len(dead_all) can be higher
+        # because a reserve pulled in to replace one can itself turn out dead.
+        engine.emit(
+            f"[pipeline] final-pick liveness: {n_dropped} of {len(final)} pick(s) no "
+            f"longer exist, backfilled {funnel['final_verify_backfilled']} "
+            f"({funnel['final_verify_checked']} checked, {len(dead_all)} dead in total)")
+    else:
+        engine.emit(f"[pipeline] final-pick liveness: all {funnel['final_verify_checked']} "
+                    f"checked listing(s) still live")
+    return picks, funnel
 
 
 def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
@@ -1760,6 +2999,30 @@ def _cluster_label(cluster: dict) -> str:
     return cluster.get("label") or (cluster.get("roles") or ["General"])[0]
 
 
+def _drop_expired_candidates(scored: list[dict]) -> tuple[list[dict], int]:
+    """Remove candidates whose employer-stated closing date has already passed.
+
+    Until this existed a passed expires_at only produced PROSE -- _listing_age_tag
+    mentions it and rank_gate's CLOSED LISTING rule caps the score -- so a
+    definitively-closed listing could still consume gate, rank and judge budget
+    and, if it scored well enough despite the cap, still be shown. An expiry
+    date is the employer's own statement that applications have closed; there is
+    nothing for a model to weigh.
+
+    Unknown stays unknown: a null expires_at is never treated as expired, which
+    matters because roughly 90% of the store has no expiry date at all."""
+    now = datetime.utcnow()
+    kept, dropped = [], 0
+    for j in scored:
+        raw = j.get("_expires_at")
+        dt = _parse_iso(raw) if raw else None
+        if dt is not None and dt < now:
+            dropped += 1
+            continue
+        kept.append(j)
+    return kept, dropped
+
+
 def _cluster_candidate_queues(scored: list[dict]) -> tuple[dict[int, list[dict]], bool, dict[int, str]]:
     """Groups already-sorted-desc `scored` candidates by cluster into the full
     ordered queue _gate_rank_refill_cluster pulls batches from -- unlike the
@@ -1880,7 +3143,6 @@ def _gate_rank_refill_cluster(
     returns."""
     report = report or (lambda _: None)
     soft_axes, hard_axes = _hard_enforced_axes(engine, cluster_profile)
-    pos = 0
     examined = 0
     gate_survivors: list[dict] = []    # in-sector, below this round's hard-drop threshold (all rounds)
     hard_dropped: list[dict] = []      # in-sector, at/above this round's hard-drop threshold
@@ -1888,27 +3150,51 @@ def _gate_rank_refill_cluster(
     hard_gate_failed: list[dict] = []  # _hard_gate_ok=False, or a candidate-promoted hard axis failed
     judge_eligible: list[dict] = []    # ranked, >= RANK_REJECT_SCORE_FLOOR
     below_rank_floor: list[dict] = []  # ranked, < RANK_REJECT_SCORE_FLOOR
-    stop_reason = "pool_exhausted"
 
-    while pos < len(queue):
-        if len(judge_eligible) >= judge_target:
-            stop_reason = "target_reached"
-            break
-        if examined >= examine_cap:
-            stop_reason = "absolute_pool_cap"
-            break
-        cancel_check()
-        # Small first round -> earliest possible provisional cards (report() below
-        # fires per round), larger rounds after to bound orchestration overhead.
-        # dynamic_hard_drop_threshold (below) is now computed per smaller round --
-        # more responsive, slightly noisier -- which is fine: it already defaulted
-        # to "unsure -> keep" on any axis it isn't confident about.
-        round_cap = GATE_FIRST_ROUND if examined == 0 else GATE_ROUND_SIZE
-        batch_size = min(len(queue) - pos, round_cap, TARGET_POOL, examine_cap - examined)
-        batch = queue[pos:pos + batch_size]
-        pos += batch_size
-        examined += len(batch)
+    # ONE pass over the whole examine budget, not an incremental refill loop.
+    #
+    # The loop this replaces examined the queue in rounds (GATE_FIRST_ROUND then
+    # GATE_ROUND_SIZE), and each round was a BLOCKING screen_gate call followed by
+    # a BLOCKING rank_gate call -- so round COUNT, not batch size, set the stage's
+    # wall time. Its purpose was to stop early once `judge_target` judge-eligible
+    # candidates had accumulated, spending fewer LLM calls on a queue that was
+    # already producing enough.
+    #
+    # That early exit has never once fired. Across every run that recorded a
+    # per-cluster stop_reason (17 cluster-runs), the tally is absolute_pool_cap 16,
+    # pool_exhausted 1 (a queue of only 114), target_reached ZERO -- judge_eligible
+    # lands at 5-12 per cluster against a target of 40. The incrementality was
+    # therefore buying no call savings at all while costing 2 serial LLM latencies
+    # per round: 3 rounds x 2 = 6 for a 160-candidate cluster, measured at ~10.3s
+    # each.
+    #
+    # Screening the whole budget in one call costs exactly the same LLM calls
+    # (screen_gate/rank_gate batch internally at _GATE_BATCH=20 over
+    # _GATE_MAX_WORKERS=4 either way) but collapses those 6 serial waves to 3:
+    # 160 candidates = 8 screen batches = 2 waves, then one rank wave.
+    #
+    # `judge_target` survives as a post-hoc trim below rather than a loop break,
+    # so the safety valve is still there if discovery ever gets good enough to
+    # need it -- it just no longer costs latency on every run where it doesn't.
+    batch = queue[:examine_cap]
+    examined = len(batch)
+    stop_reason = "absolute_pool_cap" if len(queue) > examine_cap else "pool_exhausted"
+    cancel_check()
 
+    # Defined out here, not inside `if batch:`, because the two floor-backfill
+    # blocks below call _clears_rank_floor even when the batch was empty.
+    def _clears_hard(j: dict) -> bool:
+        return (j.get("_hard_gate_ok", True) and j.get("_listing_ok", True)
+                and all(j.get(a, True) for a in hard_axes))
+
+    def _clears_rank_floor(j: dict) -> bool:
+        # rank_gate had no real signal for this job (same-model retry and
+        # cheap-tier fallback both failed, see full_auto.rank_gate) -- pass it
+        # through instead of comparing a fabricated neutral score against
+        # RANK_REJECT_SCORE_FLOOR, which would silently guarantee rejection.
+        return j.get("_rank_gate_failed", False) or j.get("_rank_score", 50.0) >= RANK_REJECT_SCORE_FLOOR
+
+    if batch:
         # Deterministic, LLM-free hard filter: a listing whose DEFINITE (non-
         # approximate) posted date is confirmed older than the candidate's own
         # "Maximum listing age" preference, when enforced Hard (the default) --
@@ -1946,18 +3232,6 @@ def _gate_rank_refill_cluster(
         # no real listing underneath to backfill toward, so re-surfacing it via
         # the floor backfill would just show the candidate the same non-job text
         # again.
-        def _clears_hard(j: dict) -> bool:
-            return (j.get("_hard_gate_ok", True) and j.get("_listing_ok", True)
-                    and all(j.get(a, True) for a in hard_axes))
-
-        def _clears_rank_floor(j: dict) -> bool:
-            # rank_gate had no real signal for this job (same-model retry and
-            # cheap-tier fallback both failed, see full_auto.rank_gate) -- pass it
-            # through instead of comparing a fabricated neutral score against
-            # RANK_REJECT_SCORE_FLOOR, which would silently guarantee rejection.
-            # Still bounded by the judge_target cap in the while loop above.
-            return j.get("_rank_gate_failed", False) or j.get("_rank_score", 50.0) >= RANK_REJECT_SCORE_FLOOR
-
         hard_gate_failed.extend(j for j in annotated if not _clears_hard(j))
         annotated = [j for j in annotated if _clears_hard(j)]
         in_sector = [j for j in annotated if j.get("_sector_ok", True)]
@@ -1975,15 +3249,26 @@ def _gate_rank_refill_cluster(
             sum(1 for axis in soft_axes if not j.get(axis, True))
             for j in in_sector
         ]
-        hard_drop_threshold = engine.dynamic_hard_drop_threshold(soft_fail_counts)
-
+        # Still computed over GATE_ROUND_SIZE-sized SLICES, even though the whole
+        # budget is now screened in one call. This threshold is a judgement about
+        # a LOCAL stretch of the queue -- "is this part of the pool thin on real
+        # mismatches?" -- and the queue is embed-score ordered, so its head and
+        # its tail have genuinely different clean rates. Feeding one pooled
+        # fraction over all 160 would average the strong head into the weak tail
+        # and silently change gate strictness as a side effect of a latency
+        # change. Slicing keeps the calibration identical to the round-based
+        # loop; only the number of LLM round-trips changed.
         round_survivors = []
-        for j, fails in zip(in_sector, soft_fail_counts):
-            if fails >= hard_drop_threshold:
-                hard_dropped.append(j)
-            else:
-                gate_survivors.append(j)
-                round_survivors.append(j)
+        for start in range(0, len(in_sector), GATE_ROUND_SIZE):
+            chunk = in_sector[start:start + GATE_ROUND_SIZE]
+            chunk_fails = soft_fail_counts[start:start + GATE_ROUND_SIZE]
+            threshold = engine.dynamic_hard_drop_threshold(chunk_fails)
+            for j, fails in zip(chunk, chunk_fails):
+                if fails >= threshold:
+                    hard_dropped.append(j)
+                else:
+                    gate_survivors.append(j)
+                    round_survivors.append(j)
 
         if round_survivors:
             ranked = engine.rank_gate(round_survivors, cluster_profile)
@@ -2033,6 +3318,23 @@ def _gate_rank_refill_cluster(
             report(list(judge_eligible))
 
     judge_eligible.sort(key=_selection_score, reverse=True)
+    # `judge_target` as a post-hoc trim rather than the loop break it used to be
+    # (see the single-pass note at the top). Keeping the cap costs nothing and
+    # preserves the invariant the old early exit stood for -- one cluster can
+    # never hand the caller an unbounded judge-eligible list. It trims the WORST
+    # by _selection_score, whereas the loop break kept whatever arrived first, so
+    # if this ever does bind it now bites in the right direction. On every run
+    # measured to date it is a no-op: judge_eligible lands at 5-12 per cluster
+    # against a target of 40.
+    # Recorded as its own counter rather than by overwriting stop_reason. That
+    # field answers "how much of the queue did this cluster get through", and it
+    # is the ONLY evidence that showed the old early exit never fired (17
+    # cluster-runs: absolute_pool_cap 16, pool_exhausted 1, target_reached 0).
+    # Folding a trim into it would destroy exactly the signal needed to re-check
+    # that finding later.
+    judge_target_trimmed = max(0, len(judge_eligible) - judge_target)
+    if judge_target_trimmed:
+        judge_eligible = judge_eligible[:judge_target]
     stats = {
         "examined": examined, "queue_len": len(queue),
         "gate_survivors": len(gate_survivors), "hard_dropped": len(hard_dropped),
@@ -2044,7 +3346,7 @@ def _gate_rank_refill_cluster(
         "off_sector": len(off_sector), "rank_floor_rejected": rank_floor_rejected,
         "hard_gate_dropped": len(hard_gate_failed),
         "judge_eligible": len(judge_eligible), "stop_reason": stop_reason,
-        "backfilled": backfilled,
+        "backfilled": backfilled, "judge_target_trimmed": judge_target_trimmed,
     }
     return judge_eligible, gate_survivors, stats
 
@@ -2166,20 +3468,151 @@ def _filter_by_country(engine, jobs: list[dict], country_codes: list[str]) -> li
     return kept
 
 
-def _filter_by_local_place(jobs: list[dict], place: str) -> list[dict]:
-    """Hard-drop jobs whose location doesn't mention the candidate's city/place.
-    Only active when the profile's location_scope is "local" -- a much tighter
-    filter than the country check, so it's applied on top of it, not instead of
-    it. Unlike _filter_by_country, a blank location is dropped rather than
-    falling back to the snippet/description: a substring match against free
-    text is far more prone to false positives than the country token match, so
-    it needs the stronger signal (an actual location field) to keep a job."""
+def _filter_by_local_place(jobs: list[dict], place: str, radius_miles: int = 0) -> list[dict]:
+    """Hard-drop jobs that are neither in the candidate's stated city nor within
+    `radius_miles` of it. Only active when the profile's location_scope is
+    "local" -- a much tighter filter than the country check, so it's applied on
+    top of it, not instead of it.
+
+    TWO ways in, and a job needs only one:
+
+      * the name match this filter originally was: the candidate's place appears
+        in the listing's location field. Kept verbatim, including its stricter
+        posture (a blank location is dropped rather than falling back to the
+        snippet -- a substring match against free text produces far more false
+        positives than the country token check, so it needs the stronger signal
+        of an actual location field).
+      * within the commute radius by straight-line distance between postcode
+        centroids (services/geo.py).
+
+    The distance half is what makes "Local" usable at all. Name matching alone
+    meant a candidate in Southend saw Southend jobs and NOTHING else -- not the
+    role two towns over, not the one in the next borough -- because the filter
+    could only ask "is this the same string", never "is this near me". That is
+    the gap this whole feature exists to close, and it is why distance is an
+    additional way IN and never a new way out: `radius_miles` <= 0 (the
+    candidate's own "No limit") or an unresolvable location on either side
+    leaves the original name-match behaviour exactly as it was, and no job that
+    passes today can be dropped by this change.
+
+    Note the asymmetry with the rest of the pipeline: an UNRESOLVABLE listing
+    location is dropped here, not kept, because that is what "Local" already
+    did. Everywhere else unknown means no penalty -- see geo.py."""
     if not place:
         return jobs
     needle = place.strip().lower()
     if not needle:
         return jobs
-    return [j for j in jobs if needle in (j.get("location", "") or "").lower()]
+    origin = geo.resolve(place) if radius_miles > 0 else None
+    kept = []
+    for j in jobs:
+        location = (j.get("location", "") or "")
+        if needle in location.lower():
+            kept.append(j)
+            continue
+        if origin is None:
+            continue
+        point = geo.resolve(location)
+        if point is not None and geo.haversine_miles(origin, point) <= radius_miles:
+            kept.append(j)
+    return kept
+
+
+def _annotate_geo(jobs: list[dict], origin_place: str) -> int:
+    """Stamp `_distance_miles` and `_location_label` onto each candidate dict.
+
+    Done ONCE here, over the dicts every later stage shares by reference, rather
+    than at the Role-persist sites: there are two of those (the provisional paint
+    and finalization) and neither has the profile in scope, so threading an
+    origin through both would mean widening two signatures and a third helper
+    for no gain. `_role_location_fields` then just copies, exactly as
+    `_role_date_fields` copies the listing dates.
+
+    Both fields are honestly absent when unknown: no origin, an unresolvable
+    listing location, or a location with no postcode in it leaves the key unset,
+    and the card renders no distance chip and the location string untouched.
+    Returns how many got a distance, for the run log."""
+    resolved = 0
+    origin = geo.resolve(origin_place) if origin_place else None
+    for j in jobs:
+        location = j.get("location", "") or ""
+        label = geo.pretty_location(location)
+        if label:
+            j["_location_label"] = label
+        if origin is None:
+            continue
+        point = geo.resolve(location)
+        if point is None:
+            continue
+        j["_distance_miles"] = round(geo.haversine_miles(origin, point))
+        resolved += 1
+    return resolved
+
+
+def _filter_by_sponsor(jobs: list[dict], enabled: bool) -> tuple[list[dict], dict]:
+    """Keep only listings whose company is on the UK licensed-sponsor register.
+
+    THIS IS THE ONE FILTER IN THE PIPELINE THAT DROPS ON UNKNOWN, and that is
+    deliberate rather than an oversight. Everywhere else -- the country filter,
+    the listing-age tag, the salary floor, the liveness check -- unknown means
+    no penalty, because the cost of wrongly dropping a good role outweighs the
+    cost of carrying a doubtful one. Sponsorship inverts that: a candidate who
+    needs a visa cannot act on a role they can't confirm sponsors, so a short
+    list of confirmed sponsors beats a long list of maybes. Off by default; a
+    candidate who doesn't need it never meets this behaviour.
+
+    What that costs, measured on a live 9,042-row store: ~76% of unique
+    companies do not resolve, and the two structural cases in that 76% are
+    recruitment agencies (the listing names the agency, not the employer who
+    holds the licence) and blank-company aggregator rows. Both are counted
+    separately in the returned stats so the cost stays visible in the run log
+    rather than being inferred from a drop in the totals.
+
+    Returns (kept, stats) rather than just the list because the blank-company
+    count is not derivable afterwards -- those rows are gone."""
+    stats = {"before": len(jobs), "after": len(jobs), "blank_company": 0}
+    if not enabled:
+        return jobs, stats
+
+    from . import sponsors
+
+    kept = []
+    blank = 0
+    for j in jobs:
+        company = (j.get("company") or "").strip()
+        if not company:
+            blank += 1
+            continue
+        if sponsors.is_sponsor(company):
+            kept.append(j)
+    stats["after"] = len(kept)
+    stats["blank_company"] = blank
+    return kept, stats
+
+
+def _role_sponsor_fields(j: dict) -> dict:
+    """sponsor_licensed for a Role row. Three-state on purpose: True/False when
+    there was a company name to check, None when there wasn't -- the card must
+    be able to say "we couldn't tell" rather than render a blank company as a
+    confirmed non-sponsor. Computed for every run, not just when the filter is
+    on, because it is free signal on a card the candidate is deciding from."""
+    company = (j.get("company") or "").strip()
+    if not company:
+        return {"sponsor_licensed": None}
+    from . import sponsors
+
+    return {"sponsor_licensed": sponsors.is_sponsor(company)}
+
+
+def _role_location_fields(j: dict) -> dict:
+    """distance_miles/location_label for a Role row, straight off the job dict's
+    own _distance_miles/_location_label (see _annotate_geo). Pure copy -- an
+    unknown distance stays NULL rather than becoming 0, which would render as
+    "0 miles away" on a card for a listing whose location we couldn't read."""
+    return {
+        "distance_miles": j.get("_distance_miles"),
+        "location_label": j.get("_location_label"),
+    }
 
 
 def _filter_by_salary(jobs: list[dict], salary_floor: int) -> list[dict]:
@@ -2188,19 +3621,30 @@ def _filter_by_salary(jobs: list[dict], salary_floor: int) -> list[dict]:
     and unknown salary always passes through (never hard-dropped on missing data).
     Only the *max* is compared, and only when it's a positive number, so a role
     listing a range whose top end is under the floor is dropped while an
-    unpriced role survives. Note: magnitudes are compared as-is across
-    currencies (GBP/USD/EUR/AUD are close enough for a floor check); this is a
-    coarse guard, not a precise salary match. floor <= 0 disables it entirely."""
+    unpriced role survives. floor <= 0 disables it entirely.
+
+    The comparison is ANNUALISED (services/salary.py) because the candidate's
+    floor is annual and a source's figure need not be. This filter used to
+    compare `salary_max` as-is, which silently assumed every board quoted a
+    yearly number -- JSearch alone returns HOUR/DAY/WEEK/MONTH/YEAR, so a
+    £25/hour role (~£48,750 a year) was hard-dropped for a candidate with a
+    £30,000 floor, at discovery, before anything could look at it.
+
+    Currency is still compared as-is: converting needs a live FX rate this app
+    has no business fetching per search, and GBP/USD/EUR/AUD are close enough
+    that a floor check survives it. That is a known coarseness, not an
+    oversight -- but it is now the ONLY unit assumption left here."""
     if not salary_floor or salary_floor <= 0:
         return jobs
     kept = []
     for j in jobs:
-        smax = j.get("salary_max")
-        try:
-            smax = float(smax) if smax is not None else None
-        except (ValueError, TypeError):
-            smax = None
-        if smax is not None and smax > 0 and smax < salary_floor:
+        # Structured source figures only, never the description -- same reason
+        # as _jobseen_salary_fields. This is a HARD DROP, so a number scraped out
+        # of prose ("270+ locations and 4,000+ employees") would silently delete
+        # real roles at discovery.
+        parsed = _parsed_salary(j, None)
+        annual_max = salary.to_annual(parsed["max"], parsed["period"]) if parsed else None
+        if annual_max is not None and annual_max > 0 and annual_max < salary_floor:
             continue
         kept.append(j)
     return kept
@@ -2631,16 +4075,41 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         funnel["country_filter_raw_after"] = len(raw_jobs)
         emit(f"[pipeline] country filter {country_codes}: {before} -> {len(raw_jobs)} listings")
 
+    # Licensed-sponsor filter, on fresh discovery. Applied here as well as over
+    # the stored candidate pool below for the same reason the country filter is:
+    # the pool comes from `jobs_seen`, which holds rows discovered under earlier
+    # settings, so a store-only pass would let pre-existing rows through and a
+    # discovery-only pass would let the backlog through.
+    sponsor_only = bool(eng_profile.get("visa_sponsor_only"))
+    if sponsor_only:
+        raw_jobs, s = _filter_by_sponsor(raw_jobs, True)
+        funnel["sponsor_filter_raw_before"] = s["before"]
+        funnel["sponsor_filter_raw_after"] = s["after"]
+        funnel["sponsor_filter_raw_blank_company"] = s["blank_company"]
+        emit(f"[pipeline] licensed-sponsor filter: {s['before']} -> {s['after']} "
+             f"listings ({s['blank_company']} dropped for having no company name)")
+
     local_place = eng_profile.get("local_place") or ""
+    # Only enforced at local scope, and only when the Location row is Hard --
+    # commute_hard mirrors local_place's own gate (see snapshot.build_snapshot).
+    commute_miles = (int(eng_profile.get("commute_miles") or 0)
+                     if eng_profile.get("commute_hard") else 0)
     if eng_profile.get("location_scope") == "local" and local_place:
         before = len(raw_jobs)
-        raw_jobs = _filter_by_local_place(raw_jobs, local_place)
-        emit(f"[pipeline] local-place filter ({local_place!r}): {before} -> {len(raw_jobs)} listings")
+        raw_jobs = _filter_by_local_place(raw_jobs, local_place, commute_miles)
+        funnel["commute_miles"] = commute_miles
+        emit(f"[pipeline] local-place filter ({local_place!r}, "
+             f"{f'within {commute_miles} miles' if commute_miles else 'name match only'}): "
+             f"{before} -> {len(raw_jobs)} listings")
 
-    # Salary hard-filter on fresh discovery only (salary isn't persisted on the
-    # JobSeen store, so it can't be re-applied to backlog candidates -- but a
-    # clearly-underpaid fresh listing is dropped here before it ever enters the
-    # store). Unknown salary passes through.
+    # Salary hard-filter on fresh discovery only: a clearly-underpaid listing is
+    # dropped here before it ever enters the store. Unknown salary passes
+    # through. Salary IS persisted on JobSeen now, so this could also run over
+    # the backlog candidates -- deliberately left alone, because that would be a
+    # new hard drop applied to roles the candidate has already been shown, and
+    # the floor is a Soft row by default (config.ENFORCEMENT_DEFAULT). The cheap
+    # gate's salary axis and rank_gate's HARD DOWNGRADE (e) remain the enforcers
+    # for anything already in the store, and they now see the figures too.
     salary_floor = int(eng_profile.get("salary_floor") or 0)
     if salary_floor > 0:
         before = len(raw_jobs)
@@ -2733,11 +4202,36 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         funnel["country_filter_scored_after"] = len(scored)
         emit(f"[pipeline] country filter on candidates {country_codes}: "
              f"{before} -> {len(scored)} rows")
+    if sponsor_only:
+        scored, s = _filter_by_sponsor(scored, True)
+        funnel["sponsor_filter_scored_before"] = s["before"]
+        funnel["sponsor_filter_scored_after"] = s["after"]
+        funnel["sponsor_filter_scored_blank_company"] = s["blank_company"]
+        emit(f"[pipeline] licensed-sponsor filter on candidates: {s['before']} -> "
+             f"{s['after']} rows ({s['blank_company']} with no company name)")
     if eng_profile.get("location_scope") == "local" and local_place:
         before = len(scored)
-        scored = _filter_by_local_place(scored, local_place)
-        emit(f"[pipeline] local-place filter on candidates ({local_place!r}): "
+        scored = _filter_by_local_place(scored, local_place, commute_miles)
+        emit(f"[pipeline] local-place filter on candidates ({local_place!r}, "
+             f"{f'within {commute_miles} miles' if commute_miles else 'name match only'}): "
              f"{before} -> {len(scored)} rows")
+    # Distance + a readable place name for every surviving candidate, stamped on
+    # the dicts the Role-persist sites later copy from (see _annotate_geo). Runs
+    # at EVERY scope, not just local: a distance is information worth showing on
+    # a card even when it isn't filtering anything, and the postcode-to-place
+    # fix has nothing to do with scope at all.
+    n_geo = _annotate_geo(scored, eng_profile.get("origin_place") or "")
+    funnel["distance_resolved"] = n_geo
+    if scored:
+        emit(f"[pipeline] resolved a distance for {n_geo}/{len(scored)} candidate(s)")
+    # An employer-stated closing date that has already passed is a fact, not a
+    # signal to weigh -- drop before anything spends a gate/rank/judge call.
+    scored, n_expired = _drop_expired_candidates(scored)
+    funnel["expired_date_dropped"] = n_expired
+    if n_expired:
+        emit(f"[pipeline] dropped {n_expired} candidate(s) whose stated closing date "
+             f"has already passed")
+
     top_score = scored[0]["embed_score"] if scored else 0.0
     above_primary = sum(1 for j in scored if j["embed_score"] >= RELEVANCE_PRIMARY)
     funnel["scored_total"] = len(scored)
@@ -2750,8 +4244,21 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     scored, n_prescreen = _heuristic_prescreen(scored, eng_profile)
     funnel["heuristic_prescreen_dropped"] = n_prescreen
     if n_prescreen:
-        emit(f"[pipeline] heuristic prescreen dropped {n_prescreen} obvious seniority mismatch(es) "
-             f"before any gate")
+        emit(f"[pipeline] heuristic prescreen dropped {n_prescreen} obvious seniority/"
+             f"placement-year mismatch(es) before any gate")
+    # Facts-on-their-face drops (foreign location, board category page). Runs
+    # after the seniority prescreen and before the queues are cut, so anything it
+    # removes frees an examine slot for a real candidate rather than merely being
+    # rejected later at LLM cost -- see _pool_quality_prescreen for the audit that
+    # motivated it.
+    scored, quality_dropped = _pool_quality_prescreen(scored, eng_profile)
+    for reason, n in quality_dropped.items():
+        funnel[f"pool_quality_dropped_{reason}"] = n
+    n_quality = sum(quality_dropped.values())
+    funnel["pool_quality_dropped"] = n_quality
+    if n_quality:
+        emit(f"[pipeline] pool-quality prescreen dropped {n_quality} candidate(s) before any "
+             f"gate: " + ", ".join(f"{n} {reason}" for reason, n in quality_dropped.items() if n))
     _snap("heuristic_survivors", scored)
 
     skipped_clusters = _clusters_without_fresh_terms(eng_profile, role_clusters)
@@ -3058,6 +4565,13 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                  f"{comp} / {title} x{n}" for (comp, title), n in
                  sorted(decided_hits.items(), key=lambda kv: -kv[1])[:5]))
 
+    # Liveness check immediately before the expensive judge: confirm the
+    # listings still exist rather than paying the strong model to read adverts
+    # for vacancies that closed. Runs against rank_by_cluster (not the allocated
+    # pool) so a dropped row's slot is backfilled by the _fair_allocate below.
+    funnel.update(_verify_listings_alive(engine, db, profile_id, rank_by_cluster))
+    t0 = _lap("verify_liveness", t0)
+
     selected = _fair_allocate(rank_by_cluster, JUDGE_POOL)
     # Now genuinely just dedup + fair-allocate -- the judge-floor top-up round
     # above is timed separately. Expect this to read near-instant.
@@ -3140,12 +4654,19 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # on screen (nothing is waiting on it), it is plain HTTP with no LLM and no
     # browser, and it is bounded by JUDGE_POOL(40) rather than by an examine budget.
     # It also SHRINKS phase 5, since anything enriched now skips the scrape.
-    n_judge_enriched = (_enrich_reed_full_text(engine, db, profile_id, selected)
-                        + _enrich_adzuna_full_text(engine, db, profile_id, selected))
+    #
+    # revalidate=True: the judge is the point where stale cached text would
+    # otherwise be trusted uncritically, so this is also where a judge-pool
+    # candidate whose listing hasn't been directly verified in
+    # LISTING_REVALIDATE_AFTER_DAYS gets one more cheap check -- same call,
+    # same cost when nothing is stale, see _enrich_pre_gate.
+    n_judge_enriched = (_enrich_reed_full_text(engine, db, profile_id, selected, revalidate=True)
+                        + _enrich_adzuna_full_text(engine, db, profile_id, selected, revalidate=True))
     funnel["judge_pool_enriched"] = n_judge_enriched
     if n_judge_enriched:
         emit(f"[pipeline] enriched {n_judge_enriched} judge-pool candidate(s) with their full "
-             f"description before final review (missed by the pre-gate caps)")
+             f"description before final review (missed by the pre-gate caps, or reverified "
+             f"after going stale)")
 
     scrape_enabled = get_full_scrape_enabled(db)
     if not scrape_enabled:
@@ -3398,6 +4919,18 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # overlap per cluster (see _scrape_then_judge), so there is no longer a
     # wall-clock boundary between them to measure.
     t0 = _lap("scrape+judge", t0)
+
+    # Last gate before anything is written: confirm the picks still exist. The
+    # reserves are every judged pick that lost the FINAL_PICKS cut, in the same
+    # grade order, so a dropped corpse's slot is refilled by the next-best real
+    # role rather than simply vanishing.
+    _progress(db, run, "Checking the top picks are still live…")
+    reserves = [p for by_cluster in (*(graded_by_cluster[g] for g in _VERDICT_GRADES),
+                                     ungraded_by_cluster)
+                for picks in by_cluster.values() for p in picks]
+    final, verify_funnel = await _verify_final_picks(engine, db, profile_id, final, reserves)
+    funnel.update(verify_funnel)
+    t0 = _lap("verify_final_picks", t0)
     funnel["final_picks"] = len(final)
     _snap("final_picks", final)
     # Per-cluster funnel, carried out alongside the stage samples (see _snap's
@@ -3730,11 +5263,17 @@ def _upsert_provisional_rows(db: Session, profile_id: int, run: SearchRun,
             company=j.get("company"),
             location=j.get("location"),
             url=j.get("url"),
-            salary_text=_salary_text(j),
+            **_role_salary_fields(j, _salary_text(j)),
             source=j.get("board"),
             fit_rank=pos,
             provisional_stage=stage,
+            **_role_date_fields(j),
+            **_role_location_fields(j),
+            **_role_sponsor_fields(j),
         )
+        # Deliberately no last_verified_at here: a provisional card has NOT been
+        # liveness-checked (that happens once, over the final picks), and writing
+        # a timestamp would claim a check that never ran.
         # No rank_score at the embedding stage -- nothing has scored this job yet,
         # and writing the 50.0 default would render a fabricated "Fit estimate
         # 50/100" chip on a card whose whole point is that no AI has seen it.
@@ -3918,6 +5457,16 @@ def _resolve_leftover_provisional(db: Session, row: Role, marker: str | None = N
         row.status = "deleted"
         row.provisional = False
         row.provisional_stage = None
+        # Clear the provisional fit_rank, exactly as every other branch above
+        # does. Omitting it here was a real, user-visible bug: a mid-run
+        # "Verifying…" card carries a provisional rank assigned by its position
+        # in the interim top-N, and that numbering is INDEPENDENT of the final
+        # picks' 1..N. A leftover keeping its stale rank therefore collides with
+        # a genuine pick -- a live run showed two different cards both badged
+        # "3" (a judge-REJECTED Revolut listing sitting next to the real rank-3
+        # pick), because this branch left fit_rank=3 on a soft-deleted row while
+        # clearing the flags that would otherwise have filed it elsewhere.
+        row.fit_rank = None
 
 
 def _cleanup_provisional_roles(db: Session, run_id: int) -> None:
@@ -4066,8 +5615,10 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 tags=_derive_tags(entry, snap["skills"], snap["seniority_label"]),
                 # The judge read the salary off the full JD; the regex only ever
                 # saw whatever text was to hand. Prefer the judge, fall back to
-                # the regex for a pick it had nothing to say about.
-                salary_text=(entry.get("role_salary") or "").strip() or _salary_text(entry),
+                # the regex for a pick it had nothing to say about. Whichever
+                # wins is then parsed into the comparable columns alongside it.
+                **_role_salary_fields(
+                    entry, (entry.get("role_salary") or "").strip() or _salary_text(entry)),
                 source=entry.get("board"),
                 fit_rank=rank,
                 ai_analysis=_compose_analysis(entry),
@@ -4075,6 +5626,15 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 work_style=(entry.get("work_style") or "").strip() or None,
                 seniority_level=(entry.get("role_seniority") or "").strip() or None,
                 deadline_text=(entry.get("deadline") or "").strip() or None,
+                **_role_date_fields(entry),
+                **_role_location_fields(entry),
+                **_role_sponsor_fields(entry),
+                # Stamped by _verify_final_picks just before this. Absent only if
+                # verification was disabled or the check couldn't reach a verdict
+                # even through the browser -- in which case the card shows no
+                # "checked" chip rather than claiming one.
+                last_verified_at=_parse_iso(entry.get("_verified_at"))
+                if entry.get("_verified_at") else None,
             )
             row = provisional_by_id.pop(ident, None)
             if row is not None:

@@ -703,6 +703,86 @@ export default function SettingsPage() {
                     );
                   })()}
                 </div>
+                {(runFunnel.heuristic_prescreen_dropped > 0 ||
+                  runFunnel.pool_quality_dropped > 0) && (
+                  <div className="annotation" style={{ marginTop: 14 }}>
+                    <b>Free pre-filters.</b> Removed before any AI call, so the examine
+                    budget goes to candidates that could actually become a pick:{" "}
+                    {runFunnel.heuristic_prescreen_dropped > 0 && (
+                      <>
+                        {runFunnel.heuristic_prescreen_dropped} on seniority or a student
+                        placement year
+                      </>
+                    )}
+                    {runFunnel.heuristic_prescreen_dropped > 0 &&
+                      runFunnel.pool_quality_dropped > 0 &&
+                      ", "}
+                    {runFunnel.pool_quality_dropped_foreign_location > 0 && (
+                      <>
+                        {runFunnel.pool_quality_dropped_foreign_location} located outside
+                        your country
+                      </>
+                    )}
+                    {runFunnel.pool_quality_dropped_foreign_location > 0 &&
+                      runFunnel.pool_quality_dropped_junk_listing > 0 &&
+                      ", "}
+                    {runFunnel.pool_quality_dropped_junk_listing > 0 && (
+                      <>
+                        {runFunnel.pool_quality_dropped_junk_listing} job-board category
+                        page{runFunnel.pool_quality_dropped_junk_listing === 1 ? "" : "s"}{" "}
+                        with no posting behind them
+                      </>
+                    )}
+                    .
+                  </div>
+                )}
+                {(runFunnel.final_verify_checked > 0 || runFunnel.verify_checked > 0) && (
+                  <div className="annotation" style={{ marginTop: 14 }}>
+                    <b>Listing liveness.</b> Every pick shown to you was fetched and
+                    confirmed to still exist before it was written:{" "}
+                    {runFunnel.final_verify_checked} checked,{" "}
+                    <b>{runFunnel.final_verify_dead} found dead</b> and replaced with{" "}
+                    {runFunnel.final_verify_backfilled}{" "}
+                    {runFunnel.final_verify_backfilled === 1 ? "reserve" : "reserves"}.
+                    {runFunnel.final_verify_unverifiable > 0 && (
+                      <>
+                        {" "}{runFunnel.final_verify_unverifiable} host
+                        {runFunnel.final_verify_unverifiable === 1 ? "" : "s"} refused a
+                        plain request ({runFunnel.final_verify_browser} retried through the
+                        browser); anything still unanswerable is kept, since
+                        &ldquo;couldn&rsquo;t check&rdquo; is not &ldquo;closed&rdquo;.
+                      </>
+                    )}
+                    {runFunnel.verify_checked > 0 && (
+                      <>
+                        {" "}Earlier, {runFunnel.verify_dead} of {runFunnel.verify_checked}{" "}
+                        candidates were dropped as dead before the expensive judge read
+                        them.
+                      </>
+                    )}
+                  </div>
+                )}
+                {runFunnel.sponsor_filter_raw_before > 0 && (
+                  <div className="annotation" style={{ marginTop: 14 }}>
+                    <b>Visa sponsorship filter.</b> Kept only employers on the Home Office
+                    register: {runFunnel.sponsor_filter_raw_after} of{" "}
+                    {runFunnel.sponsor_filter_raw_before} newly discovered listings, and{" "}
+                    {runFunnel.sponsor_filter_scored_after} of{" "}
+                    {runFunnel.sponsor_filter_scored_before} candidates from the store.{" "}
+                    {runFunnel.sponsor_filter_raw_blank_company +
+                      runFunnel.sponsor_filter_scored_blank_company >
+                      0 && (
+                      <>
+                        {runFunnel.sponsor_filter_raw_blank_company +
+                          runFunnel.sponsor_filter_scored_blank_company}{" "}
+                        of those were dropped only because the listing named no employer to
+                        check.{" "}
+                      </>
+                    )}
+                    This is the one filter that drops on unknown, so a role advertised by a
+                    recruitment agency goes too.
+                  </div>
+                )}
                 {runFunnel.token_usage?.length > 0 && (
                   <>
                     <div className="annotation" style={{ marginTop: 14 }}>

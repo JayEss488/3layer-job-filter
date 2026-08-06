@@ -2,8 +2,9 @@
 
 import { useState } from "react";
 
+import { formatSalary, useSalaryPeriod } from "@/lib/salary";
 import { VERDICT_LABEL } from "@/lib/types";
-import type { Role, RoleVerdict } from "@/lib/types";
+import type { Role, RoleVerdict, SalaryPeriod } from "@/lib/types";
 
 interface Props {
   role: Role;
@@ -95,19 +96,112 @@ function parseAnalysis(text: string): Analysis {
   return out;
 }
 
-function factChips(role: Role): string[] {
-  // Only what the AI actually read off the listing — a null means the listing
-  // was silent, and no chip is better than a guessed one. While provisional,
-  // the cheap rank stage's estimate is the only fit signal there is — surface
-  // it honestly as an estimate (it disappears when the real verdict lands).
-  // The estimate shows while provisional AND on a retained "quick-scored only"
-  // row (provisional false, stage still "rank") -- there it is the only fit
-  // signal that role will ever have, so hiding it would leave a bare card.
+/** Mirrors full_auto._humanise_days: plain day count under 2 months, else months. */
+function humaniseDays(days: number): string {
+  const months = Math.floor(days / 30);
+  return months >= 2 ? `${months} months` : `${days} day${days === 1 ? "" : "s"}`;
+}
+
+/**
+ * Single age/closing-date chip, pure date math off Role.posted_at/expires_at/
+ * posted_at_approx -- no AI involved, same fields the pipeline already carries
+ * for its own prompts (full_auto._listing_age_tag), just finally rendered.
+ * Closing-date info takes priority when it's actually actionable (passed or
+ * imminent); otherwise falls back to posting age. Null on both means the
+ * source stated no date at all, which is common and must render as no chip,
+ * never a guessed one.
+ */
+function ageChip(role: Role): string | null {
+  const now = Date.now();
+  if (role.expires_at) {
+    const daysLeft = Math.floor((new Date(role.expires_at).getTime() - now) / 86400000);
+    if (daysLeft < 0) return "Closing date passed";
+    if (daysLeft <= 7) return `Closes in ${daysLeft} day${daysLeft === 1 ? "" : "s"}`;
+  }
+  if (role.posted_at) {
+    const daysAgo = Math.floor((now - new Date(role.posted_at).getTime()) / 86400000);
+    if (daysAgo < 0) return null; // clock skew or a future-dated source value -- say nothing rather than guess
+    const humanised = humaniseDays(daysAgo);
+    if (role.posted_at_approx) {
+      // Greenhouse etc.: this is the board's last-updated time, not a stated
+      // posting date -- must never claim "posted", see Role.posted_at_approx.
+      return daysAgo === 0 ? "Updated today" : `Updated ~${humanised} ago`;
+    }
+    return daysAgo === 0 ? "Posted today" : `Posted ${humanised} ago`;
+  }
+  return null;
+}
+
+/**
+ * Straight-line distance from the candidate's stated place, when it's known.
+ *
+ * Null distance means the listing's location couldn't be resolved (or the
+ * candidate has stated no place) — the common case, and it renders as no chip.
+ * That is deliberately NOT the same as "far": see services/geo.py.
+ *
+ * 0 is rendered as "Nearby" rather than "0 miles away", because outcode
+ * centroids can't tell same-town from same-street and shouldn't pretend to.
+ */
+function distanceChip(role: Role): string | null {
+  const miles = role.distance_miles;
+  if (miles == null) return null;
+  if (miles <= 1) return "Nearby";
+  return `${miles} miles away`;
+}
+
+/**
+ * "Checked live" — this exact listing was fetched and confirmed to still exist
+ * just before it was shown (engine._verify_final_picks).
+ *
+ * Only ever renders when the check actually ran and answered. Null covers three
+ * different cases that all mean the same thing to the reader — a provisional
+ * card, a row from a run predating the check, and a listing whose host refused
+ * to answer even through the browser — and in all three the honest output is no
+ * chip, never a claim.
+ *
+ * Deliberately does NOT age out into "checked 3 days ago": there is no post-run
+ * re-check, so a stale timestamp would be reporting when the app last looked
+ * rather than anything about the vacancy. Beyond a day it simply stops showing.
+ */
+function verifiedChip(role: Role): string | null {
+  if (!role.last_verified_at || role.provisional) return null;
+  const hours = (Date.now() - new Date(role.last_verified_at).getTime()) / 3600000;
+  if (hours < 0 || hours >= 24) return null;
+  return "Checked live";
+}
+
+/**
+ * Licensed visa sponsor, per the Home Office register. Only ever shown for a
+ * positive match: false means "not on the register", which for an agency-posted
+ * or vaguely-named listing is not the same as "does not sponsor", and null means
+ * there was no employer name to check at all. Neither earns a chip — an absent
+ * badge is correctly read as "unknown", a "Not a sponsor" badge would not be.
+ */
+function sponsorChip(role: Role): string | null {
+  return role.sponsor_licensed === true ? "Visa sponsor" : null;
+}
+
+function factChips(role: Role, salaryPeriod: SalaryPeriod): string[] {
+  // Mostly what the AI actually read off the listing — a null means the
+  // listing was silent, and no chip is better than a guessed one. While
+  // provisional, the cheap rank stage's estimate is the only fit signal there
+  // is — surface it honestly as an estimate (it disappears when the real
+  // verdict lands). The estimate shows while provisional AND on a retained
+  // "quick-scored only" row (provisional false, stage still "rank") -- there
+  // it is the only fit signal that role will ever have, so hiding it would
+  // leave a bare card. ageChip is the one exception: pure date math off the
+  // source's own posted_at/expires_at, no AI involved — see ageChip above.
   return [
     role.rank_score != null && (role.provisional || role.provisional_stage === "rank")
       ? `Fit estimate ${role.rank_score}/100`
       : null,
-    role.salary_text,
+    ageChip(role),
+    verifiedChip(role),
+    sponsorChip(role),
+    distanceChip(role),
+    // Normalised into the user's chosen unit where the backend could parse it,
+    // falling back to whatever the employer wrote when it couldn't.
+    formatSalary(role, salaryPeriod),
     role.work_style,
     role.seniority_level,
     role.deadline_text ? `Apply by ${role.deadline_text}` : null,
@@ -124,7 +218,13 @@ export function RoleCard({
   indentActions = false,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
-  const companyLine = [role.company, role.location].filter(Boolean).join(" — ");
+  const salaryPeriod = useSalaryPeriod();
+  // location_label is the readable form of a location the source gave as a raw
+  // postcode ("B706AW" -> "Sandwell"). Null on most rows, where `location` is
+  // already a place name and needs no help.
+  const companyLine = [role.company, role.location_label || role.location]
+    .filter(Boolean)
+    .join(" — ");
   const a = role.ai_analysis ? parseAnalysis(role.ai_analysis) : null;
   const hasNewSections =
     !!a &&
@@ -139,7 +239,7 @@ export function RoleCard({
       a.applyHighlights.length > 0 ||
       a.aiReasoning.length > 0);
   const hasBody = !!a && (a.notes.length > 0 || a.qualificationVerdict.length > 0 || hasDetail);
-  const facts = factChips(role);
+  const facts = factChips(role, salaryPeriod);
   const verdict = role.verdict as RoleVerdict | null | undefined;
 
   return (

@@ -158,9 +158,26 @@ class RoleOut(ORMModel):
     title: str
     company: Optional[str] = None
     location: Optional[str] = None
+    # Readable stand-in for `location` when the source gave a raw postcode, and
+    # straight-line miles from the candidate's stated place. Both null far more
+    # often than not -- see models.Role.
+    location_label: Optional[str] = None
+    distance_miles: Optional[int] = None
+    # Three-state: True/False once checked, None when the listing named no
+    # employer to check against the register. See models.Role.
+    sponsor_licensed: Optional[bool] = None
+    # When this listing was last directly confirmed to still exist.
+    last_verified_at: Optional[datetime] = None
     url: Optional[str] = None
     tags: Optional[Any] = None
     salary_text: Optional[str] = None
+    # salary_text parsed into comparable numbers (services/salary.py), in
+    # salary_period's units and NOT annualised. All null together when nothing
+    # parseable was stated, in which case salary_text is what the card shows.
+    salary_min: Optional[float] = None
+    salary_max: Optional[float] = None
+    salary_period: Optional[str] = None
+    salary_currency: Optional[str] = None
     source: Optional[str] = None
     fit_rank: Optional[int] = None
     rank_score: Optional[int] = None
@@ -171,10 +188,14 @@ class RoleOut(ORMModel):
     work_style: Optional[str] = None
     seniority_level: Optional[str] = None
     deadline_text: Optional[str] = None
+    posted_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    posted_at_approx: Optional[bool] = None
     status: str
     application_status: Optional[str] = None
     applied_at: Optional[datetime] = None
     created_at: datetime
+    updated_at: datetime
 
 
 class ApplicationStatusIn(BaseModel):

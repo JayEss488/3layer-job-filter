@@ -92,6 +92,52 @@ class RunFunnelOut(BaseModel):
     decided_family_keys: int = 0         # saved/applied families this run checked against
     decided_family_suppressed: int = 0   # listings matching one of them
     decided_family_shadow: bool = True   # True = counted only, nothing withheld
+    # Listing liveness (engine.py::_verify_listings_alive) -- one plain HTTP GET
+    # per judge-pool candidate we've never read, immediately before the
+    # expensive model. verify_dead is the headline: those are listings the judge
+    # would otherwise have graded, and the user would have clicked through to a
+    # closed vacancy. verify_enriched counts rows that gained real text/dates
+    # from the same fetch, free.
+    verify_checked: int = 0
+    verify_dead: int = 0
+    verify_unverifiable: int = 0         # host refused to answer -- NOT known dead
+    verify_unverifiable_dropped: int = 0 # unverifiable AND a mirror AND no text
+    verify_enriched: int = 0
+    # Final-pick liveness (engine.py::_verify_final_picks) -- the guarantee
+    # behind the results page, run after the judge and before any Role row is
+    # written. Distinct from the pass above: that one rations fetches across the
+    # rank pool and skips anything already carrying text, this one checks EVERY
+    # pick unconditionally. final_verify_dead is the number of dead listings the
+    # user would otherwise have clicked through to; final_verify_browser counts
+    # picks a plain GET couldn't answer for that were escalated to the headless
+    # browser.
+    final_verify_checked: int = 0
+    final_verify_dead: int = 0
+    final_verify_unverifiable: int = 0
+    final_verify_browser: int = 0
+    final_verify_backfilled: int = 0     # replacements pulled in for dropped picks
+    # Licensed visa-sponsor filter (engine.py::_filter_by_sponsor), only non-zero
+    # when the profile has the preference on. THE ONE FILTER THAT DROPS ON
+    # UNKNOWN -- _blank_company counts rows dropped purely for naming no
+    # employer, which is the cost of that choice made visible.
+    sponsor_filter_raw_before: int = 0
+    sponsor_filter_raw_after: int = 0
+    sponsor_filter_raw_blank_company: int = 0
+    sponsor_filter_scored_before: int = 0
+    sponsor_filter_scored_after: int = 0
+    sponsor_filter_scored_blank_company: int = 0
+    expired_date_dropped: int = 0        # employer's stated closing date already passed
+    # Free, LLM-free pool-quality drops applied at pool admission
+    # (engine.py::_heuristic_prescreen / _pool_quality_prescreen). Broken out by
+    # reason rather than totalled, because a filter that removes candidates
+    # before any model sees them is only safe to keep while its cost stays
+    # attributable: if one of these starts eating a large share, the number
+    # should say WHICH one. A live audit found 28% of one run's 320-candidate
+    # examine budget going to candidates in these categories.
+    heuristic_prescreen_dropped: int = 0     # seniority mismatch or placement-year
+    pool_quality_dropped: int = 0            # total of the two below
+    pool_quality_dropped_foreign_location: int = 0
+    pool_quality_dropped_junk_listing: int = 0
     shown: int = 0                       # final_picks
     examined: int = 0                    # rank_scored -- total examined by the cheap+mid gates
     # final_judge / examined -- a coarse "how niche is this profile" gauge, not
@@ -350,6 +396,30 @@ def get_run_funnel(
         decided_family_keys=counts.get("decided_family_keys", 0),
         decided_family_suppressed=counts.get("decided_family_suppressed", 0),
         decided_family_shadow=bool(counts.get("decided_family_shadow", True)),
+        verify_checked=counts.get("verify_checked", 0),
+        verify_dead=counts.get("verify_dead", 0),
+        verify_unverifiable=counts.get("verify_unverifiable", 0),
+        verify_unverifiable_dropped=counts.get("verify_unverifiable_dropped", 0),
+        verify_enriched=counts.get("verify_enriched", 0),
+        final_verify_checked=counts.get("final_verify_checked", 0),
+        final_verify_dead=counts.get("final_verify_dead", 0),
+        final_verify_unverifiable=counts.get("final_verify_unverifiable", 0),
+        final_verify_browser=counts.get("final_verify_browser", 0),
+        final_verify_backfilled=counts.get("final_verify_backfilled", 0),
+        sponsor_filter_raw_before=counts.get("sponsor_filter_raw_before", 0),
+        sponsor_filter_raw_after=counts.get("sponsor_filter_raw_after", 0),
+        sponsor_filter_raw_blank_company=counts.get("sponsor_filter_raw_blank_company", 0),
+        sponsor_filter_scored_before=counts.get("sponsor_filter_scored_before", 0),
+        sponsor_filter_scored_after=counts.get("sponsor_filter_scored_after", 0),
+        sponsor_filter_scored_blank_company=counts.get(
+            "sponsor_filter_scored_blank_company", 0),
+        expired_date_dropped=counts.get("expired_date_dropped", 0),
+        heuristic_prescreen_dropped=counts.get("heuristic_prescreen_dropped", 0),
+        pool_quality_dropped=counts.get("pool_quality_dropped", 0),
+        pool_quality_dropped_foreign_location=counts.get(
+            "pool_quality_dropped_foreign_location", 0),
+        pool_quality_dropped_junk_listing=counts.get(
+            "pool_quality_dropped_junk_listing", 0),
         shown=counts.get("final_picks", 0),
         examined=examined,
         filtering_ratio=round(shown_to_judge / examined, 4) if examined else None,

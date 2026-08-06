@@ -42,3 +42,6 @@ beta_credentials_prod.txt
 /analyze_rank_gate.py
 /migrate_embedding_format.py
 /test_pipeline_offline.py
+
+# Dev-only crawl cache for scripts/gen_uk_geo.py (the generated module is committed)
+scripts/.uk_geo_crawl_cache.json

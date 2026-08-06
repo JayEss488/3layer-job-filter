@@ -55,6 +55,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate_columns()
     _migrate_family_tier_vocabulary()
+    _migrate_soft_dup_key()
 
 
 def _migrate_columns():
@@ -77,6 +78,11 @@ def _migrate_columns():
             ("gate_signature", "TEXT"),
             ("posted_at_approx", "BOOLEAN"),
             ("seen_days", "INTEGER"),
+            ("last_verified_at", "DATETIME"),
+            ("salary_min", "FLOAT"), ("salary_max", "FLOAT"),
+            ("salary_period", "TEXT"), ("salary_currency", "TEXT"),
+            ("seen_dates", "TEXT"), ("dead_at", "DATETIME"), ("repost_key", "TEXT"),
+            ("soft_dup_key", "TEXT"),
         ],
         "company_ats": [("keyword", "TEXT")],
         "search_runs": [("phase_timings", "TEXT"), ("funnel_counts", "TEXT"), ("cancel_requested", "BOOLEAN"),
@@ -84,7 +90,12 @@ def _migrate_columns():
         "roles": [("source", "TEXT"), ("search_run_id", "INTEGER"), ("verdict", "TEXT"),
                    ("work_style", "TEXT"), ("seniority_level", "TEXT"), ("deadline_text", "TEXT"),
                    ("rank_score", "INTEGER"), ("provisional", "BOOLEAN DEFAULT 0"),
-                   ("provisional_stage", "TEXT")],
+                   ("provisional_stage", "TEXT"), ("posted_at", "DATETIME"),
+                   ("expires_at", "DATETIME"), ("posted_at_approx", "BOOLEAN"),
+                   ("distance_miles", "INTEGER"), ("location_label", "TEXT"),
+                   ("sponsor_licensed", "BOOLEAN"), ("last_verified_at", "DATETIME"),
+                   ("salary_min", "FLOAT"), ("salary_max", "FLOAT"),
+                   ("salary_period", "TEXT"), ("salary_currency", "TEXT")],
         "profiles": [("cv_text", "TEXT"), ("cv_summary", "TEXT"), ("intent_text", "TEXT"),
                      ("search_feedback", "TEXT")],
         "profile_attributes": [("proficiency", "TEXT"), ("evidence_origin", "TEXT"),
@@ -99,6 +110,58 @@ def _migrate_columns():
             if name not in existing:
                 with engine.begin() as conn:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}"))
+
+
+def _migrate_soft_dup_key():
+    """Backfill + index jobs_seen.soft_dup_key, the normalized company+title key
+    the discovery upsert's soft-duplicate lookup keys on (see
+    engine._soft_dup_key / _find_soft_duplicate).
+
+    Why this exists at all: the lookup used to pre-filter with
+    `lower(company) = x OR lower(company) LIKE x || '%'` and hydrate FULL JobSeen
+    entities for every match. On a real store that returned ~818 rows per call --
+    each carrying an 8KB base64 embedding -- and it ran once per newly-discovered
+    identity (992 of them in a measured run). Profiling put 45s of a 61s
+    _upsert_discovered inside those queries alone, which is most of what the
+    "embed" phase timing actually measures. Keyed equality on an indexed column
+    took the same workload from 53.6s to 0.34s.
+
+    A plain index on lower(company) is NOT a substitute (measured 81.4s -> 77.8s):
+    the cost is the VOLUME of rows a common company prefix returns, not scan time.
+
+    The key is also strictly more correct than the SQL it replaces. `_norm_company`
+    strips leading/trailing whitespace on the incoming side, but SQL could not
+    strip it on the stored side, so a source that emits "\\t ZENOVO LTD" never
+    matched its own earlier row. Computing both sides in Python fixes that: on a
+    400-row sample the two agreed 397 times and all 3 differences were duplicates
+    the old query MISSED.
+
+    Idempotent: rows already carrying a key are left alone, so this is a no-op
+    after the first boot. Backfill measured 1.4s for 9,042 rows, and adds no
+    measurable file size."""
+    from sqlalchemy import inspect, text
+    from app.services.engine import _soft_dup_key
+
+    insp = inspect(engine)
+    if not insp.has_table("jobs_seen"):
+        return
+    if "soft_dup_key" not in {c["name"] for c in insp.get_columns("jobs_seen")}:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_jobs_seen_soft_dup "
+            "ON jobs_seen (profile_id, soft_dup_key)"
+        ))
+        rows = conn.execute(text(
+            "SELECT id, title, company FROM jobs_seen WHERE soft_dup_key IS NULL"
+        )).fetchall()
+        if not rows:
+            return
+        conn.execute(
+            text("UPDATE jobs_seen SET soft_dup_key = :k WHERE id = :i"),
+            [{"k": _soft_dup_key(company, title), "i": rid}
+             for rid, title, company in rows],
+        )
 
 
 def _migrate_family_tier_vocabulary():

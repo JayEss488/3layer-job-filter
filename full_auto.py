@@ -166,15 +166,34 @@ ADZUNA_DETAIL_ENRICH_ENABLED = os.getenv("ADZUNA_DETAIL_ENRICH_ENABLED", "true")
 ADZUNA_DETAIL_MAX_PER_RUN = int(os.getenv("ADZUNA_DETAIL_MAX_PER_RUN", "80"))
 ADZUNA_DETAIL_MAX_WORKERS = int(os.getenv("ADZUNA_DETAIL_MAX_WORKERS", "3"))
 
-# Pages fetched per (source, term) by gather_jobs' per-run discovery, cut from
-# the fetchers' own pages=3 default (which the legacy standalone path keeps).
-# One page still returns up to 100 (Reed) / 50 (Adzuna) results per term, and a
-# measured live run discovered 7,800 raw listings of which only ~100 were ever
-# examined past the embedding stage -- pages 2-3 were pure fetch latency. The
-# fetchers emit a "page cap hit" note whenever the last page came back full, so
-# the coverage trade-off stays visible per term.
-REED_PAGES_PER_TERM = int(os.getenv("REED_PAGES_PER_TERM", "1"))
-ADZUNA_PAGES_PER_TERM = int(os.getenv("ADZUNA_PAGES_PER_TERM", "1"))
+# Pages fetched per (source, term) by gather_jobs' per-run discovery. One page
+# returns up to 100 (Reed) / 50 (Adzuna) results per term. The fetchers emit a
+# "page cap hit" note whenever the last page came back full, so the coverage
+# trade-off stays visible per term.
+#
+# These were cut to 1 on the measurement that a live run discovered 7,800 raw
+# listings of which only ~100 were ever examined past the embedding stage,
+# making pages 2-3 pure fetch latency in front of first paint. They are back at
+# the fetchers' own pages=3 default because two things changed: RANK_EXAMINE_
+# BUDGET is now 320 rather than 40-80, so the deeper pages have somewhere to go;
+# and across runs Reed and Adzuna are where most strongly-ranked picks actually
+# come from, so depth on these two specifically is worth more than depth
+# anywhere else.
+#
+# The cost is real and lands in the worst place -- discovery sits before the
+# first "early matches" paint. What keeps it bounded is that gather_jobs fans
+# out one pool task per (source, term), so 3 pages is 3 sequential HTTP calls
+# inside ONE slot of the 12-wide pool, not 3x the wall clock. If time-to-first-
+# card regresses, these two env vars are the knob, not the examine budget.
+REED_PAGES_PER_TERM = int(os.getenv("REED_PAGES_PER_TERM", "3"))
+ADZUNA_PAGES_PER_TERM = int(os.getenv("ADZUNA_PAGES_PER_TERM", "3"))
+# Deeper still when the licensed-sponsor filter is on. That filter keeps ~10% of
+# rows (see services/sponsors.py), so the pool behind it has to be correspondingly
+# deeper or a profile that needs sponsorship gets a near-empty results page.
+REED_PAGES_PER_TERM_SPONSOR = int(os.getenv("REED_PAGES_PER_TERM_SPONSOR", "5"))
+ADZUNA_PAGES_PER_TERM_SPONSOR = int(os.getenv("ADZUNA_PAGES_PER_TERM_SPONSOR", "5"))
+# Left at 1: USAJobs self-gates to nothing outside the US, so depth here buys
+# nothing for the profiles this change is about.
 USAJOBS_PAGES_PER_TERM = int(os.getenv("USAJOBS_PAGES_PER_TERM", "1"))
 
 DEBUG_SAVE_RAW = True
@@ -681,6 +700,12 @@ def fetch_reed(query: str, location: str = "United Kingdom", country_code: str =
                 "location": job.get("locationName", ""),
                 "salary_min": job.get("minimumSalary"),
                 "salary_max": job.get("maximumSalary"),
+                # Reed is UK-only, so the currency is never in doubt. It carries
+                # no period field at all and returns an hourly rate for hourly
+                # roles in the same numbers as an annual one for salaried roles,
+                # so the period is deliberately left unset for
+                # services/salary.py to infer from magnitude.
+                "salary_currency": "GBP",
                 "snippet": job.get("jobDescription", ""),
                 "posted_at": _uk_date_to_iso(job.get("date")),
                 "expires_at": _uk_date_to_iso(job.get("expirationDate")),
@@ -771,15 +796,28 @@ def _adzuna_detail_url(url: str) -> str | None:
     return f"https://{host}/details/{ad_id}" if host else None
 
 
-def _adzuna_description_from_html(page: str) -> str:
-    """Pull the JobPosting description out of an Adzuna detail page.
+def _jobposting_from_html(page: str) -> dict:
+    """Pull the schema.org JobPosting description (+ datePosted/validThrough,
+    when present) out of any HTML page that publishes one.
+
+    Written for Adzuna's detail pages, but there is nothing Adzuna-specific in
+    it -- JobPosting is a public schema every board that wants to be indexed by
+    Google for Jobs publishes, so the same reader serves the listing-liveness
+    verification pass too (see engine._verify_listings_alive), where
+    validThrough is the one FORWARD-looking expiry signal available without
+    asking the employer.
 
     Read from the page's JSON-LD rather than by scraping its rendered markup: the
     schema.org block is a stable contract the site maintains for search engines,
     while the surrounding HTML is ordinary site chrome that redesigns freely. It
     also arrives already scoped to THIS posting, so none of the board's "similar
     jobs" list can leak in -- the exact contamination the final judge's SCOPE OF
-    EACH POSTING'S TEXT rule exists to warn about."""
+    EACH POSTING'S TEXT rule exists to warn about.
+
+    datePosted/validThrough ride along in the SAME block already being parsed for
+    description -- free to read, no extra fetch. Adzuna's own search API supplies
+    `created` (-> posted_at) but never an expiry, so validThrough is the only
+    source of expires_at this pipeline has for Adzuna at all."""
     for m in re.finditer(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>',
                          page or "", re.S | re.I):
         try:
@@ -790,12 +828,23 @@ def _adzuna_description_from_html(page: str) -> str:
             if isinstance(item, dict) and item.get("@type") == "JobPosting":
                 text = _strip_html(item.get("description") or "")
                 if text:
-                    return text
-    return ""
+                    return {
+                        "description": text,
+                        "posted_at": _loose_date_to_iso(item.get("datePosted")),
+                        "expires_at": _loose_date_to_iso(item.get("validThrough")),
+                    }
+    return {}
 
 
-def fetch_adzuna_details(urls: List[str], dead_out: set | None = None) -> Dict[str, str]:
-    """Adzuna listing URL -> full plain-text description, for the ones that resolved.
+# Kept so fetch_adzuna_details and anything else reading the old name is
+# untouched by the rename -- the function was never Adzuna-specific.
+_adzuna_description_from_html = _jobposting_from_html
+
+
+def fetch_adzuna_details(urls: List[str], dead_out: set | None = None) -> Dict[str, dict]:
+    """Adzuna listing URL -> {"text", "posted_at", "expires_at"}, for the ones that
+    resolved (a key is only present at all when a description was actually found;
+    posted_at/expires_at inside it may still individually be None).
 
     The Adzuna counterpart to fetch_reed_details -- see ADZUNA_DETAIL_ENRICH_ENABLED
     for why this exists and why it's throttled harder. Keyed by the ORIGINAL url the
@@ -809,10 +858,17 @@ def fetch_adzuna_details(urls: List[str], dead_out: set | None = None) -> Dict[s
     limited out of DISCOVERY (which shares this host) would cost far more than the
     text is worth.
 
-    `dead_out`, when given, collects the URLs whose detail page came back 404/410 --
-    see fetch_reed_details for the reasoning. 429 is pointedly excluded here: this
-    host rate-limits aggressively and a throttled response says nothing whatever
-    about whether the posting still exists."""
+    `dead_out`, when given, collects the URLs whose detail page proves the listing is
+    gone -- three signals, all free on a fetch already being made: a 404/410 from the
+    detail endpoint itself (see fetch_reed_details for the reasoning; 429 is pointedly
+    excluded, this host rate-limits aggressively and a throttle says nothing about
+    whether the posting exists); a JSON-LD validThrough date that has already passed
+    (the board's own stated closing date -- structured, no text-pattern guessing); or
+    the page's own rendered text matching the (now board-chrome-aware) expired-listing
+    phrasing. That last one exists because a closed Adzuna listing's JSON-LD often
+    keeps serving its original description for SEO -- the description text alone gives
+    no hint the ad has closed, which is exactly how one survives past its real
+    expiry with nothing in the pipeline able to tell."""
     seen = list(dict.fromkeys(u for u in urls if u))[:ADZUNA_DETAIL_MAX_PER_RUN]
     targets = [(u, _adzuna_detail_url(u)) for u in seen]
     targets = [(u, d) for u, d in targets if d]
@@ -827,27 +883,42 @@ def fetch_adzuna_details(urls: List[str], dead_out: set | None = None) -> Dict[s
     }
     throttled = [0]        # consecutive-ish 429 count, shared across workers
     _THROTTLE_GIVE_UP = 3
+    now_iso = datetime.utcnow().isoformat()
 
-    def _one(target: tuple[str, str]) -> tuple[str, str, bool]:
+    def _one(target: tuple[str, str]) -> tuple[str, dict, bool]:
         original, detail_url = target
         if throttled[0] >= _THROTTLE_GIVE_UP:
-            return original, "", False
+            return original, {}, False
         try:
             r = requests.get(detail_url, headers=headers, timeout=15)
             if r.status_code == 429:
                 throttled[0] += 1
-                return original, "", False
+                return original, {}, False
             if r.status_code != 200:
-                return original, "", r.status_code in (404, 410)
-            return original, _adzuna_description_from_html(r.text), False
+                return original, {}, r.status_code in (404, 410)
+            parsed = _adzuna_description_from_html(r.text)
+            if not parsed:
+                return original, {}, False
+            expired = bool(parsed.get("expires_at")) and parsed["expires_at"] < now_iso
+            if not expired:
+                # Belt-and-braces: the JSON-LD description often survives a real
+                # closure untouched (no validThrough update either), so also check
+                # the rendered page for the same closure phrasing Phase 5 looks
+                # for -- unbounded here (no position/length gate) since this is
+                # always exactly one posting's own page, not a multi-listing
+                # scrape that could pick up an unrelated "similar jobs" mention.
+                expired = bool(_EXPIRED_LISTING_RE.search(_strip_html(r.text)))
+            return original, parsed, expired
         except Exception:
-            return original, "", False
+            return original, {}, False
 
     with ThreadPoolExecutor(max_workers=max(1, ADZUNA_DETAIL_MAX_WORKERS)) as ex:
         results = list(ex.map(_one, targets))
-    out = {u: text for u, text, _dead in results if text}
+    out = {u: {"text": p["description"], "posted_at": p.get("posted_at"),
+               "expires_at": p.get("expires_at")}
+           for u, p, dead in results if p and not dead}
     if dead_out is not None:
-        dead_out.update(u for u, _t, dead in results if dead)
+        dead_out.update(u for u, _p, dead in results if dead)
     note = " (rate-limited, batch cut short)" if throttled[0] >= _THROTTLE_GIVE_UP else ""
     emit(f"   [adzuna] full descriptions fetched for {len(out)}/{len(targets)} listing(s){note}")
     return out
@@ -951,6 +1022,12 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
                 "location": (job.get("location") or {}).get("display_name", ""),
                 "salary_min": job.get("salary_min"),
                 "salary_max": job.get("salary_max"),
+                # Adzuna documents salary_min/max as ANNUALISED regardless of
+                # how the employer quoted it, so the period is known even though
+                # the field doesn't exist. Currency is left unset: it varies by
+                # country endpoint and guessing it wrong is worse than a figure
+                # rendered without a symbol.
+                "salary_period": "year",
                 "snippet": job.get("description", ""),
                 "posted_at": _loose_date_to_iso(job.get("created")),
             })
@@ -1015,6 +1092,10 @@ def fetch_usajobs(query: str, location: str = "", country_code: str = "us", page
                 "location": job.get("PositionLocationDisplay", ""),
                 "salary_min": _usajobs_to_float(remun.get("MinimumRange")),
                 "salary_max": _usajobs_to_float(remun.get("MaximumRange")),
+                # "Per Year" / "Per Hour" -- federal pay scales include both.
+                "salary_period": (remun.get("RateIntervalCode")
+                                  or remun.get("Description") or None),
+                "salary_currency": "USD",
                 "snippet": summary,
                 "posted_at": _loose_date_to_iso(job.get("PublicationStartDate")),
                 "expires_at": _loose_date_to_iso(job.get("ApplicationCloseDate")),
@@ -1405,6 +1486,12 @@ def fetch_jsearch(query: str, location: str = "United Kingdom") -> List[Dict]:
                 "location": "Remote" if job.get("job_is_remote") else loc,
                 "salary_min": job.get("job_min_salary"),
                 "salary_max": job.get("job_max_salary"),
+                # JSearch is the one source that states its period explicitly
+                # (HOUR/DAY/WEEK/MONTH/YEAR), and it genuinely varies -- reading
+                # its numbers as annual is how a $25/hour role gets dropped for
+                # a candidate with a $30,000 floor.
+                "salary_period": job.get("job_salary_period"),
+                "salary_currency": job.get("job_salary_currency"),
                 "snippet": job.get("job_description", ""),
                 "posted_at": _loose_date_to_iso(job.get("job_posted_at_datetime_utc")),
                 "expires_at": _loose_date_to_iso(job.get("job_offer_expiration_datetime_utc")),
@@ -1557,12 +1644,19 @@ def _google_location(profile: Dict) -> str:
 # pool slot into 6 concurrent one-page calls. Reed/Adzuna pass the
 # *_PAGES_PER_TERM caps explicitly; the fetchers' own pages=3 defaults are the
 # legacy path's behavior and stay untouched.
+def _pages_for(profile: Dict, normal: int, sponsor: int) -> int:
+    """Page depth for this run: deeper when the licensed-sponsor filter is on,
+    since that filter keeps roughly a tenth of what it sees."""
+    return sponsor if profile.get("visa_sponsor_only") else normal
+
+
 class ReedSource:
     name, tier = "reed", "fast"
     def fetch_term(self, profile, term):
         return fetch_reed(term, _geo_scoped_location(profile),
                           profile.get("adzuna_country_code", "gb"),
-                          pages=REED_PAGES_PER_TERM)
+                          pages=_pages_for(profile, REED_PAGES_PER_TERM,
+                                           REED_PAGES_PER_TERM_SPONSOR))
     def fetch(self, profile, since=None):
         out: List[Dict] = []
         for term in _terms(profile):
@@ -1575,7 +1669,8 @@ class AdzunaSource:
     def fetch_term(self, profile, term):
         return fetch_adzuna(term, _geo_scoped_location(profile),
                             profile.get("adzuna_country_code", "gb"),
-                            pages=ADZUNA_PAGES_PER_TERM)
+                            pages=_pages_for(profile, ADZUNA_PAGES_PER_TERM,
+                                             ADZUNA_PAGES_PER_TERM_SPONSOR))
     def fetch(self, profile, since=None):
         out: List[Dict] = []
         for term in _terms(profile):
@@ -1899,12 +1994,195 @@ ATS_FEEDS = {
     # Personio is the odd one out: it publishes an XML positions feed (not JSON)
     # and exposes no per-job URL, so it's parsed separately (see _fetch_personio).
     "personio":   "https://{token}.jobs.personio.com/xml",
+    # SmartRecruiters is the other odd one out, for the opposite reason: its
+    # listing endpoint carries no description AT ALL, only posting metadata, so
+    # the text costs one extra call per posting (see _fetch_smartrecruiters).
+    "smartrecruiters": "https://api.smartrecruiters.com/v1/companies/{token}/postings",
 }
 
 
-def _fetch_personio(url: str, token: str) -> List[Dict]:
+# SmartRecruiters' Posting API is public and unauthenticated like the six above,
+# but it splits into two endpoints and only the second one carries any text:
+#   /v1/companies/{token}/postings            -> id, name, location, releasedDate
+#   /v1/companies/{token}/postings/{id}       -> jobAd.sections.{...}.text
+# So unlike every other vendor here, one company costs 1 + N HTTP calls rather
+# than 1. Both caps below exist for that reason: a large board would otherwise
+# fire hundreds of requests from inside a slot of gather_jobs' 12-wide pool,
+# i.e. up to 12 companies' worth of fan-out hitting one host at once.
+SMARTRECRUITERS_MAX_POSTINGS = int(os.getenv("SMARTRECRUITERS_MAX_POSTINGS", "120"))
+SMARTRECRUITERS_DETAIL_WORKERS = int(os.getenv("SMARTRECRUITERS_DETAIL_WORKERS", "4"))
+SMARTRECRUITERS_PAGE_SIZE = 100  # the API's own documented maximum
+
+# jobAd.sections in SmartRecruiters' own display order. Emitted with their titles
+# for the same reason _lever_text keeps Lever's list headings: the heading is
+# real signal, and "Qualifications" in particular is the marker that the
+# REQUIREMENTS section starts here -- the half a fit judgement turns on, and the
+# half every vendor that splits its description was dropping (see _ats_text).
+_SR_SECTION_ORDER = ("companyDescription", "jobDescription",
+                     "qualifications", "additionalInformation")
+
+
+def _smartrecruiters_text(detail: dict) -> str:
+    """Detail payload -> one plain-text description, sections in display order."""
+    sections = ((detail.get("jobAd") or {}).get("sections") or {})
+    if not isinstance(sections, dict):
+        return ""
+    ordered = list(_SR_SECTION_ORDER)
+    # Any section the vendor adds later still lands in the text rather than
+    # being silently dropped, which is the failure mode this whole area exists
+    # to prevent -- it just lands after the ones we know the order of.
+    ordered += [k for k in sections if k not in _SR_SECTION_ORDER]
+    parts: List[str] = []
+    for key in ordered:
+        sec = sections.get(key)
+        if not isinstance(sec, dict):
+            continue
+        text = sec.get("text") or ""
+        if not text.strip():
+            continue
+        title = (sec.get("title") or "").strip()
+        parts.append(f"{title}\n{text}" if title else text)
+    return _ats_text(*parts)
+
+
+def _fetch_smartrecruiters(base_url: str, token: str, company: str = "") -> List[Dict]:
+    """Page the postings list, then fetch each posting's detail for its text.
+
+    A posting whose detail call fails is DROPPED rather than emitted text-less.
+    That looks harsh but it is the only safe option: `smartrecruiters` is an ATS
+    key, and engine._has_judgeable_text treats any ATS-keyed row as already
+    carrying enough text to judge -- so a text-less row here would skip phase 5,
+    collect RICH_TEXT_SELECTION_BONUS, and reach the expensive judge on its job
+    title alone. That is exactly the inversion documented for un-enriched Adzuna
+    rows, and there is no reason to reintroduce it on a new source.
+    """
+    postings: List[Dict] = []
+    offset = 0
+    while len(postings) < SMARTRECRUITERS_MAX_POSTINGS:
+        try:
+            r = requests.get(base_url, timeout=12,
+                             params={"limit": SMARTRECRUITERS_PAGE_SIZE, "offset": offset})
+            data = r.json()
+        except Exception as e:
+            emit(f"   [!] ATS smartrecruiters/{token} list error: {e}")
+            break
+        content = data.get("content") or []
+        if not content:
+            break
+        postings.extend(content)
+        offset += len(content)
+        if offset >= int(data.get("totalFound") or 0):
+            break
+    postings = postings[:SMARTRECRUITERS_MAX_POSTINGS]
+    if not postings:
+        return []
+
+    def _detail(p: dict) -> Dict | None:
+        pid = p.get("id")
+        if not pid:
+            return None
+        try:
+            d = requests.get(f"{base_url}/{pid}", timeout=12).json()
+        except Exception:
+            return None
+        text = _smartrecruiters_text(d)
+        if not text:
+            return None  # see the docstring -- never emit a text-less ATS row
+        loc = p.get("location") or d.get("location") or {}
+        place = loc.get("fullLocation") or ", ".join(
+            x for x in [loc.get("city"), loc.get("country")] if x)
+        released = p.get("releasedDate") or d.get("releasedDate")
+        return {"board": f"smartrecruiters:{token}",
+                "title": p.get("name") or d.get("name") or "",
+                # The posting's own company name wins: SmartRecruiters is the one
+                # vendor whose payload carries it, and it is the most specific of
+                # the three (a multi-brand group posts under the hiring brand).
+                "company": ((p.get("company") or {}).get("name")
+                            or (company or "").strip() or token),
+                "url": d.get("postingUrl") or d.get("applyUrl")
+                       or f"https://jobs.smartrecruiters.com/{token}/{pid}",
+                "location": place,
+                "snippet": text,
+                "updated_at": released,
+                "posted_at": released}
+
+    with ThreadPoolExecutor(max_workers=max(1, SMARTRECRUITERS_DETAIL_WORKERS)) as ex:
+        results = list(ex.map(_detail, postings))
+    out = [r for r in results if r]
+    dropped = len(postings) - len(out)
+    if dropped:
+        emit(f"   [!] ATS smartrecruiters/{token}: {dropped}/{len(postings)} posting(s) "
+             f"dropped (no description returned by the detail endpoint)")
+    return out
+
+
+# How a vendor's board token appears in a URL found in the wild. Path-segment
+# vendors carry it after the domain; subdomain vendors (recruitee, personio)
+# carry it before. SHARED source of truth: harvest_ats_tokens' `site:` search
+# and services/direct_employer.py's careers-page crawl both read this, so the
+# two can't drift into disagreeing about what a valid token looks like.
+#
+# A list per vendor because several publish their board under more than one
+# host: Greenhouse alone has the legacy boards.greenhouse.io/{token}, the newer
+# job-boards.greenhouse.io/{token}, and an EMBED form that carries the token in
+# a query parameter instead of the path. That last one is why a single loose
+# `greenhouse\.io/([A-Za-z0-9_-]+)` is not good enough -- against an embed URL
+# it captures the literal path segment "embed" as the company's token.
+ATS_TOKEN_PATTERNS: Dict[str, List] = {
+    "greenhouse": [
+        re.compile(r"greenhouse\.io/embed/job_board(?:/js)?\?(?:[^\"'\s]*&)?for=([A-Za-z0-9_-]+)"),
+        re.compile(r"(?:job-)?boards\.greenhouse\.io/([A-Za-z0-9_-]+)"),
+    ],
+    "lever":      [re.compile(r"jobs\.lever\.co/([A-Za-z0-9_-]+)")],
+    "ashby":      [re.compile(r"jobs\.ashbyhq\.com/([A-Za-z0-9_-]+)")],
+    "workable":   [re.compile(r"apply\.workable\.com/([A-Za-z0-9_-]+)"),
+                   re.compile(r"https?://([A-Za-z0-9_-]+)\.workable\.com")],
+    "recruitee":  [re.compile(r"https?://([A-Za-z0-9_-]+)\.recruitee\.com")],
+    "personio":   [re.compile(r"https?://([A-Za-z0-9_-]+)\.jobs\.personio\.")],
+    "smartrecruiters": [
+        re.compile(r"(?:jobs|careers)\.smartrecruiters\.com/([A-Za-z0-9_-]+)"),
+        re.compile(r"api\.smartrecruiters\.com/v1/companies/([A-Za-z0-9_-]+)"),
+    ],
+}
+
+# Path segments that sit where a token does but name a vendor route, not a
+# company. Without this an embed/widget/api URL yields a "company" called
+# "embed" that then fails live validation and wastes a probe.
+_ATS_TOKEN_STOPWORDS = {
+    "embed", "api", "v1", "widget", "accounts", "job_board", "jobs", "job",
+    "www", "boards", "careers", "career", "search", "postings", "company",
+    "companies", "static", "assets", "js", "css", "images", "img",
+    # "apply" is the host in Workable's own apply.workable.com/{token} form, so
+    # the subdomain pattern below it matches the ROUTE rather than a company.
+    "apply", "help", "support", "blog", "app", "account", "login",
+}
+
+
+def ats_tokens_in(text: str) -> List[tuple]:
+    """Every (vendor, token) pair an ATS board URL in `text` points at.
+
+    Deliberately extraction-only: it says which boards a page LINKS to, never
+    whether they are live. Callers pass each pair through validate_ats_token
+    before storing it, the same guard harvested tokens already go through."""
+    out: List[tuple] = []
+    seen: set = set()
+    for vendor, patterns in ATS_TOKEN_PATTERNS.items():
+        for pattern in patterns:
+            for token in pattern.findall(text or ""):
+                token = token.strip()
+                if not token or token.lower() in _ATS_TOKEN_STOPWORDS:
+                    continue
+                key = (vendor, token)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+    return out
+
+
+def _fetch_personio(url: str, token: str, company: str = "") -> List[Dict]:
     """Personio exposes an XML positions feed rather than JSON, and gives no
     per-job URL, so the apply URL is constructed from the position id."""
+    name = (company or "").strip() or token
     import xml.etree.ElementTree as ET
     try:
         r = requests.get(url, timeout=12)
@@ -1921,12 +2199,18 @@ def _fetch_personio(url: str, token: str) -> List[Dict]:
         desc = " ".join(
             jd.findtext("value") or "" for jd in pos.findall("./jobDescriptions/jobDescription")
         )
+        created = pos.findtext("createdAt") or pos.findtext("createDate")
         out.append({"board": f"personio:{token}", "title": pos.findtext("name") or "",
-                    "company": token,
+                    "company": name,
                     "url": f"{base}/job/{job_id}" if job_id else base,
                     "location": pos.findtext("office") or "",
                     "snippet": _strip_html(desc)[:3000],
-                    "updated_at": pos.findtext("createdAt") or pos.findtext("createDate")})
+                    "updated_at": created,
+                    # Personio's createdAt is a genuine creation date (like Lever's,
+                    # unlike Greenhouse's aliased updated_at) -- it was being read into
+                    # updated_at only, so posted_at/the age tag stayed null for every
+                    # Personio-sourced job even though the feed always carries it.
+                    "posted_at": created})
     return out
 
 
@@ -1968,14 +2252,28 @@ def _lever_text(j: dict) -> str:
     return _ats_text(*sections)
 
 
-def fetch_ats(vendor: str, token: str) -> List[Dict]:
+def fetch_ats(vendor: str, token: str, company: str = "") -> List[Dict]:
+    """One ATS board -> its open postings.
+
+    `company` is the employer's real name from the CompanyATS registry. Without
+    it these rows carry the vendor TOKEN in their company field ("tiger-analytics"
+    rather than "Tiger Analytics"), which is both what the card renders and what
+    every company-keyed consumer sees -- services.sponsors could match only 2-4%
+    of ATS rows against the licensed-sponsor register purely because of it, while
+    the same employers matched at 9.6% via CompanyATS.company. Optional and
+    defaulted so the standalone/validation callers (validate_ats_token,
+    seed_ats.py, direct_employer's probe) need not supply one; the token remains
+    the fallback."""
     tmpl = ATS_FEEDS.get(vendor)
     if not tmpl:
         return []
     url = tmpl.format(token=token)
+    name = (company or "").strip() or token
 
     if vendor == "personio":
-        return _fetch_personio(url, token)
+        return _fetch_personio(url, token, name)
+    if vendor == "smartrecruiters":
+        return _fetch_smartrecruiters(url, token, name)
 
     try:
         data = requests.get(url, timeout=12).json()
@@ -1995,7 +2293,7 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
     for j in rows or []:
         if vendor == "greenhouse":
             out.append({"board": f"gh:{token}", "title": j.get("title", ""),
-                        "company": token, "url": j.get("absolute_url", ""),
+                        "company": name, "url": j.get("absolute_url", ""),
                         "location": (j.get("location") or {}).get("name", ""),
                         "snippet": _ats_text(j.get("content", "")),
                         "updated_at": j.get("updated_at"),
@@ -2012,7 +2310,7 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
                         "posted_at_approx": True})
         elif vendor == "lever":
             out.append({"board": f"lever:{token}", "title": j.get("text", ""),
-                        "company": token, "url": j.get("hostedUrl", ""),
+                        "company": name, "url": j.get("hostedUrl", ""),
                         "location": (j.get("categories") or {}).get("location", ""),
                         "snippet": _lever_text(j),
                         # createdAt is epoch MILLISECONDS, not ISO -- _parse_iso
@@ -2023,7 +2321,7 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
         elif vendor == "workable":
             loc = j.get("location") or {}
             out.append({"board": f"workable:{token}", "title": j.get("title", ""),
-                        "company": token,
+                        "company": name,
                         "url": j.get("url") or j.get("application_url", ""),
                         "location": loc.get("location_str") or ", ".join(
                             x for x in [loc.get("city"), loc.get("country")] if x),
@@ -2034,7 +2332,7 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
                         "posted_at": j.get("published_on") or j.get("created_at")})
         elif vendor == "recruitee":
             out.append({"board": f"recruitee:{token}", "title": j.get("title", ""),
-                        "company": token,
+                        "company": name,
                         "url": j.get("careers_url") or j.get("careers_apply_url", ""),
                         "location": j.get("location") or ", ".join(
                             x for x in [j.get("city"), j.get("country")] if x),
@@ -2044,7 +2342,7 @@ def fetch_ats(vendor: str, token: str) -> List[Dict]:
                         "posted_at": j.get("published_at")})
         else:  # ashby
             out.append({"board": f"ashby:{token}", "title": j.get("title", ""),
-                        "company": token, "url": j.get("jobUrl", ""),
+                        "company": name, "url": j.get("jobUrl", ""),
                         "location": j.get("location", ""),
                         # Ashby's descriptionPlain IS the whole posting (measured
                         # 5.5k chars on a live board) -- no split fields to merge.
@@ -2185,9 +2483,85 @@ def select_sources_for_run(profile: Dict) -> List[JobSource]:
     else:
         start = (cur * TERMS_PER_RUN) % n
         profile["search_terms_batch"] = [terms[(start + i) % n] for i in range(TERMS_PER_RUN)]
+    profile["search_terms_batch"] += _sponsor_scoped_terms(
+        profile, profile["search_terms_batch"], cur)
     picked = always + [rotation[cur % len(rotation)]]
     _save_cursor(profile, cur + 1)
     return picked
+
+
+SPONSOR_TERMS_PER_RUN = int(os.getenv("SPONSOR_TERMS_PER_RUN", "2"))
+
+
+def _sponsor_scoped_terms(profile: Dict, batch: List[str], cur: int) -> List[str]:
+    """"<role> <employer>" terms aimed at named licensed sponsors.
+
+    Only when the sponsor filter is on. The generic term query returns whoever
+    the board ranks highest for "data analyst", which is overwhelmingly agencies
+    and non-sponsors -- and a ~90% filter then discards them. Naming an employer
+    the candidate could actually be sponsored by asks the board a question whose
+    answers survive the filter.
+
+    Which employers: ones already proven to surface for THIS profile -- a company
+    whose listings have reached the gate before is one whose roles match this
+    candidate, so this deepens a seam rather than guessing at a new one. Read-side
+    join over columns that already exist (same posture as direct_employer's
+    _charity_board_yield), so it costs the search path nothing but one indexed
+    query. Fails soft to no extra terms: this is an enhancement, and a profile
+    with no history yet simply gets the normal batch.
+
+    Rotates on the same cursor as the term window, so successive runs work
+    through different employers rather than re-asking about the same two."""
+    if not profile.get("visa_sponsor_only") or not batch or SPONSOR_TERMS_PER_RUN <= 0:
+        return []
+    try:
+        from app.services import sponsors as _sp
+    except Exception:
+        return []
+
+    profile_id = profile.get("profile_id")
+    if profile_id is None:
+        return []
+    try:
+        conn = _ats_db()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT company FROM jobs_seen "
+                "WHERE profile_id = ? AND company IS NOT NULL AND company != '' "
+                "AND state IN ('enriched', 'shown') AND dead_reason IS NULL",
+                (profile_id,)).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+    # Deduped by NORMALISED key, not raw string: a store routinely holds the same
+    # employer under several spellings ("Davies" and "Davies Group"), and since
+    # the picks below are consecutive in sorted order those variants land
+    # adjacent -- spending both of a run's two slots re-asking about one company.
+    companies = sorted({(r[0] or "").strip() for r in rows if (r[0] or "").strip()})
+    seen_keys: set = set()
+    sponsors_seen = []
+    for c in companies:
+        if not _sp.is_sponsor(c):
+            continue
+        k = _sp.key(_sp.normalise(c))
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        sponsors_seen.append(c)
+    if not sponsors_seen:
+        return []
+
+    n = len(sponsors_seen)
+    start = (cur * SPONSOR_TERMS_PER_RUN) % n
+    picked = [sponsors_seen[(start + i) % n]
+              for i in range(min(SPONSOR_TERMS_PER_RUN, n))]
+    # Pair each with a different role term so two extra queries don't both probe
+    # the same role shape.
+    out = [f"{batch[i % len(batch)]} {company}" for i, company in enumerate(picked)]
+    emit(f"   [sponsor] added {len(out)} employer-scoped term(s): {out}")
+    return out
 
 
 # Word-level match makes the batch profile-aware: harvested rows carry the phrase
@@ -2198,14 +2572,18 @@ _ATS_MATCH_STOP = {"the", "and", "for", "with", "junior", "senior", "lead", "mid
                    "associate", "intern", "graduate", "specialist", "role", "jobs"}
 
 
-def _profile_match_words(profile: Dict) -> set:
-    parts = list(profile.get("search_terms") or []) + list(profile.get("sectors") or [])
+def _words_of(parts) -> set:
     words = set()
-    for p in parts:
+    for p in parts or []:
         for w in re.findall(r"[a-z0-9]+", str(p).lower()):
             if len(w) > 2 and w not in _ATS_MATCH_STOP:
                 words.add(w)
     return words
+
+
+def _profile_match_words(profile: Dict) -> set:
+    return _words_of(list(profile.get("search_terms") or [])
+                     + list(profile.get("sectors") or []))
 
 
 def _ats_keyword_matches(keyword, words: set) -> bool:
@@ -2219,14 +2597,60 @@ def select_ats_batch_for_run(profile: Dict) -> List[tuple]:
     """Return (company, vendor, token) rows, profile-aware. company_ats is a
     single store shared by all profiles, so favour companies whose harvest
     keyword matches this profile's sector, then fill the batch from the rest by
-    rotation (so the shared, multi-sector store doesn't dilute any one profile)."""
+    rotation (so the shared, multi-sector store doesn't dilute any one profile).
+
+    THREE tiers, not two, and the split that was added matters. A keyword match
+    used to be one boolean over search terms and sectors merged together, which
+    meant a board tagged "data analyst" and a board tagged "charity nonprofit"
+    were equally "preferred" for a charity-sector data analyst -- and since the
+    tier is then rotated in insertion order, the sector-specific boards (the
+    newest rows, appended last) sat at the BACK. Measured on the live store: a
+    freshly-crawled charity board landed at index 283 of a 285-row preferred
+    list, i.e. ~7 runs of rotation before the batch would ever reach it, ranked
+    behind 283 boards that matched only on the generic word "data".
+
+    A SECTOR word is the far stronger signal of "this company is in the
+    candidate's field" -- a role-shape word like "data" or "analyst" matches
+    employers in every industry -- so sector matches now get their own tier
+    ahead of term-only matches. Each tier still rotates independently, so
+    nothing is starved; only the order in which the 40 slots are claimed
+    changes.
+
+    A FOURTH tier goes in front of all three, but only for a profile that has
+    the licensed-sponsor filter on: boards whose company is on the register.
+    Every other board's postings will be dropped outright by
+    engine._filter_by_sponsor, so spending the batch's 40 slots on them is
+    spending the whole ATS tier on nothing. Note the ceiling this runs into --
+    seed_ats.py stores the vendor token AS the company for its curated rows, so
+    a board only lands in this tier when its token happens to normalise to the
+    registered name; it grows with the direct-employer crawl, which does record
+    real names. Empty tier is harmless: the other three fill the batch exactly
+    as before."""
     rows = load_company_ats()  # (company, vendor, token, keyword)
     if not rows:
         return []
     size = 40
-    words = _profile_match_words(profile)
-    preferred = [r for r in rows if _ats_keyword_matches(r[3], words)]
-    others = [r for r in rows if not _ats_keyword_matches(r[3], words)]
+    sector_words = _words_of(profile.get("sectors"))
+    term_words = _words_of(profile.get("search_terms"))
+
+    is_sponsor = None
+    if profile.get("visa_sponsor_only"):
+        try:
+            from app.services.sponsors import is_sponsor as _is_sponsor
+            is_sponsor = _is_sponsor
+        except Exception:
+            is_sponsor = None   # standalone path without the backend importable
+
+    by_sponsor, by_sector, by_term, others = [], [], [], []
+    for r in rows:
+        if is_sponsor is not None and is_sponsor(r[0] or ""):
+            by_sponsor.append(r)
+        elif _ats_keyword_matches(r[3], sector_words):
+            by_sector.append(r)
+        elif _ats_keyword_matches(r[3], term_words):
+            by_term.append(r)
+        else:
+            others.append(r)
 
     cur = _load_cursor(profile)
 
@@ -2237,8 +2661,10 @@ def select_ats_batch_for_run(profile: Dict) -> List[tuple]:
         start = (cur * size) % len(lst)
         return (lst[start:] + lst[:start])[:size]
 
-    # Preferred first (up to the cap), then fill with rotated others.
-    ordered = _rotate(preferred) + _rotate(others)
+    # Licensed sponsors first (when the filter is on), then sector matches, then
+    # term matches, then fill with rotated others.
+    ordered = (_rotate(by_sponsor) + _rotate(by_sector)
+               + _rotate(by_term) + _rotate(others))
     return [(c, v, t) for (c, v, t, _kw) in ordered[:size]]
 
 
@@ -2267,8 +2693,11 @@ def gather_jobs(profile: Dict) -> List[Dict]:
             tasks += [("term", (s, t)) for t in terms]
         else:
             tasks.append(("src", s))
-    tasks += [("ats", (vendor, token))
-              for (_company, vendor, token) in select_ats_batch_for_run(profile)
+    # The registry's `company` rides along rather than being discarded: it is the
+    # employer's real name, and without it every row this vendor emits carries
+    # the opaque token instead (see fetch_ats).
+    tasks += [("ats", (vendor, token, company))
+              for (company, vendor, token) in select_ats_batch_for_run(profile)
               if vendor not in disabled]
 
     # Visibility: which ATS vendors this run actually queried. A vendor absent
@@ -2294,8 +2723,9 @@ def gather_jobs(profile: Dict) -> List[Dict]:
             elapsed = time.monotonic() - started
             emit(f"   [source] {src.name} ('{term}'): {len(result)} jobs in {elapsed:.1f}s")
             return kind, src.name, result, elapsed
-        vendor, token = payload
-        return kind, vendor, (fetch_ats(vendor, token) or []), time.monotonic() - started
+        vendor, token, company = payload
+        return kind, vendor, (fetch_ats(vendor, token, company) or []), \
+            time.monotonic() - started
 
     all_jobs: List[Dict] = []
     term_counts: Counter = Counter()
@@ -2518,17 +2948,11 @@ def harvest_ats_tokens(sector_keywords: List[str], location: str = "") -> List[t
         "workable":   "apply.workable.com",
         "recruitee":  "recruitee.com",
         "personio":   "jobs.personio.com",
+        "smartrecruiters": "jobs.smartrecruiters.com",
     }
-    # Path-segment vendors carry the token after the domain; subdomain vendors
-    # (recruitee, personio) carry it before the domain -- hence per-vendor regex.
-    token_res = {
-        "greenhouse": re.compile(r"greenhouse\.io/([A-Za-z0-9_-]+)"),
-        "lever":      re.compile(r"lever\.co/([A-Za-z0-9_-]+)"),
-        "ashby":      re.compile(r"jobs\.ashbyhq\.com/([A-Za-z0-9_-]+)"),
-        "workable":   re.compile(r"apply\.workable\.com/([A-Za-z0-9_-]+)"),
-        "recruitee":  re.compile(r"https?://([A-Za-z0-9_-]+)\.recruitee\.com"),
-        "personio":   re.compile(r"https?://([A-Za-z0-9_-]+)\.jobs\.personio\."),
-    }
+    # Token extraction is shared with the direct-employer crawl -- see
+    # ATS_TOKEN_PATTERNS / ats_tokens_in, which own the per-vendor regexes.
+    token_res = {v: ATS_TOKEN_PATTERNS[v] for v in site_domains}
 
     # Keyed by (vendor, token) rather than appended to a list: the same board is
     # routinely surfaced by more than one keyword combo, and validating it once
@@ -2549,7 +2973,7 @@ def harvest_ats_tokens(sector_keywords: List[str], location: str = "") -> List[t
             skipped += 1
             continue
         domain = site_domains[vendor]
-        token_re = token_res[vendor]
+        token_pats = token_res[vendor]
         if SERPER_DEV_API_KEY:
             base = f"site:{domain} {keyword}" if SERPER_SITE_OPERATOR_OK else f"{keyword} {domain}"
             query = f"{base} {location}" if location else base
@@ -2575,12 +2999,13 @@ def harvest_ats_tokens(sector_keywords: List[str], location: str = "") -> List[t
                 continue
         budget -= 1
         for link in links:
-            m = token_re.search(link or "")
-            if m:
-                token = m.group(1)
-                # Tag the row with every phrase that found it so the batch
-                # selector can favour it for profiles in this sector.
-                found.setdefault((vendor, token), set()).add(keyword)
+            for pattern in token_pats:
+                m = pattern.search(link or "")
+                if m and m.group(1).lower() not in _ATS_TOKEN_STOPWORDS:
+                    # Tag the row with every phrase that found it so the batch
+                    # selector can favour it for profiles in this sector.
+                    found.setdefault((vendor, m.group(1)), set()).add(keyword)
+                    break
 
     deduped = [(token, vendor, token, ", ".join(sorted(kws)))
                for (vendor, token), kws in found.items()]
@@ -3754,6 +4179,13 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
                 raw = llm(_screen_prompt(profile, listing_block), require_json=True,
                           temperature=_safe_temperature(CHEAP_MODEL, 0),
                           stage="screen", cache_key=f"screen_v14:{sig}",
+                          # 24h retention for the same reason rank_gate's cache_key carries it:
+                          # this ~4.5k-token prefix is profile-scoped (screen_v14 + _profile_signature),
+                          # so it's only ever reused by this SAME profile's own later rounds/re-searches,
+                          # and the default few-minutes TTL was letting it expire between them -- see
+                          # rank_cache_key's comment and _FINAL_EVAL_CACHE_KEY's for the judge's version
+                          # of this same tradeoff.
+                          cache_retention="24h",
                           system="You screen job listings for role-function fit (match/ambiguous/"
                                  "mismatch), the candidate's own hard filters, whether the text is even "
                                  "a real single job posting, seniority, requirements, skills, salary, "
@@ -3908,13 +4340,35 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     return candidates
 
 
+_SALARY_PERIOD_WORD = {"year": "per year", "month": "per month", "week": "per week",
+                       "day": "per day", "hour": "per hour"}
+
+
 def _listing_salary_suffix(c: dict) -> str:
+    """The structured pay figures for a listing block, WITH their period.
+
+    The period is the load-bearing part. These numbers reach the salary axis of
+    screen_gate and HARD DOWNGRADE (e) of rank_gate, both of which compare them
+    against the candidate's stated (annual) floor -- so a bare "Salary: 25-32"
+    from an hourly listing reads as a catastrophically underpaid role rather
+    than as roughly £50k. Where no source stated a period, none is claimed here
+    either: the models get the raw figures and the same absence of information
+    the pipeline has.
+
+    Note these fields were empty for essentially every gated candidate until
+    salary was persisted on JobSeen -- the pipeline's candidates come from the
+    store (engine._rows_to_dicts), which carried no salary columns, so this
+    suffix only ever fired on the freshly-discovered dicts that never reach a
+    gate. Populating it is a change in what the cheap tiers can see."""
     salary_min, salary_max = c.get("salary_min"), c.get("salary_max")
     if not salary_min and not salary_max:
         return ""
-    if salary_min and salary_max:
-        return f" | Salary: {salary_min}-{salary_max}"
-    return f" | Salary: {salary_min or salary_max}"
+    currency = (c.get("salary_currency") or "").strip()
+    period = _SALARY_PERIOD_WORD.get((c.get("salary_period") or "").strip().lower(), "")
+    figure = (f"{salary_min}-{salary_max}" if salary_min and salary_max
+              else f"{salary_min or salary_max}")
+    parts = [p for p in (currency, figure, period) if p]
+    return f" | Salary: {' '.join(parts)}"
 
 
 def _location_scope_note(profile: dict) -> str:
@@ -4180,11 +4634,21 @@ def _score_rank_batch(
                       + hashlib.sha1((profile.get("intent_text") or "")
                                      .strip().lower().encode()).hexdigest()[:8]
                       + f":{_rank_age_cache_tag(profile)}")
-
+    # cache_retention="24h", same as the judge's _FINAL_EVAL_CACHE_KEY and for the
+    # same reason: the default few-minutes-of-inactivity TTL was measured giving
+    # this stage a 0% cache-hit rate (rank_cache_key already varies by profile
+    # signature/intent/age tag, so a changed profile naturally rotates onto a
+    # fresh, uncached key -- retention can't serve stale content). Unlike the
+    # judge's prefix this one is profile-scoped, not global, so it only pays off
+    # across this SAME profile's own rounds/re-searches -- but within a run, a
+    # cluster's later gate+rank rounds reuse the identical fixed prefix computed
+    # here, and across runs an unchanged profile does too (see the module's
+    # cross-run-reuse note), both of which the short default TTL was losing.
     raw = None
     try:
         raw = llm(prompt, require_json=True, temperature=rank_temperature, model=MID_MODEL,
-                  system=rank_system, stage="rank", cache_key=rank_cache_key)
+                  system=rank_system, stage="rank", cache_key=rank_cache_key,
+                  cache_retention="24h")
     except Exception as e:
         status = getattr(e, "status_code", None)
         resp = getattr(e, "response", None)
@@ -4205,7 +4669,8 @@ def _score_rank_batch(
         time.sleep(wait)
         try:
             raw = llm(prompt, require_json=True, temperature=rank_temperature, model=MID_MODEL,
-                      system=rank_system, stage="rank", cache_key=rank_cache_key)
+                      system=rank_system, stage="rank", cache_key=rank_cache_key,
+                      cache_retention="24h")
         except Exception as e2:
             status2 = getattr(e2, "status_code", None)
             emit(f"[gate:rank] {MID_MODEL} retry also failed (status={status2}): {e2}; "
@@ -4499,7 +4964,14 @@ _EXPIRED_LISTING_RE = re.compile(
     r"applications? (?:are|is) now closed|"
     r"this (?:vacancy|job|role|position|posting|listing|advert(?:isement)?) "
         r"(?:has|have) (?:now )?(?:closed|expired)|"
-    r"this (?:vacancy|job|role|position|posting|listing) is no longer (?:available|active|live)|"
+    # A short clause often sits between the noun and "is no longer" -- e.g. a
+    # board-stated post date ("This job from 24 Jul 2026 is no longer available
+    # for applications."), which the old direct-concatenation pattern missed
+    # entirely (a live case: it never matched at all). Bounded to <=40 chars
+    # with no sentence break, so this can't reach across into an unrelated
+    # sentence and pick up a false positive.
+    r"this (?:vacancy|job|role|position|posting|listing)(?:[^.\n]{0,40})? "
+        r"is no longer (?:available|active|live)|"
     r"(?:vacancy|position|role) has (?:already )?been filled|"
     r"job (?:posting|listing|advert) has expired|"
     r"(?:this )?posting has been removed|"

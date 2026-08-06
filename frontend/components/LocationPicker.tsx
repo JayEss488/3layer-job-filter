@@ -33,6 +33,16 @@ const SCOPE_CHOICES: { value: string; label: string }[] = [
 ];
 const SCOPE_ORDER = SCOPE_CHOICES.map((s) => s.value);
 
+// Mirrors backend/app/config.DEFAULT_COMMUTE_MILES.
+const DEFAULT_COMMUTE = "30";
+const COMMUTE_CHOICES: { value: string; label: string }[] = [
+  { value: "10", label: "10 mi" },
+  { value: "25", label: "25 mi" },
+  { value: DEFAULT_COMMUTE, label: "30 mi" },
+  { value: "50", label: "50 mi" },
+  { value: "0", label: "Any distance" },
+];
+
 function detectCountry(text: string): string | null {
   const loc = (text || "").trim().toLowerCase();
   if (!loc) return null;
@@ -48,11 +58,13 @@ export function LocationPicker({
   attributes,
   countryAttributes,
   scopeAttributes,
+  commuteAttributes,
 }: {
   profileId: number;
   attributes: Attribute[];
   countryAttributes: Attribute[];
   scopeAttributes: Attribute[];
+  commuteAttributes: Attribute[];
 }) {
   const { add, remove, invalidate } = useAttributeMutations(profileId);
 
@@ -69,6 +81,16 @@ export function LocationPicker({
     scopeAttributes.forEach((a) => remove.mutate(a.id));
     add.mutate({ type: "location_scope", value });
   }
+  // Single-value, like scope. Only shown (and only enforced) at Local scope —
+  // National and International have explicitly opted out of narrowing by place,
+  // so a radius there would be a control that does nothing.
+  const commute = commuteAttributes[0]?.value ?? DEFAULT_COMMUTE;
+  function setCommute(value: string) {
+    if (commute === value) return;
+    commuteAttributes.forEach((a) => remove.mutate(a.id));
+    add.mutate({ type: "commute_miles", value });
+  }
+
   // Scope becomes the sole authority on whether a country filter applies at
   // all once it's "local" or "international" -- showing country chips there
   // would let them silently contradict the scope setting.
@@ -148,6 +170,29 @@ export function LocationPicker({
           ))}
         </div>
       </div>
+      {showCity && (
+        <div className="location-line">
+          <span className="hint-inline">Within</span>
+          <div className="choice-row">
+            {COMMUTE_CHOICES.map((c) => (
+              <button
+                key={c.value}
+                className={`toggle sm ${commute === c.value ? "on" : "off"}`}
+                onClick={() => setCommute(c.value)}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {showCity && (
+        <div className="hint-detected">
+          Straight-line distance from your city, not drive time — and only UK
+          locations can be measured. A role whose location can&apos;t be placed on
+          a map is kept only if it names your city.
+        </div>
+      )}
       {showCountryChips && (
         <div className="choice-row" style={{ flexWrap: "wrap", gap: 6 }}>
           {/* Selected countries as removable chips (the list is worldwide now, so

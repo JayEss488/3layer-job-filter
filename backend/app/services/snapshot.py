@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import (
+    DEFAULT_COMMUTE_MILES,
     DEFAULT_MAX_LISTING_AGE_DAYS,
     MAX_ROLE_CLUSTERS,
     PINNED_ROLE_MULT,
@@ -45,6 +46,30 @@ def _parse_max_listing_age_days(values: list[str]) -> int:
         return max(0, int(str(values[0]).strip()))
     except (TypeError, ValueError):
         return DEFAULT_MAX_LISTING_AGE_DAYS
+
+
+def _parse_commute_miles(values: list[str]) -> int:
+    """The candidate's commute radius in miles, or DEFAULT_COMMUTE_MILES when
+    they've never set it. 0 is a real value (their own "No limit" choice) and
+    must not be confused with "no row at all" -- same rule as
+    _parse_max_listing_age_days above."""
+    if not values:
+        return DEFAULT_COMMUTE_MILES
+    try:
+        return max(0, int(str(values[0]).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_COMMUTE_MILES
+
+
+def _parse_visa_sponsor_only(values: list[str]) -> bool:
+    """Whether to restrict results to licensed visa sponsors.
+
+    Note the asymmetry with the two parsers above: here "no row at all" and a
+    falsey row mean the same thing (off), because the preference has no
+    meaningful third state. Written as an explicit truthy-value check rather
+    than bool(values) so a stale "false" row left behind by a UI change reads as
+    off rather than as on."""
+    return bool(values) and str(values[0]).strip().lower() in ("true", "1", "yes")
 
 
 def _grouped(db: Session, profile_id: int) -> dict[str, list[ProfileAttribute]]:
@@ -469,6 +494,23 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # above: a soft Location row means "prefer here", which can't also mean
         # "and reject anything outside this one city".
         "local_place": loc_place if (scope == "local" and location_hard) else "",
+        # The candidate's stated place, ALWAYS -- unlike local_place, which is
+        # deliberately blanked unless it's acting as a hard filter. This one is
+        # the origin distances are measured FROM (services/geo.py), and a
+        # distance is worth knowing at every scope: at National it's pure
+        # information on the card, and at International it still tells a
+        # candidate whether a role is down the road or across the country.
+        # Blank when the candidate has typed no place at all -- note `location`
+        # above falls back to "United Kingdom", which is country-level and
+        # deliberately resolves to no coordinates.
+        "origin_place": loc_place,
+        # Commute radius in miles. Only ever ENFORCED at scope="local" (see
+        # engine._filter_by_distance); 0 means the candidate turned the limit
+        # off. Rides location_hard for the same reason local_place does -- a
+        # Soft Location row means "prefer here", which cannot also mean "reject
+        # anything past 30 miles".
+        "commute_miles": _parse_commute_miles(_values(g.get("commute_miles", []))),
+        "commute_hard": location_hard,
         "salary_floor": salary_floor,     # 0 means no salary floor
         # Candidate's own tolerance for an old listing (Dashboard "Maximum
         # listing age" preference). 0 means "No limit" -- the check is skipped
@@ -478,6 +520,13 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # judge. See full_auto.py's listing_over_max_age/_listing_age_tag.
         "max_listing_age_days": max_listing_age_days,
         "max_listing_age_hard": max_listing_age_hard,
+        # Restrict to employers on the Home Office licensed-sponsor register.
+        # Always hard when on (there is no useful soft reading of "I need a
+        # visa"), so unlike the constraints above it carries no _hard twin.
+        # Read by engine._filter_by_sponsor and by full_auto's ATS batch
+        # tiering / page depth / sponsor-scoped search terms.
+        "visa_sponsor_only": _parse_visa_sponsor_only(
+            _values(g.get("visa_sponsor_only", []))),
         "search_terms": search_terms,
         "role_clusters": role_clusters,   # list[{"roles": [...], "weighted_text": "..."}]
         # value -> priority label, used by the cheap gate/rank prompts (full_auto.py's
