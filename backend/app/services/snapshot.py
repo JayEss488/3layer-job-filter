@@ -72,6 +72,14 @@ def _parse_visa_sponsor_only(values: list[str]) -> bool:
     return bool(values) and str(values[0]).strip().lower() in ("true", "1", "yes")
 
 
+def _parse_allow_overqualified(values: list[str]) -> bool:
+    """Whether the candidate is open to roles pitched below their own seniority.
+
+    Same shape and same reasoning as _parse_visa_sponsor_only above: no row and a
+    falsey row both mean off, and off is the default."""
+    return bool(values) and str(values[0]).strip().lower() in ("true", "1", "yes")
+
+
 def _grouped(db: Session, profile_id: int) -> dict[str, list[ProfileAttribute]]:
     attrs = db.execute(
         select(ProfileAttribute).where(ProfileAttribute.profile_id == profile_id)
@@ -425,6 +433,10 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # default the hard filter to the country we inferred from their location.
         country_codes = [region["adzuna_country_code"]]
     seniority = ", ".join(seniorities) if seniorities else "mid-level"
+    # Read once here because it is needed twice below: in engine_profile (for the
+    # free title prescreen and the cheap gate/rank prompts) and as a cv_text line
+    # (the only route into the final judge's constant system prompt).
+    allow_overqualified = _parse_allow_overqualified(_values(g.get("allow_overqualified", [])))
 
     # Salary floor for the hard prefilter: the lower bound of the stated range.
     # 0 (the slider's default min) means "no floor" -> the filter is a no-op.
@@ -527,6 +539,15 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # tiering / page depth / sponsor-scoped search terms.
         "visa_sponsor_only": _parse_visa_sponsor_only(
             _values(g.get("visa_sponsor_only", []))),
+        # Open to roles pitched BELOW the candidate's own stated seniority.
+        # Off by default. Read by engine._heuristic_prescreen (which stops
+        # hard-dropping junior-marked titles for a senior profile) and by
+        # full_auto's _screen_prompt/_rank_prompt/the judge, which stop treating
+        # a lower-pitched role as a seniority mismatch. Never re-admits
+        # apprenticeships or placement years -- those are excluded on eligibility,
+        # not on level. Like visa_sponsor_only it is inherently one-directional
+        # and carries no _hard twin: turning it on IS the softening.
+        "allow_overqualified": allow_overqualified,
         "search_terms": search_terms,
         "role_clusters": role_clusters,   # list[{"roles": [...], "weighted_text": "..."}]
         # value -> priority label, used by the cheap gate/rank prompts (full_auto.py's
@@ -620,12 +641,34 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         cv_lines.append("Qualifications: " + "; ".join(qualifications))
     if seniorities:
         cv_lines.append("Seniority: " + ", ".join(seniorities))
+    # The judge's system prompt is a byte-identical constant across every profile
+    # and run (that is what makes its 24h prompt-cache retention pay off), so a
+    # per-profile preference has to ride here in the CV text instead -- same
+    # mechanism as the "Maximum listing age"/"Location search scope" lines below.
+    # DISQUALIFIER 1 keys off this exact wording. Only emitted when the preference
+    # is on, so an unchanged profile's payload is unaffected.
+    if allow_overqualified:
+        cv_lines.append(
+            "Open to more junior roles: yes -- the candidate will consider roles pitched below "
+            "their stated seniority, so a more junior role is not a mismatch for them. This does "
+            "NOT extend to apprenticeships or student placements, which they are ineligible for.")
     if skills:
         cv_lines.append("Skills: " + ", ".join(_labeled(g.get("skill", []))))
     if candidate_brief:
         cv_lines.append("Skill evidence detail: " + candidate_brief)
-    if sector_targets:
-        cv_lines.append("Sector interests: " + "; ".join(sector_targets))
+    # No "Sector interests: ..." line. sector_target used to reach the final judge
+    # here and drove its (now removed) "sector_match" signal, whose only
+    # user-visible effect was a "this is not within your stated clean-energy,
+    # science, climate or nonprofit sector interests" item in `concerns` -- noise
+    # on a card about whether the candidate can do the job, and one that also
+    # silently blocked a "very_strong" grade. The candidate's own words
+    # (intent_text, at the top of this block) already carry any genuine mission
+    # preference, in a form they wrote and can edit.
+    #
+    # sector_target rows are NOT deleted and still auto-fill from the CV: they
+    # remain a DISCOVERY-side signal only (services/harvest.py uses them to pick
+    # ATS-harvest keywords, which is how a charity-sector candidate reaches
+    # charity employers at all). Nothing the candidate reads is derived from them.
     if location or work_types:
         cv_lines.append(f"Location: {location} ({', '.join(work_types) or 'any'})")
     # GEOGRAPHY (the judge's LOCATION/VISA/RELOCATION disqualifier, part (a)) judges

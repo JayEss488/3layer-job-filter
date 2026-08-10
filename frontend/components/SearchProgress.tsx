@@ -37,15 +37,15 @@ const STAGES = [
     key: "rank",
     label: "Top candidates",
     detail: "quick AI scoring — a first real read of each listing",
-    targetSeconds: 120,
-    targetLabel: "~2 min",
+    targetSeconds: 180,
+    targetLabel: "~3 min",
   },
   {
     key: "final",
     label: "Full AI review",
     detail: "the deep review that decides your final picks",
-    targetSeconds: 300,
-    targetLabel: "~5 min",
+    targetSeconds: 330,
+    targetLabel: "~5 min 30s",
   },
 ] as const;
 

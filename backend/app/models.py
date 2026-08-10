@@ -27,20 +27,153 @@ def _now() -> datetime:
 
 
 class User(Base):
-    """A login account. Added for the closed beta: credentials are hand-assigned
-    (see scripts/gen_beta_users.py), not self-service. `User.id` IS the `user_id`
-    every other table already carries, so authenticating simply makes
-    deps.current_user_id() return this id instead of the old hardcoded constant --
-    no other table changed. Passwords are stored as a pbkdf2-sha256 hash + per-user
-    salt (see services/auth.py); the plaintext is never persisted."""
+    """A login account. `User.id` IS the `user_id` every other table already
+    carries, so authenticating simply makes deps.current_user_id() return this id
+    instead of the old hardcoded constant -- no other table changed.
+
+    FOUR kinds of account now coexist, and the difference is entirely in which
+    columns are populated. `auth_provider` names which, and NULL means the
+    legacy kind (see below) -- read it rather than inferring from which of
+    `google_sub`/`password_hash` happens to be set, because an email account and
+    a legacy account are otherwise byte-identical in shape.
+
+    * **Google** (`auth_provider="google"`). `google_sub` is Google's stable
+      subject id -- the ONLY safe join key. Email is NOT: a Google Workspace
+      address can be reassigned to a different person after an employee leaves,
+      so keying on it would hand the new holder the old holder's job search.
+      Email is stored for display and for the admin signup list, never matched
+      on. These rows carry a random salt and an EMPTY `password_hash`, which
+      `verify_password` can never match (a pbkdf2 hex digest is 64 chars and is
+      compared against ""), so a Google account cannot be logged into through
+      POST /login with a blank or guessed password.
+    * **Apple** (`auth_provider="apple"`). Identical shape with `apple_sub` as
+      the join key, for the same reason and with the same empty-hash sentinel.
+      Two Apple-specific wrinkles: `email` is very often Apple's private relay
+      address (`...@privaterelay.appleid.com`) rather than the user's real one,
+      and Apple returns a NAME only on the very first authorization -- so
+      `display_name` is frequently empty and must never be treated as required.
+    * **Email + password** (`auth_provider="email"`). A real `password_hash`,
+      `email` populated, both subject columns NULL. Reachable through
+      POST /auth/email/login, not POST /login (see auth_router for why the two
+      are kept apart).
+    * **Hand-assigned beta credentials** (`auth_provider` NULL,
+      scripts/gen_beta_users.py). Kept so the original beta testers aren't
+      locked out by the switch to self-serve; there is no UI entry point beyond
+      the homepage footer link to /login. NULL is what exempts them from the
+      sign-up survey and the beta window, and ADD COLUMN gives them NULL for
+      free -- do not backfill it.
+
+    `password_hash`/`salt` stay NOT NULL rather than becoming nullable because
+    SQLite cannot drop a NOT NULL constraint with ADD COLUMN, and the empty-hash
+    sentinel is both migration-free and strictly safer than a NULL that some
+    future comparison might treat as "no password required".
+
+    NOTE: accounts are never LINKED across providers, and `email` is never an
+    identity anywhere. Someone who signs up with a password and later signs in
+    with Google gets two separate accounts. That is deliberate: linking on email
+    would mean an unverified email registration for victim@example.com could
+    capture the account the victim later reaches through their (verified) Google
+    or Apple identity. Registration 409s on an email already in use, which is
+    what keeps the two from being created in the first place."""
 
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
     username = Column(Text, nullable=False, unique=True, index=True)
-    password_hash = Column(Text, nullable=False)  # pbkdf2_hmac(sha256) hex digest
+    password_hash = Column(Text, nullable=False)  # pbkdf2 hex digest; "" for Google/Apple accounts
     salt = Column(Text, nullable=False)            # per-user hex salt
     created_at = Column(DateTime, default=_now)
+
+    # ── Self-serve sign-up ───────────────────────────────────────────────────
+    google_sub = Column(Text, unique=True, index=True)  # Google's `sub` claim; the join key
+    apple_sub = Column(Text, unique=True, index=True)   # Apple's `sub` claim; the join key
+    # "google" | "apple" | "email" | NULL (legacy hand-assigned). See the class
+    # docstring: this exists because an email account and a legacy account are
+    # otherwise indistinguishable, and the survey/beta gates must treat them
+    # differently.
+    auth_provider = Column(Text, index=True)
+    email = Column(Text, index=True)                    # display + admin list only, never matched on
+    # Whether the PROVIDER told us the address is verified. False for every
+    # email+password signup: there is no mail service in this deployment, so
+    # nothing has proved the registrant owns the address. Recorded so the admin
+    # list can say so rather than presenting it as a confirmed contact address.
+    email_verified = Column(Boolean, default=False)
+    display_name = Column(Text)
+    last_login_at = Column(DateTime)
+
+    # ── Open-beta window ─────────────────────────────────────────────────────
+    # Day 0 of this account's fixed test window. Both beta gates are derived
+    # from it (config.EXIT_SURVEY_AFTER_DAYS and BETA_WINDOW_DAYS, read through
+    # services/beta.py) -- never store a computed expiry here, or changing the
+    # window length stops applying to anyone already in it.
+    #
+    # NULL means NO WINDOW: the account never expires and is never asked the
+    # wrap-up survey. That is the legacy exemption, and it is free -- ADD COLUMN
+    # gives every pre-existing account NULL, so the original beta testers are
+    # untouched by the switch without any backfill. Same posture as
+    # auth_router._needs_survey never asking a legacy password account.
+    beta_started_at = Column(DateTime)
+
+
+class SignupSurvey(Base):
+    """The two questions asked once, immediately after self-serve sign-up.
+
+    A separate table rather than columns on `User` because it answers a
+    different question ("what did this person say when they arrived") from a
+    login row, and because a NULL row is the exact thing the survey gate reads:
+    `POST /auth/google` returns `needs_survey=True` when no row exists, the
+    frontend holds the user on /welcome until one does, and that is the whole
+    enforcement mechanism. One row per user (unique FK).
+
+    Both answers are stored as the raw option slug, not as a normalised enum, so
+    adding or renaming a question later can never invalidate answers already
+    collected -- the admin list reports what was actually said."""
+
+    __tablename__ = "signup_surveys"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    # Q1, single select -- one of config.SIGNUP_PRIORITY_CHOICES.
+    priority = Column(Text, nullable=False)
+    # Q2, yes/no -- "have you used another AI job search tool (outside chatbots)".
+    used_ai_tool = Column(Boolean, nullable=False)
+    created_at = Column(DateTime, default=_now)
+
+
+class FeedbackResponse(Base):
+    """One answer to one beta feedback question, from any of the three surfaces.
+
+    ONE store for all of them (sign-up, in-run prompts, wrap-up survey) so the
+    admin readout needs one query and can filter by question or by user without
+    new tooling. The alternative -- a table per surface -- means a new table, a
+    new endpoint and a new report every time a question is added.
+
+    `question_id` is a stable slug and `answer` is the raw value, never a
+    normalised enum: re-wording a question later must not invalidate answers
+    already collected. Multi-select answers are JSON-encoded lists. The labels
+    live in the frontend, same contract as config.SIGNUP_PRIORITY_CHOICES.
+
+    `run_id` is the SearchRun an in-run prompt was answered against, and is NULL
+    for the sign-up and wrap-up surfaces (and for the setup prompt, which fires
+    at CV-parse time when no run exists yet). It is a plain int, not an FK, for
+    the same reason EventLog's ids aren't: this is an append-only audit stream
+    that must outlive the rows it refers to.
+
+    NOTE this table is created by create_all, not by ALTER TABLE, so `index=True`
+    below genuinely takes effect -- unlike a column added to an existing table
+    (see database._migrate_signup_indexes for that trap)."""
+
+    __tablename__ = "feedback_responses"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    profile_id = Column(Integer, nullable=True, index=True)
+    run_id = Column(Integer, nullable=True, index=True)
+    # "signup" | "in_run" | "exit" -- which surface asked.
+    surface = Column(Text, nullable=False, index=True)
+    question_id = Column(Text, nullable=False, index=True)
+    answer = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=_now, index=True)
 
 
 class Profile(Base):
@@ -269,10 +402,52 @@ class Role(Base):
     work_style = Column(Text)
     seniority_level = Column(Text)
     deadline_text = Column(Text)
+    # Ghost-listing risk as assessed when this row was persisted: "high",
+    # "medium", or NULL for "nothing fired". Deliberately three-valued with no
+    # "low" -- a bottom value covering most rows would invite the card to render
+    # it, and "Low ghost risk" on an ordinary listing is noise that trains the
+    # user to ignore the chip. NULL is the overwhelmingly common case.
+    #
+    # Note the semantics are INVERTED from sponsor_licensed above: that field
+    # badges only a positive because a False there means "not on the register",
+    # which for an agency posting is not the same as "does not sponsor". Here
+    # the badge is a NEGATIVE, so absence must read as "nothing fired" -- which
+    # is only honest while every ghost rule fires on POSITIVE evidence and none
+    # fires on missing data (a listing with no posted_at produces no signal, the
+    # same rule _listing_age_tag follows: silence is not evidence of age). If a
+    # rule is ever added that fires on absence, this field's meaning breaks and
+    # so does the "none flagged" line on /search.
+    ghost_level = Column(Text)
+    # The named rules that fired, as a JSON list of slugs (see services/ghost.py).
+    # Persisted ALONGSIDE the verdict, not derivable from it, because several
+    # rules read state that is destroyed on write -- dead_at is stamped once and
+    # never overwritten, seen_dates truncates at _SIGHTING_MAX_DAYS, and a
+    # repost_key group's membership changes as rows arrive. A verdict re-derived
+    # from a later store is not the same verdict. Same reasoning as gate_cache
+    # storing the model's own score so a bonus can be retuned without
+    # invalidating it.
+    ghost_signals = Column(Text)
     status = Column(Text, nullable=False, default="new")
     # new|saved|crossed|ignored|applied|deleted
-    application_status = Column(Text)  # pending|interview|rejected (null until applied)
+    application_status = Column(Text)
+    # pending|interview|offer|rejected|no_response (null until applied).
+    # `offer` exists so the terminal states are not uniformly negative -- a form
+    # whose only outcomes are bad is a form people don't fill in. `no_response`
+    # is NOT final: the interview/offer/rejected controls stay available so a
+    # late reply can correct it.
     applied_at = Column(DateTime)
+    # When the employer first responded, or when the user declared no response.
+    # Distinct from updated_at, which moves on any edit. Stamped ONCE on the
+    # first non-pending transition and never overwritten -- same rule as dead_at
+    # and for the same reason: the interval applied_at -> response_at is the
+    # measurement, and a later correction must not rewrite the history.
+    #
+    # Read as ground truth for ghost-listing calibration, with one caveat that
+    # must travel with it: `no_response` is a BIASED label for ghosting. Most
+    # applications get no response for entirely ordinary reasons. It is usable
+    # only as a rate across many rows conditioned on a fired signal, never as
+    # per-listing confirmation that a specific role was a ghost.
+    response_at = Column(DateTime)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 
@@ -469,12 +644,103 @@ class JobSeen(Base):
     # listing hasn't been reverified in LISTING_REVALIDATE_AFTER_DAYS gets one
     # more cheap detail-endpoint check before the judge trusts its cached text.
     last_verified_at = Column(DateTime)
+    # The board's OWN id for this listing, as "<vendor>:<id>" (full_auto._board_ref),
+    # parsed back out of the URL because no fetcher stores it. Its job is
+    # observation CONTINUITY, not deduplication: identity_hash is
+    # sha1(_canonical_url(url)), so an aggregator adding a tracking parameter or
+    # Reed changing a slug mints a NEW identity and silently resets first_seen to
+    # zero -- an ongoing, undetected corruption of the exact data every
+    # longitudinal ghost rule depends on. ListingObservation looks this up before
+    # falling back to identity_hash so a URL-churned listing continues its window.
+    #
+    # Read the vendor column carefully before trusting it as a vacancy key: a
+    # reed/adzuna id identifies a LISTING (a repost gets a new number), while a
+    # greenhouse gh_jid identifies the employer's own REQUISITION and persists
+    # for as long as the req is open -- the closest thing in this codebase to
+    # ground truth about whether one vacancy is still the same vacancy.
+    # NULL for recruitee/careerjet/google_jobs, which expose no usable id.
+    source_ref = Column(Text)
+    # Whether this listing's `company` is a recruitment agency rather than the
+    # employer. Three-state: NULL when there is no company name to judge.
+    # Load-bearing for ghost scoring because agency reposting is routine
+    # business, not ghosting -- the repost-family rules are suppressed when this
+    # is true, while the age rules are NOT (an ad up for a year with no vacancy
+    # behind it is the candidate's problem whoever posted it). Never rendered as
+    # a negative on a card: the judge's own WISH-LIST rule treats agency-posted
+    # as a reason to be MORE generous.
+    agency_flag = Column(Boolean)
+    # The ghost rules that fired for this listing, JSON list of slugs. The
+    # longitudinal record; Role.ghost_signals is the snapshot the card renders.
+    ghost_signals = Column(Text)
+    ghost_evaluated_at = Column(DateTime)
     first_seen = Column(DateTime, default=_now)
     last_seen = Column(DateTime, default=_now, onupdate=_now)
 
     __table_args__ = (
         UniqueConstraint("profile_id", "identity_hash", name="uq_jobseen_profile_identity"),
     )
+
+
+class ListingObservation(Base):
+    """Global, profile-independent sighting history for one listing.
+
+    Deliberately NOT scoped by user_id/profile_id, for the same reason
+    JobEmbedding isn't: when a listing was seen is a fact about the listing, not
+    about whoever happened to search for it. Two concrete forces made this a
+    separate table rather than more columns on JobSeen:
+
+      * engine._store_age_days is PER-PROFILE, and it gates every observation
+        rule (OBSERVATION_MIN_STORE_DAYS). Without a global clock, a user who
+        signs up next month is silently blind to every longitudinal ghost signal
+        for their first 30 days, with no error anywhere to notice.
+      * The scheduled observation crawl (services/observe.py) has no profile at
+        all. JobSeen is UniqueConstraint(profile_id, identity_hash) on a
+        non-nullable FK, so a profile-free writer would need a sentinel profile
+        row, which would then pollute every profile-scoped query in the pipeline.
+
+    What it is NOT justified by: unifying history fragmented across profiles.
+    Measured on the live store, all 9,998 identity hashes appeared under exactly
+    one profile -- there was nothing to unify, and that argument does not survive
+    contact with the data.
+
+    ONE ROW PER LISTING, not one per sighting: `seen_dates` uses the identical
+    comma-separated days-since-epoch encoding as JobSeen.seen_dates and is
+    appended by the same engine._append_sighting, for the reason recorded there
+    (a row per observation is thousands of inserts per pass for data whose whole
+    value is longitudinal).
+
+    JobSeen.seen_dates stays exactly as it was and keeps being written. This
+    table is additive: nothing in the search path reads it yet, so if it turns
+    out to be the wrong shape it can be dropped without touching the pipeline."""
+
+    __tablename__ = "listing_observations"
+
+    identity_hash = Column(Text, primary_key=True)
+    # Preferred continuity key -- see JobSeen.source_ref. Indexed because the
+    # upsert looks up (source, source_ref) BEFORE falling back to the PK.
+    source_ref = Column(Text, index=True)
+    source = Column(Text)
+    company = Column(Text)
+    title = Column(Text)
+    url = Column(Text)
+    # Normalised company+title (engine._repost_key), grouping re-advertisements
+    # of arguably the same vacancy. Indexed here from the start, unlike its twin
+    # on JobSeen -- see database._migrate_ghost_indexes for why that one's
+    # index=True never actually took effect.
+    repost_key = Column(Text, index=True)
+    posted_at = Column(DateTime)
+    posted_at_approx = Column(Boolean)
+    expires_at = Column(DateTime)
+    first_seen = Column(DateTime, default=_now)
+    last_seen = Column(DateTime, default=_now, onupdate=_now)
+    seen_dates = Column(Text)
+    # Closing bracket on the listing's life. Stamped once, never overwritten.
+    # This is the column the whole feature is waiting on: without death
+    # timestamps there is no way to ask how long a listing actually stays up,
+    # and takedown-then-repost cannot be detected at all.
+    dead_at = Column(DateTime)
+    dead_reason = Column(Text)
+    last_verified_at = Column(DateTime)
 
 
 class JobEmbedding(Base):

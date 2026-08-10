@@ -18,8 +18,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import FRONTEND_ORIGINS
 from .database import init_db
-from .routers import admin, attributes, auth_router, families, onboarding, profiles, search, settings
+from .routers import (
+    admin,
+    attributes,
+    auth_router,
+    families,
+    feedback,
+    onboarding,
+    profiles,
+    search,
+    settings,
+)
 from .services.auth import parse_token, require_authenticated, reset_current_user, set_current_user
+from .services.beta import require_active_beta
 
 app = FastAPI(title="Four in a Thousand API", version="1.0.0")
 
@@ -142,17 +153,36 @@ def health():
     return {"status": "ok"}
 
 
-# Public: login (mints tokens) + /me (self-guards via current_user_id()).
+# Public, and it MUST stay public: this router carries POST /auth/google, which
+# is how an account comes into existence. Putting it behind require_authenticated
+# would make sign-up require being signed in.
+#
+# The routes inside it that DO need a user (/me, /signup/survey, /exit/survey)
+# self-guard by calling current_user_id(), which raises 401 when the request
+# carried no valid token -- the same pattern /me has always used.
+#
+# It also MUST stay off the beta-window dependency below: /exit/survey has to be
+# reachable by exactly the users whose window has lapsed, or the wrap-up survey
+# becomes unanswerable by the people it exists to ask.
 app.include_router(auth_router.router)
 
-# Protected: a valid Bearer token is required for every route below.
-_auth = [Depends(require_authenticated)]
+# Protected: a valid Bearer token AND an unlapsed beta window are required for
+# every route below. require_active_beta is what makes "access lapses at day 7"
+# real rather than cosmetic -- an expired user cannot start a search, edit a
+# profile or read roles. See services/beta.py for why the wrap-up survey gate is
+# deliberately NOT enforced here too.
+_auth = [Depends(require_authenticated), Depends(require_active_beta)]
 app.include_router(profiles.router, dependencies=_auth)
 app.include_router(attributes.router, dependencies=_auth)
 app.include_router(families.router, dependencies=_auth)
 app.include_router(onboarding.router, dependencies=_auth)
 app.include_router(search.router, dependencies=_auth)
 app.include_router(settings.router, dependencies=_auth)
+
+# Feedback is authed but NOT beta-gated: an answer the user has already typed
+# must never be lost to a window that lapsed between the prompt appearing and
+# the button being pressed.
+app.include_router(feedback.router, dependencies=[Depends(require_authenticated)])
 
 # Owner-only analytics, guarded by the ADMIN_TOKEN header (not user auth).
 app.include_router(admin.router)

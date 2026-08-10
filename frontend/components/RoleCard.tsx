@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 
+import { useAttributes } from "@/lib/hooks";
+import { useProfiles } from "@/lib/ProfileContext";
 import { formatSalary, useSalaryPeriod } from "@/lib/salary";
 import { VERDICT_LABEL } from "@/lib/types";
 import type { Role, RoleVerdict, SalaryPeriod } from "@/lib/types";
@@ -28,6 +30,7 @@ const QUALIFICATION = "§qualification";
  *  under 22 or earlier keep rendering their narrative until re-judged. */
 const AI_REASONING = "§ai-reasoning";
 const APPLY_HIGHLIGHTS = "§apply-highlights";
+const GHOST = "§ghost";
 
 interface Analysis {
   /** The judge's role-type + summary sentence pair, joined into one headline. */
@@ -46,6 +49,10 @@ interface Analysis {
   /** Pre-v23 narrative paragraph — behind "Show more". Replaced by
    *  `applyHighlights`; only ever populated on a not-yet-re-judged row. */
   aiReasoning: string[];
+  /** Why the ghost chip fired — behind "Show more". The chip on its own is an
+   *  unexplainable accusation about a named employer, so it must always be
+   *  backed by the specific facts. */
+  ghost: string[];
 }
 
 /**
@@ -65,9 +72,9 @@ interface Analysis {
 function parseAnalysis(text: string): Analysis {
   const out: Analysis = {
     headline: null, notes: [], legacy: [], qualificationVerdict: [], qualification: [],
-    applyHighlights: [], aiReasoning: [],
+    applyHighlights: [], aiReasoning: [], ghost: [],
   };
-  let bucket: "lead" | "qualification" | "applyHighlights" | "aiReasoning" = "lead";
+  let bucket: "lead" | "qualification" | "applyHighlights" | "aiReasoning" | "ghost" = "lead";
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
@@ -77,6 +84,8 @@ function parseAnalysis(text: string): Analysis {
       bucket = "applyHighlights";
     } else if (line === AI_REASONING) {
       bucket = "aiReasoning";
+    } else if (line === GHOST) {
+      bucket = "ghost";
     } else if (bucket === "lead" && line.startsWith("§")) {
       // A marker from a retired format -- skip rather than show it as text.
       continue;
@@ -88,7 +97,17 @@ function parseAnalysis(text: string): Analysis {
       else if (out.headline === null) out.notes.push(line);
       else out.legacy.push(line);
     } else if (bucket === "qualification") {
-      (line.startsWith("✓") ? out.qualificationVerdict : out.qualification).push(line);
+      // Two kinds of "✓" line, and they belong in different buckets. The bare
+      // verdict sentence (engine._compose_analysis's `can_do_fit`) is the
+      // always-visible headline; "✓ You have:" is the heading of the strengths
+      // bullet list, which must stay with its own "- " bullets behind "Show
+      // more" — otherwise the heading renders up top with its list collapsed
+      // somewhere else. A trailing colon is what distinguishes them.
+      const isListHeading = line.endsWith(":");
+      (line.startsWith("✓") && !isListHeading
+        ? out.qualificationVerdict
+        : out.qualification
+      ).push(line);
     } else {
       out[bucket].push(line);
     }
@@ -150,38 +169,86 @@ function distanceChip(role: Role): string | null {
 }
 
 /**
- * "Checked live" — this exact listing was fetched and confirmed to still exist
- * just before it was shown (engine._verify_final_picks).
+ * The INVERSE of the old "Checked live" chip, and the inversion is the point.
  *
- * Only ever renders when the check actually ran and answered. Null covers three
- * different cases that all mean the same thing to the reader — a provisional
- * card, a row from a run predating the check, and a listing whose host refused
- * to answer even through the browser — and in all three the honest output is no
- * chip, never a claim.
+ * engine._verify_final_picks verifies every final pick unconditionally before
+ * any Role row is written, so a positive badge was on essentially every card
+ * the user ever saw — a constant, which carries no information and trains the
+ * reader to stop looking at that row of chips. What actually varies is the
+ * absence: a provisional/quick-scored row, or a row from a run predating the
+ * check, was never verified at all, and THAT is worth saying.
  *
- * Deliberately does NOT age out into "checked 3 days ago": there is no post-run
- * re-check, so a stale timestamp would be reporting when the app last looked
- * rather than anything about the vacancy. Beyond a day it simply stops showing.
+ * Fires on the stable property (there is no verification timestamp on this row),
+ * never on a clock. An age-out would put a warning on every saved role a day
+ * later, which is not what it means — the guarantee is "live when shown", and a
+ * role verified last week was still verified when it was shown. Provisional
+ * cards are excluded: the card already says it is mid-run.
  */
-function verifiedChip(role: Role): string | null {
-  if (!role.last_verified_at || role.provisional) return null;
-  const hours = (Date.now() - new Date(role.last_verified_at).getTime()) / 3600000;
-  if (hours < 0 || hours >= 24) return null;
-  return "Checked live";
+function unverifiedChip(role: Role): string | null {
+  if (role.provisional) return null;
+  return role.last_verified_at ? null : "Not checked live";
 }
 
 /**
- * Licensed visa sponsor, per the Home Office register. Only ever shown for a
- * positive match: false means "not on the register", which for an agency-posted
- * or vaguely-named listing is not the same as "does not sponsor", and null means
- * there was no employer name to check at all. Neither earns a chip — an absent
- * badge is correctly read as "unknown", a "Not a sponsor" badge would not be.
+ * Licensed visa sponsor, per the Home Office register.
+ *
+ * Shown ONLY while the candidate's own sponsors-only filter is on. The backend
+ * stamps sponsor_licensed on every run regardless (it is cheap, and the filter
+ * can be switched on later), but for a candidate who does not need a visa the
+ * badge is an answer to a question they never asked, sitting in the same chip
+ * row as facts about the job itself.
+ *
+ * Within that, still only ever a positive match: false means "not on the
+ * register", which for an agency-posted or vaguely-named listing is not the
+ * same as "does not sponsor", and null means there was no employer name to
+ * check at all. Neither earns a chip — an absent badge is correctly read as
+ * "unknown", a "Not a sponsor" badge would not be.
  */
-function sponsorChip(role: Role): string | null {
+function sponsorChip(role: Role, filterOn: boolean): string | null {
+  if (!filterOn) return null;
   return role.sponsor_licensed === true ? "Visa sponsor" : null;
 }
 
-function factChips(role: Role, salaryPeriod: SalaryPeriod): string[] {
+/**
+ * Whether the candidate has the sponsors-only filter switched on. Read here
+ * rather than threaded down from the pages: RoleCard has twelve call sites
+ * across /search and /my-roles, and TanStack dedupes the attributes query to
+ * one request however many cards mount. Mirrors VisaSponsorToggle's read of the
+ * same single-value attribute — no row at all means off, which is the default.
+ */
+function useSponsorFilterOn(): boolean {
+  const { activeId } = useProfiles();
+  const { data } = useAttributes(activeId ?? null);
+  return (data?.by_type?.visa_sponsor_only ?? []).some(
+    (a) => a.value.toLowerCase() === "true",
+  );
+}
+
+/**
+ * Ghost-listing risk — an advert that may have no real vacancy behind it
+ * (already filled, a standing CV-collection pipeline, a cancelled req never
+ * taken down). See backend services/ghost.py for the rules.
+ *
+ * Note the three-state semantics are INVERTED from sponsorChip above, and the
+ * inversion is only honest because of a property of the rules. There, absence
+ * must read as "unknown", so only a positive is badged. Here the badge is a
+ * NEGATIVE, so absence has to read as "nothing fired" — which holds because
+ * every ghost rule fires on POSITIVE evidence and none fires on missing data
+ * (a listing with no posting date produces no signal at all). If a rule is ever
+ * added that fires on absence, this chip and the "none flagged" line on /search
+ * both become lies.
+ *
+ * "medium" deliberately does not say "ghost": one ordinary signal is not an
+ * accusation, and the card's expandable reasons carry the specifics.
+ */
+function ghostChip(role: Role): string | null {
+  if (role.ghost_level === "high") return "Possible ghost listing";
+  // Not "posted N ago" — ageChip already says that, from the same date.
+  if (role.ghost_level === "medium") return "Long-running listing";
+  return null;
+}
+
+function factChips(role: Role, salaryPeriod: SalaryPeriod, sponsorFilterOn: boolean): string[] {
   // Mostly what the AI actually read off the listing — a null means the
   // listing was silent, and no chip is better than a guessed one. While
   // provisional, the cheap rank stage's estimate is the only fit signal there
@@ -196,8 +263,11 @@ function factChips(role: Role, salaryPeriod: SalaryPeriod): string[] {
       ? `Fit estimate ${role.rank_score}/100`
       : null,
     ageChip(role),
-    verifiedChip(role),
-    sponsorChip(role),
+    unverifiedChip(role),
+    // Next to unverifiedChip on purpose: the two answer adjacent questions —
+    // "does this listing still exist" and "is there a job behind it".
+    ghostChip(role),
+    sponsorChip(role, sponsorFilterOn),
     distanceChip(role),
     // Normalised into the user's chosen unit where the backend could parse it,
     // falling back to whatever the employer wrote when it couldn't.
@@ -219,6 +289,7 @@ export function RoleCard({
 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const salaryPeriod = useSalaryPeriod();
+  const sponsorFilterOn = useSponsorFilterOn();
   // location_label is the readable form of a location the source gave as a raw
   // postcode ("B706AW" -> "Sandwell"). Null on most rows, where `location` is
   // already a place name and needs no help.
@@ -231,15 +302,17 @@ export function RoleCard({
     (a.qualificationVerdict.length > 0 ||
       a.qualification.length > 0 ||
       a.applyHighlights.length > 0 ||
-      a.aiReasoning.length > 0);
+      a.aiReasoning.length > 0 ||
+      a.ghost.length > 0);
   const hasDetail =
     !!a &&
     (a.legacy.length > 0 ||
       a.qualification.length > 0 ||
       a.applyHighlights.length > 0 ||
-      a.aiReasoning.length > 0);
+      a.aiReasoning.length > 0 ||
+      a.ghost.length > 0);
   const hasBody = !!a && (a.notes.length > 0 || a.qualificationVerdict.length > 0 || hasDetail);
-  const facts = factChips(role, salaryPeriod);
+  const facts = factChips(role, salaryPeriod, sponsorFilterOn);
   const verdict = role.verdict as RoleVerdict | null | undefined;
 
   return (
@@ -342,6 +415,16 @@ export function RoleCard({
                       <div className="an-h">AI reasoning</div>
                       {a.aiReasoning.map((l, i) => (
                         <div key={i}>{l}</div>
+                      ))}
+                    </div>
+                  )}
+                  {a.ghost.length > 0 && (
+                    <div className="an-sec">
+                      <div className="an-h">Why this was flagged</div>
+                      {a.ghost.map((l, i) => (
+                        <div key={i} className="concern">
+                          {l}
+                        </div>
                       ))}
                     </div>
                   )}

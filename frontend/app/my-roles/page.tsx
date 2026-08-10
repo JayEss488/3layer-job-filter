@@ -8,6 +8,7 @@ import { RoleCard } from "@/components/RoleCard";
 import { SalaryPeriodToggle } from "@/components/SalaryPeriodToggle";
 import { api } from "@/lib/api";
 import { useRoles } from "@/lib/hooks";
+import { NO_RESPONSE_PROMPT_DAYS, PRIMARY_OUTCOMES, daysSince } from "@/lib/outcomes";
 import { useProfiles } from "@/lib/ProfileContext";
 import type { ApplicationStatus, Role } from "@/lib/types";
 
@@ -175,24 +176,57 @@ export default function MyRolesPage() {
         {tab === "applied" &&
           current.map((role) => {
             const s = role.application_status ?? "pending";
+            const overdue = s === "pending" && daysSince(role.applied_at) >= NO_RESPONSE_PROMPT_DAYS;
             return (
               <RoleCard
                 key={role.id}
                 role={role}
-                variant={s === "rejected" ? "dim" : ""}
+                variant={s === "rejected" || s === "no_response" ? "dim" : ""}
                 showAnalysis
-                meta={role.applied_at ? `Applied ${fmtDate(role.applied_at)}` : undefined}
-                actions={(["pending", "interview", "rejected"] as ApplicationStatus[]).map(
-                  (opt) => (
+                // The nudge sits where the answer buttons already are. This
+                // field went completely unused past "pending" for its entire
+                // life, which was never a control problem -- nobody had a reason
+                // to come back and say what happened, so nobody did.
+                meta={
+                  overdue ? (
+                    <span className="concern">
+                      Applied {daysSince(role.applied_at)} days ago — heard anything back?
+                    </span>
+                  ) : role.applied_at ? (
+                    `Applied ${fmtDate(role.applied_at)}`
+                  ) : undefined
+                }
+                actions={
+                  <>
+                    {PRIMARY_OUTCOMES.map((opt) => (
+                      <button
+                        key={opt}
+                        className={`btn sm ${
+                          s === opt
+                            ? opt === "interview" || opt === "offer"
+                              ? "btn-primary"
+                              : "btn-ghost"
+                            : "btn-secondary"
+                        }`}
+                        onClick={() => setStatus.mutate({ id: role.id, s: opt })}
+                      >
+                        {opt[0].toUpperCase() + opt.slice(1)}
+                      </button>
+                    ))}
+                    {/* Separated from the row above: five equal-weight buttons
+                        read worse than four, and this one is a different kind of
+                        answer -- an absence rather than an event. Deliberately
+                        NOT final; the buttons above stay live so a late reply
+                        can correct it. */}
                     <button
-                      key={opt}
-                      className={`btn sm ${s === opt ? (opt === "interview" ? "btn-primary" : "btn-ghost") : "btn-secondary"}`}
-                      onClick={() => setStatus.mutate({ id: role.id, s: opt })}
+                      className={`btn sm ${s === "no_response" ? "btn-ghost" : "btn-secondary"}`}
+                      style={{ marginLeft: "auto", opacity: s === "no_response" ? 1 : 0.75 }}
+                      onClick={() => setStatus.mutate({ id: role.id, s: "no_response" })}
                     >
-                      {opt[0].toUpperCase() + opt.slice(1)}
+                      No response yet
                     </button>
-                  )
-                )}
+                  </>
+                }
               />
             );
           })}

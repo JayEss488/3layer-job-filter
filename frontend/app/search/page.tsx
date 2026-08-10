@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Nav } from "@/components/Nav";
 import { RoleCard } from "@/components/RoleCard";
@@ -11,6 +11,7 @@ import { SearchProgress } from "@/components/SearchProgress";
 import { TrainingBanner } from "@/components/TrainingBanner";
 import { api } from "@/lib/api";
 import { useRoles, useSearchStatus } from "@/lib/hooks";
+import { awaitingOutcome } from "@/lib/outcomes";
 import { useProfiles } from "@/lib/ProfileContext";
 import type { Role } from "@/lib/types";
 
@@ -19,20 +20,62 @@ export default function SearchPage() {
   const qc = useQueryClient();
   const { data: status } = useSearchStatus(activeId);
   const running = status?.status === "running";
+  // Collapsed by default: these are de-prioritised, not deleted, and the count
+  // in the heading is the point — the user should know they exist without
+  // having to scroll past them.
+  const [showGhosts, setShowGhosts] = useState(false);
+  const [outcomePromptHidden, setOutcomePromptHidden] = useState(false);
+  // "Are these results what they should be?" — armed by the FIRST cross or
+  // apply on a run, which is the moment the user has actually formed an opinion
+  // about the results rather than just looked at them. Whether it is due at all
+  // is the server's call (GET /feedback/due): it holds the prompt back until the
+  // user's second completed run, so their first search isn't interrupted, and
+  // knows whether they already answered for this run on another device.
+  //
+  // Stays null until that first action, so simply landing on the page never
+  // shows it. Cleared on answer/dismiss, which restores the bug-report box.
+  const [resultsPrompt, setResultsPrompt] = useState<{ runId: number | null } | null>(null);
   // includeProvisional + a poll while running: mid-run "being verified" rows
   // land as soon as the engine's gate+rank phase persists them (~halfway).
   const { data: roles } = useRoles(activeId ?? null, "new,saved,crossed", {
     includeProvisional: true,
     refetchInterval: running ? 2500 : false,
   });
+  // Applied roles are fetched here purely to ask the outcome question where the
+  // user actually is. The measured problem was never that the /my-roles control
+  // was hard to use -- it is that nobody navigates to that tab, so the field sat
+  // unused for its whole life. /search is where every session starts.
+  const { data: appliedRoles } = useRoles(activeId ?? null, "applied");
+  const awaiting = (appliedRoles ?? []).filter(awaitingOutcome);
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["roles", activeId] });
     qc.invalidateQueries({ queryKey: ["stats", activeId] });
   };
+  // Ask the server whether the results prompt is due, after the user's first
+  // cross or apply this session. Best-effort and deliberately silent on
+  // failure: a feedback prompt failing to appear must never look like the
+  // cross/apply itself failed.
+  const maybeArmResultsPrompt = () => {
+    if (!activeId || resultsPrompt) return;
+    api
+      .feedbackDue(activeId)
+      .then((due) => {
+        if (due.results_quality.due) {
+          setResultsPrompt({ runId: due.results_quality.run_id });
+        }
+      })
+      .catch(() => {
+        /* non-blocking by design */
+      });
+  };
+  const afterJudgement = () => {
+    invalidate();
+    maybeArmResultsPrompt();
+  };
   const tick = useMutation({ mutationFn: api.tick, onSuccess: invalidate });
-  const cross = useMutation({ mutationFn: api.cross, onSuccess: invalidate });
-  const applyRole = useMutation({ mutationFn: api.apply, onSuccess: invalidate });
+  const cross = useMutation({ mutationFn: api.cross, onSuccess: afterJudgement });
+  const applyRole = useMutation({ mutationFn: api.apply, onSuccess: afterJudgement });
   const clearAll = useMutation({ mutationFn: api.clearAllRoles, onSuccess: invalidate });
   const cancelSearch = useMutation({
     mutationFn: (id: number) => api.cancelSearch(id),
@@ -113,10 +156,20 @@ export default function SearchPage() {
   // only unique within that run and would collide with this run's numbering.
   // Scoping to latestRunId + a non-null fit_rank keeps that case out, and also
   // keeps out a saved leftover the judge never reached (fit_rank null).
+  // High ghost risk: pulled out of the ranked lists into a collapsed section of
+  // their own. Only "high" — a "medium" role stays inline carrying its chip,
+  // because one ordinary signal is a caveat, not a reason to hide a real job.
+  //
+  // Scoped to still-`new` rows: once the user has saved or applied to something,
+  // hiding it would be overriding a decision they already made, and the chip on
+  // the card already tells them what we think.
+  const isGhostRisk = (r: Role) => r.ghost_level === "high" && r.status === "new";
+  const ghostRisk = active.filter((r) => isGhostRisk(r) && !isUnreviewed(r));
   const isCurrentRankedPick = (r: Role) =>
     r.fit_rank != null && !isUnreviewed(r) && r.search_run_id === latestRunId;
   const inCurrent = (r: Role) =>
     !isUnreviewed(r) &&
+    !isGhostRisk(r) &&
     (r.status === "new"
       ? r.search_run_id == null || r.search_run_id === latestRunId
       : isCurrentRankedPick(r));
@@ -125,6 +178,7 @@ export default function SearchPage() {
     (r) =>
       r.status === "new" &&
       !isUnreviewed(r) &&
+      !isGhostRisk(r) &&
       r.search_run_id != null &&
       r.search_run_id !== latestRunId
   );
@@ -133,11 +187,55 @@ export default function SearchPage() {
   // their own section below.
   const savedRoles = active.filter((r) => r.status === "saved" && !inCurrent(r));
 
+  // Counts for the meta row. `current` is this run's ranked picks and is the
+  // only number that answers "what did this search find" -- everything else on
+  // the page is a labelled section of leftovers (earlier runs, roles already
+  // saved, rows the full review never reached, ghost-flagged, passed).
+  //
+  // One combined "Showing N results" conflated the two, and the gap is large
+  // enough to read as a bug: a live run showed "Showing 21 results" over 12
+  // ranked picks + 4 from an earlier run + 2 already-saved + 3 quick-scored.
+  // Nothing was miscounted -- all 21 render -- but the headline number claimed
+  // the search had found 21 roles when it had found 12. Both numbers are still
+  // summed from the exact buckets rendered below, never derived by subtraction,
+  // so neither can drift from what is actually on screen.
+  const currentCount = current.length;
+  const belowCount =
+    previous.length + savedRoles.length + unreviewed.length + ghostRisk.length + crossed.length;
+  const totalCount = currentCount + belowCount;
+
   return (
     <div className="app">
       <Nav />
       <div className="page-body">
-        {!running && <SearchFeedbackBox profileId={activeId} />}
+        {/* Asked here rather than on /my-roles because that is where the user
+            is. Dismissible per session: a prompt that cannot be silenced stops
+            being a prompt and becomes furniture. */}
+        {!running && awaiting.length > 0 && !outcomePromptHidden && (
+          <div className="annotation" style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <span>
+              You applied to {awaiting.length} role{awaiting.length === 1 ? "" : "s"} over three
+              weeks ago. Did any of them come back to you?
+            </span>
+            <a className="btn btn-secondary sm" href="/my-roles">
+              Tell us
+            </a>
+            <button
+              className="btn btn-ghost sm"
+              style={{ marginLeft: "auto" }}
+              onClick={() => setOutcomePromptHidden(true)}
+            >
+              Not now
+            </button>
+          </div>
+        )}
+        {!running && (
+          <SearchFeedbackBox
+            profileId={activeId}
+            resultsPrompt={resultsPrompt}
+            onResultsPromptDone={() => setResultsPrompt(null)}
+          />
+        )}
         <TrainingBanner />
 
         {running && (
@@ -175,21 +273,26 @@ export default function SearchPage() {
         {!running && (
           <div className="meta-row">
             <span>
-              {/* Quick-scored-only rows are shown but aren't results — counting them
-                  here would inflate "N results" with roles nothing reviewed. Summed
-                  from the exact buckets rendered below rather than derived by
-                  subtraction, so this can never drift from what's actually on
-                  screen (see the `unreviewed` note above for how it drifted before). */}
+              {/* See the currentCount/belowCount note above: the headline number is
+                  this search's ranked picks only, and everything else is counted
+                  separately rather than folded in. */}
               Showing{" "}
               <span className="count">
-                {current.length + previous.length + savedRoles.length + unreviewed.length + crossed.length} results
-              </span>
+                {currentCount} result{currentCount === 1 ? "" : "s"}
+              </span>{" "}
+              from this search
+              {belowCount > 0 && (
+                <>
+                  {" · "}
+                  <span className="count">{belowCount} more</span> below
+                </>
+              )}
             </span>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               {/* Only offered when something on screen actually has a parsed
                   salary — see SalaryPeriodToggle. */}
               <SalaryPeriodToggle show={(roles ?? []).some((r) => r.salary_period)} />
-            {(current.length + previous.length + savedRoles.length + unreviewed.length + crossed.length) > 0 && (
+            {totalCount > 0 && (
               <button
                 className="btn btn-ghost sm"
                 onClick={() => {
@@ -224,9 +327,9 @@ export default function SearchPage() {
               Top candidates so far — verifying with the full AI review…
             </div>
             <div className="annotation" style={{ padding: "0 0 8px" }}>
-              Quick-scored by AI (about 2 minutes in). These are provisional — anything you
-              don&apos;t Keep will disappear once the full review finishes, at around 5 minutes,
-              if it doesn&apos;t make the final cut.
+              Quick-scored by AI (about 3 minutes in). These are provisional — anything you
+              don&apos;t Keep will disappear once the full review finishes, at around 5 and a
+              half minutes, if it doesn&apos;t make the final cut.
             </div>
             {verifying.map((role) => {
               const kept = role.status === "saved";
@@ -272,7 +375,7 @@ export default function SearchPage() {
               Early matches — found by keyword/semantic similarity, not yet reviewed
             </div>
             <div className="annotation" style={{ padding: "0 0 8px" }}>
-              No AI has read these yet — they land first (about 45 seconds in) precisely
+              No AI has read these yet — they land first (about 1 minute 15 in) precisely
               because nothing has reviewed them. They&apos;re here so you can see what the
               search picked up straight away; most will be replaced above as the review
               progresses.
@@ -454,6 +557,62 @@ export default function SearchPage() {
               );
             })}
           </>
+        )}
+
+        {/* Possible ghost listings — hidden behind a count by default, but never
+            removed. A warning, not a filter: the rules infer from a posting date
+            and the listing's own words, and being wrong must cost the user
+            nothing more than a click. Expanded, these carry the FULL action row,
+            because the user overrules us, not the other way round. */}
+        {!running && ghostRisk.length > 0 && (
+          <>
+            <button
+              type="button"
+              className="crossed-section-label"
+              style={{ background: "none", border: 0, cursor: "pointer", textAlign: "left" }}
+              onClick={() => setShowGhosts((v) => !v)}
+            >
+              ⚠ {ghostRisk.length} listing{ghostRisk.length === 1 ? "" : "s"} flagged as a
+              possible ghost job — {showGhosts ? "hide" : "show"}
+            </button>
+            {showGhosts &&
+              ghostRisk.map((role) => (
+                <RoleCard
+                  key={role.id}
+                  role={role}
+                  showAnalysis
+                  variant="dim"
+                  actions={
+                    <>
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => tick.mutate(role.id)}
+                      >
+                        ✓ Save
+                      </button>
+                      <button className="btn btn-secondary" onClick={() => applyRole.mutate(role.id)}>
+                        Mark as applied
+                      </button>
+                      <button className="btn btn-ghost" onClick={() => cross.mutate(role.id)}>
+                        ✗ Pass
+                      </button>
+                    </>
+                  }
+                />
+              ))}
+          </>
+        )}
+
+        {/* Said once, globally, rather than as a per-card "looks fine" badge.
+            Without it an absent warning is indistinguishable from the check not
+            running at all, and the user has paid attention cost for a feature
+            they cannot tell is working. Suppressed mid-run and when there are no
+            results, where "none flagged" would be meaningless rather than
+            reassuring. */}
+        {!running && ghostRisk.length === 0 && current.length > 0 && (
+          <div className="annotation">
+            No listings in these results were flagged as possible ghost jobs.
+          </div>
         )}
 
         {!running && crossed.length > 0 && (

@@ -22,7 +22,18 @@ from ..services.feedback import apply_feedback
 
 router = APIRouter(tags=["search"])
 
-_VALID_APP_STATUS = {"pending", "interview", "rejected"}
+# `offer` and `no_response` were added for the ghost-listing feedback loop, and
+# `offer` is not decoration: before it, every terminal state here was negative,
+# and a form whose only outcomes are bad is a form people don't fill in. This
+# field had never been used past "pending" in its entire life.
+#
+# `no_response` is the ground truth the ghost rules would eventually like to be
+# calibrated against -- and it is BIASED, which must travel with it wherever it
+# is read. Most applications get no reply for entirely ordinary reasons, so it
+# is usable only as a rate across many rows conditioned on a fired signal, never
+# as proof about any one listing. It is also not final: the other values stay
+# available so a late reply can correct it.
+_VALID_APP_STATUS = {"pending", "interview", "offer", "rejected", "no_response"}
 
 # Which usage event a role lifecycle action logs (see services/analytics.py).
 _FEEDBACK_EVENT = {"tick": "role_tick", "cross": "role_cross", "ignore": "role_ignore"}
@@ -221,8 +232,26 @@ def set_application_status(
     if body.application_status not in _VALID_APP_STATUS:
         raise HTTPException(status_code=422, detail="Invalid application status")
     role.application_status = body.application_status
+    # Stamped ONCE, on the first transition away from "pending", and never
+    # overwritten -- same invariant as JobSeen.dead_at and for the same reason.
+    # The measurement is the interval applied_at -> response_at, and a later
+    # correction (a "no response" that turns into an interview three weeks on)
+    # must not silently rewrite when the employer first came back.
+    if body.application_status != "pending" and role.response_at is None:
+        role.response_at = datetime.utcnow()
     db.commit()
     db.refresh(role)
+    # The only outcome data this app will ever have. Logged to EventLog rather
+    # than inferred later from Role rows because EventLog carries user_id
+    # directly, so /admin/analytics can roll it up across every beta user
+    # without joining through profiles -- and because a status can be corrected,
+    # where the event stream keeps what was reported when.
+    if role.profile:
+        days = ((role.response_at or datetime.utcnow()) - role.applied_at).days \
+            if role.applied_at else None
+        log_event(db, role.profile.user_id, role.profile_id, "application_outcome",
+                  {"role_id": role.id, "status": body.application_status,
+                   "days_since_applied": days})
     return role
 
 

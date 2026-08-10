@@ -91,6 +91,35 @@ nothing; `--browser` escalates the rows a plain GET can't answer for):
 venv/Scripts/python scripts/audit_listing_liveness.py --limit 45 --browser
 ```
 
+**Run one observation pass — POINT A SCHEDULER AT THIS, DAILY** (board-API quota only,
+zero OpenAI; never writes `jobs_seen`, never creates a Role or a SearchRun, so it cannot
+consume the daily search cap). Daily is a functional requirement, not tidiness: the
+evergreen rule divides days-seen by days-since-discovery, so gaps suppress the signal
+rather than merely delaying it:
+```
+venv/Scripts/python scripts/observe_listings.py
+```
+```
+venv/Scripts/python scripts/observe_listings.py --status
+```
+
+Re-check tracked listings for liveness and stamp `dead_at` (plain GETs, no browser, no
+LLM, no credits). **Run `--dry-run` first and read the output** — `dead_reason` is
+unrecoverable:
+```
+venv/Scripts/python scripts/recheck_liveness.py --limit 20 --dry-run
+```
+```
+venv/Scripts/python scripts/recheck_liveness.py
+```
+
+Score every stored listing against the ghost rules, offline and read-only — the
+regression bar for any rule change. Judge it on the roles the user actually engaged
+with (bar: **zero applied-to roles flagged high**), never on the store-wide hit count:
+```
+venv/Scripts/python scripts/backtest_ghost_rules.py
+```
+
 Seed the ATS company-board store (optional, runs automatically once on first boot if
 `company_ats` is empty — see `backend/app/services/seed.py`):
 ```
@@ -637,9 +666,16 @@ of what the last finished run already recorded — see the search-pipeline secti
      to the place, which is part of why the rule collapsed into geography alone.
    Note where enforcement actually bites for a default profile: work-type rows default to
    **Soft** (`config.enforcement_for`), so `hard_axes` is empty, the cheap gate only demotes
-   (one soft-axis failure), and the judge only deprioritises. The mechanical filter is
-   `rank_gate`'s ≤15 cap landing under `RANK_REJECT_SCORE_FLOOR` (50) — the same way the
-   salary floor, also a Soft-by-default type, is enforced (rule e). Flipping Dashboard →
+   (one soft-axis failure), and the judge only deprioritises. The mechanical filter **used to
+   be** `rank_gate`'s ≤15 cap landing under `RANK_REJECT_SCORE_FLOOR` — the same way the
+   salary floor, also a Soft-by-default type, was enforced (rule e). That is no longer true
+   and the distinction matters: a Soft-enforced arrangement/salary mismatch now goes to
+   `_rank_prompt`'s **SOFT-PREFERENCE MISMATCHES** section, which sets `soft_violation` and
+   leaves the score alone, and `_selection_score` demotes it by
+   `SOFT_VIOLATION_SELECTION_PENALTY` instead of eliminating it. See that constant and
+   `RANK_REJECT_SCORE_FLOOR` for why the two had to be separated before the floor could
+   move. The Hard path is unchanged — those rules stay in HARD DOWNGRADES and still cap at
+   15. Flipping Dashboard →
    Preferences → Work style to **Hard** adds `_work_arrangement_ok` to `hard_axes` (an
    unconditional cheap-gate drop, no `MIN_RESULTS` backfill) and makes it a judge
    disqualifier. The default was left Soft on purpose, for two reasons: the cheap gate
@@ -858,9 +894,12 @@ of what the last finished run already recorded — see the search-pipeline secti
    `SNIPPET_SUFFICIENT_CHARS`, deliberately above Adzuna's exact-500-char API truncation
    so Adzuna snippets don't wave through as "sufficient" by coincidence — and for
    anything with a persisted `full_text` from a prior run — see
-   `engine.py::_needs_full_scrape`) → **Phase 6 final LLM evaluation runs once per
-   cluster**, each a **single** expensive call (`full_auto.final_evaluation_split`)
-   returning a strict `strong` list, a lenient disqualifier-only `backup` list, and
+   `engine.py::_needs_full_scrape`) → **Phase 6 final LLM evaluation runs once per judge
+   group** — usually one per cluster, with thin clusters merged into a shared call, see
+   `JUDGE_MERGE_THIN_CLUSTER_MAX`/`_judge_groups` — each a **single** expensive call
+   (`full_auto.final_evaluation_split`)
+   returning a strict `strong` list, a `backup` list of every other worth-applying-to
+   role (both capped at `FINAL_PICKS`, both SHOWN — see the v26 note below), and
    **two exclusion lists that account for every remaining job**: `disqualified` (hard
    DISQUALIFIERS hits, reason must carry the verbatim quoted clause) and `not_selected`
    (passed the disqualifiers but wasn't among the best picks). Every `job_number` the
@@ -893,7 +932,7 @@ of what the last finished run already recorded — see the search-pipeline secti
    identically to a fresh one), and are rendered by `engine._compose_analysis`. There is
    still no separate JD-summarisation pass — the three-axis read happens inside this same
    call, on the `full_text` it already receives, deliberately avoiding an extra paid call
-   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 23)
+   per job. **Any edit to these prompts must bump `FINAL_EVAL_PROMPT_VERSION`** (now 26)
    or every already-persisted verdict is served stale forever.
    **`fit_level` is derived mechanically from the model's own step-D requirements
    checklist and `concerns`, not from an overall impression, and is decoupled from which
@@ -902,7 +941,8 @@ of what the last finished run already recorded — see the search-pipeline secti
    in the prompt tied the grade to anything: the model listed a decisive concern ("no
    hands-on exposure to PLCs, industrial control systems, robotics") and still returned
    `strong`. Two rules fix it. The **rubric** (in `_FINAL_EVAL_SCHEMA`) sets `very_strong`
-   = all core requirements met + `sector_match` + no concern touching a core requirement,
+   = all core requirements met + no concern touching a core requirement (it also required
+   `sector_match` until v26 removed that field),
    `strong` = all core met + at most one such concern, `ok` = one unmet core or 2+ such
    concerns, `stretch` = 2+ unmet core; a `strong`-list pick may legitimately grade `ok`,
    so the strong/backup split (a disqualifier + worth-showing decision) no longer forces
@@ -949,7 +989,8 @@ of what the last finished run already recorded — see the search-pipeline secti
    field is only what can go on the page), and `highlight` must name evidence that
    actually appears in the profile, framing weak/self-directed evidence honestly rather
    than dressing it as commercial. Two things step E used to own moved to `concerns`: a
-   false `sector_match` trade-off (step G) and a want-fit mismatch (step B).
+   false `sector_match` trade-off (step G, itself removed in v26) and a want-fit mismatch
+   (step B).
    v23 also closed a **nice-to-have vocabulary hole**: "ideally", "preferably",
    "desirable", "a plus", "a bonus", "an advantage", "welcome", "would be great" were
    absent from QUOTE-THEN-CLASSIFY's SOFT list and from step D's rule (b), so
@@ -959,6 +1000,97 @@ of what the last finished run already recorded — see the search-pipeline secti
    `concerns`: it is now explicitly held to the same bar, and may never cite a
    nice-to-have or a trained-for ask as the reason a role was passed over ("out-competed"
    is the honest answer there).
+   **v26 is the leniency/output rework, and it changes what the judge's two lists MEAN.**
+   * **`backup` is no longer last-resort filler.** It was capped at 3 ("least-bad
+     survivors") and `engine._evaluate_cluster` used it **only when a cluster had zero
+     strong picks** — so a run could finish with 3 picks while a dozen judged,
+     perfectly-applicable roles sat discarded, and every other such role had been filed
+     under `not_selected`, which carries only an internal audit phrase and therefore
+     **cannot be displayed at all**. Now: capped at `FINAL_PICKS`, described in the prompt
+     as SHOWN to the candidate, and `picks = strong_tier + backup_tier` unconditionally.
+     The run-wide assembly is grade-ordered (`_VERDICT_GRADES`) and capped at
+     `FINAL_PICKS`, so appending backups can never displace a better-graded pick — it only
+     fills slots that would otherwise go empty. `eval_fallback` is still tagged only when
+     there were NO strong picks, but **it no longer prints a banner**
+     (`engine._SILENT_FALLBACK_TAGS`). It used to render *"X matches were thin this run —
+     showing the closest available instead of only confident picks"*, which was true under
+     the pre-v26 design and is not under this one: a run made entirely of backup picks is
+     now a normal run of verified, applicable roles, so the banner framed a verified pick
+     as a consolation prize — exactly the reason the per-card "Closest available match"
+     line went in the same rework. The tag is still SET and still lands in the run
+     diagnostics; suppression is one entry in a frozenset, and it has to be done there
+     rather than by deleting the message, or the tag falls through to
+     `_compose_fallback_warning`'s generic multi-cluster line and says the same thing in
+     vaguer words. Every other fallback reason (`cluster_skipped`, `gate_fallback`,
+     `broadened`/`floor_fallback`) still speaks. Two knock-on
+     fixes: the scam-verify backup fallback was **removed** (backup is now already inside
+     `picks` and has been through the same filter, so re-adding it would resurrect
+     listings just corroborated as scam and persisted as reject overrides), and the
+     `MIN_RESULTS` backfill retry — the single most expensive optional call in the run —
+     now fires far less often because `picks` is fuller. Harvesting `not_selected`
+     directly was considered and rejected: those entries have no `summary`/`can_do_fit`/
+     `fit_level`/`concerns`, so they would render as blank cards, and they are persisted
+     as rejects. Widening `backup`, which already carries display-quality output, gets the
+     same roles onto the page for free.
+   * **A WISH-LIST bar.** Employers hire "under-qualified" candidates far more often than
+     their adverts suggest. Three tells that a posting's stated requirements are a
+     recruiter's ideal-hire sketch rather than a bar — posted by a **recruitment/staffing
+     agency** (a padded summary of a manager's brief, written for a wide funnel); a
+     **contract/interim/fixed-term/day-rate** role (lower, more negotiable bars, less
+     long-term risk); a **long "essential" list** (~8+ items, especially split into
+     technical/analytical/communication groupings) and/or **"negotiable"/"competitive"
+     pay**. At the judge these push toward including a role in `backup` and toward the
+     more generous of two adjacent `fit_level`s. Mirrored at the mid tier as a **WISH-LIST
+     EXCEPTION** on `rank_gate`'s HARD DOWNGRADES (a) and (b) *only* — those two are about
+     stated expectations, so a wish-list posting takes an ordinary DEPTH FIT deduction
+     instead of a score cap. It explicitly does NOT apply to (c)–(h): closed listings,
+     geography/right-to-work, max-age elimination and apprenticeship over-qualification
+     are facts about **eligibility**, not negotiable expectations. Not added to
+     `screen_gate`: its soft axes only demote and are floor-protected, and touching that
+     prompt costs a `screen_v` bump that re-screens the whole store.
+   * **`sector_match` and reasoning step G are gone**, along with DISQUALIFIER 5's closing
+     "judged separately as a ranking signal" paragraph, the sector clauses in steps B/E,
+     and the `very_strong` rubric's dependency on it. Rule 5 is renamed **PROFESSIONAL
+     FIELD FIT** and now says explicitly that it is about the professional FIELD only,
+     never the industry/sector/cause, and that an industry objection may never appear
+     anywhere in the output. The field's only user-visible effect was a *"this is not
+     within your stated clean-energy, science, climate or nonprofit sector interests"*
+     item in `concerns` — noise on a card about whether the candidate can do the job —
+     while silently gating `very_strong`. `snapshot.build_snapshot` no longer emits the
+     "Sector interests:" CV line and `profile_intel._BACKGROUND_TYPES` no longer carries
+     `sector_target` (`PROFILE_INTEL_VERSION` 9 → 10). **`sector_target` rows still exist
+     and still auto-fill from the CV** — they are a DISCOVERY-side signal only now
+     (`services/harvest.py` picks ATS-harvest keywords from them, which is how a
+     charity-sector candidate reaches charity employers at all). Nothing the candidate
+     reads is derived from them.
+   * **Step G is now STRENGTHS**, required for an `ok`/`stretch` pick and omitted for
+     `very_strong`/`strong`: 1–3 concrete things the candidate genuinely DOES bring,
+     each naming a step-D item marked `met: true` and the candidate's own evidence for
+     it. Those two grades' cards previously showed a list of gaps and **nothing
+     alongside them** for a role the judge was recommending. `concerns` is capped at 3
+     (asked for in step C, enforced by `_sanitize_bullets`, which caps `strengths` to
+     match) — a longer list stops being things to address and reads as "don't bother".
+   * **A WORDING rule on whose side a shortfall is stated from.** `can_do_fit`,
+     `concerns` and `not_selected` reasons must describe a gap as something the POSTING
+     asks for or prefers, never as a deficiency in the candidate: "you would be a stretch
+     because the role expects X" becomes "the posting prefers X". "you would be a
+     stretch", "you lack", "you fall short", "you are under-qualified", "you do not
+     meet", "you are not a fit" are banned outright.
+   Card-side (`engine._compose_analysis` / `RoleCard.tsx` / `lib/types.ts`): the
+   `⚠ Closest available match — no role fully met the bar this run.` line is **gone**
+   (it fired for every non-strong-list pick, which is now a routine outcome, and framed a
+   verified role as a consolation prize); `⚠ You lack N aspects:` is now `⚠ Note that:`
+   (the count invited the card to be read as a score, and "you lack" states a property of
+   the candidate); strengths render as `✓ You have:` + bullets; and **`VERDICT_LABEL` no
+   longer labels `ok`/`stretch` at all** — the badge is the first thing read on a card and
+   "Ok fit" told the candidate to discount a role the judge had just verified, while the
+   card body says the same thing with the specifics attached. The grade still does its
+   real job (ordering, `_VERDICT_GRADES`), it just isn't printed; the schema tells the
+   model this explicitly so it grades honestly rather than protectively. `VERDICT_LABEL`
+   is now a `Partial<Record<…>>` and `RoleCard` already guarded on the lookup. Note the
+   `§qualification` parse rule: a `✓` line ENDING IN A COLON is a bullet-list heading
+   (collapsible, with its bullets), a `✓` line that doesn't is the always-visible
+   `can_do_fit` verdict.
    **Tier hand-off — what the cheap/mid stages pass forward so the judge re-derives
    less** (`full_auto._final_eval_job_block`, all as bracketed notes in each job block;
    the judge's system prompt has a `WHAT THE BRACKETED HINTS IN A JOB BLOCK ARE`
@@ -1339,22 +1471,69 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   primary) after a live `tests/gate_harness.py` run confirmed jobs scoring below ~0.39
   were reliably screened out later anyway — admitting them at all just burned gate/rank
   calls on jobs with no realistic path to a final pick.
-- `RANK_EXAMINE_BUDGET` (240, later **320**) / `RANK_TARGET_POOL` (80) / `JUDGE_POOL` (40) /
-  `RANK_REJECT_SCORE_FLOOR` (50), all `engine.py` — the four numbers that set what the
+- `RANK_EXAMINE_BUDGET` (240 → 320 → **480**) / `RANK_TARGET_POOL` (80) / `JUDGE_POOL` (40) /
+  `RANK_REJECT_SCORE_FLOOR` (50 → **32**), all `engine.py` — the four numbers that set what the
   cheap+mid stages cost and what the judge gets to choose from, see pipeline step 2.
   `RANK_EXAMINE_BUDGET` is the honest cost dial: it is roughly a 3x increase on what the
   old per-cluster caps summed to, and screen (CHEAP) + rank (MID) calls scale directly
   with it. Raised 240 → 320 after a live single-cluster run stopped on "absolute pool
   cap" at 240 examined / 69 gated / 9 judged against a 760-deep queue — the ceiling
-  itself, not `MIN_RESULTS`/`JUDGE_POOL`/a thin queue, was the limiting factor.
+  itself, not `MIN_RESULTS`/`JUDGE_POOL`/a thin queue, was the limiting factor. Raised
+  again 320 → 480: with the free pool-quality prescreens removing ~65% of the queue
+  before a token is spent, too little was still reaching the judge on a real profile.
+  Because the gate screens the whole budget in ONE wave (see `GATE_ROUND_SIZE` below), a
+  wider budget costs more parallel batches rather than more serial waves — so if
+  time-to-first-card regresses, `REED_/ADZUNA_ENRICH_PRE_GATE_CAP` and `*_PAGES_PER_TERM`
+  are the knobs, not this one.
+  **`RANK_REJECT_SCORE_FLOOR` was doing two unrelated jobs, and could not be lowered
+  until they were separated.** It reads as a quality bar, but `rank_gate`'s work-arrangement
+  and salary HARD DOWNGRADES capped a violating listing's score at 15 *precisely so this
+  floor would eliminate it* — i.e. the floor was also the enforcement path for two
+  preferences the candidate had explicitly marked **Soft**, and lowering it would have
+  silently switched that enforcement off. `_rank_prompt` now renders those two rules into
+  their own **SOFT-PREFERENCE MISMATCHES** section whenever the candidate left them Soft
+  (they stay in HARD DOWNGRADES when marked Hard — the prompt is assembled from
+  `profile["hard_axes"]`). That section sets a `soft_violation` boolean and explicitly
+  does NOT touch the score; `engine._selection_score` then subtracts
+  `SOFT_VIOLATION_SELECTION_PENALTY` (12.0) — ordering only, never `_rank_score`, under the
+  same rule as `RICH_TEXT_SELECTION_BONUS` and `_unverified_penalty`, so the card's "Fit
+  estimate" chip and the floor test both keep showing the model's own number. That is what
+  "Soft" was supposed to mean all along; a capped-to-15 score was indistinguishable from a
+  genuinely terrible fit at every downstream stage. With that split, 32 is free to be what
+  the name says ("the mid tier is not telling us this is clearly a no"), clearing the
+  score-15 band the real hard downgrades still occupy with headroom. The flag rides in
+  `gate_cache`'s text column as a third packed field (`{score}|{note}|{0|1}`); `rank_v15` →
+  `rank_v16`, since a v15 score of 15 for a soft-mismatching listing means "preference
+  mismatch", not "bad fit", and is not comparable.
   `full_auto.rank_gate`'s fail-open path (its `llm()` call erroring,
   e.g. an intermittent permission/rate error on `MID_MODEL`) retries once on the same
   model after a short backoff, then falls back to `CHEAP_MODEL`, before giving up; a
   job that still has no real score after all of that is tagged `_rank_gate_failed` and
   bypasses `RANK_REJECT_SCORE_FLOOR` entirely in `engine._gate_rank_refill_cluster`
-  rather than being compared against it — the fallback neutral score (50) is now exactly
-  AT the floor rather than below it, but the bypass stays: it must not depend on those
-  two numbers happening to coincide.
+  rather than being compared against it — the fallback neutral score (50) no longer
+  coincides with the floor at all, but the bypass stays: it must not depend on those
+  two numbers happening to differ either.
+- `JUDGE_MERGE_THIN_CLUSTER_MAX` (6) / `engine._judge_groups` — which clusters SHARE a
+  Phase 6 judge call. A judge call pays ~12k tokens of `_FINAL_EVAL_SYSTEM` plus the
+  cluster CV before it reads a single job, and each job then costs ~770 — jobs are ~17x
+  cheaper than calls, so two 4-job clusters cost far more as two calls than as one 8-job
+  call. Deliberately a LOW threshold rather than "merge whenever it's cheaper": the
+  per-cluster CV (`cv_text_for_cluster`) is the mechanism that stops a candidate targeting
+  two unrelated fields being judged against a blend, and a profile-wide judge call diluting
+  a minority cluster is **a bug this pipeline has already had once**. Merging only genuinely
+  thin clusters keeps that protection where it works while removing the case it protects
+  worst — a 3-job cluster whose judge can only pick the least-bad of three either way. A
+  group never exceeds `FINAL_EVAL_MAX_JOBS_PER_CALL`, or `final_evaluation_split` would
+  re-split it into concurrent chunks and hand back exactly the per-call overhead the merge
+  was for. Groups are decided from the selected pool *before* scraping so each group can
+  still scrape-then-judge as one pipelined task (`_scrape_then_judge` now takes a group and
+  `asyncio.gather`s its clusters' scrapes). `_run_cluster_final_eval` takes `idxs: list[int]`
+  and returns `"idxs"`; the caller loops per GROUP for the per-call work (verdict persistence,
+  run-wide counters, the shared scam-verify budget) and splits `picks`/diagnostics back per
+  cluster by each entry's own `_cluster`. `_cluster_label` is stamped per JOB, not per group,
+  or a merged group would tell the user a role was "matched via A + B track" when the
+  embedding stage only ever assigned it to A. Count lands in
+  `funnel_counts.judge_calls_saved_by_merge`.
 - `GATE_ROUND_SIZE` (80) / `full_auto._GATE_MAX_WORKERS` (4) — the latency side of that
   budget. **The gate no longer examines its budget in incremental rounds.** It used to:
   a small `GATE_FIRST_ROUND` then `GATE_ROUND_SIZE`-sized ones, each a blocking
@@ -1480,6 +1659,33 @@ for *ambiguous* cases, not the place to catch a Texas listing for a UK candidate
   from the senior reject entirely**. That exemption is what makes broad tokens like
   `manager` safe, and it applies only in the junior-profile direction (the senior
   direction rejects ON that marker, so exempting it there would disable the check).
+  **The senior direction is conditional on the candidate's "Allow overqualified"
+  preference** (`allow_overqualified`, single-value boolean, default **off**, Dashboard →
+  Preferences → "Roles below your level", just above Visa sponsorship). With it on, a
+  junior-marked title stops being an unconditional drop and goes through to the soft gate,
+  and `_screen_prompt`/`_rank_prompt`/the judge are told a lower-pitched role is not itself
+  a mismatch. Strictly one-directional: it never loosens the junior-profile direction,
+  since a Graduate candidate is not helped by being shown Director roles.
+  **The trap, and the thing not to undo:** it must NOT re-admit apprenticeships or
+  placement years (`_INELIGIBLE_REGARDLESS_OF_LEVEL_RE`, which still hard-drops them).
+  Those were never excluded for being *junior* — an apprenticeship is a place on a course
+  with an eligibility bar against applicants who already hold the qualification, and a
+  placement year requires the applicant to still be mid-degree. Both get **worse**, not
+  better, the more qualified the applicant is, which is exactly the failure fixed at all
+  three LLM tiers together in screen_v13 / rank_v10 / eval 19. "I'll consider a more junior
+  role" is not consent to a course you cannot enrol on. The carve-out is therefore restated
+  at every tier alongside the flag, for the same reason those apprenticeship rules are:
+  dropping it at one tier reinstates the hole at that tier.
+  Cache scoping: the flag rides in `full_auto._profile_signature_v2`, which appends to the
+  base signature **only when the flag is on** — so a default profile's hash is byte-identical
+  and nothing is re-screened, while turning it on invalidates just that profile's screen/rank
+  verdicts. `screen_gate`, `rank_gate` and the run's `gate_sig` (`JobSeen.gate_signature`, the
+  gate-retirement key) all use `_v2`, so flipping it also re-opens rows a previous run retired
+  under the other setting. The final judge's system prompt is a byte-identical constant across
+  every profile (that is what makes its 24h prompt-cache retention pay), so the flag reaches it
+  as an **"Open to more junior roles:" line in the per-run CV text** instead — the same
+  mechanism as the "Maximum listing age" and "Location search scope" lines, and DISQUALIFIER 1
+  keys off that exact wording.
 - **Placement year** (`_PLACEMENT_YEAR_RE`). A sandwich-year/industrial-placement role
   exists for someone still part-way through a degree, reads as a near-perfect match on
   every other axis, and therefore survives all three LLM tiers — a live run put a
@@ -1605,17 +1811,55 @@ inbox at the time.
 
 **Deliberately NOT built: post-run re-checking.** No endpoint re-verifies a role after its
 run, and a saved role is never re-checked. The guarantee is "live when shown", not "live
-forever". This is why `verifiedChip` stops rendering after 24h rather than ageing into
-"checked 3 days ago" — with no re-check, an old timestamp reports when the app last looked,
-not anything about the vacancy.
+forever". The card therefore badges the **absence** of a check, not its presence
+(`RoleCard.unverifiedChip`): since `_verify_final_picks` verifies every pick
+unconditionally, a positive "Checked live" chip was a constant on every card and carried
+no information, while a row that was never verified at all (provisional/quick-scored, or
+from a run predating the check) is worth saying. It fires on the stable property — no
+`last_verified_at` on the row — never on a clock, because a role verified last week WAS
+verified when it was shown, and ageing the chip into a warning would contradict the
+guarantee above rather than restate it.
 
 **Check order, and the trap in it.** 404/410 first (the workhorse — every genuine death
 in a 45-row live sample was a hard 404, nothing else contributed one), then a schema.org
 `validThrough` already in the past, then `_dead_listing_signal`. **Never call
-`_EXPIRED_LISTING_RE` raw here.** A LIVE bebee posting matches that bare regex on its own
-page furniture; only the guarded `_looks_like_expired_listing`, with its length and
-head-position gates, correctly declines. Using the raw pattern turned 5 live listings into
-"dead" in an early measurement, and `dead_reason` cannot be undone.
+`_EXPIRED_LISTING_RE` raw here**, and never hand any of it `_strip_html` output.
+
+Both halves of that were live bugs, and the second one was hiding the first. `_strip_html`
+removes TAGS but keeps the CONTENTS of `<script>`/`<style>`, which is right for its actual
+remit (an ATS description fragment) and catastrophic on a whole document from a JS
+framework. `full_auto._visible_text` (used by `_classify_listing` and by
+`fetch_adzuna_details`' unbounded closure-phrase check) strips those elements first.
+Measured on the flexa.careers page that prompted this: `_strip_html` gave **234,757 chars
+with the closure notice at offset 107,967**, `_visible_text` gives **7,736 with it at 288**
+— and `_looks_like_expired_listing`'s gates are calibrated on exactly those two numbers,
+so the listing read as alive, was graded a pick, and was shown at rank 6 badged
+"Checked live" while its page said *"we're really sorry but this job is no longer
+available"*.
+
+Two consequences worth keeping:
+- **`_looks_like_expired_listing` no longer has a length ceiling** —
+  `_EXPIRED_LISTING_MAX_CHARS` is gone and `_EXPIRED_LISTING_HEAD_CHARS` (1500) is the
+  only gate. The ceiling was a proxy for "the phrase is somewhere incidental", and a bad
+  one: the flexa page kept the ENTIRE job description rendered below the notice (16k of
+  markdown), so no ceiling under 16k could ever have caught it. What makes dropping it
+  safe is that the same `_visible_text` fix removed the ceiling's original justification —
+  the bebee false positive was never in the page's TEXT, it was in the inlined script/style
+  `_strip_html` left behind. Re-measured over 382 live pages (376 stored scraped pages with
+  real text + 6 live bebee postings of 3.0k–6.6k visible chars): the pattern matches **zero
+  of them at any offset**. The two bebee rows that did match were hard 404s at offset 36,
+  which check 1 catches anyway. The head window is now the only guard — don't widen it.
+- **A 200 that renders to nothing is `unverifiable`, not `alive`**
+  (`_VERIFY_MIN_VISIBLE_CHARS`, 200 chars, and no JSON-LD either). The existing
+  `len(body) < 400` floor reads the RAW body and cannot see this: flexa served **89,201
+  bytes of Next.js bootstrap with 0 chars of readable text** to `_VERIFY_UA`, and the old
+  code called that alive. Saying unverifiable is what routes it to `_verify_via_browser`,
+  which renders the JS and returns a real answer — measured end-to-end, this exact listing
+  now goes `plain GET → unverifiable/no_visible_text` then `browser → dead/expired_phrase`.
+  Note the UA quirk behind it, which is worth not "fixing" blind: flexa serves the SSR'd
+  page to an honest bot UA and the client-only shell to `_VERIFY_UA`'s Chrome string, i.e.
+  here the browser-spoofing UA is what costs us the content. The architectural fix
+  (unverifiable + escalate) is right regardless of one host's behaviour; the UA is not.
 
 **Mirror hosts are not a drop list, and there is no host-level dead rate.** An earlier
 reading of the data appeared to show bebee/glassdoor at a 100% dead rate — that was an
@@ -1635,6 +1879,42 @@ readable text (nothing to judge, no way to check); otherwise they take
 `UNVERIFIED_RANK_PENALTY` on `_selection_score` **only**, never `_rank_score`, so the
 card's "Fit estimate" chip and `RANK_REJECT_SCORE_FLOOR` keep showing the model's own
 number — the same separation `RICH_TEXT_SELECTION_BONUS` respects.
+
+**Some hosts cannot report closure at all, and a 200 from them is not evidence of life**
+(`_LIVENESS_BLIND_HOSTS`, today just `linkedin.com`). This is a *narrower and different*
+claim from `MIRROR_BRANDS`: an ordinary mirror still 404s or serves a closure notice when
+its copy comes down, which is precisely what `_classify_listing` reads. A blind host
+renders an apparently-healthy posting to a logged-out client regardless of the vacancy's
+real state, so every check passes — and passes for a dead vacancy.
+
+Measured on the listing that prompted it: a jsearch-sourced LinkedIn row (Finance Data
+Analyst / Polaris Consulting International) shown at **rank 6** and stamped
+`last_verified_at`, i.e. badged as checked, while the user's signed-in view of the same
+page read *"No longer accepting applications"*. Fetched anonymously that URL returns
+**200 with 11,755 chars of visible text**, an active apply button, "Applications so far
+50" and "Closes 15 Sept 2026" — **zero** occurrences of "no longer", "closed" or
+"expired" anywhere in 304KB of HTML, and **no JSON-LD `JobPosting` at all**. LinkedIn's
+guest job-posting fragment (`/jobs-guest/jobs/api/jobPosting/{id}`) says the same. There
+is no anonymous signal to read.
+
+Three things about the fix, all deliberate:
+- The verdict is **`unverifiable`, never `dead`** — nothing here is evidence the vacancy
+  closed either, and `dead_reason` is unrecoverable. What it buys is the three things the
+  pipeline already does with an unverifiable row: the `UNVERIFIED_RANK_PENALTY` demotion,
+  the card's honest "not verified" chip (which fires precisely because
+  `_persist_verified_alive` only ever stamps `alive` rows), and the
+  mirror-with-no-readable-text drop.
+- The check sits **after every dead route, not before the fetch**. A removed LinkedIn job
+  really does 404, and 404 is the workhorse — every genuine death in the original 45-row
+  sample was one. Only the NEGATIVE conclusion is withheld.
+- Blind hosts are excluded from **browser escalation** but still counted in
+  `final_verify_unverifiable`. The browser renders the same logged-out page, so it can
+  only fail open, and `VERIFY_BROWSER_MAX` is 12 slots a host that genuinely 403s a plain
+  client can still use.
+`linkedin` is also in `MIRROR_BRANDS`, which it plainly is — the page that prompted this
+renders *"This is an excerpt from Reed. Click apply to see the full job description … on
+Reed.co.uk"* in its own body. Note the ceiling: LinkedIn rows arrive only via jsearch and
+were 59 of 9,998 store rows, so this is a correctness fix, not a volume one.
 
 **`_needs_liveness_check` skips known dead-end URLs first.** Adzuna's `/jobs/land/ad/`
 interstitial (`_KNOWN_DEAD_END_URL_RE`) answers every request with a stub, so fetching it
@@ -1780,7 +2060,15 @@ saved under the old token form.
 NULL when the listing named no employer. The card badges only a positive match — "not on
 the register" is not the same as "does not sponsor" for an agency posting, and an absent
 badge reads correctly as "unknown" where a "Not a sponsor" badge would not. Stamped on
-every run, not only when the filter is on.
+every run, not only when the filter is on — but **shown only while the candidate's own
+sponsors-only filter is on** (`RoleCard.useSponsorFilterOn`, reading the same
+`visa_sponsor_only` attribute `VisaSponsorToggle` writes). Keep the two apart: stamping
+always is what lets a user switch the filter on and have their existing rows already
+answered, while a candidate who does not need a visa should not get a chip answering a
+question they never asked, in the same row as facts about the job. The hook reads
+`useProfiles()` + `useAttributes()` inside `RoleCard` rather than being threaded down —
+there are twelve call sites across `/search` and `/my-roles`, and TanStack dedupes the
+query to one request however many cards mount.
 
 Discovery adapts when the filter is on (see the discovery section): a sponsor-priority
 tier ahead of all three existing tiers in `select_ats_batch_for_run` (measured: sponsors in
@@ -1999,14 +2287,208 @@ scheduler. Scheduled discovery/embed *pre-runs* were considered and not built �
 (first cards at ~7s), and the crawler turned out not to need the scheduler that would have
 justified them.
 
-### Ghost-listing evidence (recording only)
+### Ghost-listing detection (`backend/app/services/ghost.py`)
 
-`JobSeen.seen_dates` / `dead_at` / `repost_key` exist to be **written now and analysed
-later**, and nothing in the pipeline reads any of them — that is the intended state,
-not an oversight. A ghost listing (up for months, or taken down and reposted verbatim,
-with no real vacancy behind it) can only be identified from a history of observations,
-and **that history cannot be reconstructed after the fact**: every week it isn't
-recorded is permanently lost, while the scoring and the UI can be built whenever.
+A ghost listing is an advert with no real vacancy behind it — already filled, a
+standing CV-collection pipeline, a cancelled req never taken down. The candidate can't
+tell from the page, and it costs them an application.
+
+**The scoring shape is a count of NAMED RULES, not a weighted score**, for the reason
+`dynamic_hard_drop_threshold` counts soft-axis failures and `fit_level` was rewritten
+(v16) to derive mechanically off a checklist: there is nothing to fit weights to (24
+feedback rows, and zero terminal application outcomes ever recorded), and a chip reading
+"Possible ghost listing" is an accusation about a named employer — `0.71` can't be shown
+to anyone, "posted 8 months ago, and the text says it's a talent pool" can. A count can't
+say 400 days is worse than 95, so rules come in two tiers exactly as `screen_gate` does:
+**decisive** ones are individually sufficient for `high`, **ordinary** ones must agree in
+pairs (`ordinary == 1` → `medium`). There is deliberately **no `low`** — a value covering
+~90% of rows would get rendered and train the reader to ignore the chip.
+
+| rule | tier | fires when |
+|---|---|---|
+| `stated_age_absurd` | decisive | definite `posted_at` ≥ 365d (subsumes the next, counted once) |
+| `pipeline_language` | decisive | title/body announces a talent pool or speculative application |
+| `takedown_repost` | decisive (dormant) | a `repost_key` sibling has `dead_at` and this row's `first_seen` is later |
+| `stated_age_extreme` | ordinary | definite `posted_at` ≥ 90d |
+| `stale_untouched` | ordinary | `posted_at_approx` and ≥ 180d |
+| `date_refreshed` | ordinary (dormant) | `posted_days + 14 < observed_days` |
+| `evergreen_observed` | ordinary (dormant) | `seen_days ≥ 30` at density ≥ 0.6 |
+| `repost_burst` | ordinary (dormant) | ≥3 rows, ≥45d `posted_at` span, ≥2 distinct `first_seen` days, **not agency** |
+
+**Invariants, all load-bearing:**
+- **Every rule fires on POSITIVE evidence; none fires on missing data.** A listing with
+  no `posted_at` produces no signal — the same discipline `_listing_age_tag` follows
+  ("silence is not evidence of age"). This is the *only* thing that makes the card's
+  absent-badge read as "nothing fired" rather than "unknown", and the /search "none
+  flagged" line honest. Note the semantics are **inverted from `sponsorChip`**, which
+  badges only positives precisely because *its* absence must read as unknown. Add a rule
+  that fires on absence and both of those become lies.
+- **Never a hard drop.** `GHOST_SELECTION_PENALTY` (8.0) rides `_selection_score` only —
+  never `_rank_score` — under the same rule as `RICH_TEXT_SELECTION_BONUS` /
+  `UNVERIFIED_RANK_PENALTY` / `SOFT_VIOLATION_SELECTION_PENALTY`. Set *below* the
+  soft-violation penalty (12.0) because a stated preference being missed is firmer
+  evidence than an inference from a date. Unlike `dead_reason`, a suspicion must be undoable.
+- **Signals are persisted alongside the verdict** (`Role.ghost_level`/`ghost_signals`,
+  `JobSeen.ghost_signals`), not re-derived on read: `dead_at` is stamped once, `seen_dates`
+  truncates, and a repost group's membership changes as rows arrive, so a verdict
+  re-derived from a later store is not the same verdict.
+- **No LLM, no network, no DB in the rules.** Same bar as `_pool_quality_prescreen`.
+- **Thresholds are imported from `full_auto`, never restated** — the `SOFT_GATE_AXES` lesson.
+
+**Calibration is measured against roles the user engaged with, never the store-wide hit
+count** (`scripts/backtest_ghost_rules.py`, read-only, free). Most of the store is US ATS
+rows the country filter discards, so a rule can fire thousands of times and never reach a
+card. Bar: **zero applied-to roles flagged `high`**. Current: 0 of 6 applied, 0 of 2 saved,
+0 of 88 ever-shown flagged high (2 medium, both genuinely 3+ months old).
+
+Two measurements that shaped the rules and should not be undone:
+- **`pipeline_language` is TWO patterns, title-broad and body-narrow.** One broad pattern
+  over title+body over-fired badly: 22 of 57 hits were one staffing agency
+  (`blue-united-sourcing`) whose boilerplate says "Talent Network" atop *every* posting,
+  including "Registered Nurse (RN) - ER" — specific, real, fillable vacancies. A pipeline
+  ad announces itself in its **title**; the same words in the body are a call-to-action
+  appended to a real posting. Splitting took it 57 → 30 with every remaining hit genuine.
+- **All three `repost_burst` guards are load-bearing.** Simulated at day 40 over 4,000
+  candidates: all guards → **1** fire; without the agency guard → **98**; without the
+  first-seen-days guard → **82**; without the span guard → **15**; with none → **595**.
+  `noir|.net developer` alone is 88 rows / 88 distinct URLs / 6 distinct `posted_at`
+  inside 3 days — one recruiter spraying geographic variants, which is not reposting.
+
+**`ghost.is_agency` is three-state and its structural half detects a POSTING PATTERN, not
+an employer type.** Name-regex alone caught 271 of 1,547 companies but only 5.9% of rows
+and missed Noir/Hays/Robert Half/Michael Page/Adecco/Randstad outright, so there are three
+tests (name regex, `_KNOWN_AGENCIES` measured list, structural few-titles-many-locations),
+any sufficient — now 9.1% of rows. The structural half's only unique hit is `howdens
+joinery` (15 rows, 4 titles, 15 locations), a genuine multi-site retailer — and
+suppressing `repost_burst` for it is the **correct** outcome reached through a slightly
+wrong name, because one depot role across 15 towns has the identical signature to agency
+spray. Safe only because agency status may only ever *modify* which rules apply, is never
+itself ghost evidence, and **never reaches a card** (the judge's own WISH-LIST rule treats
+agency-posted as a reason to be more generous).
+
+**UI**: `high` is pulled out of the ranked lists into a collapsed count-plus-link section
+on `/search` (after `unreviewed`, before `crossed`) carrying the **full** action row —
+the user overrules us, not the other way round; `medium` stays inline with a chip and the
+page never re-sorts (`fit_rank` is positional from the judge). A `§ghost` marker in
+`_compose_analysis` renders the fired rules as sentences, because the chip alone is
+unexplainable. **Any new section must be added to the "Showing N results" sum** at
+`search/page.tsx` — it's summed from the exact rendered buckets, and the comment there
+records the bug that caused.
+
+### Scheduled observation & liveness re-check (`backend/app/services/observe.py`)
+
+The longitudinal half of ghost detection, and **the reason this had to ship before the
+rules that read it**: a week not observed is permanently lost.
+
+- **`run_pass`** (`scripts/observe_listings.py`, `POST /admin/observe`) — discovery +
+  sighting upsert only. **Its entire safety contract follows from one fact: it never
+  writes `jobs_seen`.** That alone means no row marked `enriched`, no `Role`, no
+  embeddings, no gate/rank/judge. It also never creates a `SearchRun`, which is precisely
+  why it can't consume `MAX_SEARCHES_PER_DAY` (`_searches_today` counts `SearchRun`).
+  `profile_id = -1` keeps it off any user's source-rotation cursor. `OBSERVE_SOURCES`
+  defaults to reed+adzuna — **zero OpenAI spend**. Terms are the union of every profile's
+  active target roles **plus** the titles of listings already under observation: without
+  that carry-forward a listing drifting out of the term rotation vanishes from the window,
+  and a gap is indistinguishable from the ad coming down.
+- **`recheck_liveness`** (`scripts/recheck_liveness.py`, `POST /admin/recheck`) — the
+  high-value half. `dead_at` was set on **3 of 9,998 rows** and `last_verified_at` on
+  0.36%, because the existing machinery only ran over an interactive search's judge pool.
+  Reuses `engine._classify_listing` verbatim (documented DB-free for exactly this).
+  Plain GETs, fail-open, **no browser escalation** (unattended, nobody waiting). A
+  confirmed death fans out to `jobs_seen` so the pipeline's existing `dead_reason IS NULL`
+  selectors exclude it for free, then `_auto_hide_dead_roles` retires the card. First real
+  pass: **20 of 60 oldest tracked listings were already dead.**
+- **`ListingObservation` is global and profile-independent** (precedent: `JobEmbedding`).
+  Two reasons, and *not* de-duplication — all 9,998 identity hashes sat under exactly one
+  profile, so that argument doesn't survive the data. (1) `_store_age_days` is per-profile
+  and gates every observation rule, so a user signing up next month would silently be
+  blind to the feature for 30 days with no error anywhere. (2) The crawl has no profile,
+  and `JobSeen`'s non-nullable FK would force a sentinel row that pollutes every
+  profile-scoped query.
+- **`JobSeen.source_ref` / `full_auto._board_ref`** exist for observation CONTINUITY, not
+  dedup. `identity_hash` is `sha1(_canonical_url(url))`, so a re-slug or an added tracking
+  parameter mints a new identity and **restarts `first_seen` at zero** — silently
+  corrupting the exact data the longitudinal rules need. Measured: 91.4% URL coverage, and
+  two listings had already done this in a 12-day store (Reed job 57106990 appeared as both
+  "lead-software-engineer" and "lead-oracle-applications-engineer"). Read the vendor before
+  trusting it as a vacancy key: reed/adzuna ids identify a **listing** (a repost gets a new
+  number), while a greenhouse `gh_jid` identifies the employer's own **requisition** and
+  persists while the req is open — the closest thing here to ground truth.
+  Never retrofit it into `identity_hash`: that re-keys the store and orphans every cached
+  embedding, verdict and `gate_cache` entry.
+
+**DAILY IS A FUNCTIONAL REQUIREMENT.** `EVERGREEN_SEEN_DENSITY` divides days-seen by
+days-since-discovery, so a missed day inflates the denominator while the numerator stands
+still — gaps don't delay the signal, they *suppress* it. There is still no in-process
+scheduler (same reasoning as `crawl_direct_employers.py`). Watch
+`distinct_observation_days` in `GET /admin/observe`: a crawl that has silently stopped
+looks healthy in every other field.
+
+**How it is actually scheduled in production: supercronic, in the Fly machine.** The
+Dockerfile installs it (SHA1-pinned) and the CMD runs it alongside uvicorn; `crontab` at
+the repo root is the schedule. Four things about that arrangement are load-bearing and
+easy to undo by accident:
+- **`exec uvicorn`, not plain `uvicorn`.** With two commands in the `sh -c` the shell no
+  longer execs, so `sh` stays PID 1 — and a non-interactive shell installs no SIGTERM
+  handler, which for PID 1 means the kernel discards the signal. Fly's shutdown would be
+  ignored for the whole of `kill_timeout` and end in SIGKILL, tearing the machine down
+  mid-write and unmounting `/data` dirty. That is precisely what `fly.toml`'s
+  `kill_timeout = "25s"` exists to prevent, so this is the one-word difference between the
+  setting working and being decorative.
+- **Two crontab entries, never `&&`.** They are independent jobs and the recheck is the
+  more valuable of the two (a live pass found 20 of the 60 oldest tracked listings already
+  dead). Chained, a transient board-API failure in the observation pass — which exits
+  non-zero on `ok: false` — silently skips the recheck for that day too.
+- **`.gitattributes` pins `crontab`/`Dockerfile` to LF.** This machine has
+  `core.autocrlf=true` and `fly deploy` builds from the WORKING TREE, so a checkout would
+  otherwise hand supercronic `python scripts/observe_listings.py\r`, which fails with a
+  "not found" naming a command that plainly exists — and fails silently, since supercronic
+  itself keeps running.
+- **`crontab` must be committed.** It is read from the image at `/app/crontab`, and
+  supercronic exits immediately if the file is missing while the container stays healthy
+  and the health check keeps passing. Nothing anywhere reports "cron is not running".
+
+Concurrent SQLite access from the cron process and the API is safe because
+`database.py::_sqlite_pragmas` puts every connection in WAL mode.
+
+**Do NOT also schedule this from GitHub Actions.** A runner has no access to the Fly
+volume the SQLite file lives on, so a workflow pointed at `scripts/observe_listings.py`
+writes to an empty throwaway database at best. It also cannot import the app at all
+unless it installs `backend/requirements.txt` (SQLAlchemy lives there, not in the root
+`requirements.txt`).
+
+> ⚠ **`JobSeen.repost_key` declares `index=True` and the index did not exist**, because
+> `_migrate_columns` only does `ALTER TABLE ADD COLUMN` and `create_all` never revisits an
+> existing table. `index=True` takes effect only on a database built from scratch *after*
+> the column was declared — check this for any column added that way.
+> `_migrate_ghost_indexes` now creates it.
+
+### Application-outcome feedback (the only ground truth)
+
+`Role.application_status` gained `offer` and `no_response`, plus `response_at` (stamped
+once on the first non-`pending` transition, never overwritten — same invariant as
+`dead_at`, because `applied_at → response_at` is the measurement). Logged to `EventLog`
+as `application_outcome` so `/admin/analytics` can roll it up across users.
+
+The field had **never once been used past `pending`** in its entire life. That was never a
+control problem — nobody had a reason to navigate to `/my-roles` → Applied and report back.
+So the prompt lives on **`/search`**, where every session starts, and `offer` exists because
+a form whose only outcomes are negative is a form nobody fills in.
+
+**Two caveats that must travel with this data.** `no_response` is a **biased** label for
+ghosting — most applications get no reply for ordinary reasons — so it is only ever read as
+a *rate across many rows conditioned on a fired signal*, never as proof about one listing;
+and it is not final (the other controls stay live so a late reply can correct it). And at
+~2 applies/month a usable base rate is years away: it is collected now because it cannot be
+reconstructed later, and the rule thresholds stay hand-set and named.
+
+### Ghost-listing evidence (the recording layer)
+
+`JobSeen.seen_dates` / `dead_at` / `repost_key` are the **write-now-read-later** columns the
+rules above consume. They predate the rules deliberately: a ghost listing can only be
+identified from a history of observations, and **that history cannot be reconstructed after
+the fact** — every week it isn't recorded is permanently lost, while the scoring and the UI
+can be built whenever.
 
 - `seen_dates` — the distinct UTC dates this identity has been observed, as
   days-since-epoch integers, comma-separated. `seen_days` is the *count* of exactly
@@ -2021,8 +2503,11 @@ recorded is permanently lost, while the scoring and the UI can be built whenever
 - `dead_at` — when we first confirmed the listing gone, closing the bracket
   `first_seen` opens. `dead_reason` already recorded *that* it died; without a
   timestamp there was no way to ask how long any listing actually stayed up, which is
-  the central question. Stamped once at both death-detection sites
-  (`_persist_dead_scrapes`, `_persist_enrich_dead`), never overwritten.
+  the central question. Stamped once at every death-detection site
+  (`_persist_dead_scrapes`, `_persist_enrich_dead`, and now `observe.recheck_liveness`),
+  never overwritten. `_migrate_dead_at_backfill` repairs rows carrying a `dead_reason`
+  with no `dead_at` — the live store had one, and `takedown_repost` keys on this column,
+  so such a row would have been skipped forever.
 - `repost_key` — normalised company+title via `_family_key`, so "the same vacancy
   re-advertised" means what it already means elsewhere in the module. **Not** a dedupe
   key: a repost is a distinct listing with its own dates, and the signal is precisely
@@ -2059,6 +2544,364 @@ retraining. Weight has two effects:
   reordered since attributes are sorted by weight within their group) — weighting
   doesn't argue a value more strongly to it, only shapes which candidates arrive there.
 
+### Auth & self-serve sign-up
+
+**Sign-up is self-serve and instant.** There is no approval step, no waiting list and no
+manual credential hand-off: a visitor signs in on the homepage, answers two questions, and
+is in the product. That is a product decision the code is built around — nothing in the
+auth path is allowed to gate a new account on an owner action.
+
+**THREE self-serve paths, offered side by side on the homepage** — Google, Apple, and
+email+password — plus the legacy hand-assigned credentials behind the footer link. Google
+alone silently lost everyone who doesn't have (or won't use) a Google account, and lost
+them at the *first* screen, so they never reached a page that could count them: the cost
+of that is unmeasurable by construction, which is itself the argument for not running it.
+`GET /admin/signups` now reports `by_method`, which is the only way that decision ever
+gets checked.
+
+All three create the account on first sight and mint the same Bearer token every other
+route already expects, so authentication still changes at exactly one seam and
+`deps.current_user_id()` is still the single chokepoint. All three responses go through
+`auth_router._login_out` — shared so a field added to `LoginOut` cannot be wired to two
+paths and missed on the third, which for `needs_survey` would mean a whole provider's
+users skipping the survey gate with nothing anywhere reporting it.
+
+For the two PROVIDERS, sign-up and sign-in are **the same call**: the browser can't know
+which it is, and making the user pick the right button only ever produces a wrong answer
+and a confusing error. `is_new` in the response tells the frontend which happened. For
+**email that is inverted** — `/auth/email/register` and `/auth/email/login` are separate,
+because the user knows perfectly well whether they have registered before, and merging
+them would let a mistyped password on an existing account silently create a SECOND,
+empty account whose owner then finds a blank profile and no explanation.
+
+Verification (`services/auth.py::verify_google_id_token`) delegates signature/issuer/
+expiry to Google's own `tokeninfo` endpoint rather than validating RS256 against their
+JWKS locally. That is one outbound call per sign-in, which is the wrong trade on a hot
+path and the right one here — sign-in happens roughly once per user per month
+(`TOKEN_MAX_AGE_SECONDS`), and local verification means owning JWKS fetching, key
+rotation and caching: three places to get subtly wrong in the one part of the app where a
+subtle mistake is an authentication *bypass*. **Two things tokeninfo does not check and
+this function therefore must**, both load-bearing:
+- **`aud` must equal `GOOGLE_CLIENT_ID`.** tokeninfo will happily validate a token Google
+  minted for a *different application*. Without this comparison, an ID token obtained from
+  any other Google-integrated site would authenticate here. This is the single most
+  important line in the auth path.
+- **`email_verified`.** An unverified address must not be stored as if confirmed — it is
+  shown in `GET /admin/signups` as a contact address for someone who never proved they own
+  it. An unverified token still authenticates (the `sub` is real); the email is dropped.
+
+An unset `GOOGLE_CLIENT_ID` **disables** Google sign-in (503) rather than falling back
+to an unverified path, and `GET /auth/config` reports that so the frontend renders a "sign-in
+unavailable" note instead of a button that 503s. The frontend reads the client id from that
+endpoint rather than from `NEXT_PUBLIC_GOOGLE_CLIENT_ID`: both are public, but the env var
+is baked in at BUILD time while the backend reads it at RUN time, so a frontend built
+before the credential existed would otherwise render a permanently broken button against a
+perfectly configured server. The env var stays as a fallback for an unreachable API. The
+same run-time-not-build-time rule applies to `APPLE_CLIENT_ID`, and to whether the email
+form renders at all.
+
+**Apple** (`POST /auth/apple`, `services/auth.py::verify_apple_id_token`) differs from
+Google in four ways that all follow from Apple giving less:
+- **Verification is LOCAL**, because Apple publishes no tokeninfo equivalent. PyJWT
+  (`pyjwt[crypto]`, added to `backend/requirements.txt`) does RS256 against Apple's JWKS
+  plus `exp`, and — the load-bearing part — `audience=APPLE_CLIENT_ID` and
+  `issuer=https://appleid.apple.com` as *arguments*, not as post-hoc comparisons. The
+  `aud` pin is the same single most important line as on the Google path: Apple will sign
+  a valid token for any Services ID. Unit-checked against forged tokens (wrong aud, wrong
+  iss, expired, `alg=none`) — all rejected.
+- **`PyJWKClient` is created once and reused**, because it caches Apple's signing keys. A
+  fresh client per sign-in would fetch the JWKS every time.
+- **The browser flow is the POPUP** (`usePopup: true`), not Apple's default redirect. The
+  redirect flow POSTs a form back to `redirectURI`, which would mean a second, quite
+  different session mechanism (cookie or URL fragment) beside the Bearer token everything
+  else uses, plus a full page reload mid-signup. The popup hands the page a signed
+  `id_token` in a promise — byte-for-byte the shape the Google button already produces —
+  so it joins at exactly the same seam. `redirectURI` is still required by Apple even in
+  popup mode and must be a registered Return URL on the Services ID.
+- **`APPLE_CLIENT_ID` is the Services ID, not the App ID**, and there is **no client
+  secret and no .p8 key**: those are only needed for the server-side authorization-code
+  exchange, which this does not do.
+Two Apple facts callers must handle rather than assume away: `email` is frequently Apple's
+private relay address (real and deliverable — not a placeholder), and **there is no name
+claim, ever**. Apple returns the name once, in the authorization RESPONSE on first sign-up
+only, outside the token; it rides in on the request body, is written only when creating
+the account, and is display-only — identity is the verified `sub` alone.
+
+**`User.google_sub` / `User.apple_sub` are the join keys, never `email`.** A Google
+Workspace address can be reassigned to a different person after an employee leaves; keying
+on it would hand the new holder the old holder's job search. Email is stored for display
+and the admin list only. Both columns carry UNIQUE indexes created by
+`database._migrate_signup_indexes` — not by `index=True` on the model, which
+`ALTER TABLE ADD COLUMN` cannot apply to an existing table (the same trap the
+`jobs_seen.repost_key` note documents). Two rows for one provider account would silently
+split a person's profiles and history in two, so those indexes are an invariant, not an
+optimisation.
+
+**Accounts are NEVER linked across providers**, and that is a security decision, not a
+missing feature. Someone who registers with a password and later signs in with Google gets
+two separate accounts. Linking them on email would mean an *unverified* registration for
+`victim@example.com` capturing the account the victim later reaches through their verified
+Google or Apple identity — an account takeover with a signup form as the only tool
+required. What stops the two being created in the first place is registration returning
+**409 on an email already in use by any account**. That does let someone probe whether an
+address is registered; that is an accepted and near-universal property of signup forms, and
+a far smaller problem than the one it prevents.
+
+**`User.auth_provider` (`"google" | "apple" | "email" | NULL`) exists because an email
+account and a legacy account are otherwise byte-identical in shape** — both have a real
+password hash and no subject id. `_needs_survey` used to key on `google_sub`, which was
+equivalent only while Google was the sole self-serve path; keyed that way, every email
+signup would silently inherit the legacy survey exemption. NULL still means legacy, which
+`ALTER TABLE ADD COLUMN` gives every pre-existing row for free.
+`database._migrate_auth_provider` backfills `"google"` from a non-null `google_sub` — it
+cannot guess wrong, since only the Google path has ever written that column — and leaves
+everything else NULL. Do **not** extend it to stamp a provider on NULL rows: NULL is also
+what `beta_started_at` uses to exempt the original cohort from the 7-day window, and the
+two exemptions travel together.
+
+**Email+password has NO verification email, because this deployment has no mail service of
+any kind.** The consequence is recorded rather than hidden: `User.email_verified` stays
+False for those accounts and `GET /admin/signups` reports it, so an address nobody has
+proved they own is never presented there as a confirmed contact. `PASSWORD_MIN_LENGTH` (8)
+is the only password rule — composition rules measurably push people toward shorter, more
+guessable passwords, and this account holds a CV and a list of job adverts, not a payment
+method. There *is* an upper bound (1024 chars), which is not cosmetic: pbkdf2 hashes
+whatever it is handed, so an unbounded password field is a free CPU-exhaustion lever
+against an unauthenticated endpoint. Set `EMAIL_SIGNUP_ENABLED=0` to hide the form and
+503 the endpoints.
+
+`POST /login` is scoped to **`auth_provider IS NULL`**. An email signup does have a real
+password hash and its username is derived from the email's local part, so without that
+scoping `jay@example.com` could also sign in there as `jay`. Same credential, so not a
+weakening — but it would make `/login` a quiet second front door to a path that has its
+own endpoint, and any rate-limiting, lockout or audit added to one would then silently not
+cover the other.
+
+**Legacy hand-assigned credentials still work** (`scripts/gen_beta_users.py`, `POST /login`,
+the `/login` page) purely so the first beta cohort isn't locked out of their own profiles
+and saved roles. Not linked except from the homepage footer. A Google account can never be
+reached through `/login` whatever password is sent: those rows store an **empty**
+`password_hash`, and a pbkdf2 hex digest is always 64 chars, so `verify_password` can never
+match it. `password_hash`/`salt` stay NOT NULL rather than becoming nullable because SQLite
+cannot drop a NOT NULL constraint with ADD COLUMN — the empty-hash sentinel is both
+migration-free and safer than a NULL some future comparison might read as "no password
+required".
+
+**The two sign-up questions** (`SignupSurvey`: Q1 `priority`, single select from
+`config.SIGNUP_PRIORITY_CHOICES`; Q2 `used_ai_tool`, yes/no) are asked on `/welcome`,
+AFTER the account exists — questions on the sign-up form are friction at the exact moment
+there is least patience for it, and they'd be asked of people who never finish. Answers are
+stored as the raw option slug so re-wording a label later can't invalidate answers already
+collected; only the frontend holds the labels.
+
+**The survey gate is enforced in the CLIENT, deliberately** (`app/providers.tsx`). A
+backend that 403'd every request until the survey was answered would also reject the survey
+submission itself, and would surface as an auth failure that `api.ts`'s 401 handling reads
+as a logged-out session — turning two optional-in-spirit questions into a lockout. So the
+server reports `needs_survey` on every sign-in route and on `/me`, the gate routes on it,
+and a user with devtools can skip it. `GET /admin/signups` reports `answered: false` rows
+rather than filtering them out precisely so skipping — or a broken gate — stays visible; a
+filtered list would make a broken gate look like low sign-up volume. `needsSurvey()` in
+`lib/auth.ts` is a localStorage CACHE of the server's answer, refreshed from `/me` once per
+mount, or a second device would silently skip the survey forever.
+
+Every SELF-SERVE account is asked (all three providers — see `auth_provider` above), and
+only those. A legacy beta account predates the survey and its holder has usually already
+answered by other means; asking on next login would read as the app breaking, not as
+onboarding. `/admin/signups`' `survey_outstanding` is computed over the same set for the
+same reason — it used to be `method == "google"`, which after this would have silently
+ignored Apple and email signups, making a broken gate on those paths look like nobody
+using them.
+
+`GET /admin/signups` (ADMIN_TOKEN header, same guard as `/admin/analytics`) is the **only**
+place anyone learns who has arrived — with no approval step in the flow, nothing else
+reports it. `signup` and `signup_survey` are also `EventLog` types, counted separately from
+`login` in `/admin/analytics` so "how many new people" needs no subtraction of one series
+from another.
+
+**Deployment checklist — Google** (all three, or Google sign-in is dead in prod):
+`GOOGLE_CLIENT_ID` set on the backend host; the site's origin added to *Authorised
+JavaScript origins* on that OAuth client in Google Cloud Console; the frontend's origin in
+`FRONTEND_ORIGINS`. There is no client *secret* anywhere — GSI hands the browser a signed
+ID token directly and the backend only verifies it, so no auth-code exchange and no
+confidential credential is involved.
+
+**Deployment checklist — Apple.** Everything here is on Apple's side and needs a paid
+Apple Developer Program membership; until it exists the button simply doesn't render (the
+component returns null on `apple_enabled: false`, deliberately, rather than showing a
+"temporarily unavailable" note beside two working alternatives). (1) An App ID. (2) A
+**Services ID** with Sign in with Apple enabled — its identifier is `APPLE_CLIENT_ID`.
+(3) The site's domain registered on that Services ID **and the origin added as a Return
+URL**, or Apple rejects the popup before it opens. Again no client secret and no .p8 key,
+for the reason in the Apple bullet above.
+
+**Deployment checklist — email.** Nothing. It is on by default (`EMAIL_SIGNUP_ENABLED`),
+which is the point: it is the path that needs no third-party account, so requiring an env
+var to enable it would leave the default deployment offering exactly the two providers it
+exists to supplement.
+
+### The open beta: a fixed 7-day window
+
+`User.beta_started_at` is day 0. **Everything else is derived from it at read time**
+(`services/beta.py`) — no expiry is ever stored, so changing the window length in config
+applies immediately to everyone already inside it.
+
+**NULL means NO WINDOW: never expires, never asked the wrap-up survey.** That is the
+legacy exemption and it is free — `ALTER TABLE ADD COLUMN` gives every pre-existing
+account NULL, so the original testers were untouched by the switch with no backfill
+(verified: 51 accounts, all NULL). `beta_started_at` is stamped in exactly one place, the
+`is_new` branch of `POST /auth/google`. Do not "fix" `_migrate_columns` to stamp a date —
+that starts a 7-day clock on the existing cohort.
+
+**Two gates off that one clock, and they are independent.** Collapsing them re-creates
+the problem the split exists to solve:
+
+* **The wrap-up survey gate** — `EXIT_SURVEY_AFTER_DAYS` (4). From day 4, the next time
+  the user loads the app they are held on `/exit-survey` until they answer, then released
+  back into the app for their remaining days. Client-side, exactly like the sign-up
+  survey. Triggering on day 4 rather than day 7 is the whole point: **day 7 would require
+  the user to log in on one specific day**, which is the single most likely way to collect
+  nothing at all.
+* **The lapse gate** — `BETA_WINDOW_DAYS` (7). Server-side, a real 403 from
+  `require_active_beta`, on the `_auth` dependency list in `main.py` covering profiles,
+  attributes, families, onboarding, search and settings.
+
+`needs_exit_survey` deliberately does **not** consult `expired`. A user who never logs in
+between day 4 and day 7 hits both gates at once and must still get the survey — that is
+precisely the person the day-4 trigger exists to catch. `/exit-survey` therefore renders
+three states off `/me`: unanswered (→ back to `/start`), answered+expired (the "access has
+ended" screen), unanswered+expired (the form, then that screen).
+
+**Three things must stay reachable when expired**, or the survey becomes unanswerable by
+the group it exists to ask: the `auth_router` (public + self-guarding — `/me`,
+`/signup/survey`, `/exit/survey`), the `feedback` router (authed but not beta-gated, so an
+answer already typed is never lost to a window that lapsed mid-interaction), and `admin`.
+The survey gate is client-side for the reason the `auth_router` docstring already gives: a
+server that 403s until a survey is answered also 403s the submission, and surfaces as an
+auth failure the frontend reads as a logged-out session.
+
+`require_active_beta` raises a **dict** detail (`{"code": "beta_expired", "message": ...}`),
+not a string. `api.ts` needs to tell it from an ordinary 403 to route to the survey instead
+of showing a raw error, and a code in the body avoids a custom response header (which would
+also need adding to the CORS `expose_headers`). `handleBetaExpired` **must not**
+`clearAuth()` — the user has to stay signed in to answer — and latches, because several
+queries can 403 before the navigation lands and `location.pathname` is still the old route
+for all of them.
+
+`POST /admin/users/{id}/beta` (`extend`/`restart`/`clear`) is the escape hatch and is
+**required**, not a nicety: lapsing is a real 403 across every data router, so without it
+there is no way to give a tester more time or reopen an account to chase a bug they
+reported. `clear` sets NULL, i.e. makes them exempt like the original cohort.
+
+### Beta feedback: one store, three surfaces
+
+`FeedbackResponse` (`feedback_responses`) holds every answer from all three surfaces —
+sign-up, the two in-run prompts, and the wrap-up survey — as
+`user_id, profile_id, run_id, surface, question_id, answer, created_at`. One store so the
+admin readout is one query and can filter by question or by user with no new tooling; a
+table per surface means a new table, endpoint and report per question added.
+
+`question_id` is a stable slug and `answer` is the raw value (JSON-encoded for
+multi-select), never a normalised enum — re-wording a question must not invalidate answers
+already collected. Labels live in the frontend, same contract as
+`SIGNUP_PRIORITY_CHOICES`. Written through `analytics.record_feedback`, which sits beside
+`log_event` but **does** raise where `log_event` swallows: a dropped analytics row is
+invisible, a dropped answer shows the user a thank-you for something that did not happen.
+
+**Sign-up answers are dual-written.** `SignupSurvey` stays the source of truth (it *is* the
+survey gate, and `/admin/signups` reads it); `POST /signup/survey` also upserts the two
+mirrored rows, and `_migrate_signup_feedback_backfill` mirrors rows collected before the
+store existed.
+
+The two in-run prompts (`routers/feedback.py`):
+
+* **`results_quality`** — fired by the first cross or apply on a run, and rendered **in
+  place of** the "got a bug or an idea" box in `SearchFeedbackBox`; two feedback asks
+  stacked is how both get ignored. Held back until the user's second completed run
+  (`RESULTS_PROMPT_MIN_RUNS`) so their first search is not interrupted. Scoped per run, so
+  a later run can legitimately ask again.
+* **`setup_ok`** — fired when a CV/notes parse *succeeds*, shown beside the run button at
+  the bottom of `/onboarding`. Scoped per user, asked once ever; `run_id` is NULL because
+  no run exists yet.
+
+**`GET /feedback/due` exists so the trigger rules live server-side.** The client knows a
+cross happened but cannot know the user already answered on another device, and a prompt
+that reappears after you have answered it reads as the app losing your input.
+
+Both prompts keep the answer and the free-text detail as **two rows** (`<id>` and
+`<id>_detail`), so a No with no typed detail still leaves a usable signal instead of an
+abandoned prompt recording nothing.
+
+Wrap-up Q2 (`EXIT_SURVEY_FEATURE_CHOICES`) carries a `"none"` option that is **not**
+padding: with a plain checkbox group, zero ticks cannot be told from "hasn't answered", and
+the gate reads presence-of-any-row to decide when to release the user. Q1 (free text) is
+deliberately optional — a required free-text box on a blocking page is where people bail or
+type "n/a", and an answer nobody means looks like signal in the readout.
+
+### Reading the beta back: `scripts/admin_fetch.py`
+
+`GET /admin/analytics` gained `runs`, `run_stats` and `feedback`; `/admin/signups` gained
+the per-account window fields. `scripts/admin_fetch.py` is the CLI over both — before it,
+the only documented way in was a hand-written `curl` returning several hundred lines of
+JSON.
+
+**Roles found per run** is reported as a distribution *and* an average, because "runs
+average 7" and "one run found 12 and three found 1" are very different situations an
+average cannot separate. It reads `SearchRun.result_count`, which the engine already writes
+— do not count `Role` rows instead, they disagree in both directions (picks already saved
+in an earlier run are counted but not re-persisted; retained quick-scored leftovers are
+persisted but not counted). **Status is reported alongside it and must stay that way**:
+`result_count` is only written on the `done` path, so a cancelled or errored run reads 0
+and would otherwise look like a search that found nothing. `run_stats` averages `done` runs
+only, and breaks out `runs_done_with_zero` — a run that completed normally and still
+surfaced nothing is the failure worth seeing on its own.
+
+`_EVENT_FIELDS` is now the single source for the per-user counters (`_COUNTER_FIELDS` is
+derived from it), so adding an event type is one edit rather than three.
+
+The script reconfigures stdout to UTF-8. It prints text people typed, which routinely
+contains curly quotes and em dashes, and a Windows console defaults to cp1252 — the same
+failure `full_auto.emit()` guards against, hitting exactly when someone has finally left
+useful feedback.
+
+### The public homepage
+
+`frontend/app/page.tsx` is the landing page, the sign-up form and the app's entry point,
+all one route. It replaced both the old `/login` screen and a **separate static
+`index.html` that lived outside this repo** (a bundled artifact in the `4-in-1000` docs
+folder, deployed to Netlify, posting emails to a Google Apps Script sheet). Merging them
+was the point: marketing copy and the sign-up form are the same set of pages, so keeping
+them in two codebases meant every copy change had to be made twice with a manual
+access-granting step in between.
+
+- **Logged out** → the landing page. **Logged in** → `/start`, which is the old `/`
+  first-run router (no profile data → `/onboarding`, else `/search`). That logic had to
+  move to its own route because `/` is now rendered OUTSIDE `ProfileProvider` (see
+  `PUBLIC_ROUTES` in `providers.tsx`) and it needs `useProfiles`/`useAttributes`.
+- The hero's **demo card is built from the app's own `.card`/`.tag`/`.verdict`/`.an-h`
+  rules**, not bespoke landing markup, so the page cannot drift from the product it is
+  advertising. Its buttons are `<span>`s (`.lp-static`) — a dead button that looks live is
+  worse than an obviously static one.
+- Landing/`/welcome`/`/login` styles are all `lp-`-prefixed in `globals.css` and use the
+  app's existing tokens (one terracotta accent, same warm neutrals). They run wider and
+  looser than the app, which is a dense 900px working surface.
+- Copy carried over from the old page because it tested well: the **"We tested the leading
+  matcher"** receipt and the four **"Why the tools you've tried don't solve this"** points.
+  Deliberately gone: the "UK jobseekers · early access" pill and the "Built for UK
+  jobseekers" footer — the tool is UK-optimised but saying so up front narrows the audience
+  for no gain, and the waiting-list framing is simply no longer true.
+- The `#join` box holds all three sign-up controls. `AppleSignInButton` and
+  `EmailSignUpForm` each render as **nothing** when the server reports that method
+  unconfigured, so the block degrades to exactly what it was before them. The email form
+  is collapsed behind a link on purpose: the two provider buttons are one click each and a
+  form is four fields' worth of attention, so leading with the form would make the fast
+  paths look like the fallback — but the link has to be visible, because catching the
+  people for whom neither provider is an option is the entire point. The Apple button is
+  styled black-on-white, not Apple's black fill: this page's only strong colour is the
+  terracotta accent, and a solid black button beside Google's outlined one reads as the
+  primary action, which it isn't. Both are sized 320x44 to match what GSI renders at
+  `size: large`, so the three stack as one column.
+
 ### Background execution & routers
 
 Search runs as a FastAPI `BackgroundTask` (`services/engine.py::run_search_task`); the
@@ -2082,3 +2925,25 @@ component for the location/work-type/scope/country group specifically (not route
 through `AttributeRow` — see "Location scope & country filtering" above); `RoleCard` is
 the shared result card across `/search` and `/my-roles`. TanStack Query handles server
 state, polling, and cache invalidation on tick/cross.
+
+**`PreferencesPanel` is the whole Preferences block, shared by `/dashboard` and
+`/onboarding`.** Onboarding used to carry three of the seven controls (seniority, salary,
+location) and `/dashboard` all seven, so **work style, maximum listing age, "roles below
+your level" and visa sponsorship were invisible to a first-time user** — i.e. the settings
+most able to make a first search return the wrong thing were exactly the ones nobody was
+shown until they later wandered onto `/dashboard`. Onboarding also used a different
+layout (`.row.pref`) for the three it did have. Extracting the block is what makes
+"onboarding matches the profile page" structurally true rather than two lists that agree
+until the next edit; it reads its own attributes via `useAttributes` rather than taking
+props, since TanStack dedupes the query and both call sites already hold it cached.
+
+**`/search`'s "Showing N results" counts THIS RUN's ranked picks, with everything else
+counted separately.** One combined number conflated two different things, and the gap is
+large enough to read as a bug: a live run reported "Showing 21 results" over 12 ranked
+picks + 4 still-`new` rows from an earlier run + 2 already-saved + 3 quick-scored-only.
+Nothing was miscounted — all 21 render, each under its own labelled section — but the
+headline claimed the search had found 21 roles when it had found 12. It now reads
+"Showing 12 results from this search · 9 more below". Both numbers are still summed from
+the exact buckets rendered below, never derived by subtraction, so neither can drift from
+what is on screen — the invariant the older note in that file already protects. **Any new
+section must be added to one of the two sums.**

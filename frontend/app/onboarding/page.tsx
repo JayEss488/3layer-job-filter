@@ -4,12 +4,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 
+import { InRunFeedbackPrompt } from "@/components/InRunFeedbackPrompt";
 import { IntentEditor } from "@/components/IntentEditor";
-import { LocationPicker } from "@/components/LocationPicker";
+import { PreferencesPanel } from "@/components/PreferencesPanel";
 import { RequirementRows } from "@/components/RequirementRows";
 import { RoleFamilyCard } from "@/components/RoleFamilyCard";
-import { SalarySlider } from "@/components/SalarySlider";
-import { SeniorityPicker } from "@/components/SeniorityPicker";
 import { api } from "@/lib/api";
 import { useAttributes, useFamilies } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
@@ -24,6 +23,12 @@ export default function OnboardingPage() {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
+  // "Did setup work how it should?" — armed the moment a CV/notes parse
+  // finishes, and shown at the bottom of the page beside the run button, which
+  // is where the user is looking next. Asked once ever (the server scopes
+  // `setup_ok` to the user, not to a run), so re-parsing does not re-ask
+  // someone who already answered.
+  const [setupPrompt, setSetupPrompt] = useState(false);
 
   if (!activeId) {
     return <div className="app narrow"><div className="center-pad">Loading…</div></div>;
@@ -44,6 +49,21 @@ export default function OnboardingPage() {
     qc.invalidateQueries({ queryKey: ["profiles"] });
   };
 
+  // Only after a parse actually SUCCEEDS: asking "did setup work?" when the
+  // parse just errored is asking a question the screen has already answered,
+  // and would collect a "no" that says nothing beyond the error the user can
+  // see. Best-effort and silent on failure — this must never look like the
+  // parse itself went wrong.
+  const maybeArmSetupPrompt = () => {
+    if (!activeId || setupPrompt) return;
+    api
+      .feedbackDue(activeId)
+      .then((due) => setSetupPrompt(due.setup_ok.due))
+      .catch(() => {
+        /* non-blocking by design */
+      });
+  };
+
   async function onUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -53,6 +73,7 @@ export default function OnboardingPage() {
       const created = await api.parseCv(activeId!, file);
       invalidate();
       setStatus(`Added ${created.length} items from your CV.`);
+      maybeArmSetupPrompt();
     } catch (err) {
       setStatus((err as Error).message);
     } finally {
@@ -70,6 +91,7 @@ export default function OnboardingPage() {
       invalidate();
       setText("");
       setStatus(`Added ${created.length} items from your text.`);
+      maybeArmSetupPrompt();
     } catch (err) {
       setStatus((err as Error).message);
     } finally {
@@ -207,31 +229,15 @@ export default function OnboardingPage() {
                 avoid={g?.avoid ?? []}
               />
 
+              {/* The identical control set /dashboard shows, from the same
+                  component. Onboarding used to carry only three of these
+                  (seniority, salary, location), so work style, maximum listing
+                  age, junior-role tolerance and visa sponsorship were invisible
+                  to a first-time user -- who then ran their first search with
+                  all four left at their defaults without ever being told they
+                  existed. See PreferencesPanel. */}
               <div className="profile-section-label">Preferences</div>
-              <div className="row pref">
-                <div className="label">Seniority</div>
-                <div className="field">
-                  <SeniorityPicker profileId={activeId} attributes={g?.seniority ?? []} />
-                </div>
-              </div>
-              <div className="row pref">
-                <div className="label">Salary range</div>
-                <div className="field">
-                  <SalarySlider profileId={activeId} attribute={g?.salary?.[0]} />
-                </div>
-              </div>
-              <div className="row pref">
-                <div className="label">Location</div>
-                <div className="field">
-                  <LocationPicker
-                    profileId={activeId}
-                    attributes={g?.location ?? []}
-                    countryAttributes={g?.country ?? []}
-                    scopeAttributes={g?.location_scope ?? []}
-                    commuteAttributes={g?.commute_miles ?? []}
-                  />
-                </div>
-              </div>
+              <PreferencesPanel profileId={activeId} />
 
               <IntentEditor profileId={activeId} />
             </div>
@@ -251,6 +257,20 @@ export default function OnboardingPage() {
               ▶ Run first search
             </button>
           </div>
+          {/* Asked here, next to the run button, because this is where the user
+              is looking once their CV has been read — and because setup is
+              precisely the thing they have just finished doing, so it is fresh.
+              Sits below the button, not above it: nothing should stand between
+              a first-time user and starting their first search. */}
+          {setupPrompt && (
+            <InRunFeedbackPrompt
+              questionId="setup_ok"
+              question="Did setting this up work how it should?"
+              detailPlaceholder="What went wrong? e.g. 'my CV didn't upload', 'it got my job titles wrong', 'I couldn't tell what to do next'…"
+              profileId={activeId}
+              onDone={() => setSetupPrompt(false)}
+            />
+          )}
         </div>
       </div>
     </div>

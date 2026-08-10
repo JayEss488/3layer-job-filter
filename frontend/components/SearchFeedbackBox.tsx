@@ -3,6 +3,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
+import { InRunFeedbackPrompt } from "@/components/InRunFeedbackPrompt";
 import { api } from "@/lib/api";
 import { useProfiles } from "@/lib/ProfileContext";
 
@@ -17,8 +18,27 @@ import { useProfiles } from "@/lib/ProfileContext";
  * about the APP (bugs/confusing bits/ideas) -- posts to POST
  * /profiles/{id}/comment and is read back by the owner-only GET
  * /admin/analytics, not by the search pipeline.
+ *
+ * When the "Are results what they should be?" prompt is due (`resultsPrompt`,
+ * fired by the first cross or apply on a run), it renders IN PLACE OF that
+ * bottom box rather than alongside it -- two feedback asks stacked on top of
+ * each other is how both get ignored. The bug box comes back the moment the
+ * prompt is answered or dismissed.
+ *
+ * Both of those stay strictly separate from the top box: a beta tester's note
+ * about a confusing button must never reach search_feedback, which is read by
+ * the LLM judge as if it were a job-search preference.
  */
-export function SearchFeedbackBox({ profileId }: { profileId: number }) {
+export function SearchFeedbackBox({
+  profileId,
+  resultsPrompt,
+  onResultsPromptDone,
+}: {
+  profileId: number;
+  /** The run the prompt is about, or null when it isn't due. */
+  resultsPrompt?: { runId: number | null } | null;
+  onResultsPromptDone?: () => void;
+}) {
   const qc = useQueryClient();
   const { profiles } = useProfiles();
   const profile = profiles.find((p) => p.id === profileId);
@@ -120,28 +140,41 @@ export function SearchFeedbackBox({ profileId }: { profileId: number }) {
           borderTop: "1px solid var(--line)",
         }}
       >
-        <div className="label" style={{ width: "auto" }}>
-          Got a bug or an idea for the app? Tell us — it goes straight to the team
-        </div>
-        <textarea
-          className="textarea-input"
-          style={{ minHeight: 40 }}
-          placeholder="Anything about the app itself — bugs, confusing bits, features you'd want…"
-          value={comment}
-          onChange={(e) => setComment(e.target.value)}
-        />
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <button
-            className="btn btn-secondary sm"
-            onClick={sendComment}
-            disabled={!comment.trim() || sending}
-          >
-            {sending ? "Sending…" : "Send feedback"}
-          </button>
-          {commentStatus && (
-            <span style={{ fontSize: 12, opacity: 0.7 }}>{commentStatus}</span>
-          )}
-        </div>
+        {resultsPrompt ? (
+          <InRunFeedbackPrompt
+            questionId="results_quality"
+            question="Are these results what they should be?"
+            detailPlaceholder="What went wrong? e.g. 'wrong kind of role', 'all too senior', 'only 2 results'…"
+            profileId={profileId}
+            runId={resultsPrompt.runId}
+            onDone={() => onResultsPromptDone?.()}
+          />
+        ) : (
+          <>
+            <div className="label" style={{ width: "auto" }}>
+              Got a bug or an idea for the app? Tell us — it goes straight to the team
+            </div>
+            <textarea
+              className="textarea-input"
+              style={{ minHeight: 40 }}
+              placeholder="Anything about the app itself — bugs, confusing bits, features you'd want…"
+              value={comment}
+              onChange={(e) => setComment(e.target.value)}
+            />
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <button
+                className="btn btn-secondary sm"
+                onClick={sendComment}
+                disabled={!comment.trim() || sending}
+              >
+                {sending ? "Sending…" : "Send feedback"}
+              </button>
+              {commentStatus && (
+                <span style={{ fontSize: 12, opacity: 0.7 }}>{commentStatus}</span>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

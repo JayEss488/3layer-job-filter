@@ -41,6 +41,118 @@ TOKEN_MAX_AGE_SECONDS = int(os.getenv("TOKEN_MAX_AGE_SECONDS", str(60 * 60 * 24 
 # sent as the `X-Admin-Token` header). Empty string = endpoint disabled/locked.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
+# ── Self-serve sign-up (Google) ──────────────────────────────────────────────
+# The OAuth 2.0 *Web application* client id from Google Cloud Console →
+# APIs & Services → Credentials. It is public by design (it ships in the
+# frontend bundle); there is no client SECRET here because Google Identity
+# Services' button hands the browser a signed ID token directly and the backend
+# only ever VERIFIES it -- we never exchange an auth code, so no confidential
+# credential is involved.
+#
+# It is nonetheless load-bearing for security: verification checks the token's
+# `aud` claim equals this exact value. Without that check, an ID token minted by
+# Google for ANY other application would authenticate here. Empty string
+# therefore disables self-serve sign-up entirely (POST /auth/google returns 503)
+# rather than falling back to an unverified path.
+#
+# Add the site's origin to "Authorised JavaScript origins" on that OAuth client,
+# or Google refuses to render the button at all.
+#
+# GOOGLE_OAUTH_CLIENT_ID is accepted as a fallback: a client already existed in
+# the repo-root .env under that name before self-serve sign-up was built, and
+# silently ignoring it would present as "sign-in is unavailable" on a deployment
+# that is, as far as the operator is concerned, already configured.
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "") or os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+if not GOOGLE_CLIENT_ID:
+    print("[config] NOTE: GOOGLE_CLIENT_ID is unset -- Google sign-in is disabled (POST /auth/google -> 503).")
+
+# ── Sign in with Apple ───────────────────────────────────────────────────────
+# The **Services ID** (e.g. "com.fourinathousand.web"), NOT the App ID: the web
+# flow authenticates against a Services ID and Apple puts it in the token's
+# `aud`. As with Google this is public (it ships in the AppleID.js init call) and
+# is load-bearing for exactly the same reason -- verification compares `aud` to
+# this exact value, and without that comparison an Apple ID token minted for any
+# other application would authenticate here.
+#
+# Unlike Google there is NO client secret and no .p8 key needed, because the
+# browser flow used here (AppleID.auth.signIn with usePopup) hands the page a
+# signed id_token directly and the backend only verifies it. The private key is
+# only required for the server-side authorization-code exchange, which this does
+# not do.
+#
+# Empty disables Apple sign-in entirely (POST /auth/apple -> 503) and the button
+# is not rendered. Setup, all of which is on Apple's side:
+#   1. An Apple Developer Program membership (paid) and an App ID.
+#   2. A Services ID with "Sign in with Apple" enabled, whose value goes here.
+#   3. The site's domain registered on that Services ID, and the return URL
+#      added -- Apple rejects the popup outright if the origin isn't listed.
+APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID", "")
+
+# Email + password sign-up. On by default: its whole purpose is to be the path
+# that needs no third-party account, so requiring an env var to turn it on would
+# leave the default deployment offering exactly the two providers it exists to
+# supplement. Set EMAIL_SIGNUP_ENABLED=0 to hide the form and 503 the endpoints.
+#
+# There is deliberately NO verification email -- this deployment has no mail
+# service of any kind. The consequence is recorded rather than hidden:
+# User.email_verified stays False for these accounts and GET /admin/signups
+# reports it, so an unverified address is never presented as a confirmed contact.
+EMAIL_SIGNUP_ENABLED = os.getenv("EMAIL_SIGNUP_ENABLED", "1").lower() not in {"0", "false", "no"}
+# Minimum password length. A length floor is the only password rule imposed:
+# composition rules ("one number, one symbol") measurably push people toward
+# shorter, more guessable passwords, and nothing here is protecting a payment
+# method -- the account holds a CV and a list of job adverts.
+PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
+
+# Q1 of the post-signup survey (single select). Stored on SignupSurvey.priority
+# as the raw slug; the labels live in the frontend so wording can change without
+# a migration. Order is the display order.
+SIGNUP_PRIORITY_CHOICES = [
+    "ghost_roles",       # avoiding jobs that aren't really hiring
+    "visa_sponsors",     # filtering to visa sponsors
+    "faster",            # discovering ok roles faster
+    "hard_to_find_fit",  # it's difficult to find roles that fit
+    "niche",             # finding niche / lower-competition roles
+    "none",              # none of these
+]
+
+# ── Open beta: the fixed test window ─────────────────────────────────────────
+# Two SEPARATE gates off one clock (User.beta_started_at), and they must stay
+# separate -- see services/beta.py:
+#
+#   * EXIT_SURVEY_AFTER_DAYS -- from this day on, the next time the user loads
+#     the app they are held on /exit-survey until they answer. Answering
+#     releases them back into the app for the rest of the window. Deliberately
+#     NOT the last day: triggering on day 7 would require the user to log in on
+#     one specific day, which is the single most likely way to collect nothing.
+#   * BETA_WINDOW_DAYS -- access lapses (a real 403, see require_active_beta).
+#
+# Note what CANNOT enforce this: TOKEN_MAX_AGE_SECONDS above is 30 days, far
+# longer than the window, so token expiry is no help and the check is its own.
+BETA_WINDOW_DAYS = int(os.getenv("BETA_WINDOW_DAYS", "7"))
+EXIT_SURVEY_AFTER_DAYS = int(os.getenv("EXIT_SURVEY_AFTER_DAYS", "4"))
+
+# Q2 of the wrap-up survey: which features materially proved useful (multi
+# select). "none" is NOT padding -- with a plain checkbox group, zero ticks is
+# indistinguishable between "none of these were useful" (a real, valuable
+# answer) and "hasn't answered yet", and the survey gate has to be able to tell
+# when to release the user. Same reasoning as SIGNUP_PRIORITY_CHOICES' "none".
+EXIT_SURVEY_FEATURE_CHOICES = [
+    "ghost_check",        # ghost job checking
+    "sponsor_check",      # visa sponsor checking
+    "one_line_summary",   # the one-line role summary
+    "why_qualified",      # the "why qualified" summary
+    "none",               # none of these
+]
+
+# Q3 of the wrap-up survey: the speed/quality trade-off, asked assuming the
+# current ~12 roles per run.
+EXIT_SURVEY_SPEED_CHOICES = [
+    "slower_better",  # wait longer for slightly better roles
+    "as_is",          # keep it as-is
+    "faster_worse",   # wait a lot less for slightly worse roles
+]
+
 # SQLite by default; flip DATABASE_URL to a postgres:// URL to migrate later.
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'jobmatch.db'}")
 
@@ -140,6 +252,26 @@ ATTRIBUTE_TYPES = [
     # postings and blank-company aggregator rows are the two structural cases.
     # See services/sponsors.py for the measured match rate and both limitations.
     "visa_sponsor_only",
+    # Single-value boolean: is the candidate open to roles pitched BELOW their own
+    # stated seniority? Value "true"; no row at all -> off, which is the default,
+    # because most candidates searching at their level do not want to be shown
+    # roles beneath it and the free title prescreen that drops those is one of the
+    # cheapest filters in the pipeline.
+    #
+    # Direction-aware, and only meaningful for a SENIOR-side profile: it turns
+    # engine._heuristic_prescreen's junior-title reject from an unconditional drop
+    # into a soft signal, and tells the cheap gate/rank/judge that a lower-pitched
+    # role is not itself a mismatch. It does NOT touch the junior-profile
+    # direction (a Graduate candidate is not helped by being shown Director roles).
+    #
+    # Like visa_sponsor_only it carries no Hard/Soft control -- the whole point of
+    # the flag is that it makes something soft, so a "Hard" reading would be
+    # self-contradictory. Note what it deliberately does NOT re-admit:
+    # apprenticeships and placement years, which were excluded for reasons OTHER
+    # than seniority (they are courses with eligibility bars against people who
+    # already hold the qualification -- see _PLACEMENT_YEAR_RE and the
+    # apprenticeship rules at all three LLM tiers).
+    "allow_overqualified",
 ]
 
 # Where a skill's depth was earned -- distinct from proficiency (which grades
@@ -311,6 +443,7 @@ ATTRIBUTE_DIRECTION = {
     "max_listing_age": "constraint",
     "commute_miles": "constraint",
     "visa_sponsor_only": "constraint",
+    "allow_overqualified": "constraint",
 }
 
 # How far the candidate's stated location/country should be trusted as a hard

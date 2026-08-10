@@ -18,7 +18,11 @@ export type AttributeType =
   | "commute_miles"
   // Single-value boolean, value "true"; no row at all means off (the default).
   // Inherently hard, so it carries no Hard/Soft — see VisaSponsorToggle.
-  | "visa_sponsor_only";
+  | "visa_sponsor_only"
+  // Single-value boolean, value "true"; no row at all means off (the default).
+  // Carries no Hard/Soft because turning it on IS the softening — see
+  // AllowOverqualifiedToggle.
+  | "allow_overqualified";
 
 export interface Profile {
   id: number;
@@ -297,7 +301,30 @@ export type RoleStatus =
   | "applied"
   | "deleted";
 
-export type ApplicationStatus = "pending" | "interview" | "rejected";
+/**
+ * Mirrors routers/search.py::_VALID_APP_STATUS.
+ *
+ * `offer` exists so the terminal states aren't uniformly negative — a form whose
+ * only outcomes are bad is a form nobody fills in, and this field went unused
+ * past "pending" for its entire life before these two were added.
+ *
+ * `no_response` is deliberately NOT final: the other controls stay available so
+ * a late reply can correct it. It is also a biased signal for ghost detection —
+ * most applications get no reply for entirely ordinary reasons — so it is only
+ * ever read as a rate across many rows, never as proof about one listing.
+ */
+export type ApplicationStatus =
+  | "pending"
+  | "interview"
+  | "offer"
+  | "rejected"
+  | "no_response";
+
+/** Ghost-listing risk. `null`/absent means NOTHING FIRED, not "unknown" — every
+ *  backend rule fires on positive evidence only (see services/ghost.py). There
+ *  is deliberately no "low": a value covering ~90% of rows would get rendered
+ *  and train the reader to ignore the chip. */
+export type GhostLevel = "high" | "medium";
 
 /** Pay period — mirrors backend/app/services/salary.py's vocabulary. */
 export type SalaryPeriod = "year" | "month" | "week" | "day" | "hour";
@@ -305,11 +332,20 @@ export type SalaryPeriod = "year" | "month" | "week" | "day" | "hour";
 /** The final judge's fit grade — mirrors full_auto's _FINAL_EVAL_SCHEMA. */
 export type RoleVerdict = "very_strong" | "strong" | "ok" | "stretch";
 
-export const VERDICT_LABEL: Record<RoleVerdict, string> = {
+/**
+ * Badge text per grade. "ok" and "stretch" deliberately have NO label: the badge
+ * is the first thing read on a card, and "Ok fit"/"Stretch fit" told the
+ * candidate to discount a role the judge had just verified as worth applying to
+ * — while the card's own body (can_do_fit, the strengths/concerns pair) says the
+ * same thing with the specifics attached. The grade still does its real job,
+ * which is ordering the picks (engine._VERDICT_GRADES); it just isn't printed.
+ *
+ * Partial on purpose, so an unlabelled grade renders as no badge rather than as
+ * a raw enum. RoleCard already guards on `VERDICT_LABEL[verdict]` being present.
+ */
+export const VERDICT_LABEL: Partial<Record<RoleVerdict, string>> = {
   very_strong: "Very strong fit",
   strong: "Strong fit",
-  ok: "Ok fit",
-  stretch: "Stretch fit",
 };
 
 export interface Role {
@@ -376,9 +412,17 @@ export interface Role {
    *  rather than a genuine "first posted" date (e.g. Greenhouse) -- render as
    *  "updated"/"~", never "posted", when this is set. */
   posted_at_approx?: boolean | null;
+  /** Ghost-listing risk and the named rules behind it. Absent/null is the
+   *  common case and means nothing fired. `ghost_signals` is decoded from JSON
+   *  by the backend schema, so this is a real array. */
+  ghost_level?: GhostLevel | null;
+  ghost_signals?: string[] | null;
   status: RoleStatus;
   application_status?: ApplicationStatus | null;
   applied_at?: string | null;
+  /** When the employer first responded, or the user declared no response.
+   *  Stamped once, never overwritten. */
+  response_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -398,4 +442,29 @@ export interface SearchStart {
   run_id: number;
   status: string;
   searches_remaining: number;
+}
+
+// ── Beta feedback ───────────────────────────────────────────────────────────
+
+/** This user's wrap-up survey answers. `answered` is the whole gate. */
+export interface ExitSurvey {
+  answered: boolean;
+  change: string;
+  useful_features: string[];
+  speed_tradeoff: string;
+  created_at?: string | null;
+}
+
+export interface FeedbackPrompt {
+  due: boolean;
+  /** The run this answer would be about; null for the setup prompt, which fires
+   *  at CV-parse time when no run exists yet. */
+  run_id: number | null;
+}
+
+/** Which in-product prompts to show. Computed server-side — see
+ *  backend routers/feedback.py for why the trigger rules don't live in the client. */
+export interface FeedbackDue {
+  results_quality: FeedbackPrompt;
+  setup_ok: FeedbackPrompt;
 }

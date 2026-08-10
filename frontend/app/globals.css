@@ -346,6 +346,17 @@ a { color: inherit; }
 }
 .feedback-box .row { padding: 0; }
 
+/* ── In-product feedback prompts (InRunFeedbackPrompt) ──────────────────────
+   Two hosts: inside .feedback-box on /search (where it stands in for the
+   bug-report box) and inside .launch-box on /onboarding. `.annotation` is
+   italic + faint by design, which is right for a passing note and wrong for a
+   question expecting an answer -- so the question itself is reset to normal
+   weight while the container keeps its size and colour. */
+.prompt-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.prompt-q { font-style: normal; font-size: 13px; color: var(--ink); }
+.prompt-detail { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.prompt-inline { width: 100%; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+
 /* ── Role cards (Search / My Roles) ─────────────────────────────────────── */
 .card { border: 1px solid var(--line); border-radius: var(--r-panel); overflow: hidden; background: var(--surface); }
 .card.crossed { border-color: var(--line); opacity: .55; }
@@ -493,4 +504,306 @@ a { color: inherit; }
   .fam-head { flex-wrap: wrap; }
   .fam-name { flex: 1 1 100%; width: 100%; }
   .fam-head-right { flex: 1 1 100%; justify-content: space-between; }
+}
+
+/* ── Landing page / self-serve sign-up ─────────────────────────────────────
+   Scope: app/page.tsx (homepage), app/welcome/page.tsx (sign-up survey) and
+   app/login/page.tsx (legacy credentials). All prefixed `lp-` so they can never
+   collide with the app shell's classes.
+
+   These pages are the only ones a logged-out visitor sees, so they run wider
+   and looser than the app (which is a dense 900px working surface). They
+   deliberately reuse the SAME tokens — one accent, the same warm neutrals — and
+   the homepage's demo card reuses the app's real .card/.tag/.verdict rules
+   outright, so the page cannot drift from what it's advertising. */
+
+.lp {
+  width: 100%;
+  max-width: 1080px;
+}
+.lp-sheet {
+  background: var(--paper);
+  border: 1px solid #e7e1d4;
+  border-radius: var(--r-card);
+  overflow: hidden;
+  box-shadow: var(--shadow-card);
+}
+.lp-narrow { max-width: 620px; margin: 0 auto; }
+.lp-plain { max-width: 620px; }
+
+/* ── Homepage only: full-bleed section bands ───────────────────────────────
+   The homepage is the one lp- page that isn't a boxed form (welcome/login
+   stay inside .lp-sheet, unaffected by any of this).
+
+   body's own rule (`body { display:flex; justify-content:center; padding:
+   40px 20px; background:#e9e5dc; }`) is what gives the app screens their
+   centred-card-on-a-tinted-frame look, and it's shared by every route since
+   there's one root layout. Un-doing it with a 100vw breakout on .lp-home
+   alone still left a gap on the padded/centred axes: 100vw is measured
+   against the viewport including the scrollbar gutter in most browsers, so
+   it doesn't equal body's own (scrollbar-reduced) content width, and the
+   vertical 40px padding was never touched by a horizontal trick anyway -
+   between them that's the top strip and the right-edge sliver of #e9e5dc
+   still showing through.
+
+   `body:has(.lp-home)` sidesteps both: it targets body directly, resolved
+   in the same style pass as the DOM (no JS toggle, no flash), scoped to
+   exactly the one div only the signed-out homepage renders - welcome,
+   login and every app screen keep body's normal framed look untouched. */
+body:has(.lp-home) {
+  display: block;
+  padding: 0;
+  background: var(--paper);
+}
+.lp-home {
+  width: 100%;
+  background: var(--paper);
+}
+.lp-home-band { border-top: 1px solid var(--line); }
+.lp-home-band:first-child { border-top: none; }
+.lp-home-band.alt { background: var(--surface-2); }
+.lp-home-inner { max-width: 1200px; margin: 0 auto; padding: 44px 48px; }
+.lp-home-inner.tight { padding-top: 28px; padding-bottom: 28px; }
+
+/* header */
+.lp-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 20px 34px; border-bottom: 1px solid var(--line); background: var(--surface-2);
+}
+.lp-brand { display: flex; align-items: center; gap: 11px; }
+.lp-mark {
+  width: 30px; height: 30px; border-radius: 9px; background: var(--accent); color: #fff;
+  display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 15px;
+}
+.lp-brandname { font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
+.lp-headerlink {
+  font-size: 13px; font-weight: 600; padding: 8px 15px; text-decoration: none;
+  border: 1px solid var(--line-input); border-radius: var(--r-ctrl);
+  color: var(--ink); background: var(--surface);
+  transition: border-color .15s, color .15s;
+}
+.lp-headerlink:hover { border-color: var(--accent-ghost-bd); color: var(--accent); }
+
+/* hero */
+.lp-hero {
+  display: grid; grid-template-columns: 1.05fr .95fr; gap: 46px; align-items: start;
+}
+.lp-h1 {
+  font-size: 44px; line-height: 1.08; letter-spacing: -.025em; font-weight: 800;
+  color: var(--ink); margin: 0;
+}
+.lp-accent { color: var(--accent); }
+.lp-lede {
+  font-size: 16px; line-height: 1.55; color: var(--ink-2); margin: 18px 0 0; max-width: 470px;
+}
+
+/* sign-up card */
+.lp-join {
+  margin-top: 28px; background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--r-panel); padding: 22px; box-shadow: var(--shadow-card);
+}
+.lp-join-h { font-weight: 700; font-size: 16px; color: var(--ink); }
+.lp-join-sub { font-size: 13.5px; line-height: 1.5; color: var(--ink-2); margin: 6px 0 16px; }
+.lp-join-fine { font-size: 12px; line-height: 1.5; color: var(--muted); margin-top: 14px; }
+.lp-centred { text-align: center; }
+
+.lp-google { display: flex; flex-direction: column; gap: 8px; }
+/* Google renders its own button in here; it sizes itself, we only centre it. */
+.lp-google-holder { display: flex; justify-content: flex-start; min-height: 44px; }
+.lp-signin-note { font-size: 12.5px; color: var(--muted); }
+.lp-signin-down {
+  font-size: 12.5px; color: var(--ink-2); background: var(--accent-tint);
+  border: 1px solid var(--accent-tint-bd); border-radius: var(--r-ctrl); padding: 10px 12px;
+}
+.lp-signin-error { font-size: 12.5px; color: #b0503a; line-height: 1.45; }
+
+/* ── Apple + email sign-up (the two paths beside Google) ─────────────────────
+   Sized to match the Google button GSI renders (320x40 at size:large), so the
+   three controls stack as one column rather than three different widths. Apple
+   is rendered black-on-white rather than their black fill: this page's only
+   strong colour is the terracotta accent, and a solid black button beside
+   Google's outlined one reads as the primary action, which it isn't. */
+.lp-apple { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.lp-applebtn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  /* 320x44 matches what GSI renders for size:large — the two buttons stack as
+     one column rather than visibly different sizes. */
+  width: 320px; max-width: 100%; min-height: 44px; padding: 0 12px;
+  background: var(--surface); color: #1d1d1f;
+  border: 1px solid var(--line-input); border-radius: 4px;
+  font-family: inherit; font-size: 14px; font-weight: 500; cursor: pointer;
+}
+.lp-applebtn:hover:not(:disabled) { background: var(--surface-2); }
+.lp-applebtn:disabled { opacity: .6; cursor: default; }
+.lp-applemark { width: 15px; height: 15px; flex: none; margin-top: -2px; }
+
+.lp-emaillink {
+  margin-top: 12px; padding: 0; background: none; border: 0;
+  font-family: inherit; font-size: 12.5px; color: var(--ink-2);
+  text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+.lp-emaillink:hover { color: var(--ink); }
+
+.lp-emailform { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; width: 320px; max-width: 100%; }
+.lp-emailtabs { display: flex; gap: 6px; margin-bottom: 2px; }
+.lp-emailtab {
+  flex: 1; padding: 7px 10px; font-family: inherit; font-size: 12.5px;
+  background: var(--surface-2); color: var(--ink-2);
+  border: 1px solid var(--line-input); border-radius: var(--r-ctrl); cursor: pointer;
+}
+.lp-emailtab.on { background: var(--accent-tint); border-color: var(--accent-tint-bd); color: var(--ink); font-weight: 600; }
+.lp-emailinput {
+  width: 100%; padding: 9px 11px; font-family: inherit; font-size: 13.5px;
+  color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line-input); border-radius: var(--r-ctrl);
+}
+.lp-emailsubmit {
+  min-height: 44px; padding: 0 14px; font-family: inherit; font-size: 14px; font-weight: 600;
+  color: #fff; background: var(--accent); border: 1px solid var(--accent);
+  border-radius: 4px; cursor: pointer;
+}
+.lp-emailsubmit:disabled { opacity: .6; cursor: default; }
+.lp-emailfine { font-size: 11.5px; line-height: 1.5; color: var(--muted); }
+
+/* demo card column */
+.lp-eyebrow {
+  font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--faint); margin-bottom: 10px;
+}
+.lp-eyebrow-accent { color: var(--accent); }
+.lp-cardwrap {
+  background: var(--surface); border-radius: var(--r-panel); box-shadow: var(--shadow-card);
+}
+/* The demo card is a picture of the product, not a control surface. Its
+   buttons are <span>s so nothing here is focusable or clickable — a dead
+   button that looks live is worse than an obviously static one. */
+.lp-static { cursor: default; pointer-events: none; }
+.lp-fauxbtn {
+  align-self: flex-start; font-size: 11px; color: var(--muted);
+  border: 1px dashed var(--line-dash); border-radius: var(--r-pill); padding: 3px 9px;
+}
+.lp-caption { font-size: 12px; line-height: 1.5; color: var(--muted); margin-top: 12px; }
+
+/* what one run does - a stat strip, not a feature grid. Each item is a claim
+   a sceptical reader can verify against the demo card above, not a pitch. */
+.lp-h2 { font-size: 25px; letter-spacing: -.02em; font-weight: 800; color: var(--ink); margin: 0; }
+.lp-h2-tight { font-size: 27px; line-height: 1.14; margin-top: 10px; }
+.lp-bandsub { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
+.lp-stats {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-top: 18px;
+}
+.lp-stat { padding: 0 22px; border-left: 1px solid var(--line); }
+.lp-stat:first-child { border-left: none; padding-left: 0; }
+.lp-stats-checks { padding-top: 18px; border-top: 1px solid var(--line); }
+.lp-stat-n { font-size: 23px; font-weight: 800; letter-spacing: -.02em; color: var(--ink); }
+.lp-stat-l { font-size: 13px; line-height: 1.4; color: var(--ink-2); margin-top: 4px; }
+
+/* the receipt */
+.lp-proof-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 36px; align-items: center; }
+.lp-body { font-size: 15px; line-height: 1.55; color: var(--ink-2); margin: 14px 0 0; }
+.lp-body strong { color: var(--ink); }
+.lp-receipt {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-panel);
+  padding: 18px 20px; box-shadow: var(--shadow-card);
+}
+.lp-receipt-h { font-size: 11.5px; color: var(--faint); font-weight: 600; letter-spacing: .04em; }
+.lp-receipt-title {
+  font-weight: 700; font-size: 17px; color: var(--ink); margin-top: 8px;
+  text-decoration: line-through; text-decoration-color: var(--accent-ghost-bd);
+}
+.lp-receipt-sub { color: var(--ink-2); font-size: 13.5px; margin-top: 3px; }
+.lp-receipt-x {
+  display: flex; gap: 9px; font-size: 13.5px; line-height: 1.45; color: #b0503a; margin-top: 8px;
+}
+.lp-receipt-first { margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line-dash); }
+
+/* us vs. them - replaces the old separate "why others fail" reasons grid and
+   the leftover feature bullets with one scannable table, row-paired so each
+   claim sits directly against the failure it answers. */
+.lp-compare-lead { margin-top: 36px; }
+.lp-compare { margin-top: 16px; border: 1px solid var(--line); border-radius: var(--r-panel); overflow: hidden; }
+.lp-compare-head, .lp-compare-row { display: grid; grid-template-columns: 1fr 1.15fr; }
+.lp-compare-row { border-top: 1px solid var(--line); }
+.lp-compare-head > div {
+  padding: 10px 18px; font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+}
+.lp-compare-head .them { color: var(--muted); background: var(--surface-2); }
+.lp-compare-head .us { color: var(--accent); background: var(--accent-tint); }
+.lp-compare-row > div { padding: 12px 18px; font-size: 13.5px; line-height: 1.45; }
+.lp-compare-row .them { color: var(--ink-2); }
+.lp-compare-row .us { color: var(--ink); background: var(--accent-tint); font-weight: 600; }
+.lp-compare-row .them span, .lp-compare-row .us span { color: var(--faint); font-weight: 400; margin-right: 6px; }
+.lp-compare-row .us span { color: var(--accent); }
+
+.lp-cta {
+  display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap;
+}
+.lp-cta-text { font-size: 17px; font-weight: 700; color: var(--ink); }
+.lp-cta-sub { display: block; font-size: 13.5px; font-weight: 400; color: var(--ink-2); margin-top: 3px; }
+.lp-cta-btn {
+  background: var(--ink); color: #f6f2ea; padding: 12px 21px; border-radius: var(--r-ctrl);
+  font-size: 14px; font-weight: 700; text-decoration: none;
+  transition: background .15s, color .15s;
+}
+.lp-cta-btn:hover { background: #100e0b; color: #fff; }
+
+.lp-footer {
+  padding: 16px 34px; border-top: 1px solid var(--line); font-size: 12px; color: var(--faint);
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+}
+.lp-footlink { color: var(--faint); text-decoration: underline; text-underline-offset: 2px; }
+.lp-footlink:hover { color: var(--ink-2); }
+
+/* ── Sign-up survey (/welcome) ─────────────────────────────────────────── */
+.lp-survey { padding: 30px 34px 34px; display: flex; flex-direction: column; gap: 26px; }
+.lp-survey-h1 { font-size: 26px; letter-spacing: -.02em; font-weight: 800; color: var(--ink); }
+.lp-survey-sub { font-size: 14px; line-height: 1.5; color: var(--ink-2); margin-top: 7px; }
+.lp-q { border: none; display: flex; flex-direction: column; gap: 10px; }
+.lp-q-label {
+  font-size: 15px; font-weight: 700; color: var(--ink);
+  display: flex; align-items: center; gap: 9px; padding: 0;
+}
+.lp-q-n {
+  flex: none; width: 22px; height: 22px; border-radius: 6px; background: var(--accent-tint);
+  color: var(--accent); display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+}
+.lp-q-hint { font-size: 12.5px; color: var(--muted); margin: -4px 0 0 31px; }
+.lp-options { display: flex; flex-direction: column; gap: 8px; }
+.lp-options-row { flex-direction: row; }
+.lp-option {
+  text-align: left; font-size: 14px; padding: 12px 15px; border-radius: var(--r-ctrl);
+  border: 1px solid var(--line-input); background: var(--surface); color: var(--ink-2);
+  transition: border-color .12s, background .12s, color .12s;
+}
+.lp-options-row .lp-option { flex: 1; text-align: center; font-weight: 600; }
+.lp-option:hover { border-color: var(--accent-ghost-bd); }
+.lp-option.on {
+  border-color: var(--accent); background: var(--accent-tint); color: var(--ink); font-weight: 600;
+}
+.lp-survey-go { align-self: flex-start; padding: 11px 22px; font-size: 14px; }
+
+/* ── Legacy credentials (/login) ───────────────────────────────────────── */
+.lp-legacy { padding: 30px 34px 36px; }
+.lp-legacy-form { display: flex; flex-direction: column; gap: 14px; max-width: 380px; }
+.lp-legacy-h { font-weight: 700; font-size: 16px; color: var(--ink); }
+.lp-legacy-sub { font-size: 13px; line-height: 1.5; color: var(--ink-2); margin-top: 5px; }
+.lp-inline-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.lp-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+.lp-input {
+  border: 1px solid var(--line-input); border-radius: var(--r-ctrl); padding: 9px 11px;
+  font-size: 14px; font-family: inherit; background: var(--surface-2); color: var(--ink);
+}
+.lp-input:focus { outline: none; border-color: var(--accent-ghost-bd); }
+
+@media (max-width: 860px) {
+  .lp-hero, .lp-proof-grid { grid-template-columns: 1fr; }
+  .lp-hero { gap: 34px; }
+  .lp-h1 { font-size: 31px; }
+  .lp-home-inner { padding: 30px 22px; }
+  .lp-header, .lp-footer, .lp-survey, .lp-legacy { padding-left: 22px; padding-right: 22px; }
+  .lp-proof-grid { gap: 22px; }
+  .lp-cta { flex-direction: column; align-items: flex-start; }
+  .lp-google-holder { justify-content: center; }
+  .lp-compare-head > div, .lp-compare-row > div { padding: 10px 12px; font-size: 12.5px; }
 }

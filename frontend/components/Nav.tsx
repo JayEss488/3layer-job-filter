@@ -52,7 +52,11 @@ export function Nav() {
   function logout() {
     clearAuth();
     qc.clear();
-    router.replace("/login");
+    // "/" (the homepage + Google sign-in), not "/login". Since self-serve
+    // sign-up, /login only serves the original hand-assigned beta credentials --
+    // dropping a Google user there shows them a username/password form they have
+    // never had and cannot use.
+    router.replace("/");
   }
 
   const username = getUsername();

@@ -42,12 +42,17 @@ from ..config import CV_SHORT_WORD_THRESHOLD, CV_SUMMARY_MAX_CHARS, MAX_ROLE_CLU
 from ..models import Profile, ProfileAttribute, Setting
 from .llm import MID_MODEL, llm_json
 
-PROFILE_INTEL_VERSION = 9
+# 10 (from 9): sector_target no longer feeds _background_text, so the generated
+# target roles/header stop being biased toward the candidate's stated causes --
+# see that function and snapshot.build_snapshot. Bumped so a cached intel result
+# generated WITH the sector line doesn't outlive the change.
+PROFILE_INTEL_VERSION = 10
 SIG_KEY = "profile_intel_signature"
 RESULT_KEY = "profile_intel_result"
 TARGET_ROLE_HARD_CAP = 20
 
-_BACKGROUND_TYPES = ["past_role", "skill", "qualification", "seniority", "sector_target", "custom"]
+# sector_target is intentionally not here -- see _background_text below.
+_BACKGROUND_TYPES = ["past_role", "skill", "qualification", "seniority", "custom"]
 
 # How far back from a hard character cap clip_summary will hunt for a sentence
 # end before giving up and cutting at a word boundary instead. Generous enough
@@ -178,8 +183,11 @@ def _background_text(by_type: dict[str, list[str]]) -> str:
         parts.append("Skills: " + ", ".join(by_type["skill"]))
     if by_type.get("seniority"):
         parts.append("Seniority: " + ", ".join(by_type["seniority"]))
-    if by_type.get("sector_target"):
-        parts.append("Sector interests: " + "; ".join(by_type["sector_target"]))
+    # sector_target is deliberately absent: it is a discovery-side signal only now
+    # (see snapshot.build_snapshot's note where the judge's "Sector interests" line
+    # was removed). Feeding it here biased the generated target roles and header
+    # toward the candidate's stated causes, which is the same industry-over-function
+    # drift that removing sector_match from the judge fixed.
     if by_type.get("custom"):
         parts.append("Other preferences: " + "; ".join(by_type["custom"]))
     return "\n".join(parts)

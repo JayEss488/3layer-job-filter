@@ -24,6 +24,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
+from itertools import zip_longest
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -177,7 +178,17 @@ RANK_TARGET_POOL = 80         # run-wide judge-eligible target for the gate+rank
 # itself, not a thin queue or MIN_RESULTS/JUDGE_POOL, was the limiting factor,
 # with hundreds of unexamined above-floor candidates still sitting in that
 # cluster's queue.
-RANK_EXAMINE_BUDGET = 320
+# Raised again 320 -> 480 for the same reason one step further on: with the pool
+# quality prescreens now removing ~65% of the queue before a token is spent, and
+# RANK_REJECT_SCORE_FLOOR no longer doubling as the enforcement path for soft
+# preferences (see below), too little was still reaching the judge on a real
+# profile. This is the honest cost dial -- screen (CHEAP) + rank (MID) calls
+# scale directly with it -- and it is also the knob that most directly widens
+# what the expensive stage gets to choose from. If time-to-first-card regresses,
+# REED_/ADZUNA_ENRICH_PRE_GATE_CAP and *_PAGES_PER_TERM are the knobs to turn,
+# not this one: the gate screens the whole budget in one wave (see
+# GATE_ROUND_SIZE), so a wider budget costs more batches, not more serial waves.
+RANK_EXAMINE_BUDGET = 480
 # Symmetric FLOOR to the JUDGE_POOL ceiling: an absolute rank cutoff
 # (RANK_REJECT_SCORE_FLOOR) plus per-cluster examine caps can leave the judge with
 # far fewer than JUDGE_POOL candidates even when dozens of gate survivors exist
@@ -293,7 +304,46 @@ LISTING_REVALIDATE_AFTER_DAYS = 2
 # 55 did to a 5-candidate cluster), whereas a low floor plus a wide pool plus a
 # top-N cut cannot. Anything at or above the midpoint of the mid tier's own
 # 0-100 scale proceeds; ordering after that is _selection_score's job.
-RANK_REJECT_SCORE_FLOOR = 50
+#
+# Lowered again 50 -> 32, which was only SAFE once this constant stopped doing
+# two unrelated jobs at the same time. It reads as a quality bar, but rank_gate's
+# work-arrangement and salary HARD DOWNGRADES capped a violating listing's score
+# at 15 precisely so that THIS floor would eliminate it -- i.e. the floor was
+# also the enforcement path for two preferences the candidate had explicitly
+# marked Soft, and lowering it would have silently switched that enforcement off.
+# full_auto._rank_prompt now routes a Soft-enforced arrangement/salary mismatch
+# into its own SOFT-PREFERENCE MISMATCHES section, which sets `soft_violation`
+# and leaves the score alone (see SOFT_VIOLATION_SELECTION_PENALTY below), so
+# this number is free to be what its name says: "the mid tier is not telling us
+# this is clearly a no". 32 clears the score-15 band the genuine hard downgrades
+# still occupy with real headroom, while letting the borderline/stretch roles a
+# candidate would actually consider reach the judge -- the whole reason for the
+# change. Selection remains the wide-pool-plus-top-N cut's job, which cannot
+# starve a cluster the way an absolute cutoff can.
+RANK_REJECT_SCORE_FLOOR = 32
+# Ordering-only penalty for a candidate rank_gate flagged as violating one of the
+# candidate's SOFT-enforced stated preferences (work arrangement, salary floor --
+# see full_auto._rank_prompt's SOFT-PREFERENCE MISMATCHES section). Applied in
+# _selection_score, NEVER to _rank_score, under exactly the same rule as
+# RICH_TEXT_SELECTION_BONUS and _unverified_penalty: the card's "Fit estimate"
+# chip and RANK_REJECT_SCORE_FLOOR both keep showing/testing the model's own
+# unmodified number, so a soft mismatch can only ever cost a role its POSITION in
+# the judge pool, never its eligibility. That is what "Soft" is supposed to mean,
+# and it is what the old cap-at-15 mechanism could not express -- that capped
+# score was indistinguishable from a genuinely terrible fit at every downstream
+# stage. Sized well above RICH_TEXT_SELECTION_BONUS (3.0) so it actually reorders
+# rather than breaking ties, but far short of eliminating a strong role: a
+# well-matched remote job for an on-site-preferring candidate still outranks a
+# mediocre on-site one.
+SOFT_VIOLATION_SELECTION_PENALTY = 12.0
+# _selection_score demotion for a listing the ghost rules flagged "high" (see
+# services/ghost.py). Ordering only, never _rank_score -- same rule as the three
+# adjustments above it. Set BELOW the soft-violation penalty deliberately: that
+# one fires on the candidate's own stated preference being missed, which is
+# firmer evidence than an inference drawn from a posting date. Never a drop:
+# a suspected ghost listing must stay reachable, it should just lose to an
+# equally-good listing with a vacancy behind it.
+GHOST_SELECTION_PENALTY = float(os.getenv("GHOST_SELECTION_PENALTY", "8"))
 # Same-source posting-volume signal (scam/CV-farming detection, see
 # _company_title_counts): a company posting at least this many DIFFERENT
 # titles in one run's discovery is surfaced to the final judge as a hint --
@@ -346,6 +396,12 @@ VERIFY_BROWSER_BUDGET_SECONDS = float(os.getenv("VERIFY_BROWSER_BUDGET_SECONDS",
 # "unverifiable" and lose the check rather than gain anything.
 _VERIFY_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# Below this many chars of VISIBLE text (see full_auto._visible_text), a 200 is
+# a client-side-rendered shell we cannot read, not a live posting -- so it
+# classifies "unverifiable" and escalates, rather than "alive". Set well under
+# any real posting page: the smallest thing a live listing renders is still its
+# own title, company and location.
+_VERIFY_MIN_VISIBLE_CHARS = int(os.getenv("VERIFY_MIN_VISIBLE_CHARS", "200"))
 
 # Job boards that MIRROR someone else's posting rather than hosting the
 # employer's own. Used for exactly two narrow purposes: prioritising which rows
@@ -372,10 +428,41 @@ MIRROR_BRANDS = frozenset({
     "glassdoor", "simplyhired", "jobsora", "gulftalent", "expertini",
     "grabjobs", "neuvoo", "trabajo", "joblookup", "jobtome", "learn4good",
     "mindmatch", "jobleads", "adview", "careerjet",
+    # LinkedIn arrives only via jsearch and is a mirror in the literal sense:
+    # the listing that prompted _LIVENESS_BLIND_HOSTS (below) renders "This is
+    # an excerpt from Reed. Click apply to see the full job description ... on
+    # Reed.co.uk" in its own body.
+    "linkedin",
 })
 MIRROR_HOSTS = frozenset({
     "talent.com", "recruit.net", "tarta.ai",
 })
+
+# Hosts whose public page CANNOT report that a vacancy has closed, so a 200 from
+# them is not evidence of life and must never be recorded as a passed check.
+#
+# This is a narrower claim than MIRROR_BRANDS and a different one: a mirror still
+# 404s or serves a closure notice when its copy comes down, which is exactly what
+# _classify_listing reads. These hosts render an apparently-healthy posting to a
+# logged-out client regardless of the vacancy's real state.
+#
+# Measured on the listing that prompted this -- a jsearch-sourced LinkedIn row
+# (Finance Data Analyst / Polaris Consulting International) shown at rank 6 and
+# stamped last_verified_at, i.e. badged as checked. Signed in, LinkedIn showed
+# "No longer accepting applications". Fetched anonymously the SAME URL returned
+# 200 with 11,755 chars of visible text, an active apply button, "Applications so
+# far 50" and "Closes 15 Sept 2026"; zero occurrences of "no longer", "closed" or
+# "expired" anywhere in 304KB of HTML, and no JSON-LD JobPosting at all. The
+# guest job-posting fragment (/jobs-guest/jobs/api/jobPosting/{id}) says the same.
+# So every check _classify_listing runs passes, and passes for a dead vacancy.
+#
+# The verdict is "unverifiable", never "dead": nothing here is evidence the
+# vacancy has closed either, and dead_reason is unrecoverable. What that buys is
+# the three things the pipeline already does with an unverifiable row -- the
+# UNVERIFIED_RANK_PENALTY demotion, the card's honest "not verified" chip (which
+# only fires while last_verified_at is null), and the mirror-with-no-text drop --
+# instead of the false "checked live" the row carried before.
+_LIVENESS_BLIND_HOSTS = frozenset({"linkedin.com"})
 
 
 def _listing_host(url: str | None) -> str:
@@ -396,6 +483,18 @@ def _is_mirror_host(url: str | None) -> bool:
     return bool(set(host.split(".")) & MIRROR_BRANDS)
 
 
+def _is_liveness_blind_host(url: str | None) -> bool:
+    """Whether a plain GET of this URL can say anything about liveness at all.
+
+    See _LIVENESS_BLIND_HOSTS. Suffix-matched so uk.linkedin.com and
+    www.linkedin.com both count; _listing_host has already dropped a leading
+    "www.", and an exact match covers the bare domain."""
+    host = _listing_host(url)
+    if not host:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _LIVENESS_BLIND_HOSTS)
+
+
 def get_pipeline_caps() -> dict:
     """Current pipeline cap constants, for the Settings/Analytics page's
     per-role-track table -- lets a "stopped because: absolute pool cap" row be
@@ -409,6 +508,8 @@ def get_pipeline_caps() -> dict:
         "judge_pool": JUDGE_POOL,
         "judge_pool_floor": JUDGE_POOL_FLOOR,
         "rank_reject_score_floor": RANK_REJECT_SCORE_FLOOR,
+        "soft_violation_selection_penalty": SOFT_VIOLATION_SELECTION_PENALTY,
+        "judge_merge_thin_cluster_max": JUDGE_MERGE_THIN_CLUSTER_MAX,
         "target_pool_per_round": TARGET_POOL,
         "min_results_floor": MIN_RESULTS,
         "final_picks": _fa.FINAL_PICKS,
@@ -486,10 +587,29 @@ def _selection_score(j: dict) -> float:
     _unverified_penalty rides here for the same reason and under the same rule:
     a listing whose host refused to answer the liveness check is not known to be
     dead, so it must still be able to surface -- it just loses to anything we
-    could actually confirm."""
+    could actually confirm.
+
+    SOFT_VIOLATION_SELECTION_PENALTY is the third, and the reason the other two
+    were worth generalising to: a listing that misses one of the candidate's
+    SOFT-enforced preferences (remote-only for someone who asked for on-site, a
+    salary under a soft floor) is exactly a role that should still be reachable
+    but should lose to an equally-good role that matches. That used to be
+    expressed by capping the model's score at 15 so RANK_REJECT_SCORE_FLOOR would
+    eliminate it -- which is elimination, not demotion, and which pinned the floor
+    in place. See SOFT_VIOLATION_SELECTION_PENALTY.
+
+    GHOST_SELECTION_PENALTY is the fourth and rides here under exactly the same
+    rule. A listing flagged high ghost-risk is a worse use of an application
+    than an equally-good listing with a vacancy behind it -- but it is a
+    suspicion, not a fact about fit, so it must never touch the number the card
+    shows or the floor tests. Set BELOW the soft-violation penalty on purpose:
+    a candidate's own stated preference being missed is firmer evidence than an
+    inference from a posting date."""
     return (j.get("_rank_score", 50.0)
             + (RICH_TEXT_SELECTION_BONUS if _has_judgeable_text(j) else 0.0)
-            - j.get("_unverified_penalty", 0.0))
+            - j.get("_unverified_penalty", 0.0)
+            - (SOFT_VIOLATION_SELECTION_PENALTY if j.get("_rank_soft_violation") else 0.0)
+            - (GHOST_SELECTION_PENALTY if j.get("_ghost_level") == "high" else 0.0))
 
 
 # Free, high-confidence seniority pre-reject: a junior/graduate candidate will never
@@ -552,6 +672,26 @@ _PLACEMENT_YEAR_RE = re.compile(
 # this narrow is what stops "placement year" appearing in a recruiter's
 # boilerplate from disqualifying an ordinary graduate job.
 _INTERNSHIP_TITLE_RE = re.compile(r"\b(intern(ship)?|placement|student)\b", re.I)
+# The junior-side titles that stay an unconditional drop for a SENIOR profile even
+# when that profile turns "Allow overqualified" on. This is the trap in a
+# direction-aware seniority flag: the flag says "I'll take a role pitched below my
+# level", which is a statement about LEVEL -- and these two categories were never
+# excluded on level.
+#   * An apprenticeship/traineeship is a place on a course that happens to come
+#     with a job. It exists to teach someone who does not yet hold the
+#     qualification, and many carry an explicit eligibility bar against applicants
+#     who already hold an equivalent one -- so it gets WORSE, not better, the more
+#     qualified the applicant is. That is enforced at all three LLM tiers
+#     (screen_v13's APPRENTICESHIPS block, rank HARD DOWNGRADE (f), the judge's
+#     DISQUALIFIER 3); readmitting it here would reopen the hole underneath them.
+#   * A placement/sandwich year requires the applicant to be part-way through a
+#     degree. A finished candidate is usually ineligible outright.
+# "Graduate scheme"/"junior"/"entry-level"/"assistant" are NOT here: those are
+# ordinary jobs at a lower level, which is exactly what the flag opts into.
+_INELIGIBLE_REGARDLESS_OF_LEVEL_RE = re.compile(
+    r"\b(apprentice(ship)?|traineeship|placement\s+year|sandwich\s+(year|placement)"
+    r"|year\s+in\s+industry|industrial\s+placement|undergraduate\s+placement"
+    r"|placement\s+student)\b", re.I)
 _JUNIOR_BAND = ("intern", "graduate", "entry", "junior", "student", "trainee", "apprentice", "placement")
 _SENIOR_BAND = ("senior", "lead", "principal", "head", "director", "manager",
                 "staff", "vp", "chief", "executive", "president")
@@ -566,16 +706,34 @@ def _heuristic_prescreen(scored: list[dict], eng_profile: dict) -> tuple[list[di
     For a junior/graduate profile this also drops student PLACEMENT-year postings
     (_PLACEMENT_YEAR_RE): a sandwich-year role is for someone mid-degree, reads as
     an excellent match on every other axis, and so survives all three LLM tiers --
-    a live run put a "12month/placement year" internship at rank 5."""
+    a live run put a "12month/placement year" internship at rank 5.
+
+    The candidate's "Allow overqualified" preference makes the SENIOR-profile
+    direction conditional: a junior-marked title stops being an unconditional drop
+    and goes through to the soft gate, which can weigh it against the rest of the
+    listing. Deliberately one-directional -- it never loosens the junior-profile
+    direction, since a Graduate candidate is not helped by being shown Director
+    roles -- and it never re-admits an apprenticeship or a placement year, which
+    are excluded on ELIGIBILITY rather than on level (see
+    _INELIGIBLE_REGARDLESS_OF_LEVEL_RE)."""
     seniority = (eng_profile.get("seniority") or "").lower()
     is_junior = any(b in seniority for b in _JUNIOR_BAND)
     is_senior = (not is_junior) and any(b in seniority for b in _SENIOR_BAND)
     if not (is_junior or is_senior):
         return scored, 0
+    allow_overqualified = bool(eng_profile.get("allow_overqualified")) and is_senior
     reject_re = _SENIOR_TITLE_RE if is_junior else _JUNIOR_TITLE_RE
     kept, dropped = [], 0
     for j in scored:
         title = j.get("title") or ""
+        if allow_overqualified:
+            # The whole junior-title reject is off for this profile, except for
+            # the two categories the flag was never about. Those still drop.
+            if _INELIGIBLE_REGARDLESS_OF_LEVEL_RE.search(title):
+                dropped += 1
+            else:
+                kept.append(j)
+            continue
         # A title that advertises itself as junior is never "too senior",
         # whatever else it contains -- see _JUNIOR_MARKER_RE. Applies only to the
         # junior-profile direction; the senior-profile direction rejects ON that
@@ -868,8 +1026,11 @@ def _compose_analysis(entry: dict) -> str:
     parts = []
     if entry.get("_cluster_label"):
         parts.append(f"Matched via: {entry['_cluster_label']} track")
-    if entry.get("strong_fit") is False:
-        parts.append("⚠ Closest available match — no role fully met the bar this run.")
+    # No "⚠ Closest available match — no role fully met the bar this run." line any
+    # more. It was emitted for every non-strong-list pick, which since the backup
+    # tier became an ordinary part of the result set (see _evaluate_cluster) is a
+    # routine outcome rather than a warning -- and it framed a role the judge had
+    # just verified as worth applying to as a consolation prize.
 
     headline = " ".join(
         p.strip() for p in (entry.get("role_type"), entry.get("summary")) if p and p.strip()
@@ -880,10 +1041,22 @@ def _compose_analysis(entry: dict) -> str:
     qualification: list[str] = []
     if entry.get("can_do_fit"):
         qualification.append(f"✓ {entry['can_do_fit'].strip()}")
+    # "strengths" is only generated for an ok/stretch pick (full_auto reasoning step
+    # G) -- a very_strong/strong card's grade and can_do_fit line already say the
+    # candidate clears the bar, so listing what they bring there is restatement.
+    # For the lower two grades it is the missing half: those cards used to show a
+    # bare list of gaps for a role the judge was recommending.
+    strengths = [str(s).strip() for s in (entry.get("strengths") or []) if str(s).strip()]
+    if strengths:
+        qualification.append("✓ You have:")
+        qualification.extend(f"- {s}" for s in strengths)
     concerns = [str(c).strip() for c in (entry.get("concerns") or []) if str(c).strip()]
     if concerns:
-        noun = "aspect" if len(concerns) == 1 else "aspects"
-        qualification.append(f"⚠ You lack {len(concerns)} {noun}:")
+        # Was "⚠ You lack N aspects:". Both halves were wrong: the count invited the
+        # card to be read as a score, and "you lack" states a property of the
+        # candidate where the honest statement is about what the posting asked for
+        # (see full_auto's WORDING rule on which side a shortfall is stated from).
+        qualification.append("⚠ Note that:")
         qualification.extend(f"- {c}" for c in concerns)
     if qualification:
         parts.append("§qualification")
@@ -908,7 +1081,28 @@ def _compose_analysis(entry: dict) -> str:
         parts.append("§ai-reasoning")
         parts.append(entry["top_match_reason"].strip())
 
+    # Why the ghost chip fired, in the listing's own terms. The chip alone is an
+    # unexplainable accusation about a named employer, so it must always be
+    # backed by the specific facts behind it. Rendered through the same §-marker
+    # mechanism as the blocks above rather than a new card field.
+    ghost_lines = _ghost_module().describe(entry.get("_ghost_signals"))
+    if ghost_lines:
+        parts.append("§ghost")
+        parts.extend(f"- {line}" for line in ghost_lines)
+
     return "\n".join(p for p in parts if p)
+
+
+def _ghost_module():
+    from . import ghost
+    return ghost
+
+
+# Fallback tags that are recorded but never rendered as a banner. Kept as a set
+# rather than an `if tag == ...` inside the function so that suppressing a tag is
+# one edit and cannot accidentally suppress only SOME of the paths that read it
+# (the multi-cluster generic message below would otherwise still fire on it).
+_SILENT_FALLBACK_TAGS = frozenset({"eval_fallback"})
 
 
 def _compose_fallback_warning(role_clusters: list[dict], fallback_notes: dict[int, set[str]]) -> str | None:
@@ -916,8 +1110,22 @@ def _compose_fallback_warning(role_clusters: list[dict], fallback_notes: dict[in
     "broadened"/"floor_fallback" and _run_engine_pipeline's "gate_fallback"/
     "eval_fallback"/"cluster_skipped") into a user-facing message. Names the
     specific role when only one cluster needed a fallback; generic wording
-    otherwise."""
-    affected = [idx for idx, tags in fallback_notes.items() if tags]
+    otherwise.
+
+    `eval_fallback` is deliberately NOT surfaced (see _SILENT_FALLBACK_TAGS). It
+    is tagged whenever a cluster produced no STRONG-list picks, which since the
+    v26 leniency rework is an ordinary outcome rather than a degraded one: the
+    judge's `backup` list is now shown as a matter of course, capped at
+    FINAL_PICKS and described in the prompt as reaching the candidate, so a run
+    made entirely of backup picks is a normal run of verified, applicable roles.
+    Telling the reader those are "the closest available instead of only
+    confident picks" framed a verified pick as a consolation prize -- the same
+    reason the per-card "Closest available match" line was removed in v26. The
+    tag is still SET, and still lands in the run diagnostics, because it remains
+    a useful signal when reading a run back; it just no longer prints a banner.
+    """
+    notes = {idx: (tags - _SILENT_FALLBACK_TAGS) for idx, tags in fallback_notes.items()}
+    affected = [idx for idx, tags in notes.items() if tags]
     if not affected:
         return None
     if len(role_clusters) <= 1 or len(affected) > 1:
@@ -925,12 +1133,9 @@ def _compose_fallback_warning(role_clusters: list[dict], fallback_notes: dict[in
                 "matches anyway; some may be a stretch.")
     idx = affected[0]
     label = _cluster_label(role_clusters[idx])
-    tags = fallback_notes[idx]
+    tags = notes[idx]
     if "cluster_skipped" in tags:
         return f'"{label}" wasn\'t searched this run — it\'ll come up again in a future search.'
-    if "eval_fallback" in tags:
-        return (f'"{label}" matches were thin this run — showing the closest available '
-                f"instead of only confident picks.")
     if "gate_fallback" in tags:
         return f'Few roles cleared our sector/seniority screen for "{label}" — showing the closest matches found.'
     return f'"{label}" matches were sparse this run — showing the best available instead of only strong fits.'
@@ -1828,6 +2033,9 @@ def _rows_to_dicts(rows: list[JobSeen]) -> list[dict]:
         # never an upper one, and never evidence that a listing is fresh.
         "_first_seen": r.first_seen.isoformat() if r.first_seen else None,
         "_seen_days": r.seen_days or 1,
+        # The repost family this row belongs to, so the ghost rules can look up
+        # its group aggregate without recomputing _family_key per candidate.
+        "_repost_key": r.repost_key,
         "_eval_verdict": r.eval_verdict,
         "_eval_signature": r.eval_signature,
         "_eval_analysis": r.eval_analysis,
@@ -2210,11 +2418,35 @@ def _classify_listing(engine, job: dict) -> tuple[str, str, dict]:
     if expires and expires < datetime.utcnow().isoformat():
         return "dead", "validThrough_passed", jsonld
 
-    text = engine._strip_html(body)
+    # _visible_text, NOT _strip_html: the latter keeps the CONTENTS of <script>
+    # and <style>, and on a whole JS-framework document that is nearly all of it.
+    # Both of _looks_like_expired_listing's gates are calibrated on document
+    # length and match offset, so feeding them inlined CSS turns a dead page into
+    # a live one -- which is exactly what happened to the listing that prompted
+    # this (see full_auto._visible_text for the measurements).
+    text = engine._visible_text(body)
+    # A big response that renders to nothing is a client-side-only shell, and it
+    # is NOT evidence of life -- it is the same "the host didn't answer" case as
+    # a 403, reached by a different route, and it has to return the same verdict.
+    # The len(body) floor above cannot see it: the listing that prompted this
+    # served 89,201 bytes of Next.js bootstrap with 0 chars of readable text, so
+    # the old code declared a dead vacancy alive and badged it "Checked live".
+    # Saying "unverifiable" instead is what routes it to _verify_via_browser,
+    # which renders the JS and gets a real answer (measured: it does, here).
+    if len(text) < _VERIFY_MIN_VISIBLE_CHARS and not jsonld:
+        return "unverifiable", "no_visible_text", jsonld
     shim = SimpleNamespace(status_code=status, redirected_status_code=status, success=True)
     signal = engine._dead_listing_signal(shim, text, job.get("title") or "")
     if signal:
         return "dead", signal, jsonld
+    # Every DEAD route above still applies to a liveness-blind host -- a removed
+    # LinkedIn job really does 404, and that is the workhorse check -- so the
+    # fetch is still worth making. What cannot be concluded is the negative: a
+    # healthy-looking page from a host that never shows closure to a logged-out
+    # client is silence, and silence recorded as "alive" is what put a closed
+    # vacancy on the results page badged as checked. See _LIVENESS_BLIND_HOSTS.
+    if _is_liveness_blind_host(url):
+        return "unverifiable", "host_hides_closure", jsonld
     return "alive", f"status_{status}", jsonld
 
 
@@ -2558,11 +2790,16 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
                 verdicts[id(j)] = (state, detail)
 
         unresolved = [j for j in todo if verdicts.get(id(j), ("", ""))[0] == "unverifiable"]
-        if unresolved:
-            funnel["final_verify_unverifiable"] += len(unresolved)
+        funnel["final_verify_unverifiable"] += len(unresolved)
+        # A liveness-blind host is excluded from browser ESCALATION but still
+        # counted above: the browser renders the same logged-out page the plain
+        # GET already read, so it can only ever fail open, and VERIFY_BROWSER_MAX
+        # is 12 slots a host that genuinely 403s a plain client can still use.
+        escalate = [j for j in unresolved if not _is_liveness_blind_host(j.get("url"))]
+        if escalate:
             try:
-                verdicts.update(await _verify_via_browser(engine, unresolved))
-                funnel["final_verify_browser"] += len(unresolved[:VERIFY_BROWSER_MAX])
+                verdicts.update(await _verify_via_browser(engine, escalate))
+                funnel["final_verify_browser"] += len(escalate[:VERIFY_BROWSER_MAX])
             except Exception:
                 pass
 
@@ -2649,6 +2886,13 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             "highlight": src.get("highlight", ""),
             "requirements": src.get("requirements") or [],
             "concerns": src.get("concerns", []),
+            # The "what you do bring" half of the card, generated only for an
+            # ok/stretch pick (full_auto reasoning step G). Persisted for the same
+            # reason as everything else here -- a cache-served pick must render
+            # identically to a freshly-judged one, and a missing strengths list on
+            # a reused verdict would silently reproduce the gaps-only card this
+            # field exists to fix.
+            "strengths": src.get("strengths", []),
             # The judge's finer verdict grade and the facts it read off the JD,
             # for the result card. Persisted here for the same reason as the
             # reasoning split above: these are merged straight back onto a
@@ -2660,9 +2904,6 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             "role_seniority": src.get("role_seniority") or "",
             "deadline": src.get("deadline") or "",
             "scam_suspect": bool(src.get("scam_suspect", False)),
-            # Ranking-only signal (see full_auto's reasoning step G) -- never gates
-            # a verdict, just persisted so a cache-served pick renders identically.
-            "sector_match": bool(src.get("sector_match", True)),
         })
         verdicts[ident] = (verdict, analysis)
     rows = db.execute(
@@ -3615,6 +3856,119 @@ def _role_location_fields(j: dict) -> dict:
     }
 
 
+def _role_ghost_fields(j: dict) -> dict:
+    """ghost_level/ghost_signals for a Role row, straight off the job dict's own
+    _ghost_level/_ghost_signals (see _annotate_ghost). Pure copy, same shape as
+    _role_location_fields and for the same reason: neither Role-persist site has
+    the profile or the run's store age in scope, so the assessment happens once
+    upstream and both sites just copy it.
+
+    The signals are stored ALONGSIDE the level rather than re-derived on read,
+    because several of them read state that is destroyed on write -- dead_at is
+    stamped once and never overwritten, seen_dates truncates, and a repost
+    group's membership changes as rows arrive. A verdict re-derived from a later
+    store is not the same verdict."""
+    signals = j.get("_ghost_signals") or []
+    return {
+        "ghost_level": j.get("_ghost_level"),
+        "ghost_signals": json.dumps(signals) if signals else None,
+    }
+
+
+def _build_ghost_context(db: Session, profile_id: int, store_age_days: float):
+    """Per-run state the ghost rules read, built once before any of them runs.
+
+    The repost aggregate and the agency set are both whole-store questions that
+    would otherwise be re-answered per candidate. Both are read-side joins over
+    columns that already exist, so this costs the search path two indexed
+    queries -- the same posture direct_employer's yield reporting takes."""
+    from . import ghost as gh
+    import full_auto as fa
+
+    ctx = gh.GhostContext(
+        now=datetime.utcnow(),
+        store_age_days=store_age_days,
+        observation_min_store_days=int(fa.OBSERVATION_MIN_STORE_DAYS),
+        evergreen_seen_days=int(fa.EVERGREEN_SEEN_DAYS),
+        evergreen_seen_density=float(fa.EVERGREEN_SEEN_DENSITY),
+    )
+    # Skip the aggregates entirely while the observation clock is shut: nothing
+    # reads them, and they are the only expensive part of building this.
+    if not ctx.observation_clock_open:
+        return ctx
+
+    rows = db.execute(
+        select(JobSeen.repost_key, JobSeen.posted_at, JobSeen.first_seen,
+               JobSeen.dead_at, JobSeen.company, JobSeen.title, JobSeen.location,
+               JobSeen.source)
+        .where(JobSeen.profile_id == profile_id)
+        .where(JobSeen.repost_key.isnot(None))
+    ).all()
+
+    groups: dict[str, dict] = {}
+    # company -> (titles, locations, rows), aggregator sources only. An ATS row
+    # is a whole-board dump, so its title/location spread measures how
+    # exhaustively we crawled that board, not how the employer advertises.
+    agg: dict[str, list] = {}
+    for key, posted, first_seen, dead_at, company, title, location, source in rows:
+        g = groups.setdefault(key, {"posted": [], "first_seen": set(),
+                                    "dead_before": None, "rows": 0})
+        g["rows"] += 1
+        if posted:
+            g["posted"].append(posted)
+        if first_seen:
+            g["first_seen"].add(first_seen.date())
+        if dead_at and (g["dead_before"] is None or dead_at < g["dead_before"]):
+            g["dead_before"] = dead_at
+        if canonical_key(source) not in ATS_KEYS:
+            norm = _norm_company(company or "")
+            if norm:
+                a = agg.setdefault(norm, [set(), set(), 0])
+                a[0].add(_norm(title or ""))
+                a[1].add(_norm(location or ""))
+                a[2] += 1
+
+    for key, g in groups.items():
+        posted = g.pop("posted")
+        g["span_days"] = (max(posted) - min(posted)).days if len(posted) > 1 else 0
+        g["first_seen_days"] = len(g.pop("first_seen"))
+    ctx.repost_groups = groups
+    ctx.agencies = frozenset(
+        name for name, (titles, locs, n) in agg.items()
+        if n >= gh.AGENCY_MIN_ROWS and titles
+        and len(locs) / max(1, len(titles)) >= gh.AGENCY_LOC_TITLE_RATIO
+    )
+    return ctx
+
+
+def _annotate_ghost(jobs: list[dict], ctx) -> dict:
+    """Stamp _ghost_level/_ghost_signals onto every candidate, once.
+
+    Placed here rather than at the Role-persist sites for the reason
+    _annotate_geo records: there are two of those, neither carries the run
+    context, and a per-site computation would drift. Also runs at every scope
+    and for every run -- a ghost assessment is worth having on a card whether or
+    not it changes ordering.
+
+    Returns per-level and per-signal counts for the funnel. Broken out by RULE,
+    not just by level, for the reason _pool_quality_prescreen's counters are:
+    a check that demotes candidates is only safe to keep while its cost stays
+    attributable to a specific rule."""
+    from . import ghost as gh
+
+    counts: dict[str, int] = {"ghost_high": 0, "ghost_medium": 0}
+    for j in jobs:
+        j["_is_agency"] = gh.is_agency(j.get("company") or "", ctx)
+        level, signals = gh.evaluate(j, ctx)
+        j["_ghost_level"] = level
+        j["_ghost_signals"] = signals
+        if level:
+            counts[f"ghost_{level}"] += 1
+        for s in signals:
+            counts[f"ghost_signal_{s}"] = counts.get(f"ghost_signal_{s}", 0) + 1
+    return counts
+
+
 def _filter_by_salary(jobs: list[dict], salary_floor: int) -> list[dict]:
     """Hard-drop jobs whose stated maximum salary is clearly below the candidate's
     floor. Same posture as the country filter but softer: salary data is sparser
@@ -3772,20 +4126,91 @@ def _progress(db: Session, run: SearchRun, message: str) -> None:
     db.commit()
 
 
+def _interleave(lists: list[list[dict]]) -> list[dict]:
+    """Round-robin merge, preserving each input list's own order. Used where a
+    merged judge group has to draw fairly from several clusters' leftovers rather
+    than exhausting the first list before touching the second."""
+    out: list[dict] = []
+    for row in zip_longest(*lists):
+        out.extend(x for x in row if x is not None)
+    return out
+
+
+# A cluster with at most this many judge-pool candidates is a candidate for being
+# merged into a shared judge call rather than getting one of its own.
+#
+# The arithmetic that motivates it: a judge call pays for the ~12k-token
+# _FINAL_EVAL_SYSTEM prefix plus the cluster CV before it reads a single job, and
+# each job then costs roughly 770 tokens -- so jobs are about 17x cheaper than
+# calls, and two 4-job clusters cost far more as two calls than as one 8-job call.
+# (The prefix itself is prompt-cached with 24h retention against a constant key,
+# which already absorbs most of that; what merging saves on top is the per-call
+# uncached remainder plus one whole round-trip of latency in the run's longest
+# tail.)
+#
+# Why the threshold is LOW rather than "merge whenever it's cheaper": the
+# per-cluster CV (cv_text_for_cluster) is the mechanism that stops a candidate
+# targeting two unrelated fields being judged against a blend of both, and a
+# profile-wide judge call diluting a minority cluster is a bug this pipeline has
+# already had once. Merging only genuinely thin clusters keeps that protection
+# where it does work -- a cluster with a real pool of its own always gets its own
+# call -- while removing the case it protects worst: a 3-job cluster whose judge
+# can only pick the least-bad of three either way.
+JUDGE_MERGE_THIN_CLUSTER_MAX = 6
+
+
+def _judge_groups(cluster_items: list[tuple[int, list[dict]]],
+                  max_jobs_per_call: int) -> list[list[int]]:
+    """Which clusters share a Phase 6 judge call. Returns a list of groups, each a
+    list of cluster indices; the common case is one single-element group per
+    cluster.
+
+    Clusters at or under JUDGE_MERGE_THIN_CLUSTER_MAX are packed together, in
+    index order, without ever letting a group exceed `max_jobs_per_call` -- going
+    over it would push final_evaluation_split into its concurrent-chunk path,
+    which re-splits the group into separate calls and hands back exactly the
+    per-call overhead the merge was for. A lone thin cluster is left alone: there
+    is nothing to merge it with, and a group of one is just the old behaviour."""
+    groups: list[list[int]] = []
+    pending: list[int] = []
+    pending_jobs = 0
+    for idx, jobs in cluster_items:
+        if len(jobs) > JUDGE_MERGE_THIN_CLUSTER_MAX:
+            groups.append([idx])
+            continue
+        if pending and pending_jobs + len(jobs) > max_jobs_per_call:
+            groups.append(pending)
+            pending, pending_jobs = [], 0
+        pending.append(idx)
+        pending_jobs += len(jobs)
+    if pending:
+        groups.append(pending)
+    return groups
+
+
 def _run_cluster_final_eval(
-    idx: int, jobs: list[dict], role_clusters: list[dict], cv_text_base: str,
+    idxs: list[int], jobs: list[dict], role_clusters: list[dict], cv_text_base: str,
     eng_profile: dict, rank_by_cluster: dict[int, list[dict]], engine,
 ) -> dict:
-    """Per-cluster Phase 6 judging (main call + bounded backfill retry). Pure
-    w.r.t. shared state -- makes no DB writes, and touches no shared counter or
-    list -- so the caller can run this concurrently across clusters via
+    """Phase 6 judging for ONE judge group (main call + bounded backfill retry).
+    Pure w.r.t. shared state -- makes no DB writes, and touches no shared counter
+    or list -- so the caller can run this concurrently across groups via
     ThreadPoolExecutor. Safe to parallelize here (unlike the gate+rank stage)
     because _fair_allocate has already picked each cluster's `jobs` by the time
     this runs, so there's no cross-cluster fairness decision left to disturb.
     Returns a dict the caller uses, in the main thread, to persist verdicts,
-    accumulate funnel counters, extend `to_evaluate`, and run scam-verify."""
-    label = _cluster_label(role_clusters[idx])
-    cluster_roles = role_clusters[idx].get("roles") or []
+    accumulate funnel counters, extend `to_evaluate`, and run scam-verify.
+
+    A group is USUALLY one cluster. Several thin clusters are merged into one
+    group by _judge_groups (see there for the cost argument and the limits), in
+    which case this call judges all of their jobs together against a CV scoped to
+    the union of their target roles -- exactly the situation a single-cluster
+    multi-role profile is already in, and which the judge's own DISQUALIFIER 5
+    handles explicitly ("when the candidate targets more than one distinct field,
+    judge sector fit against the NEAREST one, never penalise a role for not
+    matching their OTHER field")."""
+    label = " + ".join(_cluster_label(role_clusters[i]) for i in idxs)
+    cluster_roles = [r for i in idxs for r in (role_clusters[i].get("roles") or [])]
     cv_text = cv_text_for_cluster(cv_text_base, cluster_roles) if cluster_roles else cv_text_base
     # Signature includes EXP_MODEL and FINAL_EVAL_PROMPT_VERSION so a judge-model
     # upgrade (e.g. gpt-5.4 -> gpt-5.5) OR a DISQUALIFIERS/schema prompt edit
@@ -3820,7 +4245,7 @@ def _run_cluster_final_eval(
         else:
             fresh.append(j)
 
-    engine.emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}): {len(fresh)} to judge, "
+    engine.emit(f"[pipeline] final_evaluation cluster{idxs} ({label}): {len(fresh)} to judge, "
                 f"{len(jobs) - len(fresh)} reused from prior verdict (LLM cap={engine.FINAL_PICKS})")
 
     strong, backup, disqualified, call_failed = [], [], [], False
@@ -3834,7 +4259,7 @@ def _run_cluster_final_eval(
         # rejecting anyone, and folding the out-competed ones in would inflate it.
         _hard = sum(1 for d in (disqualified or []) if d.get("_disqualifier")) if strong is not None else 0
         _reasoned = len(disqualified) if strong is not None else 0
-        engine.emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}) took "
+        engine.emit(f"[pipeline] final_evaluation cluster{idxs} ({label}) took "
                     f"{time.monotonic() - _cluster_eval_start:.1f}s for {len(fresh)} job(s) -> "
                     f"{len(strong) if strong is not None else 0} strong, "
                     f"{len(backup) if strong is not None else 0} backup, {_rejected_this_call} rejected "
@@ -3859,12 +4284,24 @@ def _run_cluster_final_eval(
     backup_tier = ([p for p in cached_strong if not p.get("strong_fit")]
                    + [dict(p, strong_fit=False) for p in backup])
 
-    picks = strong_tier
+    # Both tiers are contributed, strong first. The backup tier used to be
+    # last-resort filler used ONLY when a cluster had zero strong picks, which
+    # threw away every judged, worth-applying-to role whenever a cluster produced
+    # even one strong pick -- a run could finish with 3 picks while a dozen
+    # perfectly applicable ok/stretch roles sat judged and discarded. The run-wide
+    # assembly in _run_engine_pipeline is grade-ordered (_VERDICT_GRADES) and caps
+    # at FINAL_PICKS, so appending these can never displace a better-graded pick:
+    # it only fills slots that would otherwise go empty, which is exactly the
+    # "show more roles, honestly labelled" behaviour wanted here.
+    #
+    # eval_fallback is still tagged only when there were NO strong picks at all --
+    # it drives the "matches were thin this run" banner, which would be wrong on a
+    # run that produced strong picks and merely also has backups behind them.
+    picks = strong_tier + backup_tier
+    if not strong_tier and backup_tier:
+        fallback_tags.add("eval_fallback")
     if not picks:
-        if backup_tier:
-            picks = backup_tier
-            fallback_tags.add("eval_fallback")
-        elif call_failed:
+        if call_failed:
             # Only fall back to an unverified top-N when the AI call itself
             # failed -- never when it succeeded and genuinely rejected
             # everyone, and never resurfacing a job already rejected under
@@ -3893,7 +4330,10 @@ def _run_cluster_final_eval(
     backfill_call_succeeded = False
     if not call_failed and len(picks) < MIN_RESULTS:
         already_ids = {j.get("_identity") for j in jobs}
-        extras = [c for c in rank_by_cluster.get(idx, [])
+        # Drawn from every cluster in this group, interleaved rather than
+        # concatenated so a merged group's thin second cluster can't be starved
+        # out of the retry by the first one's whole leftover list.
+        extras = [c for c in _interleave([rank_by_cluster.get(i, []) for i in idxs])
                   if c.get("_identity") not in already_ids][:engine.FINAL_EVAL_MAX_JOBS_PER_CALL]
         if extras:
             for c in extras:
@@ -3925,21 +4365,32 @@ def _run_cluster_final_eval(
             if backfill_picks:
                 picks = picks + backfill_picks
                 fallback_tags.add("judge_backfill")
-                engine.emit(f"[pipeline] final_evaluation cluster[{idx}] ({label}) backfill: "
+                engine.emit(f"[pipeline] final_evaluation cluster{idxs} ({label}) backfill: "
                             f"retried {len(extras)} next-ranked candidate(s), now {len(picks)} pick(s)")
 
+    # Per-JOB label, not the group's: a merged group's label names every cluster
+    # in it, which would tell the user a role was "matched via A + B track" when
+    # it was only ever assigned to A by the embedding stage.
     for p in picks:
-        p["_cluster_label"] = label if len(role_clusters) > 1 else None
+        p_idx = p.get("_cluster")
+        p["_cluster_label"] = (
+            _cluster_label(role_clusters[p_idx])
+            if len(role_clusters) > 1 and isinstance(p_idx, int) and 0 <= p_idx < len(role_clusters)
+            else None
+        )
 
     return {
-        "idx": idx, "label": label, "eval_sig": eval_sig,
+        "idxs": idxs, "label": label, "eval_sig": eval_sig,
         "fresh": fresh, "strong": strong, "backup": backup, "disqualified": disqualified,
         "call_failed": call_failed, "reused_from_cache": len(jobs) - len(fresh),
         "extras_for_to_evaluate": extras_fresh + extras_cached,
         "extras_fresh": extras_fresh, "b_strong": b_strong, "b_backup": b_backup,
         "b_disqualified": b_disqualified, "backfill_reused_from_cache": len(extras_cached),
         "backfill_call_succeeded": backfill_call_succeeded,
-        "picks": picks, "backup_tier": backup_tier, "fallback_tags": fallback_tags,
+        # No "backup_tier": it used to be returned so the caller could fall back to
+        # it when scam-verify emptied `picks`; the backup tier is now always inside
+        # `picks`, so there is nothing left to fall back TO -- see that call site.
+        "picks": picks, "fallback_tags": fallback_tags,
     }
 
 
@@ -3982,7 +4433,11 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # here because it is needed at BOTH ends of the run: to decide which
     # gate-retired rows this profile has since invalidated (pool assembly below)
     # and to stamp the rows this run retires (see _mark/_gate_reopened_rows).
-    gate_sig = engine._profile_signature(eng_profile)
+    # _v2, matching what those two gates actually use: turning "Allow
+    # overqualified" on rewrites the seniority rule, so the rows a previous run
+    # retired under the other setting must be re-admitted rather than left locked
+    # out -- which is precisely what a differing gate_signature does.
+    gate_sig = engine._profile_signature_v2(eng_profile)
 
     # Role clusters: usually one (today's behavior), sometimes several for a
     # candidate targeting genuinely different fields. Each gets its own
@@ -4224,6 +4679,17 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     funnel["distance_resolved"] = n_geo
     if scored:
         emit(f"[pipeline] resolved a distance for {n_geo}/{len(scored)} candidate(s)")
+    # Ghost-listing assessment, stamped on the same dicts for the same reason
+    # (see _annotate_ghost). A downgrade only -- nothing is dropped here.
+    ghost_ctx = _build_ghost_context(db, profile_id, store_age_days)
+    ghost_counts = _annotate_ghost(scored, ghost_ctx)
+    funnel.update(ghost_counts)
+    if ghost_counts.get("ghost_high") or ghost_counts.get("ghost_medium"):
+        fired = {k.replace("ghost_signal_", ""): v for k, v in ghost_counts.items()
+                 if k.startswith("ghost_signal_")}
+        emit(f"[pipeline] ghost risk: {ghost_counts['ghost_high']} high, "
+             f"{ghost_counts['ghost_medium']} medium (rules fired: {fired}; "
+             f"observation clock {'open' if ghost_ctx.observation_clock_open else 'not yet open'})")
     # An employer-stated closing date that has already passed is a fact, not a
     # signal to weigh -- drop before anything spends a gate/rank/judge call.
     scored, n_expired = _drop_expired_candidates(scored)
@@ -4681,7 +5147,19 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         if n_titles >= TEMPLATE_FACTORY_TITLE_THRESHOLD:
             j["_posting_volume_hint"] = f"{n_titles} differently-titled roles from this source this run"
         selected_by_cluster[j.get("_cluster", 0)].append(j)
-    cluster_items = list(selected_by_cluster.items())
+    cluster_items = sorted(selected_by_cluster.items())
+    # Which clusters share a judge call. Decided here, from the selected pool, so
+    # each group can still scrape and then judge as one pipelined task -- deciding
+    # it after scraping would mean waiting for every cluster's pages before any
+    # judge call could start, giving back the overlap _scrape_then_judge exists
+    # for. Group sizes shrink slightly by judge time (phase 5 drops confirmed-dead
+    # listings), which only ever makes a merged group smaller than planned.
+    judge_groups = _judge_groups(cluster_items, engine.FINAL_EVAL_MAX_JOBS_PER_CALL)
+    jobs_by_cluster = dict(cluster_items)
+    if any(len(g) > 1 for g in judge_groups):
+        emit(f"[pipeline] phase 6 judge groups: {judge_groups} "
+             f"(thin clusters merged into a shared call -- see _judge_groups)")
+    funnel["judge_calls_saved_by_merge"] = len(cluster_items) - len(judge_groups)
 
     # Shared across the concurrent per-cluster scrapes so the crawler still uses
     # ONE MAX_CONCURRENT-wide lane and ONE alt-source lookup budget for the whole
@@ -4726,13 +5204,19 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                  f"(no alt-source recovery) -- excluded before final judge")
         return already_ready + [j for j in scraped if not j.get("_dead_reason")]
 
-    async def _scrape_then_judge(idx: int, jobs: list[dict], crawler) -> dict:
-        ready = await _scrape_cluster(idx, jobs, crawler)
+    async def _scrape_then_judge(idxs: list[int], crawler) -> dict:
+        """Phase 5 then Phase 6 for one judge group. A group's clusters scrape
+        concurrently with each other (they already shared one crawler lane via
+        `scrape_sem`), then their combined ready pool takes ONE judge call."""
+        ready_per_cluster = await asyncio.gather(
+            *[_scrape_cluster(i, jobs_by_cluster.get(i, []), crawler) for i in idxs]
+        )
+        ready = [j for sub in ready_per_cluster for j in sub]
         # _run_cluster_final_eval is blocking (expensive-model calls) but makes no
         # DB writes and touches no shared state, so it's safe in a worker thread --
-        # which is what lets the OTHER clusters keep scraping while it runs.
+        # which is what lets the OTHER groups keep scraping while it runs.
         result = await asyncio.to_thread(
-            _run_cluster_final_eval, idx, ready, role_clusters, cv_text_base,
+            _run_cluster_final_eval, idxs, ready, role_clusters, cv_text_base,
             eng_profile, rank_by_cluster, engine,
         )
         result["_evaluated"] = ready
@@ -4758,7 +5242,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
 
     async def _run_all(crawler) -> list[dict]:
         return list(await asyncio.gather(
-            *[_scrape_then_judge(idx, jobs, crawler) for idx, jobs in cluster_items]
+            *[_scrape_then_judge(idxs, crawler) for idxs in judge_groups]
         ))
 
     # Only pay for a browser launch when something actually needs fetching.
@@ -4772,7 +5256,6 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     else:
         results = await _run_all(None)
 
-    eval_results: dict[int, dict] = {r["idx"]: r for r in results}
     to_evaluate = [j for r in results for j in r["_evaluated"]]
 
     # Scrape persistence stays on the main thread (these touch the request
@@ -4787,8 +5270,14 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         funnel["dead_dropped"] = len(dead_all)
     _snap("scraped", to_evaluate)
 
-    for idx, jobs in cluster_items:
-        r = eval_results[idx]
+    # One iteration per JUDGE GROUP, not per cluster: everything in this block --
+    # verdict persistence, the run-wide counters, and the shared scam-verify
+    # budget -- is per-CALL work, and a merged group made exactly one call. The
+    # per-cluster bookkeeping (final_by_cluster, fallback_notes, the diagnostics
+    # row) is split back out at the end of the block by each entry's own
+    # `_cluster`, which every job dict has carried since the embedding stage.
+    for r in results:
+        idxs: list[int] = r["idxs"]
         final_fresh_judged += len(r["fresh"])
         final_reused_from_cache += r["reused_from_cache"]
         if r["fresh"] and not r["call_failed"]:
@@ -4815,7 +5304,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             final_disqualified += _hard_dq(r["b_disqualified"])
             final_reject_reasoned += len(r["b_disqualified"])
 
-        fallback_notes[idx].update(r["fallback_tags"])
+        for idx in idxs:
+            fallback_notes[idx].update(r["fallback_tags"])
 
         # Cross-site duplicate-content corroboration for judge-flagged scam_suspect
         # picks (see full_auto.verify_not_duplicated) -- gated to only picks about to
@@ -4826,7 +5316,6 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         # decrements one shared per-run budget.
         picks = r["picks"]
         if scam_verify_budget[0] > 0:
-            had_picks = bool(picks)
             verified_picks = []
             for p in picks:
                 if (scam_verify_budget[0] > 0 and p.get("scam_suspect") and p.get("_identity")):
@@ -4840,34 +5329,65 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                              f"{p.get('company')} -- {dup_reason}")
                         continue
                 verified_picks.append(p)
+            # No backup-tier fallback here any more. It existed because the backup
+            # tier was DISCARDED whenever a cluster had strong picks, so a cluster
+            # whose only strong pick was scam-dropped had something real left to
+            # fall back to. _evaluate_cluster now contributes strong + backup
+            # together, so the backup tier is already inside `picks` and has been
+            # through this same filter -- re-adding it would resurrect exactly the
+            # listings just corroborated as scam and persisted as reject overrides.
             picks = verified_picks
-            if had_picks and not picks and r["backup_tier"]:
-                # The only strong/cached pick(s) got corroborated as scam and removed
-                # -- fall back to this cluster's own backup tier (computed
-                # earlier, discarded above because strong was non-empty) rather than
-                # silently contributing nothing, same posture as the original
-                # empty-picks fallback. Not itself re-verified for scam_suspect --
-                # bounds cost/complexity for what should be a rare double-fallback.
-                picks = r["backup_tier"]
-                fallback_notes[idx].add("eval_fallback")
 
-        final_by_cluster[idx] = picks
-        # Judge-side half of this cluster's diagnostics row (the gate stage filled
-        # in the other half). A cluster that reaches the judge with a healthy pool
-        # and still returns nothing strong is the shape a run-wide funnel can't
-        # show -- see the Settings "Search run timings" panel.
-        diag = cluster_diagnostics.get(idx)
-        if diag is not None:
+        # Split this group's output back per cluster. Every entry the judge
+        # returned is a copy of a candidate dict, so it still carries the
+        # `_cluster` the embedding stage assigned -- which is what keeps the
+        # downstream grade-ordered _fair_allocate genuinely fair across clusters
+        # even when two of them shared a call. A group of one behaves exactly as
+        # before.
+        def _mine(entries, idx: int) -> list[dict]:
+            return [e for e in (entries or []) if e.get("_cluster") == idx]
+
+        for idx in idxs:
+            cluster_picks = _mine(picks, idx) if len(idxs) > 1 else picks
+            final_by_cluster[idx] = cluster_picks
+            # Judge-side half of this cluster's diagnostics row (the gate stage
+            # filled in the other half). A cluster that reaches the judge with a
+            # healthy pool and still returns nothing strong is the shape a
+            # run-wide funnel can't show -- see the Settings "Search run timings"
+            # panel. Attributed per cluster rather than reported per call, so a
+            # merged group doesn't blank out the very per-cluster view this row
+            # exists to give.
+            diag = cluster_diagnostics.get(idx)
+            if diag is None:
+                continue
+            if len(idxs) > 1:
+                fresh_n = len(_mine(r["fresh"], idx)) + len(_mine(r["extras_fresh"], idx))
+                strong_n = len(_mine(r["strong"], idx)) + len(_mine(r["b_strong"], idx))
+                backup_n = len(_mine(r["backup"], idx)) + len(_mine(r["b_backup"], idx))
+                dq_n = _hard_dq(_mine(r["disqualified"], idx)) + _hard_dq(_mine(r["b_disqualified"], idx))
+                reasoned_n = len(_mine(r["disqualified"], idx)) + len(_mine(r["b_disqualified"], idx))
+                # Not attributable per cluster: these count rows served from cache,
+                # which are keyed by identity rather than split by list.
+                reused_n = None
+            else:
+                fresh_n = len(r["fresh"]) + len(r["extras_fresh"])
+                strong_n = len(r["strong"]) + len(r["b_strong"])
+                backup_n = len(r["backup"]) + len(r["b_backup"])
+                dq_n = _hard_dq(r["disqualified"]) + _hard_dq(r["b_disqualified"])
+                reasoned_n = len(r["disqualified"]) + len(r["b_disqualified"])
+                reused_n = r["reused_from_cache"] + r["backfill_reused_from_cache"]
             diag.update({
-                "judged": len(r["fresh"]) + len(r["extras_fresh"]),
-                "judge_reused_from_cache": r["reused_from_cache"] + r["backfill_reused_from_cache"],
-                "judge_strong": len(r["strong"]) + len(r["b_strong"]),
-                "judge_backup": len(r["backup"]) + len(r["b_backup"]),
-                "judge_disqualified": _hard_dq(r["disqualified"]) + _hard_dq(r["b_disqualified"]),
-                "judge_reject_reasoned": len(r["disqualified"]) + len(r["b_disqualified"]),
-                "picks": len(picks),
+                "judged": fresh_n,
+                "judge_strong": strong_n,
+                "judge_backup": backup_n,
+                "judge_disqualified": dq_n,
+                "judge_reject_reasoned": reasoned_n,
+                "picks": len(cluster_picks),
                 "fallbacks": sorted(fallback_notes[idx]),
+                "judge_call_shared_with": [i for i in idxs if i != idx],
             })
+            if reused_n is not None:
+                diag["judge_reused_from_cache"] = reused_n
 
     funnel["final_fresh_judged"] = final_fresh_judged
     funnel["final_reused_from_cache"] = final_reused_from_cache
@@ -5270,6 +5790,7 @@ def _upsert_provisional_rows(db: Session, profile_id: int, run: SearchRun,
             **_role_date_fields(j),
             **_role_location_fields(j),
             **_role_sponsor_fields(j),
+            **_role_ghost_fields(j),
         )
         # Deliberately no last_verified_at here: a provisional card has NOT been
         # liveness-checked (that happens once, over the final picks), and writing
@@ -5629,6 +6150,7 @@ def run_search_task(profile_id: int, run_id: int) -> None:
                 **_role_date_fields(entry),
                 **_role_location_fields(entry),
                 **_role_sponsor_fields(entry),
+                **_role_ghost_fields(entry),
                 # Stamped by _verify_final_picks just before this. Absent only if
                 # verification was disabled or the check couldn't reach a verdict
                 # even through the browser -- in which case the card shows no

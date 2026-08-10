@@ -907,7 +907,10 @@ def fetch_adzuna_details(urls: List[str], dead_out: set | None = None) -> Dict[s
                 # for -- unbounded here (no position/length gate) since this is
                 # always exactly one posting's own page, not a multi-listing
                 # scrape that could pick up an unrelated "similar jobs" mention.
-                expired = bool(_EXPIRED_LISTING_RE.search(_strip_html(r.text)))
+                # _visible_text, not _strip_html: an unbounded search over a whole
+                # document must not be able to match inside a <script> i18n string
+                # table, which is the one way this could produce a false positive.
+                expired = bool(_EXPIRED_LISTING_RE.search(_visible_text(r.text)))
             return original, parsed, expired
         except Exception:
             return original, {}, False
@@ -1977,6 +1980,37 @@ def _strip_html(text: str) -> str:
         return ""
     no_tags = _HTML_TAG_RE.sub(" ", text)
     return re.sub(r"\s+", " ", html.unescape(no_tags)).strip()
+
+
+# Elements whose CONTENT is not page text. _strip_html removes the tags but keeps
+# what's between them, which is right for an ATS description field and badly
+# wrong for a whole document from a modern JS framework.
+_NOISE_ELEMENT_RE = re.compile(
+    r"(?is)<(script|style|noscript|template|svg)\b[^>]*>.*?</\1\s*>"
+)
+
+
+def _visible_text(raw_html: str) -> str:
+    """What a reader would actually see on a WHOLE fetched page, as opposed to
+    _strip_html's remit (an HTML fragment from an ATS description field).
+
+    This exists because _strip_html on a full document keeps every byte of
+    inlined CSS and JS, and both of the dead-listing gates are calibrated on
+    document LENGTH and on the OFFSET of the match. A measured live case (a
+    Next.js board page, flexa.careers) whose only real content was "we're really
+    sorry but this job is no longer available" came out of _strip_html as
+    234,757 chars of @font-face rules and RSC payload, with the closure notice at
+    offset 107,967 -- so _looks_like_expired_listing failed the length gate
+    outright, and would have failed the head-position gate too. Through here the
+    same page is 7,736 chars with the notice at offset 288, which is what those
+    gates were designed to read. The listing was graded a pick and shown.
+
+    Only for the verification path, which is the only caller holding raw
+    server-returned HTML. Phase 5 goes through crawl4ai, which already extracts
+    to markdown and never had this problem."""
+    if not raw_html:
+        return ""
+    return _strip_html(_NOISE_ELEMENT_RE.sub(" ", raw_html))
 
 
 # ── ATS feeds ─────────────────────────────────────────────────────────────────
@@ -3105,6 +3139,63 @@ def make_job_id(board: str, url: str) -> str:
     return hashlib.md5(f"{board}|{url}".encode()).hexdigest()[:16]
 
 
+# The board's own id for a listing, parsed back out of the URL. No fetcher
+# stores one -- every Source class discards the id its API hands over -- and
+# rather than widen seven return shapes for a value the URL already encodes,
+# this reads it back the way reed_job_id already does for Reed.
+#
+# WHAT IT IS FOR: observation continuity, not deduplication. engine.identity_hash
+# is sha1(_canonical_url(url)), so an aggregator appending a tracking parameter,
+# or Reed changing a slug, mints a NEW identity and silently restarts that
+# listing's first_seen at zero. That quietly corrupts the one measurement the
+# whole ghost-listing feature depends on, and nothing else detects it.
+#
+# READ THE VENDOR BEFORE TRUSTING IT AS A VACANCY KEY. The two halves mean
+# genuinely different things:
+#   * reed / adzuna ids identify a LISTING. A repost gets a fresh number, and
+#     re-syndication mints new ones, so equality proves continuity but
+#     inequality proves nothing.
+#   * greenhouse gh_jid identifies the EMPLOYER'S OWN REQUISITION, and lever /
+#     ashby / workable / personio ids identify a posting that persists for its
+#     life. A gh_jid holding steady across a long observation window is the
+#     closest thing in this codebase to ground truth that one vacancy is still
+#     the same vacancy -- and one disappearing while a new one appears for the
+#     same title is a genuine close-and-reopen.
+# recruitee (slug only), careerjet (opaque jobviewtrack.com/v2/<blob>) and
+# google_jobs (arbitrary destination, often a category page) expose no usable
+# id at all and always return None. Verified against live URLs in the store.
+_BOARD_REF_PATTERNS: List[tuple] = [
+    ("reed",       re.compile(r"reed\.co\.uk/jobs/[^/]+/(\d+)", re.I)),
+    # Both Adzuna shapes carry the same ad id: the API's /jobs/land/ad/ tracking
+    # interstitial and the site's own /jobs/details/ page (what
+    # fetch_adzuna_details reads). Matching both is what lets a row enriched via
+    # the detail page keep the observation window its land-URL twin started.
+    ("adzuna",     re.compile(r"adzuna\.[a-z.]+/jobs/(?:land/ad|details)/(\d+)", re.I)),
+    ("greenhouse", re.compile(r"[?&]gh_jid=(\d+)", re.I)),
+    ("greenhouse", re.compile(r"(?:job-)?boards\.greenhouse\.io/[A-Za-z0-9_-]+/jobs/(\d+)", re.I)),
+    ("lever",      re.compile(r"jobs\.lever\.co/[A-Za-z0-9_-]+/([0-9a-f-]{16,})", re.I)),
+    ("ashby",      re.compile(r"jobs\.ashbyhq\.com/[A-Za-z0-9_-]+/([0-9a-f-]{16,})", re.I)),
+    ("workable",   re.compile(r"apply\.workable\.com/(?:[A-Za-z0-9_-]+/)?j/([A-Z0-9]{6,})", re.I)),
+    ("personio",   re.compile(r"\.jobs\.personio\.[a-z.]+/job/(\d+)", re.I)),
+    ("remotive",   re.compile(r"remotive\.(?:io|com)/remote-jobs/[^/]+/[^/]*?-(\d+)/?$", re.I)),
+]
+
+
+def _board_ref(url: str) -> str | None:
+    """"<vendor>:<id>" for a listing URL, or None when the board exposes no id.
+
+    Keyed off the URL alone rather than the source name: an aggregator row
+    (jsearch, google_jobs) often points AT a board we can read, and that
+    destination id is exactly the stable key its own feed would have given us."""
+    if not url:
+        return None
+    for vendor, pattern in _BOARD_REF_PATTERNS:
+        m = pattern.search(url)
+        if m:
+            return f"{vendor}:{m.group(1)}"
+    return None
+
+
 from typing import Sequence
 
 def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
@@ -3342,6 +3433,23 @@ def _profile_signature(profile: dict) -> str:
         "must_have": sorted(m.lower() for m in (profile.get("must_have") or [])),
     }, sort_keys=True)
     return hashlib.sha1(basis.encode()).hexdigest()[:12]
+
+
+def _profile_signature_v2(profile: dict) -> str:
+    """_profile_signature plus the facets added after it, folded in ONLY when they
+    are non-default so an unchanged profile keeps its existing cache entries.
+
+    "Allow overqualified" has to participate: it rewrites the seniority rule in
+    both _screen_prompt and _rank_prompt, so without it a candidate who turns the
+    preference on would keep being served verdicts reached under the old rule --
+    exactly the stale-cache failure the signature exists to prevent. Adding the
+    key unconditionally would instead re-screen every store row for every profile
+    to get an identical answer for the (default) off case, so it is added only
+    when true."""
+    base = _profile_signature(profile)
+    if not profile.get("allow_overqualified"):
+        return base
+    return hashlib.sha1(f"{base}|overqual".encode()).hexdigest()[:12]
 
 
 def _rank_age_cache_tag(profile: dict) -> str:
@@ -3616,6 +3724,33 @@ CANDIDATE BACKGROUND (concrete evidence -- use this to judge depth/fit, not just
 """
 
 
+def _overqualified_note(profile: dict) -> str:
+    """The candidate's "Allow overqualified" preference, rendered for whichever
+    seniority rule is about to be applied. "" when the preference is off, which is
+    the default -- so an unchanged profile's prompt is byte-identical to before and
+    keeps its prompt-cache prefix.
+
+    Deliberately carves out the two cases the preference was never about (see
+    engine._INELIGIBLE_REGARDLESS_OF_LEVEL_RE): an apprenticeship is a course with
+    an eligibility bar against the already-qualified, and a placement year requires
+    the applicant to still be mid-degree. Both get worse, not better, the more
+    qualified the candidate is, so "I'll consider a more junior role" is not
+    consent to either. All three tiers repeat this carve-out for the same reason
+    the apprenticeship rules themselves are repeated at all three: a rule dropped
+    at one tier reinstates the hole at that tier."""
+    if not profile.get("allow_overqualified"):
+        return ""
+    return """
+- OPEN TO MORE JUNIOR ROLES: this candidate has explicitly said they will consider roles pitched BELOW
+  their own stated seniority. So a listing being more junior than them is NOT by itself a mismatch --
+  do not set seniority_ok=false with reason="seniority_low" merely because the role sits a level or two
+  under their stated level. Judge it as an ordinary listing. This changes NOTHING about the opposite
+  direction ("seniority_high" is unaffected), and NOTHING about the APPRENTICESHIPS AND TRAINING
+  SCHEMES rule above -- an apprenticeship or a student placement year is excluded because the candidate
+  is INELIGIBLE for it, not because it is junior, and being open to junior roles is not consent to a
+  course they cannot enrol on. Keep failing those exactly as that rule says."""
+
+
 def _screen_prompt(profile: dict, listing_block: str) -> str:
     # The candidate's own requirement chips reach this prompt in two groups (see
     # snapshot.build_snapshot): the ones they marked Hard drive the unconditional
@@ -3781,7 +3916,7 @@ alone satisfy a requirement that clearly expects professional/production-level c
   "Executive"-style title with no such signal, or a general impression that the role "sounds senior"
   or "sounds junior" without one, is NOT enough -- in that case seniority_ok=true and omit
   "seniority_signal".
-- otherwise seniority_ok=true. When unsure or genuinely ambiguous, seniority_ok=true.{_strict("_seniority_ok")}
+- otherwise seniority_ok=true. When unsure or genuinely ambiguous, seniority_ok=true.{_overqualified_note(profile)}{_strict("_seniority_ok")}
 
 CANDIDATE-SPECIFIC REQUIREMENTS
 {req_block}
@@ -4094,7 +4229,11 @@ def screen_gate(candidates: list[dict], profile: dict) -> list[dict]:
     editing either naturally misses the cache and re-screens every job."""
     if not candidates:
         return []
-    sig = _profile_signature(profile)
+    # _v2, not the base signature: the "Allow overqualified" preference rewrites
+    # the seniority rule in _screen_prompt, so a verdict reached under the other
+    # setting must not be served. Identical to the base hash while the preference
+    # is off (the default), so turning it on invalidates only that profile.
+    sig = _profile_signature_v2(profile)
     # screen_v14 (from screen_v13): the WORK ARRANGEMENT conflict table's remote row
     # went from "candidate stated ONLY On-site" to "stated preferences NOT including
     # Remote". Under v13 a candidate stating On-site AND Hybrid matched neither
@@ -4420,6 +4559,44 @@ def _rank_prompt(profile: dict, listing_block: str) -> str:
     # that's already covered by SCORING component 3 (STALENESS) below, so adding
     # this rule for a Soft candidate would just contradict it. See
     # snapshot.build_snapshot's engine_profile["max_listing_age_days"/"_hard"].
+    # Which of the candidate's stated PREFERENCES they marked binding. A Hard one
+    # keeps its old cap-the-score-at-15 downgrade; a Soft one moves to the
+    # SOFT-PREFERENCE MISMATCHES section below, which sets a flag instead of
+    # destroying the score.
+    #
+    # Why this split exists: RANK_REJECT_SCORE_FLOOR was doing two unrelated jobs
+    # at once. It is nominally a quality bar ("is this clearly not a fit"), but
+    # the work-arrangement and salary downgrades cap the score at 15 precisely so
+    # that the floor would catch them -- which meant the floor could not be
+    # lowered to let more borderline roles reach the judge without simultaneously
+    # disabling the enforcement of two soft preferences. Splitting them lets the
+    # floor go back to being only a quality bar (engine.RANK_REJECT_SCORE_FLOOR,
+    # now 32) while soft-preference mismatches demote via
+    # engine._selection_score's SOFT_VIOLATION_SELECTION_PENALTY -- ordering only,
+    # never elimination, which is what "Soft" meant all along.
+    hard_axes = set(profile.get("hard_axes") or [])
+    arrangement_hard = "_work_arrangement_ok" in hard_axes
+    salary_hard = "_salary_ok" in hard_axes
+    _arrangement_rule = """{lbl} STATED ARRANGEMENT: classify the LISTING's own arrangement first (explicit remote/distributed/
+   work-from-home wording means remote; explicit hybrid wording means hybrid; a stated city/office with
+   no remote/hybrid mention means ON-SITE there, never remote-by-default), then check whether it matches
+   ANY of the candidate's stated work-type preferences above. A fully REMOTE listing is not automatically
+   fine -- remote is always geographically workable, but a candidate who listed On-site and/or Hybrid and
+   did NOT list Remote has said they want office presence, and a remote-only role gives them none of it.
+   A HYBRID listing matches any stated preference (it has both office and remote days). If the candidate
+   stated no work-type preference at all, this rule does not apply.
+"""
+    _salary_rule = """{lbl} SALARY: the listing states a salary clearly below the candidate's stated floor (never fires
+   when either is unstated or the ranges could plausibly overlap).
+"""
+    # See _overqualified_note (the screen_gate twin) for why the apprenticeship
+    # carve-out is repeated at every tier rather than stated once.
+    overqualified_rank_note = ("""
+   THIS CANDIDATE IS OPEN TO MORE JUNIOR ROLES -- they have said so explicitly. So do not deduct here
+   for a role being pitched below their stated seniority; score it on how well it matches otherwise.
+   HARD DOWNGRADE (f) is unaffected: an apprenticeship or structured training scheme they are
+   over-qualified for is excluded because they are ineligible for the course, not because it is junior,
+   and being open to junior roles is not consent to that.""" if profile.get("allow_overqualified") else "")
     max_age_days = profile.get("max_listing_age_days")
     max_age_rule = (
         f"""g. MAX LISTING AGE: the candidate has set a maximum listing age of {max_age_days} days. If the
@@ -4430,6 +4607,36 @@ def _rank_prompt(profile: dict, listing_block: str) -> str:
    concern, see STALENESS below) -- only a definite, confirmed age past the stated limit qualifies.
 """
         if max_age_days and profile.get("max_listing_age_hard", True) else ""
+    )
+    # Assemble the two sections. A preference the candidate marked binding stays a
+    # score-destroying downgrade; a soft one only raises the flag.
+    # Rule letters/numbers are assigned by position within whichever section the
+    # rule lands in, so neither list ever shows a gap. The hard list continues
+    # from (d) LOCATION, which is always present; the soft list numbers from s1.
+    downgrade_extra = ""
+    soft_pref_rules = ""
+    # "f" (OVER-QUALIFIED) and "g" (MAX LISTING AGE) are hard-coded in the template
+    # below, so an inserted rule may only take "e" or "h" -- taking "f" produced two
+    # rules labelled (f) when both preferences were Hard.
+    hard_labels = iter("eh")
+    soft_labels = iter(("s1.", "s2."))
+    for rule, is_hard in ((_arrangement_rule, arrangement_hard), (_salary_rule, salary_hard)):
+        if is_hard:
+            downgrade_extra += rule.format(lbl=f"{next(hard_labels)}.")
+        else:
+            soft_pref_rules += rule.format(lbl=next(soft_labels))
+    soft_pref_block = (
+        f"""
+SOFT-PREFERENCE MISMATCHES -- a SEPARATE, much weaker check, and the scoring rules above still apply
+in full. These are things the candidate said they PREFER but explicitly did NOT ask to be rejected on.
+When one of these CLEARLY fires for a listing, do NOT cap or crush its score: score the role on its
+merits exactly as you otherwise would, and set "soft_violation": true on it instead. Something
+downstream uses that flag to rank such a role below an equally-good one that matches, which is what a
+soft preference is supposed to mean. Setting it wrongly costs the candidate a good role's position, so
+require the same CLEAR, explicit evidence as the downgrades above -- silence, ambiguity or truncation
+never raises it. If none of these fire, set "soft_violation": false.
+{soft_pref_rules}"""
+        if soft_pref_rules else ""
     )
     return f"""You are estimating how well each job listing fits ONE candidate, as a rough numeric score.
 This score gates which listings proceed to detailed review -- a wrong score buries a job silently, so
@@ -4470,6 +4677,20 @@ a. EXPERIENCE BAR: the listing states a minimum professional-experience requirem
    "familiar evidence only" -- or a background of degree/personal projects with no paid role in the
    function -- is NOT professional experience here: matching the listed tools does not clear a stated
    experience bar. Wording like "internships count" only helps if the candidate actually evidences one.
+   WISH-LIST EXCEPTION (applies to rules a and b, and to nothing else): some postings list an ideal
+   hire rather than a bar, and downgrading those to 15 buries roles the candidate would realistically
+   be interviewed for. Three tells, all readable from the text you are shown: the poster is a
+   RECRUITMENT OR STAFFING AGENCY rather than the employer (agency adverts are a recruiter's padded
+   summary of a manager's brief, written for a wide funnel); the role is CONTRACT / interim /
+   fixed-term / day-rate rather than permanent (contract bars are lower and more negotiable -- the org
+   needs a competent gap-filler, with less long-term risk); or the "essential" list is LONG (roughly
+   eight or more items, especially grouped into technical / analytical / communication sections) and/or
+   the pay is stated as "negotiable"/"competitive". Where one or more of these clearly holds, do NOT
+   fire rule (a) or (b): score the role normally on function and depth fit, taking a real shortfall
+   as an ordinary DEPTH FIT deduction instead. This exception NEVER applies to rules (c) through (h) --
+   a closed listing, a geography/right-to-work failure, a maximum-age elimination and an apprenticeship
+   over-qualification are facts about eligibility, not negotiable expectations -- and it is never a
+   reason to pretend evidence exists.
 b. REQUIRED CREDENTIAL OR TOOL: the listing names a specific certification, qualification level, or
    tool as REQUIRED (not nice-to-have) and nothing in the candidate's skills/background above
    evidences it or plainly covers it.
@@ -4478,8 +4699,8 @@ c. CLOSED LISTING: the text says the vacancy is closed -- e.g. "the application 
    closing date has PASSED.
 d. LOCATION / WORK ARRANGEMENT: first classify the LISTING's own arrangement -- explicit remote/
    distributed/work-from-home wording means remote; explicit hybrid wording means hybrid; a stated
-   city/office with no remote/hybrid mention means ON-SITE there (never remote-by-default). Two
-   separate downgrades follow from that, and BOTH count:
+   city/office with no remote/hybrid mention means ON-SITE there (never remote-by-default). What
+   follows from that classification:
    - GEOGRAPHY: the classified arrangement clearly cannot work given the candidate's stated location
      search scope (see "Candidate location search scope" above -- it defines what "cannot work"
      means and overrides a bare distance/city reading: under "national" scope, an in-country on-site
@@ -4487,15 +4708,7 @@ d. LOCATION / WORK ARRANGEMENT: first classify the LISTING's own arrangement -- 
      under "international" scope distance/country alone is never one either), or the listing requires
      an already-held work permit / right-to-work in a country that clearly isn't the candidate's --
      that half applies regardless of scope.
-   - STATED ARRANGEMENT: the classified arrangement matches NONE of the candidate's stated work-type
-     preferences above. A fully REMOTE listing is not automatically fine -- remote is always
-     geographically workable, but a candidate who listed On-site and/or Hybrid and did NOT list
-     Remote has said they want office presence, and a remote-only role gives them none of it. A
-     HYBRID listing matches any stated preference (it has both office and remote days). If the
-     candidate stated no work-type preference at all, this half of the rule does not apply.
-e. SALARY: the listing states a salary clearly below the candidate's stated floor (never a downgrade
-   when either is unstated or the ranges could plausibly overlap).
-f. OVER-QUALIFIED FOR A TRAINING SCHEME: the listing is a formal apprenticeship, traineeship or
+{downgrade_extra}f. OVER-QUALIFIED FOR A TRAINING SCHEME: the listing is a formal apprenticeship, traineeship or
    structured training scheme ("Apprentice"/"Apprenticeship" in the title, "Level 2/3/4/5", "you will
    study towards a qualification", "we will train you in ..."), AND the candidate above already holds a
    qualification at or above the level it awards (for a degree-holder: any below-degree scheme), AND
@@ -4504,7 +4717,7 @@ f. OVER-QUALIFIED FOR A TRAINING SCHEME: the listing is a formal apprenticeship,
    many carry an eligibility bar against applicants who already hold an equivalent qualification. A
    DEGREE apprenticeship or Level 7/master's-level scheme is not covered by this, nor is a graduate
    scheme or graduate programme -- those hire at the candidate's level and are normal listings.
-{max_age_rule}
+{max_age_rule}{soft_pref_block}
 SCORING -- four components, in this order (for listings with no hard downgrade):
 1. FUNCTION MATCH (the primary driver of the score): does the role's actual day-to-day work match the
    target roles above -- a same-function role in a different industry is a good match; a different-
@@ -4524,7 +4737,7 @@ SCORING -- four components, in this order (for listings with no hard downgrade):
 2. DEPTH FIT (a secondary adjustment -- do NOT let it override a poor function match): given the
    candidate's background evidence above, how plausible is it they can do THIS role's tasks at its stated
    seniority? Use this to move the score up or down a moderate amount within a function-match band, not to
-   rescue a role whose core function doesn't match. A target role or skill tagged "strongly
+   rescue a role whose core function doesn't match.{overqualified_rank_note} A target role or skill tagged "strongly
    preferred"/"preferred" reflects the candidate's own past tick feedback -- nudge the score up a little for
    a strong match on it. One tagged "deprioritize"/"lower priority" reflects past cross feedback -- nudge
    the score down a little if the listing leans heavily on it.
@@ -4555,12 +4768,17 @@ SCORING -- four components, in this order (for listings with no hard downgrade):
 Give each listing a fit_score from 0 (clearly wrong fit) to 100 (excellent fit). Judge relatively across
 the whole batch -- spread scores out rather than clustering everything near one number.
 
-Output ONLY JSON: {{"scores":[{{"n":1,"fit_score":72,"note":"..."}},{{"n":2,"fit_score":40,"note":"..."}}]}}
+Output ONLY JSON: {{"scores":[{{"n":1,"fit_score":72,"note":"...","soft_violation":false}},
+{{"n":2,"fit_score":40,"note":"...","soft_violation":false}}]}}
 "note": one short phrase (under 12 words) naming the main driver of the score -- e.g. "strong function +
 title match" or "operational role, weak function match despite title". For a hard-downgraded listing,
 the note MUST name the downgrade, e.g. "hard: 3+ years paid experience bar" or "hard: on-site Cyprus,
 candidate UK". For audit purposes only, never shown to the candidate. Include one object per listing,
 numbered exactly as shown.
+"soft_violation": true only when a SOFT-PREFERENCE MISMATCH above clearly fired for that listing, false
+otherwise (and always false when no such section appears above). It must NOT change "fit_score" -- the
+two are independent, and a role can score 80 with "soft_violation": true. When you set it, say which one
+fired in the note too, e.g. "soft: remote-only, candidate wants on-site".
 
 Listings:
 {listing_block}"""
@@ -4568,8 +4786,8 @@ Listings:
 
 def _score_rank_batch(
     batch: list[tuple[dict, str]], profile: dict
-) -> tuple[dict[int, float], dict[int, str], bool]:
-    """Scores one rank_gate batch. Returns (scores, notes, batch_failed) without
+) -> tuple[dict[int, float], dict[int, str], dict[int, bool], bool]:
+    """Scores one rank_gate batch. Returns (scores, notes, soft_flags, batch_failed) without
     mutating `batch`'s candidate dicts or any shared cache/entry list, so rank_gate
     can run this concurrently across batches -- the caller applies the result back
     onto its own candidates/new_entries in the main thread. `notes` is the judge's
@@ -4615,6 +4833,11 @@ def _score_rank_batch(
     prompt = _rank_prompt(profile, listing_block)
     scores: dict[int, float] = {}
     notes: dict[int, str] = {}
+    # Which listings tripped a SOFT-PREFERENCE MISMATCH (see _rank_prompt). Kept
+    # entirely separate from `scores`: this demotes a role's ORDERING into the
+    # judge pool (engine._selection_score) and must never touch the score the
+    # reject floor and the card's "Fit estimate" chip are computed from.
+    soft_flags: dict[int, bool] = {}
     # See _safe_temperature -- gpt-5.6-luna 400s on temperature=0 just
     # like gpt-5.6-terra does on 0.2, which was silently tripping the
     # fail-open except branch below on every single rank_gate batch (every
@@ -4630,7 +4853,7 @@ def _score_rank_batch(
     # down from rank_gate: it's one small sha1 against several thousand tokens of
     # prompt, and keeping it local means the two concurrent batch workers can't
     # disagree about it.
-    rank_cache_key = (f"rank_v15:{_profile_signature(profile)}:"
+    rank_cache_key = (f"rank_v16:{_profile_signature_v2(profile)}:"
                       + hashlib.sha1((profile.get("intent_text") or "")
                                      .strip().lower().encode()).hexdigest()[:8]
                       + f":{_rank_age_cache_tag(profile)}")
@@ -4701,6 +4924,8 @@ def _score_rank_batch(
                     note = str(d.get("note", "") or "").strip().replace("|", "/")[:100]
                     if note:
                         notes[n] = note
+                    if d.get("soft_violation") is True:
+                        soft_flags[n] = True
         except Exception as e4:
             emit(f"[gate:rank] batch response parse failed ({e4}); no rank signal for this batch.")
             batch_failed = True
@@ -4708,7 +4933,7 @@ def _score_rank_batch(
     if batch_failed:
         emit(f"[gate:rank] no rank signal for {len(batch)} candidate(s) in this batch -- "
              f"fail-open (bypassing RANK_REJECT_SCORE_FLOOR).")
-    return scores, notes, batch_failed
+    return scores, notes, soft_flags, batch_failed
 
 
 def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
@@ -4728,7 +4953,18 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     phrase, "" if none) in place and returns the full list unfiltered -- the
     caller applies its own cutoff (e.g. drop the bottom fraction, cap at N).
     Cached per (profile signature + intent hash + max-listing-age tag, job id) in
-    gate_cache under gate="rank_v15.{intent_tag}.{age_tag}"
+    gate_cache under gate="rank_v16.{intent_tag}.{age_tag}"
+    bumped from "rank_v15": the two SOFT-preference downgrades (STATED ARRANGEMENT
+    and SALARY) no longer cap the score at 15 when the candidate left them Soft.
+    They now live in their own SOFT-PREFERENCE MISMATCHES section which sets a
+    "soft_violation" flag instead, and only the Hard-enforced ones stay in HARD
+    DOWNGRADES. This untangles RANK_REJECT_SCORE_FLOOR, which had been doing two
+    unrelated jobs -- a quality bar AND the enforcement path for those two soft
+    preferences (they capped at 15 precisely so the floor would catch them), so
+    the floor could not be lowered without silently disabling soft enforcement.
+    A v15 score for a soft-mismatching listing is a 15 that means "preference
+    mismatch", not "bad fit", and is not comparable to a v16 score. The gate_cache
+    text column also gained a third packed field for the flag. "rank_v15" was
     bumped from "rank_v14": new HARD DOWNGRADE (g), MAX LISTING AGE -- replaces the
     old fixed STALE_LISTING_DAYS=45 downgrade-only mechanism with the candidate's own
     configurable "Maximum listing age" preference (default 30 days), and caps the
@@ -4821,7 +5057,8 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     encoding can't be corrupted by the model's own output."""
     if not candidates:
         return []
-    sig = _profile_signature(profile)
+    # _v2 for the same reason screen_gate uses it -- see there.
+    sig = _profile_signature_v2(profile)
     # "rank_v15" (not "rank_v14"): the gate name doubles as part of the cache key, and
     # _gate_cache_key has no model field -- bumping it forces every previously
     # scored job to be re-ranked under the reworded prompt (new HARD DOWNGRADE (g),
@@ -4842,19 +5079,24 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     # intent does -- see _rank_age_cache_tag -- so editing it re-scores without
     # re-running screen_gate, which never sees this preference at all.
     age_tag = _rank_age_cache_tag(profile)
-    keys = [_gate_cache_key(f"rank_v15.{intent_tag}.{age_tag}", sig, _gate_job_id(c)) for c in candidates]
+    keys = [_gate_cache_key(f"rank_v16.{intent_tag}.{age_tag}", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
     for c, key in zip(candidates, keys):
         if key in cached:
             _keep, reason, _req_json = cached[key]
-            score_part, _, note_part = (reason or "").partition("|")
+            # Packed "{score}|{note}|{soft_violation}". A note can never contain
+            # "|" (stripped at write time in _score_rank_batch), so a plain split
+            # is unambiguous; a 2-field entry is a pre-v16 row and reads as no
+            # soft violation, which is also what an unflagged v16 row means.
+            fields = (reason or "").split("|")
             try:
-                c["_rank_score"] = float(score_part)
-            except (TypeError, ValueError):
+                c["_rank_score"] = float(fields[0])
+            except (TypeError, ValueError, IndexError):
                 c["_rank_score"] = 50.0
-            c["_rank_note"] = note_part
+            c["_rank_note"] = fields[1] if len(fields) > 1 else ""
+            c["_rank_soft_violation"] = len(fields) > 2 and fields[2] == "1"
         else:
             to_judge.append((c, key))
 
@@ -4870,7 +5112,7 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
         with ThreadPoolExecutor(max_workers=min(_GATE_MAX_WORKERS, len(batches))) as pool:
             futures = [pool.submit(_score_rank_batch, batch, profile) for batch in batches]
             for batch, fut in zip(batches, futures):
-                scores, notes, batch_failed = fut.result()
+                scores, notes, soft_flags, batch_failed = fut.result()
                 for i, (c, key) in enumerate(batch):
                     if batch_failed:
                         # Cosmetic placeholder only -- _rank_gate_failed (not this score) is
@@ -4879,13 +5121,16 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
                         # run instead of permanently poisoning gate_cache with no signal.
                         c["_rank_score"] = 50.0
                         c["_rank_note"] = ""
+                        c["_rank_soft_violation"] = False
                         c["_rank_gate_failed"] = True
                     else:
                         score = scores.get(i + 1, 50.0)
                         note = notes.get(i + 1, "")
+                        soft = soft_flags.get(i + 1, False)
                         c["_rank_score"] = score
                         c["_rank_note"] = note
-                        new_entries.append((key, True, f"{score}|{note}", None))
+                        c["_rank_soft_violation"] = soft
+                        new_entries.append((key, True, f"{score}|{note}|{'1' if soft else '0'}", None))
 
     _gate_cache_store(new_entries)
     # Score-distribution diagnostic: a rank stage that never rejects anything
@@ -4895,9 +5140,10 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     # having to separately query gate_cache.
     all_scores = [c.get("_rank_score", 50.0) for c in candidates]
     n_failed = sum(1 for c in candidates if c.get("_rank_gate_failed"))
+    n_soft = sum(1 for c in candidates if c.get("_rank_soft_violation"))
     if all_scores:
         emit(f"[gate:rank] scored {len(candidates)} candidates ({n_cached} from cache, "
-             f"{n_failed} fail-open/no-signal) -- "
+             f"{n_failed} fail-open/no-signal, {n_soft} soft-preference mismatch) -- "
              f"min={min(all_scores):.0f} max={max(all_scores):.0f} "
              f"avg={sum(all_scores)/len(all_scores):.0f}")
     return candidates
@@ -4980,7 +5226,6 @@ _EXPIRED_LISTING_RE = re.compile(
 )
 
 
-_EXPIRED_LISTING_MAX_CHARS = 6000    # ~p90 of scraped pages in the live store
 _EXPIRED_LISTING_HEAD_CHARS = 1500   # a real closure notice replaces the posting
 
 
@@ -5048,9 +5293,30 @@ def _looks_like_expired_listing(markdown: str) -> bool:
     requiring the match to start within the first _EXPIRED_LISTING_HEAD_CHARS is
     strictly narrowing (fewer false positives than the old rule) while letting
     the length ceiling double. dead_reason is unrecoverable, so this must only
-    ever move in the conservative direction."""
-    if len(markdown) >= _EXPIRED_LISTING_MAX_CHARS:
-        return False
+    ever move in the conservative direction.
+
+    THE LENGTH CEILING IS NOW GONE and position is the only gate, which sounds
+    like a loosening and is the same argument taken one step further. The
+    ceiling was only ever a proxy for "the phrase is somewhere incidental" -- a
+    related-jobs sidebar, an archive footer -- and it is a bad one, because a
+    genuinely dead page can be long: a live case (flexa.careers, an Accenture
+    listing that reached rank 6 on the results page) kept the ENTIRE job
+    description rendered below the closure notice, at 16k chars of markdown, so
+    the ceiling hard-blocked it however the phrase was worded. Position answers
+    what the length was proxying for, and answers it directly.
+
+    What makes that safe is the measurement that also removed the original
+    reason for the ceiling. The bebee false positive it was defending against
+    was never in the page's TEXT -- it was in the inlined <script>/<style> that
+    _strip_html leaves behind, which is why the verification path now reads
+    _visible_text instead (see there). Re-measured over 382 live pages -- the
+    376 scraped pages in the store carrying real text, plus 6 live bebee
+    postings of 3.0k-6.6k visible chars fetched fresh -- this pattern matches
+    ZERO of them at any offset. The two bebee rows that did match were both hard
+    404s, at offset 36, and check 1 catches those anyway. So the head window is
+    the only guard left and it is the load-bearing one: the opening of a page is
+    its title, company and header, and a LIVE posting cannot say there that it
+    is no longer available. Don't widen it, and don't feed this raw HTML."""
     m = _EXPIRED_LISTING_RE.search(markdown)
     return bool(m) and m.start() < _EXPIRED_LISTING_HEAD_CHARS
 
@@ -5075,7 +5341,9 @@ _GENERIC_CAREERS_HUB_RE = re.compile(
     r"see all (?:our )?(?:jobs|vacancies|roles|openings)",
     re.I,
 )
-_GENERIC_CAREERS_HUB_MAX_CHARS = 6000    # mirrors _EXPIRED_LISTING_MAX_CHARS
+_GENERIC_CAREERS_HUB_MAX_CHARS = 6000    # kept: this rule has no 382-page miss
+                                         # measurement behind it, unlike the
+                                         # expired-phrase gate above
 _GENERIC_CAREERS_HUB_HEAD_CHARS = 1500   # a careers-index page leads with its own nav, same as a closure notice
 
 
@@ -5597,6 +5865,31 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
+# 26 (from 25): the leniency/output rework. Four changes, all of which make a v25
+# verdict non-comparable rather than merely differently-worded:
+#   * "backup" stopped being a 3-item last-resort list of "least-bad survivors" and
+#     became the second half of the result set (capped at FINAL_PICKS, explicitly
+#     described as SHOWN to the candidate). Roles that used to be filed under
+#     "not_selected" -- which carries only an internal audit phrase and therefore
+#     cannot be displayed at all -- now belong in "backup" whenever nothing is
+#     actually wrong with them. engine._evaluate_cluster contributes both tiers
+#     together to match.
+#   * A WISH-LIST bar paragraph attached to that list: agency-posted, contract, and
+#     long-"essential"-list/negotiable-pay postings are named as concrete tells that
+#     the stated requirements are a recruiter's ideal-hire sketch rather than a bar,
+#     and push toward including a role and toward the more generous of two adjacent
+#     fit_levels. Explicitly NOT a licence to mark an unmet requirement met or to
+#     soften a DISQUALIFIER.
+#   * "sector_match" and reasoning step G are GONE, along with DISQUALIFIER 5's
+#     closing "judged separately as a ranking signal" paragraph and the sector
+#     clauses in steps B/E and the fit_level rubric. The field's only user-visible
+#     effect was a "this is not within your stated ... sector interests" line in
+#     "concerns" that read as noise, and it also silently gated "very_strong". The
+#     rubric's very_strong condition changes as a direct result, so every v25 grade
+#     was computed under a different rule.
+#   * "concerns" is capped at 3 items (was uncapped in the prompt, 4 in effect), and
+#     a "strengths" list is now REQUIRED for an "ok"/"stretch" pick so the card can
+#     show what the candidate does bring alongside what they don't.
 # 25 (from 24): new DISQUALIFIER 8, MAX LISTING AGE -- replaces the old fixed
 # STALE_LISTING_DAYS=45 downgrade-only mechanism with the candidate's own configurable
 # "Maximum listing age" preference (default 30 days, see
@@ -5637,7 +5930,7 @@ async def expand_category_pages(
 # through for every candidate, whatever they had stated -- and NO LOCATION COMMENTARY
 # forbade even mentioning it in "concerns", so the judge could neither reject nor flag
 # it. A v20 verdict was reached under a rule that could not fail a remote role.
-FINAL_EVAL_PROMPT_VERSION = 25
+FINAL_EVAL_PROMPT_VERSION = 26
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -5665,6 +5958,13 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    "ideal candidate" sketch is SOFT even when it names a number of years, and must not disqualify - if
    the requirement is soft, negotiable, or not stated, judge fit on skills/interests as normal, don't
    invent a seniority objection that isn't in the text.
+   This rule is about the role demanding MORE than the candidate has. The opposite direction - a role
+   pitched BELOW the candidate's level - is never a disqualifier under this rule. If the profile above
+   carries an "Open to more junior roles" line, the candidate has explicitly said they will consider
+   such roles: do not exclude one for being junior, do not raise it as a concern, and do not let it
+   lower "fit_level". That line changes NOTHING about DISQUALIFIER 3's OVER-QUALIFIED FOR A TRAINING
+   SCHEME paragraph - an apprenticeship or student placement is excluded because the candidate is
+   INELIGIBLE for it, not because it is junior, so keep applying that rule exactly as written.
    A stated salary/pay figure is a real signal of the role's TRUE seniority band and often more
    trustworthy than the title itself (titles get inflated or watered down; what an employer is
    actually paying usually doesn't). Weigh it alongside the title/description when judging the real
@@ -5773,9 +6073,9 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    or a normal post-offer background check - only the concrete patterns above, never a vague "feels off"
    impression.
 
-5. SECTOR / DOMAIN FIT: Exclude a role whose core professional domain or job function is clearly in a
-   different field from what the candidate is targeting - judged against their target roles, stated
-   sector interests, and their own words about what they are looking for (all in the profile above).
+5. PROFESSIONAL FIELD FIT: Exclude a role whose core professional domain or job function is clearly in a
+   different field from what the candidate is targeting - judged against their target roles and their
+   own words about what they are looking for (both in the profile above).
    Use a HIGH bar: only genuinely unrelated professional fields disqualify (e.g. a hands-on nursing
    role for a marketing candidate, a field-sales role for someone targeting research/policy, a
    qualified-accountant role for a software engineer). Do NOT exclude adjacent, transferable, or
@@ -5797,10 +6097,10 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    supported graduate/trainee entry route into the other profession does not change this: it makes the
    role a career change, which is a different question from fit, and one the candidate has not asked for
    unless their own words say so.
-   Passing this rule does NOT mean the role matches the candidate's preferred sectors/causes - it only
-   means the field isn't clearly wrong. Whether it actually lands in a sector the candidate said they
-   want is judged separately, as a RANKING signal rather than a gate - see "sector_match" in reasoning
-   step G and the SCHEMA below.
+   This rule is about the PROFESSIONAL FIELD ONLY, never the industry, sector or cause the employer
+   happens to operate in. A same-function role at an employer in an industry the candidate has never
+   mentioned is a normal, good match. Never raise an industry/sector/cause objection anywhere in your
+   output - not here, not in "concerns", not in a "not_selected" reason.
 
 6. REQUIRED LANGUAGE / EXPLICIT HARD REQUIREMENT: If the listing states an explicit, mandatory
    requirement outside seniority/location - a required spoken or written language for the role (e.g.
@@ -5830,7 +6130,17 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    age-tag guidance above) never trigger this rule on their own. If the profile states no maximum listing
    age at all, or the tag/text gives you nothing definite to go on, this rule does not apply."""
 
-_FINAL_EVAL_WORDING = """WORDING: When you reference the candidate's OWN background in "summary", "highlight" or
+_FINAL_EVAL_WORDING = """WORDING -- WHOSE SIDE A SHORTFALL IS STATED FROM. In "can_do_fit", "concerns" and "not_selected"
+reasons, describe a gap as something the POSTING asks for or prefers, never as a deficiency in the
+candidate. Job descriptions routinely list an ideal hire rather than a bar (see the "backup" rules), so
+"the role prefers X" is both the more accurate statement and the one a candidate can act on; "you would
+be a stretch because the role expects X" states the same fact as a verdict on the person. Never write
+"you would be a stretch", "you lack", "you fall short", "you are under-qualified", "you do not meet", or
+"you are not a fit". Write the same content as "the posting prefers X", "the posting asks for X", "they
+have listed X as essential", "this one leans more on X than your evidence covers". Where the candidate
+genuinely does clear a bar, say so plainly in the same register.
+
+WORDING: When you reference the candidate's OWN background in "summary", "highlight" or
 "concerns", never state a leadership or founder title (e.g. president, chair, founder, co-founder,
 cofounder, CEO, director, co-lead) on its own. If such a title came from a student club, society, campaign
 group, fellowship, or other informal/unpaid activity, name the SPECIFIC organisation or activity it belongs
@@ -5915,22 +6225,28 @@ A. READ THE JOB on three axes, not at face value (it is a marketing document as 
    - Actual day-to-day vs aspirational language: what will this person actually DO most days, as distinct
      from the mission/impact framing the listing leads with.
 B. Assess WANT-FIT and CAN-DO-FIT SEPARATELY -- they are different questions:
-   - want-fit: does the candidate actually WANT this role -- judged against their target roles, stated
-     sector interests, and their OWN words about what they're looking for? A role the candidate is
+   - want-fit: does the candidate actually WANT this role -- judged against their target roles and their
+     OWN words about what they're looking for? A role the candidate is
      well-qualified for but clearly does NOT want (wrong function, a domain they've moved away from,
      something their own words rule out) is NOT a strong fit however well the skills line up. A strong
      can-do-fit must never paper over a weak want-fit. This assessment isn't reported in its own field --
      it feeds the strong/backup decision, and a want-fit mismatch worth flagging goes in "concerns".
+     Judge this on the FUNCTION and the day-to-day work only. The employer's industry, sector or cause
+     is NOT a want-fit signal and must never lower a grade or appear as a concern.
    - can-do-fit: can the candidate actually DO the job to the REAL bar from A -- weighing evidence
      STRENGTH, not mere presence (see EVIDENCE STRENGTH). "Used professionally, 2 years" is strong
      evidence; "self-directed, one project" is weak evidence for the very same skill tag. Report this
      as a direct, second-person verdict in "can_do_fit" (e.g. "You're mostly qualified for this role,
-     though..." or "You'd be a stretch here -- ..."), the way you'd tell the candidate to their face.
+     though..." or "You cover most of what this role asks for, though the posting prefers ..."), the
+     way you'd tell the candidate to their face -- see WORDING for how to phrase a shortfall.
    A role belongs in "strong" only when BOTH want-fit and can-do-fit are genuinely strong.
-C. List every notable gap in "concerns", ONE item per gap (a missing requirement, weak evidence for a
+C. List the notable gaps in "concerns", ONE item per gap (a missing requirement, weak evidence for a
    load-bearing skill, a seniority gap, a want-fit mismatch worth flagging) -- put the single one most
-   likely to sink this application FIRST, since the candidate sees these as a plain count before they
-   expand the list.
+   likely to sink this application FIRST, since the candidate sees these before they expand the list.
+   AT MOST THREE ITEMS. If you have more than three, keep the three most likely to sink the application
+   and drop the rest: a list longer than that stops being a set of things to address and reads as a
+   verdict that the candidate should not bother, which is the opposite of what a shown role means.
+   NEVER list the employer's industry, sector or cause as a concern -- see rule 5 and step B.
    A gap the POSTING ITSELF says it doesn't screen on -- one it trains for, or labels beneficial/
    desirable/not essential (step D's fourth rule) -- is only worth listing when it is genuinely material,
    must never be listed first, and must carry the JD's own framing in the same breath (e.g. "no prior use
@@ -6030,8 +6346,7 @@ E. APPLICATION GUIDANCE -- write "filters_on" and "highlight". This is the one p
      it is commercial (e.g. "your Salesforce work is self-directed, so pitch it as the reporting problem
      you solved with it rather than as production experience"). Name at most one thing to leave out or
      de-emphasise, and only when it would actively distract.
-   If "sector_match" (step G) is false for this role, do not put that here -- it belongs in "concerns"
-   (step C) alongside the other honest caveats. If the candidate's evidence is so thin that you cannot
+   If the candidate's evidence is so thin that you cannot
    name two real things for them to lead with, return the one or two you can and stop; do not invent
    evidence that is not in their profile, and never name a project, employer or tool the profile does
    not mention.
@@ -6047,13 +6362,21 @@ F. Classify the FUNCTIONAL NATURE of the day-to-day work in "role_type" -- one s
    support for colleagues" (that's the same functional-category information "role_type" already gave) -
    it should instead name the concrete duties/mission, e.g. "You would keep service records accurate,
    analyse outcomes, and turn evidence into reports for funders and partners."
-G. SECTOR MATCH (a ranking signal, never a disqualifier -- see rule 5 above): for every role you include
-   in "strong" or "backup", set "sector_match" true if its core domain/employer sits within one of the
-   candidate's stated sector interests or causes (their sector_target values and their own words), false
-   if it doesn't. This never excludes a role or changes "fit_level" on its own -- it only orders roles
-   within the same fit_level ("sector_match": true first) and, when you include a role despite
-   "sector_match": false, name that trade-off plainly as a "concerns" item (step C) so it's visible to
-   the candidate rather than silently absorbed into the verdict."""
+G. STRENGTHS -- required for any pick you grade "ok" or "stretch", omitted for "very_strong"/"strong".
+   Those two grades are shown to the candidate with their gaps listed and NOTHING alongside them, which
+   misrepresents a role they are being told is worth applying to. Write 1-3 "strengths" items: the
+   specific things the candidate genuinely DOES bring to THIS posting, each naming a real requirement
+   from your step-D checklist marked "met": true and the candidate's own concrete evidence for it (a
+   named tool, project, employer, dataset or result from their profile). Same discipline as "concerns":
+   one item each, most persuasive first, concrete rather than generic ("you have built Power BI
+   dashboards used by an ops team, which is the reporting stack this role runs on" -- not "you have
+   strong analytical skills"), and never evidence the profile does not actually contain. Where the best
+   evidence for an item is self-directed, academic or AI-assisted, say so in the same breath rather than
+   letting it read as commercial. If you genuinely cannot name one real strength for a role, that role
+   should not be in either list at all -- reconsider whether it belongs in "not_selected".
+   Give at least as many "strengths" as "concerns" where the evidence honestly supports it; a card
+   showing three gaps and one strength for a role you graded worth applying to is usually a sign the
+   checklist was written to fail rather than to judge."""
 
 _FINAL_EVAL_SCHEMA = """Output ONLY a valid JSON object (no markdown), with two required lists and one
 optional list, using this item shape for "strong"/"backup":
@@ -6063,12 +6386,12 @@ optional list, using this item shape for "strong"/"backup":
     "role_type": "1 short sentence classifying the FUNCTIONAL NATURE of the day-to-day work -- see reasoning step F. Written FIRST, since it's shown immediately before \\"summary\\" as one continuous sentence pair.",
     "summary": "1 concise, PLAIN-LANGUAGE sentence on what this specific role/project/mission actually involves (not why it fits the candidate) -- see PLAIN LANGUAGE and NO LOCATION COMMENTARY above. Must add information NOT already given by \\"role_type\\" -- never restate its functional-category classification (see reasoning step F's no-overlap rule).",
     "fit_level": "very_strong" | "strong" | "ok" | "stretch",
-    "sector_match": true,
     "can_do_fit": "a direct, second-person qualification verdict -- see reasoning step B.",
     "filters_on": ["2-4 concrete things this employer will screen on that the candidate CAN evidence, in the JD's own words -- see reasoning step E"],
     "highlight": "2-3 second-person sentences naming which of the candidate's own specific projects/tools/results to lead with against those -- see reasoning step E.",
     "requirements": [{"text": "a JD requirement, short and concrete", "category": "core" | "secondary", "met": true}],
-    "concerns": ["each notable gap, one per item, most sink-worthy first -- see reasoning step C; [] if none"],
+    "strengths": ["1-3 concrete things the candidate DOES bring to this posting, strongest first -- REQUIRED when \\"fit_level\\" is \\"ok\\" or \\"stretch\\", omit otherwise; see reasoning step G"],
+    "concerns": ["the notable gaps, one per item, most sink-worthy first, AT MOST 3 -- see reasoning step C; [] if none"],
     "role_salary": "the salary or range THIS posting's own description states, verbatim and short (e.g. \\"GBP 35,000-42,000\\"); null if this posting states none -- even when other salary figures appear elsewhere in the supplied text (a \\"Similar jobs\\" list or salary histogram, see SCOPE OF EACH POSTING'S TEXT)",
     "work_style": "Remote" | "Hybrid" | "On-site" | null,
     "role_seniority": "the role's REAL seniority bar from axis A (e.g. \\"Graduate\\", \\"Junior\\", \\"Mid\\", \\"Senior\\"); null if you genuinely can't tell",
@@ -6106,18 +6429,19 @@ beaten from one that was quietly misread, which a blank reject cannot distinguis
 raised exactly ONE flag on this listing (not enough alone to disqualify it into the list above); false
 otherwise. Omit or leave false when you saw none of those signals.
 
-"sector_match" (on "strong"/"backup" items only): see reasoning step G -- true if the role's core domain
-sits within one of the candidate's stated sector interests, false otherwise. Never changes "fit_level" or
-which list a role is in; only orders roles within a fit_level and is named in "concerns" when false for
-an included role.
+"strengths" (on "strong"/"backup" items only): see reasoning step G. REQUIRED whenever "fit_level" is
+"ok" or "stretch" -- those are the grades whose card would otherwise show the candidate a list of gaps
+and nothing else for a role you are telling them to apply to. Omit it for "very_strong"/"strong", where
+the grade and "can_do_fit" already say the candidate clears the bar.
 
-"fit_level" is the grade the candidate actually SEES on this pick, so it must be earned, not
-inferred from the fact that you decided to include the role. Derive it mechanically from your
-own step-D checklist and your own "concerns" list, and never grade a role higher than those
-two support. A concern "touches a core requirement" when it names, qualifies, or weakens the
+"fit_level" is used internally to ORDER the picks the candidate sees; it is not printed as a
+label on their card, so grade it honestly rather than protectively -- an accurate "ok" costs
+the candidate nothing and a flattering "strong" corrupts the ordering. Derive it mechanically
+from your own step-D checklist and your own "concerns" list, and never grade a role higher than
+those two support. A concern "touches a core requirement" when it names, qualifies, or weakens the
 evidence for one of your "core" items (an evidence-strength caveat on a core skill -- "your
 evidence is portfolio-based, not paid" -- IS such a concern, not a footnote):
-- "very_strong": every core requirement "met": true, "sector_match": true, and NO concern
+- "very_strong": every core requirement "met": true and NO concern
   touching a core requirement. Genuinely rare -- often none in a batch, seldom more than one.
 - "strong": every core requirement "met": true, and at most ONE concern touching a core
   requirement, which the candidate's other evidence plausibly closes.
@@ -6204,10 +6528,34 @@ DISQUALIFIERS -- apply to EVERY role, for BOTH lists, first:
 {_FINAL_EVAL_STRONG_RULES}
 Include a role in "strong" only if it is a genuinely strong fit; never pad it with weak matches.
 
-"backup" -- least-bad survivors, for when nothing (or too little) is strong. Include a role here only if
-it passes the DISQUALIFIERS above. In this list, evidence weakness and cumulative nice-to-have gaps are
-EXPECTED and ACCEPTABLE -- do NOT use them to exclude a role, only note them honestly in "concerns".
-Leave "backup" empty when "strong" already gives good coverage, or when every role is disqualified.
+"backup" -- every OTHER role worth the candidate's time, not just the least-bad two or three. Include a
+role here whenever it passes the DISQUALIFIERS above and a reasonable candidate might actually apply to
+it, even though it fell short of the "strong" bar. In this list, evidence weakness and cumulative
+nice-to-have gaps are EXPECTED and ACCEPTABLE -- do NOT use them to exclude a role, only note them
+honestly in "concerns" and let them show in an honest "ok"/"stretch" fit_level. This list is SHOWN to
+the candidate, below the strong picks and labelled as the lesser fits, so fill it properly: a role with
+nothing actually wrong with it belongs here, NOT in "not_selected". A short "backup" list is only
+correct when the remaining roles genuinely are poor fits. Leave it empty only when every remaining role
+is disqualified or is plainly not worth an application.
+
+Why this bar is set where it is: employers hire "under-qualified" candidates far more often than their
+adverts suggest, so a role the candidate can plausibly do most of is a real opportunity and not padding.
+Three concrete tells that a posting's stated requirements are a wish-list rather than a bar, each of
+which should push you toward including a role in "backup" rather than passing over it, and toward the
+more generous of two adjacent fit_levels:
+ - It is posted by a RECRUITMENT OR STAFFING AGENCY rather than the employer directly. Agency adverts
+   are compiled by a recruiter from a hiring manager's brief and then padded; they are written to
+   attract a wide funnel, not to gatekeep precisely.
+ - It is a CONTRACT, interim, fixed-term or day-rate role rather than a permanent one. Contract hiring
+   bars are lower and more negotiable than the advert implies -- the org needs someone competent to
+   cover a gap for a fixed period, with far less long-term risk if it doesn't work out.
+ - The "essential" list is LONG (roughly eight or more items, especially split into technical /
+   analytical / communication groupings) and/or the pay is "negotiable"/"competitive". A list that long
+   is a description of an ideal hire nobody will match; the real bar is closer to "can do most of this
+   and talk credibly about the rest".
+None of these three is a reason to overstate fit, to mark an unmet requirement "met", or to soften a
+DISQUALIFIER -- they change whether a role is worth SHOWING and how harshly a shortfall is graded, never
+what the evidence actually says. Say the gap plainly in "concerns" and put the role in the list anyway.
 
 {_FINAL_EVAL_REASONING}
 
@@ -6304,6 +6652,29 @@ def _sanitize_filters_on(raw) -> list[str]:
     return out
 
 
+# Both bullet lists the card renders ("concerns" and its new "strengths" twin) are
+# capped at the same number. The cap is a display decision, not a modelling one: the
+# card shows them as two matched blocks under one heading each, so an overrunning
+# "concerns" list turns a role the judge just recommended into a wall of reasons not
+# to apply -- which is precisely the complaint that prompted the "strengths" field.
+# Asked for in the prompt too (reasoning steps C and G); enforced here because a
+# prompt-only cap is a request, and a malformed reply must not be able to corrupt a
+# persisted verdict.
+_BULLET_LIST_MAX = 3
+
+
+def _sanitize_bullets(raw) -> list[str]:
+    """Validate/cap one of the card's bullet lists ("concerns"/"strengths")."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for r in raw[:_BULLET_LIST_MAX]:
+        item = str(r).strip()
+        if item:
+            out.append(item[:300])
+    return out
+
+
 def _sanitize_requirements_checklist(raw) -> list[dict]:
     """Validate/cap the final judge's requirements-checklist output (see reasoning
     step D / _FINAL_EVAL_SCHEMA) -- at most 12 items, each normalised to a fixed
@@ -6352,10 +6723,12 @@ def _run_final_eval(jobs: list[dict], cv_text: str | None,
 {cv_text}
 
 Judge the {len(jobs)} complete job postings below. Return up to {FINAL_PICKS} genuinely strong fits in
-"strong" (best first), and up to 3 least-bad disqualifier-only survivors in "backup" (best first; empty
-if "strong" already covers it or nothing qualifies). For any job you hard-exclude from both lists via a
-DISQUALIFIERS rule, add it to "disqualified" with a short reason. Put every job that is in none of those
-three lists into "not_selected" with a short reason -- all {len(jobs)} job numbers must be accounted for.
+"strong" (best first), and up to {FINAL_PICKS} further worth-applying-to roles in "backup" (best first;
+see the "backup" rules above -- this list is shown to the candidate, so put every role with nothing
+actually wrong with it here rather than in "not_selected"). For any job you hard-exclude from both lists
+via a DISQUALIFIERS rule, add it to "disqualified" with a short reason. Put every job that is in none of
+those three lists into "not_selected" with a short reason -- all {len(jobs)} job numbers must be
+accounted for.
 
 Jobs Payload:
 {jobs_block}"""
@@ -6434,10 +6807,13 @@ Jobs Payload:
                 # the card's one-line "This role likely filters on: ..." readable.
                 merged["filters_on"] = _sanitize_filters_on(merged.get("filters_on"))
                 merged["highlight"] = str(merged.get("highlight") or "").strip()[:700]
-                # Default true (not "unknown mismatch") when the model omits it -- this
-                # is a ranking/display signal, never a gate, so a missing field should
-                # never read as a silent sector-mismatch flag.
-                merged["sector_match"] = bool(entry.get("sector_match", True))
+                # "concerns" is capped here as well as asked for in the prompt: it is
+                # rendered as a bullet list under one heading, and a model that
+                # overruns turns a role it just recommended into a wall of reasons
+                # not to bother. "strengths" is capped to match, so the card can
+                # never show more of one than the other by accident.
+                merged["concerns"] = _sanitize_bullets(merged.get("concerns"))
+                merged["strengths"] = _sanitize_bullets(merged.get("strengths"))
                 out.append(merged)
         return out
 
@@ -6458,8 +6834,14 @@ Jobs Payload:
             continue
         d["_disqualifier"] = False
         excluded.append(d)
+    # Both lists capped at FINAL_PICKS. "backup" used to be capped at 3 ("least-bad
+    # survivors"), which made it a last-resort filler rather than the second half of
+    # the result set -- and pushed every other perfectly-applicable role into
+    # "not_selected", which carries only an internal audit phrase and so cannot be
+    # shown at all. Widening the list is what lets a thin run fill its 12 slots with
+    # roles the judge has actually written display-quality output for.
     return (_merge(data.get("strong"), FINAL_PICKS),
-            _merge(data.get("backup"), min(3, len(jobs))),
+            _merge(data.get("backup"), FINAL_PICKS),
             excluded)
 
 
@@ -6533,7 +6915,7 @@ def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None 
         return None, None, None
     strong.sort(key=lambda j: j.get("_rank_score", 0.0), reverse=True)
     backup.sort(key=lambda j: j.get("_rank_score", 0.0), reverse=True)
-    return strong[:FINAL_PICKS], backup[:min(3, len(jobs))], disqualified
+    return strong[:FINAL_PICKS], backup[:FINAL_PICKS], disqualified
 
 
 def final_evaluation(jobs: list[dict], profile: dict, cv_text: str | None = None) -> list[dict]:

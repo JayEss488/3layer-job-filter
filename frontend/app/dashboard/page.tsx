@@ -4,29 +4,15 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 
-import { HardSoftToggle } from "@/components/HardSoftToggle";
 import { IntentEditor } from "@/components/IntentEditor";
-import { LocationPicker, WORK_SET } from "@/components/LocationPicker";
-import { MaxListingAgePicker } from "@/components/MaxListingAgePicker";
-import { VisaSponsorToggle } from "@/components/VisaSponsorToggle";
 import { Nav } from "@/components/Nav";
+import { PreferencesPanel } from "@/components/PreferencesPanel";
 import { ProfileTabs } from "@/components/ProfileTabs";
 import { RequirementRows } from "@/components/RequirementRows";
 import { RoleFamilyCard } from "@/components/RoleFamilyCard";
-import { SalarySlider } from "@/components/SalarySlider";
-import { SeniorityPicker } from "@/components/SeniorityPicker";
-import { WorkStylePicker } from "@/components/WorkStylePicker";
 import { api } from "@/lib/api";
-import {
-  useAttributeMutations,
-  useAttributes,
-  useFamilies,
-  useFamilyMutations,
-  useStats,
-} from "@/lib/hooks";
+import { useAttributes, useFamilies, useFamilyMutations, useStats } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
-import { enforcementOf } from "@/lib/types";
-import type { Attribute, Enforcement } from "@/lib/types";
 
 /**
  * Profile = what the candidate WANTS: the role families the engine searches as
@@ -56,7 +42,7 @@ export default function DashboardPage() {
 const MAX_ROLE_FAMILIES = 4;
 
 // Split out so every hook below runs unconditionally: the page above returns
-// early until a profile id exists, and useAttributeMutations needs a real one.
+// early until a profile id exists, and the hooks here need a real one.
 function ProfileBody({ profileId }: { profileId: number }) {
   const router = useRouter();
   const qc = useQueryClient();
@@ -66,33 +52,10 @@ function ProfileBody({ profileId }: { profileId: number }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const { update } = useAttributeMutations(profileId);
   const fam = useFamilyMutations(profileId);
   const g = attrs?.by_type;
 
   const targetRoles = g?.target_role ?? [];
-  const locationAttrs = g?.location ?? [];
-  const cityAttr = locationAttrs.find((a) => !WORK_SET.has(a.value.toLowerCase()));
-  const workTypeAttrs = locationAttrs.filter((a) => WORK_SET.has(a.value.toLowerCase()));
-  const seniorityAttrs = g?.seniority ?? [];
-  const salaryAttr = g?.salary?.[0];
-  const maxListingAgeAttrs = g?.max_listing_age ?? [];
-  const visaSponsorAttrs = g?.visa_sponsor_only ?? [];
-
-  /**
-   * Hard/Soft for a preference is stored per attribute row, but the UI shows one
-   * toggle per preference — so a group with several rows (every selected
-   * seniority level, every ticked work type) writes the same value to all of
-   * them. Reading takes the first row's value: they're only ever set together.
-   */
-  function groupEnforcement(rows: Attribute[], fallback: Enforcement): Enforcement {
-    return rows.length ? enforcementOf(rows[0]) : fallback;
-  }
-  function setGroupEnforcement(rows: Attribute[], v: Enforcement) {
-    rows.forEach((a) => update.mutate({ id: a.id, enforcement: v }));
-  }
-
-  const workStyleEnforcement = groupEnforcement(workTypeAttrs, "soft");
 
   async function runSearch() {
     setBusy(true);
@@ -236,92 +199,11 @@ function ProfileBody({ profileId }: { profileId: number }) {
         <IntentEditor profileId={profileId} />
 
         {/* ── Preferences ── */}
+        {/* Extracted to a shared component so /onboarding renders the identical
+            set of filters — see PreferencesPanel for why the two drifting apart
+            was a real problem rather than a tidiness one. */}
         <div className="subhead">Preferences</div>
-        <div className="pref-list">
-          <div className="pref-card">
-            <div className="pref-label">Seniority</div>
-            <div className="pref-field">
-              <SeniorityPicker profileId={profileId} attributes={seniorityAttrs} />
-            </div>
-            <HardSoftToggle
-              value={groupEnforcement(seniorityAttrs, "soft")}
-              onChange={(v) => setGroupEnforcement(seniorityAttrs, v)}
-              disabled={seniorityAttrs.length === 0}
-              disabledReason="Pick a seniority level first — there's nothing to enforce yet."
-            />
-          </div>
-
-          <div className="pref-card">
-            <div className="pref-label">Salary</div>
-            <div className="pref-field">
-              <SalarySlider profileId={profileId} attribute={salaryAttr} />
-            </div>
-            <HardSoftToggle
-              value={salaryAttr ? enforcementOf(salaryAttr) : "soft"}
-              onChange={(v) => salaryAttr && update.mutate({ id: salaryAttr.id, enforcement: v })}
-              disabled={!salaryAttr}
-              disabledReason="Set a salary range first — there's nothing to enforce yet."
-            />
-          </div>
-
-          <div className="pref-card">
-            <div className="pref-label">Location</div>
-            <div className="pref-field">
-              <LocationPicker
-                profileId={profileId}
-                attributes={locationAttrs}
-                countryAttributes={g?.country ?? []}
-                scopeAttributes={g?.location_scope ?? []}
-                commuteAttributes={g?.commute_miles ?? []}
-              />
-            </div>
-            <HardSoftToggle
-              value={cityAttr ? enforcementOf(cityAttr) : "hard"}
-              onChange={(v) => cityAttr && update.mutate({ id: cityAttr.id, enforcement: v })}
-              disabled={!cityAttr}
-              disabledReason="Enter a city or region first — there's nothing to enforce yet."
-            />
-          </div>
-
-          <div className="pref-card">
-            <div className="pref-label">Work style</div>
-            <div className="pref-field">
-              <WorkStylePicker
-                profileId={profileId}
-                attributes={locationAttrs}
-                enforcement={workStyleEnforcement}
-              />
-            </div>
-            <HardSoftToggle
-              value={workStyleEnforcement}
-              onChange={(v) => setGroupEnforcement(workTypeAttrs, v)}
-              disabled={workTypeAttrs.length === 0}
-              disabledReason="Pick a work style first — there's nothing to enforce yet."
-            />
-          </div>
-
-          <div className="pref-card">
-            <div className="pref-label">Maximum listing age</div>
-            <div className="pref-field">
-              <MaxListingAgePicker profileId={profileId} attributes={maxListingAgeAttrs} />
-            </div>
-            <HardSoftToggle
-              value={groupEnforcement(maxListingAgeAttrs, "hard")}
-              onChange={(v) => setGroupEnforcement(maxListingAgeAttrs, v)}
-              disabled={maxListingAgeAttrs.length === 0}
-              disabledReason="Hard by default at 30 days — pick a different limit first to change enforcement."
-            />
-          </div>
-
-          {/* No HardSoftToggle: this filter is inherently hard, so the card
-              renders a two-column field instead of the usual three. */}
-          <div className="pref-card">
-            <div className="pref-label">Visa sponsorship</div>
-            <div className="pref-field">
-              <VisaSponsorToggle profileId={profileId} attributes={visaSponsorAttrs} />
-            </div>
-          </div>
-        </div>
+        <PreferencesPanel profileId={profileId} />
 
         <div className="bottom-row">
           <div className="action-row">

@@ -1,8 +1,9 @@
 """Pydantic request/response models."""
+import json
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class ORMModel(BaseModel):
@@ -15,15 +16,139 @@ class LoginIn(BaseModel):
     password: str
 
 
-class LoginOut(BaseModel):
+class BetaWindowOut(BaseModel):
+    """The open-beta window fields carried by every identity response.
+
+    All four are computed fresh from User.beta_started_at (services/beta.py),
+    never stored, so changing the window length in config applies immediately to
+    everyone already inside it.
+
+    An account with no window (the legacy exemption) reports nulls and False
+    throughout, so the frontend needs no special case for it."""
+
+    beta_expires_at: Optional[datetime] = None
+    beta_days_left: Optional[int] = None
+    # Drives nothing on the client except messaging -- the real lapse is the 403
+    # from require_active_beta. Reported so the UI can explain rather than just
+    # bounce.
+    beta_expired: bool = False
+    # The day-4 gate: hold the user on /exit-survey until answered. Independent
+    # of beta_expired; both can be true at once.
+    needs_exit_survey: bool = False
+
+
+class LoginOut(BetaWindowOut):
     token: str
     user_id: int
     username: str
+    # True when this account has no SignupSurvey row yet. The frontend holds the
+    # user on /welcome until it flips false; it is the whole survey gate. Legacy
+    # password accounts predate the survey and are never asked (see the router).
+    needs_survey: bool = False
+    # Present for Google accounts, "" for hand-assigned beta credentials.
+    email: str = ""
+    display_name: str = ""
+    # True the very first time an account signs in, so the frontend can route a
+    # brand-new user to the survey instead of to the app shell.
+    is_new: bool = False
 
 
-class MeOut(BaseModel):
+class GoogleAuthIn(BaseModel):
+    """The `credential` field of the Google Identity Services callback -- a
+    signed JWT ID token, verified server-side (services/auth.py)."""
+
+    credential: str
+
+
+class AppleAuthIn(BaseModel):
+    """`authorization.id_token` from the AppleID.js sign-in response -- a signed
+    JWT, verified server-side against Apple's JWKS (services/auth.py).
+
+    `name` is carried separately and is NOT part of the token: Apple returns the
+    user's name exactly once, in the authorization response on the very first
+    sign-up, and never again. It is display-only and never trusted for identity
+    -- an account is found by the token's verified `sub` and nothing else, so a
+    forged name changes only what the header prints for that person."""
+
+    credential: str
+    name: str = ""
+
+
+class EmailAuthIn(BaseModel):
+    """Registration and sign-in both. One shape because the fields are the same
+    and the endpoints differ only in what they do with an existing account."""
+
+    email: str
+    password: str
+
+
+class MeOut(BetaWindowOut):
     user_id: int
     username: str
+    needs_survey: bool = False
+    email: str = ""
+    display_name: str = ""
+
+
+class SurveyIn(BaseModel):
+    priority: str
+    used_ai_tool: bool
+
+
+class SurveyOut(BaseModel):
+    priority: str
+    used_ai_tool: bool
+    created_at: Optional[datetime] = None
+
+
+# ── Wrap-up survey (asked from EXIT_SURVEY_AFTER_DAYS onwards) ───────────────
+class ExitSurveyIn(BaseModel):
+    """The three wrap-up questions.
+
+    `change` is OPTIONAL and the other two are not. A required free-text box on
+    a blocking page is where people either bail or type "n/a", and an answer
+    nobody means looks like signal in the admin readout -- the same reasoning
+    that put a first-class "None of these" on the sign-up survey. The two
+    structured questions each carry their own "none"/neutral option instead, so
+    "required" never means "pick something untrue"."""
+
+    change: str = ""
+    useful_features: list[str] = []
+    speed_tradeoff: str
+
+
+class ExitSurveyOut(BaseModel):
+    answered: bool = False
+    change: str = ""
+    useful_features: list[str] = []
+    speed_tradeoff: str = ""
+    created_at: Optional[datetime] = None
+
+
+# ── In-product feedback prompts ─────────────────────────────────────────────
+class FeedbackIn(BaseModel):
+    question_id: str
+    answer: str
+    profile_id: Optional[int] = None
+    # The SearchRun this answer is about. Null for the setup prompt, which fires
+    # at CV-parse time when no run exists yet.
+    run_id: Optional[int] = None
+
+
+class FeedbackPromptOut(BaseModel):
+    due: bool = False
+    run_id: Optional[int] = None
+
+
+class FeedbackDueOut(BaseModel):
+    """Which in-product prompts this profile should currently show.
+
+    Computed server-side rather than in the client so the trigger rules live in
+    one place and a user who answered on their laptop is not asked again on
+    their phone -- localStorage cannot know what was already recorded."""
+
+    results_quality: FeedbackPromptOut = FeedbackPromptOut()
+    setup_ok: FeedbackPromptOut = FeedbackPromptOut()
 
 
 # ── Profiles ────────────────────────────────────────────────────────────────
@@ -191,15 +316,36 @@ class RoleOut(ORMModel):
     posted_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
     posted_at_approx: Optional[bool] = None
+    # "high" | "medium" | None, plus the named rules behind it. None is the
+    # common case and means NOTHING FIRED, not "unknown" -- every ghost rule
+    # fires on positive evidence and none fires on missing data (services/ghost.py).
+    # ghost_signals is stored as a JSON string and decoded here so the card gets
+    # a real list.
+    ghost_level: Optional[str] = None
+    ghost_signals: Optional[list[str]] = None
     status: str
     application_status: Optional[str] = None
     applied_at: Optional[datetime] = None
+    # When the employer first responded, or the user declared no response.
+    # Stamped once on the first non-pending transition, never overwritten.
+    response_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
+    @field_validator("ghost_signals", mode="before")
+    @classmethod
+    def _decode_ghost_signals(cls, v):
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+            except (TypeError, ValueError):
+                return None
+            return parsed if isinstance(parsed, list) else None
+        return v
+
 
 class ApplicationStatusIn(BaseModel):
-    application_status: str  # pending|interview|rejected
+    application_status: str  # pending|interview|offer|rejected|no_response
 
 
 # ── Search ──────────────────────────────────────────────────────────────────
