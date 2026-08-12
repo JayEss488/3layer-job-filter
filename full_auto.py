@@ -22,7 +22,7 @@ import sqlite3
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from typing import Optional, List, Dict
 import numpy as np
@@ -268,19 +268,57 @@ MAX_CONCURRENT      = 5       # Max general simultaneous crawl requests
 # never renders burns the whole thing -- so it's kept below the budget.
 SCRAPE_BUDGET_SECONDS = float(os.getenv("SCRAPE_BUDGET_SECONDS", "80"))
 SCRAPE_PAGE_TIMEOUT_MS = int(os.getenv("SCRAPE_PAGE_TIMEOUT_MS", "20000"))
+# Discovery pool: same "budget it, keep partial results" shape as the scrape budget
+# above, for gather_jobs' outer per-(source,term)/per-ATS-company pool -- a backstop
+# so a single stuck task (network hang, a misbehaving board) can't block the whole
+# discovery phase, however long it runs. See also SMARTRECRUITERS_BUDGET_SECONDS,
+# a tighter budget on the one vendor that has actually caused this.
+DISCOVERY_MAX_WORKERS = int(os.getenv("DISCOVERY_MAX_WORKERS", "12"))
+DISCOVERY_BUDGET_SECONDS = float(os.getenv("DISCOVERY_BUDGET_SECONDS", "100"))
 RELEVANCE_THRESHOLD = 0.35    # Balanced threshold preventing snippet penalty
 TOP_CANDIDATES      = 25      # Pool size handed to the final evaluator
 FINAL_PICKS         = 12      # Max results returned, quality-gated
-FINAL_EVAL_MAX_JOBS_PER_CALL = 20  # cap per single Phase 6 prompt; larger
-                                    # clusters split into concurrent batches
-                                    # instead of one call risking the 90s
-                                    # client read timeout (see client below).
-                                    # Raised from 15 -> 20 (fewer, larger calls
-                                    # for a JUDGE_POOL=40 run); a batch this
-                                    # size eats more into that 90s budget than
-                                    # 15 did, so watch for call_failed/timeout
-                                    # fallbacks in practice if this proves too
-                                    # aggressive.
+# Cap per single Phase 6 prompt; a larger cluster splits into CONCURRENT batches
+# rather than one call risking the client's 90s read timeout (see client below).
+#
+# 15 -> 20 -> 10. It went UP for cost (fewer, larger calls at JUDGE_POOL=40) and
+# has come back down because that trade was being paid in output quality, which
+# nothing was measuring. The judge's per-pick output budget collapsed 1305 -> 491
+# tokens across runs 20-24 as the pool grew to its cap and v26 widened "backup"
+# from 3 to FINAL_PICKS -- and the field the model economised on was the step-D
+# requirements checklist, which the fit_level rubric reads to grade every pick
+# (see FINAL_EVAL_PROMPT_VERSION 28's note, and scripts/audit_judge_checklists.py's
+# tok/pick column). Checklist size tracks that budget monotonically, and
+# tests/judge_harness.py reproduces it causally on one unchanged prompt: 6.33
+# items at 16 jobs/9 picks per call, 5.15 at 20 jobs/13 picks.
+#
+# Halving this is the cheapest of the three available levers and the only one
+# that costs the candidate nothing: it does not reduce how many roles are judged
+# or shown, it just gives each call fewer picks to write up. It is also FASTER,
+# not slower, despite being more calls -- the chunks run concurrently in a
+# ThreadPoolExecutor, so 4 x 10 wall-clock-beats 2 x 20 while also easing the 90s
+# read timeout this constant exists to protect.
+#
+# What it costs: each chunk is judged INDEPENDENTLY (no cross-chunk comparison,
+# see final_evaluation_split), so a smaller chunk gives the model fewer listings
+# to weigh each pick against; and each extra call re-pays the ~12k-token system
+# prefix, which is why that prefix is a byte-identical constant with 24h prompt
+# cache retention (see _FINAL_EVAL_CACHE_KEY) -- the marginal call is mostly
+# cached tokens, not fresh ones. Watch tokens_judge_cached_tokens: if the hit
+# rate falls, this change starts costing real money instead of cache reads.
+# Also note _judge_groups merges thin clusters up to THIS number, so lowering it
+# narrows merging too -- deliberately, since both exist to manage the same
+# per-call budget.
+FINAL_EVAL_MAX_JOBS_PER_CALL = int(os.getenv("FINAL_EVAL_MAX_JOBS_PER_CALL", "10"))
+# Explicit output ceiling for the judge call only (0 = leave the model's default
+# alone). Set generously: this is NOT a way to make the model write more -- a
+# model that stops on "stop" was never near the ceiling, and every measured judge
+# call has (7.4k completion tokens per call at the worst observed load). It is a
+# guard so that a model-default change, or a genuinely large batch, cannot start
+# silently truncating the JSON into a parse failure that disappears down
+# _run_final_eval's fail-open path. Whether it ever BINDS is measured, not
+# assumed: see _record_llm_usage's length_capped / funnel tokens_judge_length_capped.
+FINAL_EVAL_MAX_OUTPUT_TOKENS = int(os.getenv("FINAL_EVAL_MAX_OUTPUT_TOKENS", "32000"))
 # Per-job text budget in the Phase 6 prompt (see _final_eval_job_block). Up to
 # 8000 chars of real scraped text are captured and persisted per job (see
 # scrape_full_details), but the judge prompt used to hard-truncate to 2000 --
@@ -1031,6 +1069,17 @@ def fetch_adzuna(query: str, location: str = "United Kingdom", country_code: str
                 # country endpoint and guessing it wrong is worse than a figure
                 # rendered without a symbol.
                 "salary_period": "year",
+                # Adzuna MODELS a salary for postings that state none (its own docs
+                # call salary_min/max("salary_is_predicted": 1) an estimate, not the
+                # employer's figure). Left uncaptured, that guess renders identically
+                # to a real stated salary -- a live case (Caristo Diagnostics "Data
+                # Operations Analyst") showed as a confident "£54,208 a year" (a single
+                # non-round figure with min==max, the tell of a model output) when the
+                # posting's own text said "Competitive salary" with no number at all.
+                # See engine._role_salary_fields/_filter_by_salary, which must never
+                # treat this as a CONFIRMED figure for a hard drop, and
+                # _listing_salary_suffix, which must label it for the cheap-tier gates.
+                "salary_is_predicted": str(job.get("salary_is_predicted", "0")) == "1",
                 "snippet": job.get("description", ""),
                 "posted_at": _loose_date_to_iso(job.get("created")),
             })
@@ -1928,7 +1977,24 @@ def _listing_age_tag(job: dict, now: datetime | None = None,
 
     if posted_days is not None and posted_days >= 0:
         if definite_over:
-            verdict = "ELIMINATE" if hard else "well past the candidate's stated limit -- strong negative"
+            # Three severities, not two. The Soft case used to render as
+            # "... -- well past the candidate's stated limit -- strong negative",
+            # which said the same thing twice AND matched neither of the two
+            # severities the judge's system prompt describes (STALE / ELIMINATE),
+            # so a listing confirmed past the candidate's own stated maximum was
+            # read as ordinary staleness -- worth "one step down IF the grade is
+            # borderline". These two keywords are what that prompt's third
+            # paragraph keys on, so keep them in sync with it. Deliberately worded
+            # with no day count of their own beyond the stated maximum: the
+            # severity is what the judge reads, the numbers are context.
+            if hard:
+                verdict = "ELIMINATE"
+            elif posted_days >= max_age_days * 2:
+                verdict = ("MORE THAN DOUBLE THE CANDIDATE'S STATED MAXIMUM "
+                           "(a preference, not a hard limit)")
+            else:
+                verdict = ("OVER THE CANDIDATE'S STATED MAXIMUM "
+                           "(a preference, not a hard limit)")
             bits.append(f"posted ~{_humanise_days(posted_days)} ago -- past the candidate's stated "
                         f"{max_age_days}-day maximum listing age -- {verdict}")
         elif approx:
@@ -2040,12 +2106,22 @@ ATS_FEEDS = {
 #   /v1/companies/{token}/postings            -> id, name, location, releasedDate
 #   /v1/companies/{token}/postings/{id}       -> jobAd.sections.{...}.text
 # So unlike every other vendor here, one company costs 1 + N HTTP calls rather
-# than 1. Both caps below exist for that reason: a large board would otherwise
+# than 1. All three caps below exist for that reason: a large board would otherwise
 # fire hundreds of requests from inside a slot of gather_jobs' 12-wide pool,
 # i.e. up to 12 companies' worth of fan-out hitting one host at once.
 SMARTRECRUITERS_MAX_POSTINGS = int(os.getenv("SMARTRECRUITERS_MAX_POSTINGS", "120"))
 SMARTRECRUITERS_DETAIL_WORKERS = int(os.getenv("SMARTRECRUITERS_DETAIL_WORKERS", "4"))
 SMARTRECRUITERS_PAGE_SIZE = 100  # the API's own documented maximum
+# The postings/workers caps above bound how much WORK one company can generate, but
+# not how long that work can take -- every detail call has its own 12s timeout, but
+# nothing bounded the total, and a real run measured one board at 219.5s (of a 254.5s
+# discovery phase) with nothing degraded except this vendor being slow that day. This
+# is a third, wall-clock cap: hit it and _fetch_smartrecruiters returns whatever it has
+# rather than continuing to wait -- same "budget it, log it, keep partial results"
+# shape as SCRAPE_BUDGET_SECONDS. Deliberately tighter than DISCOVERY_BUDGET_SECONDS
+# (the outer gather_jobs backstop) so this fires first, with board-specific logging,
+# for the vendor that's actually caused the problem.
+SMARTRECRUITERS_BUDGET_SECONDS = float(os.getenv("SMARTRECRUITERS_BUDGET_SECONDS", "45"))
 
 # jobAd.sections in SmartRecruiters' own display order. Emitted with their titles
 # for the same reason _lever_text keeps Lever's list headings: the heading is
@@ -2089,10 +2165,23 @@ def _fetch_smartrecruiters(base_url: str, token: str, company: str = "") -> List
     collect RICH_TEXT_SELECTION_BONUS, and reach the expensive judge on its job
     title alone. That is exactly the inversion documented for un-enriched Adzuna
     rows, and there is no reason to reintroduce it on a new source.
+
+    Bounded overall by SMARTRECRUITERS_BUDGET_SECONDS on top of the existing
+    postings/workers caps: those bound how much WORK one company can generate,
+    this bounds how long it's allowed to take. A posting whose detail fetch
+    doesn't finish within budget is dropped exactly like one that answered with
+    no text -- see the two separate log lines below, kept distinct because they
+    mean different things (a vendor data-quality gap vs. a latency cutoff).
     """
+    deadline = time.monotonic() + SMARTRECRUITERS_BUDGET_SECONDS
     postings: List[Dict] = []
     offset = 0
     while len(postings) < SMARTRECRUITERS_MAX_POSTINGS:
+        if time.monotonic() >= deadline:
+            emit(f"   [!] ATS smartrecruiters/{token}: budget "
+                 f"({SMARTRECRUITERS_BUDGET_SECONDS:.0f}s) hit during listing "
+                 f"pagination -- proceeding with {len(postings)} posting(s) found so far")
+            break
         try:
             r = requests.get(base_url, timeout=12,
                              params={"limit": SMARTRECRUITERS_PAGE_SIZE, "offset": offset})
@@ -2140,13 +2229,35 @@ def _fetch_smartrecruiters(base_url: str, token: str, company: str = "") -> List
                 "updated_at": released,
                 "posted_at": released}
 
-    with ThreadPoolExecutor(max_workers=max(1, SMARTRECRUITERS_DETAIL_WORKERS)) as ex:
-        results = list(ex.map(_detail, postings))
-    out = [r for r in results if r]
-    dropped = len(postings) - len(out)
-    if dropped:
-        emit(f"   [!] ATS smartrecruiters/{token}: {dropped}/{len(postings)} posting(s) "
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        emit(f"   [!] ATS smartrecruiters/{token}: 0/{len(postings)} posting(s) fetched "
+             f"(budget exhausted before detail fetch could start)")
+        return []
+
+    # submit()+wait(timeout=) rather than ex.map(): map's own `timeout` only bounds
+    # result RETRIEVAL, not execution, and list()-ing it forces full evaluation
+    # regardless -- it cannot actually be cut off at a deadline the way this needs.
+    ex = ThreadPoolExecutor(max_workers=max(1, SMARTRECRUITERS_DETAIL_WORKERS))
+    try:
+        futs = [ex.submit(_detail, p) for p in postings]
+        done, not_done = wait(futs, timeout=remaining)
+        out = [r for r in (f.result() for f in done) if r]
+    finally:
+        # Anything still queued is dropped immediately; anything already mid-flight
+        # keeps running (bounded by its own 12s timeout) with nothing left waiting
+        # on it -- not a leak, since a fresh executor is created per call.
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    text_dropped = len(done) - len(out)
+    if text_dropped:
+        emit(f"   [!] ATS smartrecruiters/{token}: {text_dropped}/{len(done)} posting(s) "
              f"dropped (no description returned by the detail endpoint)")
+    if not_done:
+        emit(f"   [!] ATS smartrecruiters/{token}: budget "
+             f"({SMARTRECRUITERS_BUDGET_SECONDS:.0f}s) hit with {len(not_done)}/"
+             f"{len(postings)} detail fetch(es) still in flight -- returning "
+             f"{len(out)} posting(s) fetched in time")
     return out
 
 
@@ -2761,12 +2872,30 @@ def gather_jobs(profile: Dict) -> List[Dict]:
         return kind, vendor, (fetch_ats(vendor, token, company) or []), \
             time.monotonic() - started
 
+    def _task_label(t: tuple) -> str:
+        """Human-readable name for a discovery task, for the straggler log line."""
+        kind, payload = t
+        if kind == "src":
+            return payload.name
+        if kind == "term":
+            src, term = payload
+            return f"{src.name} ('{term}')"
+        vendor, token, _company = payload
+        return f"ats:{vendor}/{token}"
+
     all_jobs: List[Dict] = []
     term_counts: Counter = Counter()
     ats_counts: Counter = Counter()
     slowest: Dict[str, float] = {}
-    with ThreadPoolExecutor(max_workers=12) as ex:
-        for fut in as_completed([ex.submit(run_task, t) for t in tasks]):
+    # Managed manually rather than `with ThreadPoolExecutor(...) as ex:` -- that
+    # context manager's __exit__ calls shutdown(wait=True), which would block on
+    # any straggler anyway and undo the point of the deadline below.
+    ex = ThreadPoolExecutor(max_workers=DISCOVERY_MAX_WORKERS)
+    try:
+        fut_to_task = {ex.submit(run_task, t): t for t in tasks}
+        done, not_done = wait(list(fut_to_task), timeout=DISCOVERY_BUDGET_SECONDS)
+
+        for fut in done:
             try:
                 kind, name, result, elapsed = fut.result()
                 all_jobs.extend(result)
@@ -2778,6 +2907,25 @@ def gather_jobs(profile: Dict) -> List[Dict]:
                     term_counts[name] += len(result)
             except Exception as e:
                 emit(f"   [!] discovery task failed: {e}")
+
+        if not_done:
+            # A task this slow has already blown well past what any individual
+            # source's own retry/backoff logic allows for -- this is the backstop
+            # for a task that's hung outright (network stall, a misbehaving board),
+            # not the expected path. See SMARTRECRUITERS_BUDGET_SECONDS for the one
+            # vendor that's actually done this; it has its own tighter budget and
+            # fires first, so a straggler reaching this backstop is rarer still.
+            stragglers = [_task_label(fut_to_task[f]) for f in not_done]
+            shown = stragglers[:10]
+            more = f" (+{len(stragglers) - 10} more)" if len(stragglers) > 10 else ""
+            emit(f"   [!] discovery budget ({DISCOVERY_BUDGET_SECONDS:.0f}s) hit with "
+                 f"{len(not_done)}/{len(tasks)} task(s) still running -- results "
+                 f"discarded for: {shown}{more}")
+    finally:
+        # Queued-but-not-started tasks are cancelled outright; anything already
+        # running keeps going (bounded by its own timeout) with nothing waiting on
+        # its result -- not a leak, a fresh executor is created on every call.
+        ex.shutdown(wait=False, cancel_futures=True)
 
     # Aggregated per-source totals (the per-term lines above are the detail).
     # "slowest term" is the source's latency floor at full parallelism -- the
@@ -3239,10 +3387,19 @@ def llm_usage_snapshot() -> dict[str, dict[str, int]]:
         return {k: dict(v) for k, v in _LLM_USAGE.items()}
 
 
-def _record_llm_usage(stage: str, model: str, usage) -> None:
+def _record_llm_usage(stage: str, model: str, usage, finish_reason: str = "") -> None:
     """Accumulate one call's token usage under `stage`. Tolerates a missing or
     partial `usage` object (some error paths and non-OpenAI-compatible proxies
-    omit it) rather than letting accounting break a real pipeline stage."""
+    omit it) rather than letting accounting break a real pipeline stage.
+
+    `length_capped` counts responses the model did not finish writing -- it ran
+    into an output ceiling instead of stopping on its own. That number is the
+    only thing that distinguishes "the model chose to write less" from "we cut
+    it off", and the judge's shrinking requirements checklist is exactly the
+    symptom that could be either (see FINAL_EVAL_MAX_OUTPUT_TOKENS). It is
+    recorded for EVERY stage, not just the judge, since a truncated JSON reply
+    parses as a failure and disappears down a fail-open path anywhere it
+    happens."""
     if not stage or usage is None:
         return
     try:
@@ -3254,12 +3411,14 @@ def _record_llm_usage(stage: str, model: str, usage) -> None:
         return
     with _LLM_USAGE_LOCK:
         row = _LLM_USAGE.setdefault(
-            stage, {"calls": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+            stage, {"calls": 0, "prompt_tokens": 0, "cached_tokens": 0,
+                    "completion_tokens": 0, "length_capped": 0}
         )
         row["calls"] += 1
         row["prompt_tokens"] += prompt_tokens
         row["cached_tokens"] += cached
         row["completion_tokens"] += completion
+        row["length_capped"] += 1 if finish_reason == "length" else 0
         row["model"] = model
 
 
@@ -3282,7 +3441,8 @@ def emit_llm_usage_summary() -> dict[str, dict[str, int]]:
 
 def llm(prompt: str, system: str = "", model: str = CHEAP_MODEL,
         require_json: bool = False, temperature: float = 0.2,
-        stage: str = "", cache_key: str = "", cache_retention: str = "") -> str:
+        stage: str = "", cache_key: str = "", cache_retention: str = "",
+        max_output_tokens: int = 0) -> str:
     """`cache_key` is OpenAI's `prompt_cache_key` -- a ROUTING hint only. Requests
     sharing one are steered to the same cache, which is what this pipeline needs:
     it fires its calls concurrently (4-wide gate batches, all clusters at once,
@@ -3293,7 +3453,17 @@ def llm(prompt: str, system: str = "", model: str = CHEAP_MODEL,
 
     `cache_retention="24h"` extends a prefix's lifetime past the default few
     minutes of inactivity. Worth it only for a prefix that is identical across
-    RUNS, not merely within one -- see the judge call site."""
+    RUNS, not merely within one -- see the judge call site.
+
+    `max_output_tokens` (0 = leave the model's own default alone) sets
+    `max_completion_tokens`. Only the judge passes one -- see
+    FINAL_EVAL_MAX_OUTPUT_TOKENS. Whether it is BINDING is recorded rather than
+    assumed: `_record_llm_usage` counts responses that stopped on "length"
+    instead of "stop", surfaced per stage as `tokens_{stage}_length_capped`. A
+    truncated JSON response would fail to parse and fall through the caller's
+    fail-open path, so a rising count there is the difference between "the model
+    chose to write less" and "we cut it off" -- two diagnoses needing opposite
+    fixes, and previously indistinguishable."""
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
@@ -3306,10 +3476,14 @@ def llm(prompt: str, system: str = "", model: str = CHEAP_MODEL,
         args["prompt_cache_key"] = cache_key
     if cache_retention:
         args["prompt_cache_retention"] = cache_retention
+    if max_output_tokens:
+        args["max_completion_tokens"] = max_output_tokens
 
     resp = client.chat.completions.create(**args)
-    _record_llm_usage(stage, model, getattr(resp, "usage", None))
-    return resp.choices[0].message.content.strip()
+    choice = resp.choices[0]
+    _record_llm_usage(stage, model, getattr(resp, "usage", None),
+                      getattr(choice, "finish_reason", "") or "")
+    return choice.message.content.strip()
 
 
 def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
@@ -4498,7 +4672,15 @@ def _listing_salary_suffix(c: dict) -> str:
     salary was persisted on JobSeen -- the pipeline's candidates come from the
     store (engine._rows_to_dicts), which carried no salary columns, so this
     suffix only ever fired on the freshly-discovered dicts that never reach a
-    gate. Populating it is a change in what the cheap tiers can see."""
+    gate. Populating it is a change in what the cheap tiers can see.
+
+    Adzuna MODELS a figure for postings that state no salary at all
+    (salary_is_predicted) -- see the fetch_adzuna comment. That is not a stated
+    bar, so it is labelled "(estimated by the job board, not employer-stated)"
+    rather than presented as a fact: HARD DOWNGRADE (e)/the salary axis both
+    require CLEAR stated evidence before downgrading, and an explicitly-hedged
+    figure reads as exactly the kind of ambiguity that rule is told never to
+    fire on."""
     salary_min, salary_max = c.get("salary_min"), c.get("salary_max")
     if not salary_min and not salary_max:
         return ""
@@ -4507,7 +4689,8 @@ def _listing_salary_suffix(c: dict) -> str:
     figure = (f"{salary_min}-{salary_max}" if salary_min and salary_max
               else f"{salary_min or salary_max}")
     parts = [p for p in (currency, figure, period) if p]
-    return f" | Salary: {' '.join(parts)}"
+    estimated = " (estimated by the job board, not employer-stated)" if c.get("salary_is_predicted") else ""
+    return f" | Salary: {' '.join(parts)}{estimated}"
 
 
 def _location_scope_note(profile: dict) -> str:
@@ -4638,9 +4821,12 @@ never raises it. If none of these fire, set "soft_violation": false.
 {soft_pref_rules}"""
         if soft_pref_rules else ""
     )
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
     return f"""You are estimating how well each job listing fits ONE candidate, as a rough numeric score.
 This score gates which listings proceed to detailed review -- a wrong score buries a job silently, so
 when genuinely unsure between two scores, prefer the higher one.
+
+Today's date: {today_str}
 
 Candidate target roles: {_annotate_with_weight_tiers(profile.get('search_terms') or [], profile.get('target_role_weight_tiers'))}{intent_block}
 Candidate seniority: {profile.get('seniority', 'mid-level')}
@@ -4696,7 +4882,13 @@ b. REQUIRED CREDENTIAL OR TOOL: the listing names a specific certification, qual
    evidences it or plainly covers it.
 c. CLOSED LISTING: the text says the vacancy is closed -- e.g. "the application deadline has now
    passed", "no longer accepting applications" -- or its "[listing age: ...]" tag says the stated
-   closing date has PASSED.
+   closing date has PASSED. ALSO fires when the listing states an explicit application deadline/
+   closing date (e.g. "Apply by 9 August 2026", "Closing date: 09/08/26") and that date is BEFORE
+   today's date given above -- a listing routinely keeps its original forward-looking "apply by"
+   wording verbatim after the date has quietly passed, so do not require backward-looking phrasing
+   or the age tag for this half: work out the date yourself from what the listing states and compare
+   it to today. A deadline that is today or in the future, vague ("rolling", "ongoing"), or not
+   stated at all never fires this.
 d. LOCATION / WORK ARRANGEMENT: first classify the LISTING's own arrangement -- explicit remote/
    distributed/work-from-home wording means remote; explicit hybrid wording means hybrid; a stated
    city/office with no remote/hybrid mention means ON-SITE there (never remote-by-default). What
@@ -4853,7 +5045,7 @@ def _score_rank_batch(
     # down from rank_gate: it's one small sha1 against several thousand tokens of
     # prompt, and keeping it local means the two concurrent batch workers can't
     # disagree about it.
-    rank_cache_key = (f"rank_v16:{_profile_signature_v2(profile)}:"
+    rank_cache_key = (f"rank_v17:{_profile_signature_v2(profile)}:"
                       + hashlib.sha1((profile.get("intent_text") or "")
                                      .strip().lower().encode()).hexdigest()[:8]
                       + f":{_rank_age_cache_tag(profile)}")
@@ -4953,8 +5145,25 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     phrase, "" if none) in place and returns the full list unfiltered -- the
     caller applies its own cutoff (e.g. drop the bottom fraction, cap at N).
     Cached per (profile signature + intent hash + max-listing-age tag, job id) in
-    gate_cache under gate="rank_v16.{intent_tag}.{age_tag}"
-    bumped from "rank_v15": the two SOFT-preference downgrades (STATED ARRANGEMENT
+    gate_cache under gate="rank_v17.{intent_tag}.{age_tag}"
+    bumped from "rank_v16": the prompt now states TODAY'S DATE and HARD DOWNGRADE (c)
+    CLOSED LISTING fires on a stated application deadline that has already passed,
+    even when the listing's own wording is still forward-looking ("Apply by 9 August
+    2026") rather than an explicit closure notice. Before this, a passed deadline was
+    only ever caught via the "[listing age: ...]" tag, which only exists when the
+    SOURCE'S structured expires_at field was populated -- most sources never supply
+    one (JSearch/organic-board listings routinely come back with expires_at=None even
+    though the JD text states a real date), so a JD stating a lapsed "Apply by" date
+    verbatim was unreachable by any check in this pipeline: a live case (Met Office
+    "Junior Software Developer" via jsearch, deadline 09/08/2026, judged after that
+    date) reached "strong fit" with the model correctly extracting "deadline":
+    "09/08/2026" for display and never once comparing it to the current date because
+    nothing told it what date it was. The model must now read the date itself out of
+    the listing text and compare it, so this can misfire on an ambiguous date format
+    (day/month order) the same way any date reasoning can -- acceptable, since the
+    prior failure mode was a silent miss on every source lacking structured expiry,
+    not an occasional false positive. "rank_v16" was bumped from "rank_v15": the two
+    SOFT-preference downgrades (STATED ARRANGEMENT
     and SALARY) no longer cap the score at 15 when the candidate left them Soft.
     They now live in their own SOFT-PREFERENCE MISMATCHES section which sets a
     "soft_violation" flag instead, and only the Hard-enforced ones stay in HARD
@@ -5079,7 +5288,7 @@ def rank_gate(candidates: list[dict], profile: dict) -> list[dict]:
     # intent does -- see _rank_age_cache_tag -- so editing it re-scores without
     # re-running screen_gate, which never sees this preference at all.
     age_tag = _rank_age_cache_tag(profile)
-    keys = [_gate_cache_key(f"rank_v16.{intent_tag}.{age_tag}", sig, _gate_job_id(c)) for c in candidates]
+    keys = [_gate_cache_key(f"rank_v17.{intent_tag}.{age_tag}", sig, _gate_job_id(c)) for c in candidates]
     cached = _gate_cache_lookup(keys)
 
     to_judge: list[tuple[dict, str]] = []
@@ -5221,7 +5430,24 @@ _EXPIRED_LISTING_RE = re.compile(
     r"(?:vacancy|position|role) has (?:already )?been filled|"
     r"job (?:posting|listing|advert) has expired|"
     r"(?:this )?posting has been removed|"
-    r"sorry,? this job is no longer (?:available|live)",
+    r"sorry,? this job is no longer (?:available|live)|"
+    # Both measured on the nijobs.com page an Adzuna tracking redirect resolved
+    # to, whose whole visible content was "This listing went offline. Sorry, the
+    # listing that you're looking for is expired." Neither clause matched: the
+    # "has/have expired" branch above wants the auxiliary verb ("this listing
+    # HAS expired"), and nothing covered "went offline" at all. Boards routinely
+    # write the copular form, so this was a general gap that happened to surface
+    # on Adzuna. The <=40-char no-sentence-break bridge is the same bounded
+    # device the "is no longer available" branch above already uses, for the
+    # same reason -- here it spans "that you're looking for".
+    r"this (?:vacancy|job|role|position|posting|listing|advert(?:isement)?) went offline|"
+    # (?![\w-]) so "is expired" cannot match inside a longer hyphenated token --
+    # "the role is expired-air-handling maintenance" is a real (if contrived)
+    # sentence shape and matched before the guard. Cheap insurance: this branch
+    # ends in a word that routinely prefixes compounds, and dead_reason cannot
+    # be undone.
+    r"the (?:vacancy|job|role|position|posting|listing)(?:[^.\n]{0,40})? "
+        r"is (?:expired|no longer available)(?![\w-])",
     re.I,
 )
 
@@ -5865,6 +6091,89 @@ async def expand_category_pages(
 # engine.py folds this into eval_sig so a prompt edit re-opens every already-persisted
 # verdict on the next run instead of serving it stale forever. Same fix as rank_gate's
 # "rank_v2" cache-key bump when its model/prompt changed.
+# 28 also adds a THIRD listing-age severity to the WHAT THE BRACKETED HINTS ARE
+# paragraph. The tag had two (STALE = open for months, downgrade-only; ELIMINATE
+# = past a HARD maximum listing age, DISQUALIFIER 8), and a SOFT maximum matched
+# neither -- so a listing confirmed past the number the candidate themselves set
+# was read as ordinary staleness, i.e. "one step down IF the grade is borderline".
+# Measured on a live 7-day Soft profile: 18 of 36 shown roles were over it and 9
+# past DOUBLE it, at ranks 1-12 (a 22-day listing at rank 1, a 28-day at rank 5).
+# The engine-side _selection_score demotion added alongside this (see
+# engine.STALE_SELECTION_PENALTY) only reorders the judge POOL -- a role well
+# above the floor still reaches the judge, which then had no rule telling it to
+# care -- so the grade itself had to take the hit. Expressed through the EXISTING
+# mechanical rubric rather than as a parallel adjustment: over the stated maximum
+# counts as ONE concern touching a core requirement, more than double counts as
+# TWO (capping the role at "ok"). Never excludes, and explicitly never a reason to
+# move a role out of "backup". Folded into 28 rather than taking a 29 because 28
+# has not been run in production, so this costs no extra store-wide re-judge.
+# 28 (from 27): the step-D checklist rework. The checklist is the INPUT the
+# fit_level rubric and "concerns" are both derived from, so anything missing from
+# it is silently invisible downstream -- and it had been shrinking, run over run,
+# while the postings got LONGER:
+#     run 20  22 judged, 0 backup, text median 2926 -> checklist mean 6.00 items
+#     run 21  14 judged, 2 backup, text median 3232 -> 4.33
+#     run 22  31 judged, 18 backup, text median 2578 -> 4.33
+#     run 23  40 judged, 12 backup, text median 4919 -> 3.75
+#     run 24  40 judged, 20 backup, text median 4114 -> 3.67
+# Across 160 persisted checklists the median is 4 items / 3 core, only 20 of them
+# reach this prompt's own stated "4-10 core, 2-6 secondary", 46 carry NO secondary
+# item at all, and size barely tracks the posting's length (pearson r = 0.25;
+# a 6k-char JD gets a median of 5 items against a sub-1k JD's 3). Re-measure with
+# scripts/audit_judge_checklists.py.
+# The cause is OUTPUT PRESSURE, not a wrong rule, and tests/judge_harness.py
+# reproduces it causally: the unmodified v27 prompt, same profile, same model,
+# scores 6.33 checklist items at 16 jobs/9 picks per call and 5.15 at 20 jobs/13
+# picks. judge_pool_size went 22 -> 40 (the cap) over those runs and v26 widened
+# "backup" from 3 to FINAL_PICKS, roughly doubling the number of full card outputs
+# one call has to produce, while judge completion tokens rose only sub-linearly
+# (415 -> 368 per job). Faced with that, the model economised on the one field
+# v27 opened by calling "internal reasoning only -- not shown to the candidate":
+# the checklist. It is the worst possible field to cut, because the rubric reads
+# "core" items ONLY -- a short checklist yields an INFLATED grade, not a cautious
+# one. Live examples: a 4,979-char JD naming Node.js/TypeScript, Ruby/Rails, Nuxt,
+# AWS CDK and Salesforce produced a ONE-item checklist ("Full stack / software
+# engineering", met) graded "strong" with zero concerns.
+# Five changes, all in step D and the rubric, and every one of them makes a v27
+# checklist non-comparable rather than merely differently-worded:
+#   * The "internal reasoning only" framing is GONE, replaced by what the field
+#     actually is: the input the grade and concerns are computed from, so dropping
+#     an item does not simplify the answer but silently changes it toward
+#     flattering the role. Prose is now named explicitly as what to shorten first
+#     when a response runs long.
+#   * New rule ONE ITEM PER ASK -- NEVER A HEADING THAT SWALLOWS SEVERAL, with the
+#     "could a competent person in this field plausibly FAIL this item?" test. The
+#     existing specificity rule did not catch the Bionic case: "Full stack /
+#     software engineering" is not a CAPACITY ("ability to ...") and reads as a
+#     legitimate skill name, so it slipped past a rule aimed at "ability to learn".
+#   * New rule THE POSTING'S OWN HEADING DECIDES core. A live pick tagged the two
+#     asks under "Must have hands on experience with SQL, and data visualisation
+#     tools" as SECONDARY while promoting two Key-Responsibilities duties to core
+#     -- which, since the rubric reads core only, made the posting's own stated
+#     bar unable to affect the grade at all.
+#   * The "[key requirements]" anchoring paragraph gained THE HINT IS A FLOOR, NOT
+#     A CEILING. The hint pass reads the truncated OPENING (the blurb); the
+#     requirements section sits further down in text only the judge can see, so a
+#     checklist matching the hint and adding nothing is the symptom of skipping
+#     the ADD step. Names the two things measured as most often lost: a named
+#     platform/tool the role runs on, and a stated years-of-experience bar.
+#   * The fit_level rubric now states the dependency in the direction that
+#     matters: reading core items only means an under-tiered checklist inflates
+#     the grade rather than making it cautious.
+# 27 (from 26): new DISQUALIFIER 9, PASSED APPLICATION DEADLINE. The per-call user
+# message (never _FINAL_EVAL_SYSTEM -- that string must stay byte-identical across
+# calls, see _FINAL_EVAL_CACHE_KEY) now opens with "Today's date: YYYY-MM-DD", and rule
+# 9 excludes a role whose listing states an explicit deadline before that date, even
+# when the listing's own wording is still forward-looking ("Apply by 9 August 2026")
+# rather than an explicit closure notice -- a listing keeping its original wording
+# after the date quietly passes is the normal case, not evidence it's still open. Before
+# this the judge had no notion of the current date at all, so it could extract a
+# "deadline" fact for display (the schema already asked for one) without ever being
+# able to notice the date had passed: a live case (Met Office "Junior Software
+# Developer" via jsearch, no structured expires_at from the source, JD stating "Apply
+# by 09/08/2026") was graded "strong fit" and shown after that date, with "deadline":
+# "09/08/2026" sitting right there in the model's own output. A v26 verdict was reached
+# by a model with no access to the current date and cannot be reused.
 # 26 (from 25): the leniency/output rework. Four changes, all of which make a v25
 # verdict non-comparable rather than merely differently-worded:
 #   * "backup" stopped being a 3-item last-resort list of "least-bad survivors" and
@@ -5930,7 +6239,7 @@ async def expand_category_pages(
 # through for every candidate, whatever they had stated -- and NO LOCATION COMMENTARY
 # forbade even mentioning it in "concerns", so the judge could neither reject nor flag
 # it. A v20 verdict was reached under a rule that could not fail a remote role.
-FINAL_EVAL_PROMPT_VERSION = 26
+FINAL_EVAL_PROMPT_VERSION = 28
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -6128,7 +6437,18 @@ _FINAL_EVAL_DISQUALIFIERS = """1. SENIORITY/EXPERIENCE: Check whether the job st
    notice, a specific month/date long past) that itself works out to more than that many days ago. Silence,
    a vague sense that a posting "feels old", or a closing/deadline date alone (a different concern - see the
    age-tag guidance above) never trigger this rule on their own. If the profile states no maximum listing
-   age at all, or the tag/text gives you nothing definite to go on, this rule does not apply."""
+   age at all, or the tag/text gives you nothing definite to go on, this rule does not apply.
+
+9. PASSED APPLICATION DEADLINE: The candidate's own message below states TODAY'S DATE. If the listing's
+   text states an explicit application deadline or closing date (e.g. "Apply by 9 August 2026", "Closing
+   date: 09/08/26", "applications close Friday 7 August") and that date is BEFORE today's date, exclude the
+   role - the vacancy is no longer open to applications. This fires from the date alone: the listing keeping
+   its original forward-looking wording ("Apply by ...") after the date has quietly passed is the NORMAL
+   case, not evidence the listing is still open, so do not require backward-looking closure language
+   ("no longer accepting applications") for this rule - that phrasing is covered separately above. Work out
+   the calendar date the listing states and compare it to today yourself. Never fire this from a vague or
+   relative deadline ("rolling basis", "ongoing", "apply soon"), from silence, or from a deadline that is
+   today or still in the future."""
 
 _FINAL_EVAL_WORDING = """WORDING -- WHOSE SIDE A SHORTFALL IS STATED FROM. In "can_do_fit", "concerns" and "not_selected"
 reasons, describe a gap as something the POSTING asks for or prefers, never as a deficiency in the
@@ -6254,8 +6574,14 @@ C. List the notable gaps in "concerns", ONE item per gap (a missing requirement,
    "no evidence of X" for an X the employer has said it will teach reads to the candidate as a rejection
    on a requirement that was never asked of them, and it is the fastest way to talk a viable application
    out of an honest fit.
-D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the candidate, used purely to
-   keep this judgment disciplined): list the JD's individually-judgeable requirements (both explicitly
+D. Build a REQUIREMENTS CHECKLIST. This list is not shown to the candidate, but it is NOT optional
+   working-out and it is never the field to economise on: "fit_level" and "concerns" are both derived
+   MECHANICALLY from it (see the rubric in the schema), so an ask you leave off the checklist cannot
+   become a concern and cannot move the grade, however plainly the posting states it. Dropping an item
+   does not simplify your answer -- it silently changes it, always in the direction of flattering the
+   role. When you are judging many postings at once and the response is getting long, shorten "summary",
+   "highlight" and your other prose FIRST; the checklist is the one thing every other field depends on.
+   List the JD's individually-judgeable requirements (both explicitly
    stated and clearly implied), each tagged "core" (the requirements identified as genuinely mandatory in
    axis A -- the JD's "required" asks, or anything that would independently sink the application if
    entirely absent) or "secondary" (axis A's nice-to-have/preferred asks -- matters, but not independently
@@ -6276,11 +6602,39 @@ D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the c
    abstraction the candidate happens to satisfy. This is the single most common way this judgment goes
    wrong: the checklist gets drafted AFTER an impression has already formed, pitched at whatever level
    makes every item "met", and then reports a clean sheet for a role the candidate plainly could not do.
-   Three rules that prevent it:
+   The rules that prevent it:
+   - THE SHAPE TEST, applied to each item as you write it: could a competent person in this field,
+     looking at this posting, plausibly FAIL this item? An item nobody could fail always comes back
+     "met", the rubric counts it toward "every core requirement met", and it therefore INFLATES the
+     grade -- padding a checklist and under-filling one do the same damage by opposite routes. This is
+     a test of an item's SHAPE, not a licence to shorten the list: an unfailable item is nearly always
+     one of exactly two things, and the fix is to REPLACE it, not to delete it and move on. If it is a
+     HEADING over several asks, list the individual asks underneath it instead. If it is a CAPACITY OR
+     AN ATTITUDE, look for the concrete ask the posting states nearby and list that. Both shapes are
+     covered separately below. A checklist that gets SHORTER when you apply this test has been pruned
+     rather than corrected -- go back and find what the unfailable item was standing in for.
+   - ONE ITEM PER ASK -- NEVER A HEADING THAT SWALLOWS SEVERAL. If the posting names Node.js/TypeScript,
+     Ruby/Rails, Nuxt and AWS CDK, that is four items, not one "full stack / software engineering". An
+     item that restates the role's whole field, or effectively repeats the job title, is unfailable for
+     anyone in that field and hides exactly the differences that decide the application -- a Python/
+     FastAPI candidate and a Ruby/Rails one both "meet" it. This is the same error as the widening rule
+     below, but it is easier to miss, because such an item does not read as vague: it reads as a
+     perfectly respectable skill name. The test is whether a competent person in this field could
+     plausibly FAIL the item. If not, it is a heading, and the individual asks underneath it are the
+     requirements.
    - NOT A CAPACITY OR AN ATTITUDE. "Ability to learn X", "willingness to train", "interest in Y",
      "graduate-level technical foundation", "analytical problem-solving", "eagerness" and the like are
      not judgeable requirements, because no candidate can fail them -- never write one as a checklist
-     item. Where the JD says the person will be TRAINED in X on the job, the judgeable requirement is
+     item. THIS HOLDS EVEN WHEN THE POSTING PRINTS IT UNDER "Requirements" OR "Essential", which most
+     postings do: "strong attention to detail", "excellent communication skills", "a genuine interest in
+     data", "able to work independently and as part of a team", "a proactive mindset" are boilerplate
+     every advert carries and no applicant is ever screened out on. Leave them off entirely -- do not
+     demote them to "secondary", which still puts an unfailable "met" on the list. Dropping one is only
+     half the job: this posting screens on SOMETHING, so replace it with the failable asks in the same
+     text -- the named tools, systems, platforms, deliverables, qualifications and stated experience
+     bars, which is where the real requirements always are. Ending up with a SHORTER checklist than you
+     started is a sign you deleted the boilerplate without going to look for what it was covering.
+     Where the JD says the person will be TRAINED in X on the job, the judgeable requirement is
      still X itself ("met": false when there is no evidence of X); the training on offer is a fit
      argument for step E, not a reason the requirement is met.
    - KEEP THE JD'S OWN SPECIFICITY. If it asks for a Computer Science degree, the item is "Computer
@@ -6294,6 +6648,18 @@ D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the c
      find yourself putting the role's central technical subject in "secondary" while the core list holds
      only general aptitudes, stop: that is the shape of a role the candidate is not actually equipped
      for, and the checklist is being bent to hide it.
+   - THE POSTING'S OWN HEADING DECIDES core, AND IT OUTRANKS YOUR IMPRESSION. An ask printed under
+     "Requirements", "Experience required", "Essential", "What you'll need", or introduced by "must
+     have"/"required", is "core" -- unless the SOFT vocabulary in QUOTE-THEN-CLASSIFY applies to that
+     specific ask, or one of the three cases in the next rule does. A duty lifted from a
+     "Responsibilities"/"Key responsibilities"/"What you'll be doing" list is a description of the work,
+     not a screening bar, and must never be tagged "core" IN PLACE OF an ask the posting explicitly
+     required. Getting this backwards is as damaging as leaving the ask off the checklist altogether and
+     is much harder to see, because the item is right there on the list: the fit_level rubric reads
+     "core" items ONLY, so a required ask filed as "secondary" cannot lower the grade no matter how
+     plainly it is unmet. A posting whose "Experience required" section names SQL and a BI tool, and
+     whose responsibilities mention analysing data, has SQL and the BI tool as core -- not "analysing
+     large datasets" as core with SQL demoted underneath it.
    - NEVER HOLD THE CANDIDATE TO A BAR THE JD ITSELF DOES NOT SET. This is the mirror of the widening
      error above and is just as common: an ask the posting explicitly marks as NOT an entry condition
      gets scored as though it were one. Three cases, all of which make the item "secondary", never
@@ -6323,7 +6689,20 @@ D. Build a REQUIREMENTS CHECKLIST (internal reasoning only -- not shown to the c
    split unless the fuller text you have plainly contradicts it; then ADD whatever further requirements
    that pass could not see (it read a truncated opening, you have the full posting), and only then judge
    "met" for each. Doing it in that order saves you re-deriving the JD side from scratch and keeps the
-   list honest. Where the hint is absent, build the checklist yourself under the same three rules.
+   list honest. Where the hint is absent, build the checklist yourself under the same rules.
+   THE HINT IS A FLOOR, NOT A CEILING, AND THE SECOND HALF IS THE HALF THAT GETS SKIPPED. That pass
+   usually read only the posting's truncated OPENING -- which is the marketing blurb. The requirements
+   section, the named tools and the stated years almost always sit further down, in text ONLY YOU CAN
+   SEE. So a checklist that matches the hint and adds nothing is the expected symptom of skipping the
+   ADD step, not evidence that the posting asked for little. Before you move on from a listing, re-read
+   its requirements/responsibilities section once and check that every distinctly-judgeable ask in it is
+   either on your checklist or consciously excluded under one of the rules above. Two specific things go
+   missing this way and both belong on the list: a named platform, tool, language or dataset the role
+   runs on ("Google Cloud Platform, including BigQuery"), and a stated experience bar ("around 1-2 years
+   of development experience"). A stated years-of-experience bar is never optional to record.
+   This sweep is a search for FAILABLE asks you missed, never a licence to lengthen the list: it does
+   not override the governing test above, and an item added here that no candidate could fail has made
+   the checklist worse, not more complete.
 E. APPLICATION GUIDANCE -- write "filters_on" and "highlight". This is the one part of the output whose
    job is not to explain your verdict but to tell the candidate what to DO with this posting, so write it
    as advice, not as a rationale. Do NOT restate the grade, do NOT argue the role is a good or bad fit,
@@ -6389,7 +6768,7 @@ optional list, using this item shape for "strong"/"backup":
     "can_do_fit": "a direct, second-person qualification verdict -- see reasoning step B.",
     "filters_on": ["2-4 concrete things this employer will screen on that the candidate CAN evidence, in the JD's own words -- see reasoning step E"],
     "highlight": "2-3 second-person sentences naming which of the candidate's own specific projects/tools/results to lead with against those -- see reasoning step E.",
-    "requirements": [{"text": "a JD requirement, short and concrete", "category": "core" | "secondary", "met": true}],
+    "requirements": [{"text": "ONE JD requirement, short and concrete and in the JD's own words -- never a heading covering several, never a capacity anyone would pass; see reasoning step D", "category": "core" | "secondary", "met": true}],
     "strengths": ["1-3 concrete things the candidate DOES bring to this posting, strongest first -- REQUIRED when \\"fit_level\\" is \\"ok\\" or \\"stretch\\", omit otherwise; see reasoning step G"],
     "concerns": ["the notable gaps, one per item, most sink-worthy first, AT MOST 3 -- see reasoning step C; [] if none"],
     "role_salary": "the salary or range THIS posting's own description states, verbatim and short (e.g. \\"GBP 35,000-42,000\\"); null if this posting states none -- even when other salary figures appear elsewhere in the supplied text (a \\"Similar jobs\\" list or salary histogram, see SCOPE OF EACH POSTING'S TEXT)",
@@ -6438,7 +6817,9 @@ the grade and "can_do_fit" already say the candidate clears the bar.
 label on their card, so grade it honestly rather than protectively -- an accurate "ok" costs
 the candidate nothing and a flattering "strong" corrupts the ordering. Derive it mechanically
 from your own step-D checklist and your own "concerns" list, and never grade a role higher than
-those two support. A concern "touches a core requirement" when it names, qualifies, or weakens the
+those two support. Note what that dependency means in practice: this rubric reads "core" items
+ONLY, so a short or under-tiered checklist does not produce a cautious grade, it produces an
+inflated one -- which is why step D is the field to protect when the response is running long. A concern "touches a core requirement" when it names, qualifies, or weakens the
 evidence for one of your "core" items (an evidence-strength caveat on a core skill -- "your
 evidence is portfolio-based, not paid" -- IS such a concern, not a footnote):
 - "very_strong": every core requirement "met": true and NO concern
@@ -6497,6 +6878,19 @@ themselves set in their profile -- that is what DISQUALIFIER 8 (MAX LISTING AGE)
 this ELIMINATE wording (or your own reading of an explicit date/staleness in the text) carries that weight;
 STALE alone never does, and never treat the two as the same thing. A block with NO age tag has an unknown
 posting date: say nothing about its age and never assume it is old.
+There is a THIRD severity, between those two, and it is the one most likely to be under-weighted. A tag
+reading "OVER THE CANDIDATE'S STATED MAXIMUM (a preference, not a hard limit)" means this system has
+CONFIRMED the posting is older than the maximum the candidate set, but they chose to state that as a
+preference rather than a binding limit -- so it is not a disqualifier and the role must still be shown and
+still be judged on its merits. It is, however, much stronger evidence than plain STALE: the candidate named
+a number and this listing is past it. Do not treat it as the "borderline grades only" nudge above. Name it
+in "concerns" in the candidate's own terms ("the posting has been open longer than the maximum age you set")
+and, when you apply the fit_level rubric, count it as ONE concern touching a core requirement -- so a role
+that would otherwise be "very_strong" becomes "strong", and so on down. A tag reading "MORE THAN DOUBLE THE
+CANDIDATE'S STATED MAXIMUM" is the same rule at twice the weight: count it as TWO such concerns, which caps
+the role at "ok" however well it otherwise fits. Neither ever excludes a role, and neither is ever a reason
+to move a role out of "backup" into "not_selected" -- an old posting the candidate can do is still a role
+they may want; it simply must not outrank a fresher equal.
 The age tag may cite TWO different clocks, and only the first is the board's own claim. "posted N days ago"
 is what the board states. "we have been finding this same listing ... for N days" is how long this system
 has been seeing it advertised -- a LOWER bound on its real age, never evidence that it is new. When both
@@ -6719,7 +7113,13 @@ def _run_final_eval(jobs: list[dict], cv_text: str | None,
 
     jobs_block = "\n\n---\n\n".join(
         _final_eval_job_block(i, j, store_age_days, max_age_days, hard) for i, j in enumerate(jobs))
-    prompt = f"""Candidate Background Profile:
+    # Injected per-call, never into _FINAL_EVAL_SYSTEM (that constant must stay
+    # byte-identical across every call for the 24h prompt cache to pay off -- see
+    # _FINAL_EVAL_CACHE_KEY). DISQUALIFIER 9 (PASSED APPLICATION DEADLINE) reads this.
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    prompt = f"""Today's date: {today_str}
+
+Candidate Background Profile:
 {cv_text}
 
 Judge the {len(jobs)} complete job postings below. Return up to {FINAL_PICKS} genuinely strong fits in
@@ -6744,7 +7144,8 @@ Jobs Payload:
     try:
         raw = llm(prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL, require_json=True,
                   temperature=temperature, stage="judge",
-                  cache_key=_FINAL_EVAL_CACHE_KEY, cache_retention="24h")
+                  cache_key=_FINAL_EVAL_CACHE_KEY, cache_retention="24h",
+                  max_output_tokens=FINAL_EVAL_MAX_OUTPUT_TOKENS)
     except Exception as e:
         status = getattr(e, "status_code", None)
         resp = getattr(e, "response", None)
@@ -6776,7 +7177,8 @@ Jobs Payload:
             # calls most likely to miss.
             raw = llm(prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL, require_json=True,
                       temperature=temperature, stage="judge",
-                      cache_key=_FINAL_EVAL_CACHE_KEY, cache_retention="24h")
+                      cache_key=_FINAL_EVAL_CACHE_KEY, cache_retention="24h",
+                      max_output_tokens=FINAL_EVAL_MAX_OUTPUT_TOKENS)
         except Exception as e2:
             emit(f"[phase 6] {EXP_MODEL} retry also failed: {e2}")
             # None,None,None (not [],[],[]) -- a failed call must be distinguishable from a

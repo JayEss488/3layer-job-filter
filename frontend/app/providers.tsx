@@ -15,6 +15,7 @@ import {
   setNeedsSurvey,
 } from "@/lib/auth";
 import { ProfileProvider } from "@/lib/ProfileContext";
+import { VerifyEmailBanner } from "@/components/VerifyEmailBanner";
 
 /**
  * Public routes: rendered without a token and WITHOUT ProfileProvider, so they
@@ -25,8 +26,20 @@ import { ProfileProvider } from "@/lib/ProfileContext";
  * renders both branches itself (see app/page.tsx) rather than being redirected
  * away from here — bouncing an authed user off "/" would mean they could never
  * see their own homepage.
+ *
+ * The three link-landing routes MUST be here. Every one of them is opened from
+ * an email, on whatever device the mail client happens to be on, by someone who
+ * by definition may hold no token — /reset-password most sharply, since the
+ * whole reason that user is there is that they cannot get in. Gating any of
+ * them would bounce the click to "/" and make the emailed link a dead end.
  */
-const PUBLIC_ROUTES = new Set(["/", "/login"]);
+const PUBLIC_ROUTES = new Set([
+  "/",
+  "/login",
+  "/verify-email",
+  "/forgot-password",
+  "/reset-password",
+]);
 
 /** Where a logged-in user who still owes us the sign-up survey is held. */
 const SURVEY_ROUTE = "/welcome";
@@ -145,9 +158,22 @@ function AuthGate({ children }: { children: React.ReactNode }) {
   // pre-profile, and an expired user's profile queries would 403 anyway. Keeping
   // them outside ProfileProvider means neither survey can stall behind — or be
   // blocked by — a profile query.
+  //
+  // They also get no "confirm your email" banner. Both pages exist to ask the
+  // user for one specific thing, and a second ask stacked above it is how both
+  // get ignored — the same reasoning that makes SearchFeedbackBox render the
+  // in-run prompt INSTEAD of its own box rather than beside it.
   if (NO_PROFILE_ROUTES.has(pathname)) return <>{children}</>;
 
-  return <ProfileProvider>{children}</ProfileProvider>;
+  // Above <Nav />, which every app page renders itself. Rendering it here
+  // rather than inside Nav is what makes it one edit instead of nine, and keeps
+  // it out of the two survey routes above.
+  return (
+    <ProfileProvider>
+      <VerifyEmailBanner />
+      {children}
+    </ProfileProvider>
+  );
 }
 
 export function Providers({ children }: { children: React.ReactNode }) {

@@ -72,6 +72,12 @@ class RunTokenStageOut(BaseModel):
     cached_tokens: int = 0
     completion_tokens: int = 0
     cache_hit_ratio: float | None = None   # cached/prompt; None when nothing sent
+    # Calls the model did not finish writing -- it hit an output ceiling instead
+    # of stopping on its own. Normally 0. Non-zero means replies are being
+    # truncated, which for a require_json stage is a parse failure that
+    # disappears down a fail-open path rather than raising, so it would otherwise
+    # look like the model simply produced less.
+    length_capped: int = 0
 
 
 class RunFunnelOut(BaseModel):
@@ -123,10 +129,22 @@ class RunFunnelOut(BaseModel):
     sponsor_filter_raw_before: int = 0
     sponsor_filter_raw_after: int = 0
     sponsor_filter_raw_blank_company: int = 0
+    # Confirmed-below-the-candidate's-sponsorship-salary-floor drops (see
+    # VisaSponsorToggle's minimum-salary picker). Only ever non-zero when the
+    # floor is > 0; a listing with no parseable salary is never counted here.
+    sponsor_filter_below_salary_floor: int = 0
     sponsor_filter_scored_before: int = 0
     sponsor_filter_scored_after: int = 0
     sponsor_filter_scored_blank_company: int = 0
     expired_date_dropped: int = 0        # employer's stated closing date already passed
+    # Candidates DEMOTED (never dropped) for being past a SOFT "Maximum listing
+    # age" -- see engine.STALE_SELECTION_PENALTY. Zero whenever that preference
+    # is Hard, since the row is dropped outright before any LLM call and lands in
+    # the hard-gate counters instead. Reported separately from the drop counters
+    # around it for exactly that reason: this one costs a listing its POSITION,
+    # not its place in the run, and folding it in would read as a rising drop rate.
+    stale_soft_demoted: int = 0
+    stale_soft_demoted_double: int = 0   # subset: past DOUBLE the stated limit
     # Free, LLM-free pool-quality drops applied at pool admission
     # (engine.py::_heuristic_prescreen / _pool_quality_prescreen). Broken out by
     # reason rather than totalled, because a filter that removes candidates
@@ -379,6 +397,7 @@ def get_run_funnel(
             cached_tokens=cached,
             completion_tokens=counts.get(f"tokens_{stage}_completion_tokens", 0),
             cache_hit_ratio=round(cached / prompt_tokens, 4) if prompt_tokens else None,
+            length_capped=counts.get(f"tokens_{stage}_length_capped", 0),
         ))
     return RunFunnelOut(
         run_id=run.id,
@@ -409,11 +428,15 @@ def get_run_funnel(
         sponsor_filter_raw_before=counts.get("sponsor_filter_raw_before", 0),
         sponsor_filter_raw_after=counts.get("sponsor_filter_raw_after", 0),
         sponsor_filter_raw_blank_company=counts.get("sponsor_filter_raw_blank_company", 0),
+        sponsor_filter_below_salary_floor=counts.get(
+            "sponsor_filter_below_salary_floor", 0),
         sponsor_filter_scored_before=counts.get("sponsor_filter_scored_before", 0),
         sponsor_filter_scored_after=counts.get("sponsor_filter_scored_after", 0),
         sponsor_filter_scored_blank_company=counts.get(
             "sponsor_filter_scored_blank_company", 0),
         expired_date_dropped=counts.get("expired_date_dropped", 0),
+        stale_soft_demoted=counts.get("stale_soft_demoted", 0),
+        stale_soft_demoted_double=counts.get("stale_soft_demoted_double", 0),
         heuristic_prescreen_dropped=counts.get("heuristic_prescreen_dropped", 0),
         pool_quality_dropped=counts.get("pool_quality_dropped", 0),
         pool_quality_dropped_foreign_location=counts.get(

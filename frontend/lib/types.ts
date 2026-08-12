@@ -19,6 +19,11 @@ export type AttributeType =
   // Single-value boolean, value "true"; no row at all means off (the default).
   // Inherently hard, so it carries no Hard/Soft — see VisaSponsorToggle.
   | "visa_sponsor_only"
+  // Single-value: minimum annual salary (GBP) to count as sponsorable, as a
+  // string ("41700"); "0" means no floor. Only enforced while visa_sponsor_only
+  // is on. No row at all means the standard-applicant default — see
+  // VisaSponsorToggle and backend/app/config.DEFAULT_VISA_SPONSOR_MIN_SALARY.
+  | "visa_sponsor_min_salary"
   // Single-value boolean, value "true"; no row at all means off (the default).
   // Carries no Hard/Soft because turning it on IS the softening — see
   // AllowOverqualifiedToggle.
@@ -82,6 +87,9 @@ export interface RunFunnel {
   sponsor_filter_raw_before: number;
   sponsor_filter_raw_after: number;
   sponsor_filter_raw_blank_company: number;
+  /** Confirmed below the candidate's sponsorship salary floor — never counts an
+   *  unpriced listing. */
+  sponsor_filter_below_salary_floor: number;
   sponsor_filter_scored_before: number;
   sponsor_filter_scored_after: number;
   sponsor_filter_scored_blank_company: number;
@@ -91,6 +99,10 @@ export interface RunFunnel {
   pool_quality_dropped: number;
   pool_quality_dropped_foreign_location: number;
   pool_quality_dropped_junk_listing: number;
+  /** Demoted, never dropped, for being past a SOFT "Maximum listing age".
+   *  Always 0 when that preference is Hard — those are dropped instead. */
+  stale_soft_demoted: number;
+  stale_soft_demoted_double: number;
   shown: number;
   /** rank_scored — total examined by the cheap+mid gates. */
   examined: number;
@@ -369,6 +381,14 @@ export interface Role {
    *  THREE-STATE: true/false once checked, null when the listing named no
    *  employer to check — never render null as "not a sponsor". */
   sponsor_licensed?: boolean | null;
+  /** What the LISTING says about sponsoring THIS role, in its own words —
+   *  a different question from sponsor_licensed, which is about the employer's
+   *  licence. Null means the listing was silent (the common case); it is never
+   *  inferred from silence in either direction. */
+  sponsor_statement?: "offered" | "not_offered" | null;
+  /** The employer's own sentence behind sponsor_statement, so the card can show
+   *  the words rather than ask the reader to trust a badge. */
+  sponsor_statement_quote?: string | null;
   /** When this listing was last directly confirmed to still exist. Null on
    *  provisional cards (nothing has been checked yet) and on rows from runs
    *  that predate the check. */
@@ -381,6 +401,11 @@ export interface Role {
   salary_max?: number | null;
   salary_period?: SalaryPeriod | null;
   salary_currency?: string | null;
+  /** True when salary_min/max is a modelled estimate (Adzuna's own
+   *  salary_is_predicted) rather than a figure the employer/board stated --
+   *  see lib/salary.ts's formatSalary, which labels it rather than showing it
+   *  as fact. */
+  salary_is_predicted?: boolean | null;
   source?: string | null;
   fit_rank?: number | null;
   /** The cheap rank stage's 0-100 fit estimate; shown only while provisional. */

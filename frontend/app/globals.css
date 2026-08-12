@@ -260,8 +260,42 @@ a { color: inherit; }
    front of the commute-radius buttons). */
 .hint-inline { font-size: 12px; color: var(--muted); }
 .hint-detected strong { color: var(--ink-2); font-weight: 600; }
+
+/* ── Inline info affordance (Preferences > Visa sponsorship) ──────────────────
+   A caveat this consequential needs more room than a hint line, but putting all
+   of it inline would bury the control. The dot opens the panel below it. */
+.info-dot {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; margin-left: 2px; padding: 0; vertical-align: -2px;
+  border-radius: 50%; border: 1px solid var(--line-input); background: var(--surface);
+  font-family: inherit; font-size: 10px; font-weight: 700; font-style: italic;
+  color: var(--ink-2); cursor: pointer; line-height: 1;
+}
+.info-dot:hover { background: var(--accent-tint); border-color: var(--accent-tint-bd); }
+.info-panel {
+  margin-top: 8px; padding: 11px 13px; background: var(--surface-3);
+  border: 1px solid var(--line); border-radius: var(--r-ctrl);
+  font-size: 11.5px; line-height: 1.6; color: var(--ink-2);
+}
+.info-panel-h { font-weight: 600; color: var(--ink); margin-bottom: 6px; }
+.info-panel p { margin: 0 0 7px; }
+.info-panel p:last-child { margin-bottom: 0; }
+.info-panel ul { margin: 0 0 7px; padding-left: 16px; }
+.info-panel li { margin-bottom: 3px; }
+.info-panel strong { color: var(--ink); font-weight: 600; }
+.info-panel-fine { color: var(--muted); }
 .location-row { display: flex; flex-direction: column; gap: 8px; }
 .location-line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+/* ── Visa sponsorship salary floor (Preferences > Visa sponsorship) ────────── */
+.pref-sublabel { font-size: 11.5px; font-weight: 600; color: var(--muted); }
+.sponsor-salary-floor { display: flex; flex-direction: column; gap: 6px; }
+.sponsor-salary-custom { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.sponsor-salary-custom input {
+  background: var(--surface-3); border: 1px solid var(--line-input); border-radius: var(--r-ctrl);
+  padding: 5px 9px; font-size: 12.5px; font-family: inherit; color: var(--ink); width: 100px;
+}
+.sponsor-salary-custom input::placeholder { color: var(--faint); }
 
 /* ── Source-performance funnel ───────────────────────────────────────────── */
 .funnel-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line-2); }
@@ -369,6 +403,11 @@ a { color: inherit; }
 .card-company { font-size: 12px; color: var(--ink-2); }
 .card-tags { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
 .tag { border: 1px solid var(--line-input); border-radius: var(--r-pill); padding: 2px 9px; font-size: 10.5px; color: var(--ink-2); background: var(--surface-3); }
+/* A caveat about the listing, not a fact about the job (today: the ghost-risk
+   chip). Same tint/ink pair as .warning-banner and .tag-informal, so it stays
+   inside the one-accent palette — it has to be distinguishable from the grey
+   fact pills beside it, not louder than the verdict badge above them. */
+.tag.tag-warn { border-color: var(--accent-tint-bd); background: var(--accent-tint); color: #6b4028; font-weight: 500; }
 
 /* Verdict badge — the card leads with it, top right. Graded rather than
    binary: the accent is reserved for a genuinely strong fit so a wall of
@@ -637,14 +676,29 @@ body:has(.lp-home) {
 .lp-applebtn:disabled { opacity: .6; cursor: default; }
 .lp-applemark { width: 15px; height: 15px; flex: none; margin-top: -2px; }
 
+/* "or" divider between the provider buttons and the email form. It marks the
+   two as ALTERNATIVES; a bare rule reads as a section break and invites the
+   form below it to be taken as fine print, which is the presentation this
+   whole change exists to undo. Sized to the 320px control column so it lines
+   up with the buttons either side of it. */
+.lp-or {
+  display: flex; align-items: center; gap: 10px;
+  width: 320px; max-width: 100%; margin: 16px 0 4px;
+  font-size: 12px; color: var(--muted);
+}
+.lp-or::before, .lp-or::after {
+  content: ""; flex: 1; height: 1px; background: var(--line);
+}
+
 .lp-emaillink {
-  margin-top: 12px; padding: 0; background: none; border: 0;
+  align-self: flex-start;
+  margin-top: 2px; padding: 0; background: none; border: 0;
   font-family: inherit; font-size: 12.5px; color: var(--ink-2);
   text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
 }
 .lp-emaillink:hover { color: var(--ink); }
 
-.lp-emailform { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; width: 320px; max-width: 100%; }
+.lp-emailform { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; width: 320px; max-width: 100%; }
 .lp-emailtabs { display: flex; gap: 6px; margin-bottom: 2px; }
 .lp-emailtab {
   flex: 1; padding: 7px 10px; font-family: inherit; font-size: 12.5px;
@@ -664,6 +718,64 @@ body:has(.lp-home) {
 }
 .lp-emailsubmit:disabled { opacity: .6; cursor: default; }
 .lp-emailfine { font-size: 11.5px; line-height: 1.5; color: var(--muted); }
+
+/* ── Standalone auth pages (/verify-email, /forgot-password, /reset-password)
+   The three pages an emailed link can land on. They are entered from a mail
+   client, i.e. by someone with no page context at all, so each is a single
+   centred card that says what happened and offers exactly one next step —
+   rather than the landing page with a status somewhere in it. They reuse the
+   lp- tokens so a link from an email lands somewhere recognisably the same
+   product as the page the user signed up on. */
+.lp-authpage {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 32px 20px; background: var(--paper);
+}
+.lp-authcard {
+  width: 420px; max-width: 100%;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--r-panel); padding: 26px; box-shadow: var(--shadow-card);
+}
+.lp-authbrand { display: flex; align-items: center; gap: 9px; margin-bottom: 18px; }
+.lp-authbrand .lp-mark { width: 26px; height: 26px; font-size: 14px; }
+.lp-auth-h { font-weight: 700; font-size: 18px; color: var(--ink); margin: 0 0 8px; }
+.lp-auth-p { font-size: 13.5px; line-height: 1.55; color: var(--ink-2); margin: 0 0 16px; }
+.lp-authform { display: flex; flex-direction: column; gap: 9px; }
+/* Success is stated in the accent tint rather than a green: this palette has
+   one strong colour, and a bespoke status green here would be the only one in
+   the app. */
+.lp-auth-ok {
+  font-size: 13px; line-height: 1.5; color: var(--ink);
+  background: var(--accent-tint); border: 1px solid var(--accent-tint-bd);
+  border-radius: var(--r-ctrl); padding: 11px 12px;
+}
+.lp-auth-links { margin-top: 16px; font-size: 12.5px; color: var(--muted); }
+.lp-auth-links a { color: var(--ink-2); text-decoration: underline; text-underline-offset: 2px; }
+.lp-auth-links a:hover { color: var(--ink); }
+
+/* ── "Confirm your email" banner, shown across the app shell ───────────────
+   Deliberately a strip above the nav rather than a toast: it is a standing
+   condition, not an event, and a toast that vanishes is exactly how an
+   unverified account stays unverified. It is dismissible for the session only
+   (see VerifyEmailBanner) — permanently dismissible would make the nag
+   pointless, and non-dismissible would punish someone mid-task. */
+.verify-banner {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 9px 16px; font-size: 12.5px; line-height: 1.45;
+  color: var(--ink); background: var(--accent-tint);
+  border-bottom: 1px solid var(--accent-tint-bd);
+}
+.verify-banner-msg { flex: 1; min-width: 220px; }
+.verify-banner-act {
+  padding: 0; background: none; border: 0; font-family: inherit; font-size: 12.5px;
+  font-weight: 600; color: var(--accent); cursor: pointer;
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.verify-banner-act:disabled { opacity: .6; cursor: default; text-decoration: none; }
+.verify-banner-x {
+  padding: 0 4px; background: none; border: 0; font-family: inherit; font-size: 15px;
+  line-height: 1; color: var(--muted); cursor: pointer;
+}
+.verify-banner-x:hover { color: var(--ink); }
 
 /* demo card column */
 .lp-eyebrow {

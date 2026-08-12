@@ -41,6 +41,7 @@ export function PreferencesPanel({ profileId }: { profileId: number }) {
   const salaryAttr = g?.salary?.[0];
   const maxListingAgeAttrs = g?.max_listing_age ?? [];
   const visaSponsorAttrs = g?.visa_sponsor_only ?? [];
+  const visaSponsorMinSalaryAttrs = g?.visa_sponsor_min_salary ?? [];
   const allowOverqualifiedAttrs = g?.allow_overqualified ?? [];
 
   /**
@@ -149,7 +150,11 @@ export function PreferencesPanel({ profileId }: { profileId: number }) {
       <div className="pref-card">
         <div className="pref-label">Visa sponsorship</div>
         <div className="pref-field">
-          <VisaSponsorToggle profileId={profileId} attributes={visaSponsorAttrs} />
+          <VisaSponsorToggle
+            profileId={profileId}
+            attributes={visaSponsorAttrs}
+            minSalaryAttributes={visaSponsorMinSalaryAttrs}
+          />
         </div>
       </div>
     </div>

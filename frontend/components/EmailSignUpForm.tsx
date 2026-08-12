@@ -1,34 +1,45 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import { api } from "@/lib/api";
 import type { AuthResult } from "@/lib/api";
 
 /**
- * Email + password sign-up, the path that needs no third-party account.
+ * Email + password sign-up and sign-in — a peer of the two provider buttons,
+ * not a footnote under them.
  *
- * Collapsed behind a link by default. The two provider buttons are one click
- * each and a form is four fields' worth of attention, so leading with the form
- * would make the fast paths look like the fallback; but the link has to be
- * visible, because the entire point is to catch the people for whom neither
- * provider is an option.
+ * It used to be collapsed behind a small "or sign up with an email address"
+ * link on the theory that a form is more attention than a one-click button, so
+ * leading with it would make the fast paths look like the fallback. The theory
+ * was fine and the presentation still argued the opposite of what it should:
+ * this is the only path that needs no third-party account, i.e. the only one
+ * available to everyone, and it was drawn as the least of three. It is now
+ * always visible, below a divider that says the two groups are alternatives
+ * rather than a primary and a remainder.
  *
- * Register and sign-in are separate submissions against separate endpoints, and
- * the user picks which. That is the opposite of the provider buttons, where
+ * Register and sign-in stay separate submissions against separate endpoints,
+ * and the user picks which. That is the opposite of the provider buttons, where
  * sign-up and sign-in are deliberately one call — there the browser genuinely
  * cannot know which it is, whereas here the user knows perfectly well. Merging
  * them would mean a mistyped password on an existing account silently creating
  * a SECOND account, and the user then finding an empty profile with no
  * explanation.
  *
- * The one server error worth special handling is the 409 on registering an
- * address that already exists — that user is trying to sign in, so we say so
- * and flip the form over rather than leaving them re-reading an error.
+ * Two server errors are worth handling rather than just printing:
+ *   - 409 on registering an existing address — that person is trying to sign
+ *     in, so say so and flip the form over rather than leaving them re-reading
+ *     an error.
+ *   - 403 on signing in with an unconfirmed address (only possible when the
+ *     server has EMAIL_VERIFICATION_REQUIRED on) — the fix is in their inbox,
+ *     not in the form, so the message has to point there.
  */
 export function EmailSignUpForm({ onSuccess }: { onSuccess: (r: AuthResult) => void }) {
   const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [open, setOpen] = useState(false);
+  // Whether the server can actually send. With no mail service, promising a
+  // confirmation email is a lie the user acts on by waiting.
+  const [mail, setMail] = useState(false);
   const [mode, setMode] = useState<"register" | "login">("register");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -39,7 +50,11 @@ export function EmailSignUpForm({ onSuccess }: { onSuccess: (r: AuthResult) => v
     let cancelled = false;
     api
       .authConfig()
-      .then((c) => !cancelled && setEnabled(c.email_enabled))
+      .then((c) => {
+        if (cancelled) return;
+        setEnabled(c.email_enabled);
+        setMail(c.mail_enabled);
+      })
       .catch(() => !cancelled && setEnabled(false));
     return () => {
       cancelled = true;
@@ -67,14 +82,6 @@ export function EmailSignUpForm({ onSuccess }: { onSuccess: (r: AuthResult) => v
       if (mode === "register" && /already exists/i.test(msg)) setMode("login");
       setBusy(false);
     }
-  }
-
-  if (!open) {
-    return (
-      <button type="button" className="lp-emaillink" onClick={() => setOpen(true)}>
-        Or sign up with an email address
-      </button>
-    );
   }
 
   return (
@@ -131,9 +138,23 @@ export function EmailSignUpForm({ onSuccess }: { onSuccess: (r: AuthResult) => v
       </button>
 
       {error && <div className="lp-signin-error">{error}</div>}
+
+      {/* Only on the sign-in tab. Offering a password reset next to a "create
+          account" button is an invitation to reset a password that does not
+          exist yet, and the route answers identically either way — so the user
+          would get a reassuring "link on its way" for an account they never
+          made, and then wait for it. */}
+      {mode === "login" && (
+        <Link className="lp-emaillink" href="/forgot-password">
+          Forgotten your password?
+        </Link>
+      )}
+
       <div className="lp-emailfine">
         {mode === "register"
-          ? "No verification email — you're straight in. We'll only use your address to reach you about the beta."
+          ? mail
+            ? "You're straight in — we'll email a link to confirm your address so we can reach you and reset your password if you ever need to."
+            : "You're straight in. We'll only use your address to reach you about the beta."
           : "Signed up with Google or Apple? Use the buttons above instead."}
       </div>
     </form>

@@ -14,6 +14,7 @@ tests/tier_reports/
 tests/prompt_pipeline_reports/
 tests/profile_formation_reports/
 tests/medium_vs_strong_reports/
+tests/judge_reports/
 
 # Archived data snapshots (see scripts/reset_user_data.py)
 memory_archive/

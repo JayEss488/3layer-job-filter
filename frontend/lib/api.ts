@@ -155,6 +155,12 @@ export interface AuthResult extends BetaWindow {
   display_name: string;
   /** True only on an account's very first sign-in. */
   is_new: boolean;
+  /** Whether the address has been confirmed by clicking an emailed link.
+   *  Only ever actionable on an `email` account — a provider account can be
+   *  false simply because the provider said so, with nothing to click. */
+  email_verified: boolean;
+  /** "google" | "apple" | "email" | "" (legacy hand-assigned). */
+  auth_provider: string;
 }
 
 /** GET /auth/config — which sign-in methods this deployment actually supports.
@@ -167,6 +173,14 @@ export interface AuthConfig {
   /** Apple *Services ID*, not the App ID — what AppleID.js wants as client_id. */
   apple_client_id: string;
   email_enabled: boolean;
+  /** Whether the server can actually send mail (RESEND_API_KEY is set).
+   *  False must suppress every "check your inbox" instruction: telling someone
+   *  to wait for a link that will never arrive leaves them waiting instead of
+   *  asking, which is strictly worse than saying nothing. */
+  mail_enabled: boolean;
+  /** Whether an unconfirmed address BLOCKS sign-in. Changes what the sign-up
+   *  form is allowed to promise. */
+  email_verification_required: boolean;
 }
 
 /** Posts to a public (token-less) endpoint, surfacing the server's own message. */
@@ -221,6 +235,32 @@ export const api = {
   emailLogin: (email: string, password: string) =>
     publicPost<AuthResult>("/auth/email/login", { email, password }, "Sign-in failed"),
 
+  /** Consume a confirm-your-address link. Returns a full AuthResult — clicking
+   *  the link signs you in, because mail is usually opened on a different
+   *  device from the one the account was created on, and ending at "now go and
+   *  sign in" strands exactly those people. */
+  emailVerify: (token: string) =>
+    publicPost<AuthResult>("/auth/email/verify", { token }, "That confirmation link didn't work"),
+
+  /** Another confirmation link for the signed-in user. Authed, so it takes no
+   *  address — there is nothing for a caller to enumerate. */
+  resendVerification: () => req<{ ok: boolean; message: string }>("/auth/email/resend", { method: "POST" }),
+
+  /** Request a reset link. The response is deliberately identical whether or
+   *  not the address is registered, so never phrase the UI around it as
+   *  confirmation that an account exists. */
+  forgotPassword: (email: string) =>
+    publicPost<{ ok: boolean; message: string }>(
+      "/auth/password/forgot",
+      { email },
+      "Could not send a reset link"
+    ),
+
+  /** Consume a reset link and set the new password. Signs the user in, for the
+   *  same different-device reason as emailVerify. */
+  resetPassword: (token: string, password: string) =>
+    publicPost<AuthResult>("/auth/password/reset", { token, password }, "Could not reset your password"),
+
   /** Legacy hand-assigned beta credentials. Kept so the first cohort isn't
    *  locked out; not linked from the homepage's main flow. */
   login: (username: string, password: string) =>
@@ -234,6 +274,8 @@ export const api = {
         needs_survey: boolean;
         email: string;
         display_name: string;
+        email_verified: boolean;
+        auth_provider: string;
       }
     >("/me"),
 

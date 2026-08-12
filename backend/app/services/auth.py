@@ -283,8 +283,11 @@ def verify_apple_id_token(credential: str) -> dict:
 # Deliberately permissive: one @, something either side, a dot in the domain, no
 # whitespace. A stricter pattern's only achievable outcome is rejecting a valid
 # address (RFC 5322 permits far more than any regex people actually write), and
-# nothing downstream depends on the address being deliverable -- there is no
-# mail service here, so it is a display string and an admin contact hint.
+# a regex is the wrong instrument for the question anyway -- deliverability is
+# now settled empirically, by whether the verification email's link ever gets
+# clicked (services/mailer.py, User.email_verified). A pattern that guesses
+# wrong rejects a real person at the sign-up form; an undeliverable address that
+# gets through simply never verifies, which is visible and recoverable.
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+$")
 
 
@@ -299,23 +302,105 @@ def normalize_email(email: str) -> str:
     return (email or "").strip().lower()
 
 
-def validate_email_and_password(email: str, password: str) -> str:
-    """Return the normalized email, or raise EmailAuthError.
+def validate_password(password: str) -> None:
+    """Raise EmailAuthError unless `password` is an acceptable new password.
 
     Length is the only password rule (see config.PASSWORD_MIN_LENGTH). The upper
     bound is not cosmetic: pbkdf2 hashes whatever it is handed, so an unbounded
     password field is a free CPU-exhaustion lever against an unauthenticated
-    endpoint."""
+    endpoint.
+
+    Split out from validate_email_and_password so the password-reset route --
+    which changes a password without being given an address -- enforces exactly
+    the same rules. Two copies of a password policy is how the reset endpoint
+    quietly ends up accepting a 3-character password."""
+    if len(password or "") < PASSWORD_MIN_LENGTH:
+        raise EmailAuthError(f"Please use a password of at least {PASSWORD_MIN_LENGTH} characters.")
+    if len(password) > 1024:
+        raise EmailAuthError("That password is too long.")
+
+
+def validate_email_and_password(email: str, password: str) -> str:
+    """Return the normalized email, or raise EmailAuthError."""
     email = normalize_email(email)
     if not _EMAIL_RE.match(email):
         raise EmailAuthError("That doesn't look like an email address.")
     if len(email) > 254:  # the practical RFC limit
         raise EmailAuthError("That email address is too long.")
-    if len(password or "") < PASSWORD_MIN_LENGTH:
-        raise EmailAuthError(f"Please use a password of at least {PASSWORD_MIN_LENGTH} characters.")
-    if len(password) > 1024:
-        raise EmailAuthError("That password is too long.")
+    validate_password(password)
     return email
+
+
+# ── Email verification + password reset tokens ───────────────────────────────
+# Both are STATELESS: an itsdangerous signature over a small payload, with no
+# row anywhere recording that a link was issued. That is a deliberate choice
+# over a tokens table, and it rests on each token carrying whatever makes it
+# self-invalidating:
+#
+#   * verification -- carries the address it was issued for, so a token cannot
+#     be replayed against an account whose email later differs, and re-clicking
+#     is simply idempotent.
+#   * reset -- carries a FINGERPRINT of the password it was issued against, so
+#     using it changes the fingerprint and every outstanding link for that
+#     account dies at once. Single-use falls out of the construction rather than
+#     being enforced by a `used_at` column somebody has to remember to check,
+#     and "I reset my password, now revoke the emails" is handled for free.
+#
+# Distinct `salt=` values per purpose are what stop a token minted for one being
+# accepted by the other. A verification link that could be replayed as a
+# password reset would be a full account takeover via an old email.
+_verify_serializer = URLSafeTimedSerializer(AUTH_SECRET, salt="email-verify-v1")
+_reset_serializer = URLSafeTimedSerializer(AUTH_SECRET, salt="password-reset-v1")
+
+
+def _password_fingerprint(password_hash: str, salt: str) -> str:
+    """A short, non-reversible tag for the account's CURRENT password.
+
+    Truncated to 16 hex chars: it is compared against a value we minted
+    ourselves and is never a secret, so it only needs to be long enough that a
+    different password practically never collides with it. Hashing rather than
+    embedding the stored hash keeps the (already-hashed) credential out of a
+    string that travels through somebody's mail provider."""
+    return hashlib.sha256(f"{password_hash}:{salt}".encode("utf-8")).hexdigest()[:16]
+
+
+def make_email_verification_token(user_id: int, email: str) -> str:
+    return _verify_serializer.dumps({"uid": int(user_id), "em": (email or "").strip().lower()})
+
+
+def parse_email_verification_token(token: str, max_age: int) -> tuple[int, str] | None:
+    """Return (user_id, email) from a valid, unexpired link, else None."""
+    try:
+        data = _verify_serializer.loads(token, max_age=max_age)
+        return int(data["uid"]), str(data["em"])
+    except (BadSignature, SignatureExpired, KeyError, ValueError, TypeError):
+        return None
+
+
+def make_password_reset_token(user_id: int, password_hash: str, salt: str) -> str:
+    return _reset_serializer.dumps(
+        {"uid": int(user_id), "pw": _password_fingerprint(password_hash, salt)}
+    )
+
+
+def parse_password_reset_token(token: str, max_age: int) -> tuple[int, str] | None:
+    """Return (user_id, fingerprint) from a valid, unexpired link, else None.
+
+    The caller must still compare the fingerprint against the account's current
+    one -- that comparison is what makes the link single-use, and it cannot be
+    done here without a DB session."""
+    try:
+        data = _reset_serializer.loads(token, max_age=max_age)
+        return int(data["uid"]), str(data["pw"])
+    except (BadSignature, SignatureExpired, KeyError, ValueError, TypeError):
+        return None
+
+
+def password_fingerprint_matches(token_fingerprint: str, password_hash: str, salt: str) -> bool:
+    """Whether a reset token was issued against the password still on the account."""
+    return hmac.compare_digest(
+        token_fingerprint or "", _password_fingerprint(password_hash, salt)
+    )
 
 
 # ── Tokens ───────────────────────────────────────────────────────────────────

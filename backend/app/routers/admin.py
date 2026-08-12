@@ -28,6 +28,13 @@ _EVENT_FIELDS = {
     # returning user's sign-in is a login, their first ever is a signup.
     "signup": "signups",
     "signup_survey": "survey_answers",
+    # Email-account lifecycle. `verifications` is the ONLY end-to-end evidence
+    # that transactional mail is actually being delivered -- Resend accepting a
+    # send says nothing about it reaching an inbox, and a spam-foldered
+    # verification email looks exactly like users who couldn't be bothered.
+    # Watch it against `signups` on email accounts, not on its own.
+    "email_verified": "verifications",
+    "password_reset": "password_resets",
     "search_started": "searches",
     "role_tick": "ticks",
     "role_cross": "crosses",

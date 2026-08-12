@@ -93,10 +93,11 @@ APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID", "")
 # leave the default deployment offering exactly the two providers it exists to
 # supplement. Set EMAIL_SIGNUP_ENABLED=0 to hide the form and 503 the endpoints.
 #
-# There is deliberately NO verification email -- this deployment has no mail
-# service of any kind. The consequence is recorded rather than hidden:
-# User.email_verified stays False for these accounts and GET /admin/signups
-# reports it, so an unverified address is never presented as a confirmed contact.
+# There IS now a verification email and a password reset, both through Resend --
+# see the mail block further down and services/mailer.py. Before that existed,
+# an email account was a second-class citizen in a way that only showed up at
+# the worst moment: nobody had proved they owned the address, and a forgotten
+# password locked the holder out permanently with no recovery path at all.
 EMAIL_SIGNUP_ENABLED = os.getenv("EMAIL_SIGNUP_ENABLED", "1").lower() not in {"0", "false", "no"}
 # Minimum password length. A length floor is the only password rule imposed:
 # composition rules ("one number, one symbol") measurably push people toward
@@ -160,6 +161,73 @@ DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'jobmatch.db
 FRONTEND_ORIGINS = os.getenv(
     "FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",")
+
+# ── Transactional mail (Resend) ──────────────────────────────────────────────
+# The provider is Resend (https://resend.com). Only two things are ever sent:
+# an address-verification link and a password-reset link. There is no marketing
+# mail, no digest and no list -- every send is the direct result of an action
+# the recipient just took, which is what keeps this out of consent/unsubscribe
+# territory entirely.
+#
+# An unset RESEND_API_KEY DISABLES sending rather than erroring. That is not
+# laziness: the endpoints that send are also the endpoints that create accounts
+# and accept sign-ins, and the documented product invariant is that nothing in
+# the auth path may block a new user. A dev box with no key gets working
+# sign-up with a link printed to the console (see services/mailer.py).
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+
+# The From address. MUST be on a domain verified in the Resend dashboard, with
+# one exception: `onboarding@resend.dev` is Resend's shared testing sender,
+# which is deliverable ONLY to the email address that owns the Resend account.
+# That is the right default (it works out of the box for the operator's own
+# testing) and the wrong production value (every other recipient is rejected),
+# so it is called out in the deployment checklist rather than silently assumed.
+EMAIL_FROM = os.getenv("EMAIL_FROM", "Four in a Thousand <onboarding@resend.dev>")
+# Where replies go. Optional; when set it is usually a real inbox, since the
+# From above frequently is not.
+EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "")
+
+# The public origin the links in those emails point at -- the FRONTEND's origin,
+# not the API's. Defaults to the first CORS origin, which is right in dev and
+# right in production whenever FRONTEND_ORIGINS is set to the real site; set it
+# explicitly when several origins are allowed, because the first one wins and a
+# link to the wrong one is a dead link in someone's inbox.
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/") or FRONTEND_ORIGINS[0].strip().rstrip("/")
+
+# Whether an unverified address BLOCKS sign-in.
+#
+# Default OFF, and the reasoning is the same product invariant as above:
+# "instant access" is what this app promises, and a hard gate here means an
+# undelivered email (a wrong address, a spam folder, a Resend outage, an
+# unverified sending domain) is indistinguishable from a broken account. With
+# it off, an unverified user is signed in and nagged by a banner until they
+# click the link. Flip it to 1 once deliverability has been observed to be
+# reliable and the trade is worth making.
+EMAIL_VERIFICATION_REQUIRED = os.getenv("EMAIL_VERIFICATION_REQUIRED", "0").lower() in {"1", "true", "yes"}
+
+# Link lifetimes. The reset link is deliberately far shorter-lived than the
+# verification link: it is a bearer credential that grants a password change,
+# whereas the verification link only ever asserts "this mailbox exists".
+EMAIL_VERIFY_TOKEN_MAX_AGE_SECONDS = int(os.getenv("EMAIL_VERIFY_TOKEN_MAX_AGE_SECONDS", str(60 * 60 * 24 * 3)))
+PASSWORD_RESET_TOKEN_MAX_AGE_SECONDS = int(os.getenv("PASSWORD_RESET_TOKEN_MAX_AGE_SECONDS", str(60 * 60)))
+
+# Abuse guard on the endpoints that will send mail to an address supplied by an
+# UNAUTHENTICATED caller. Without it, /auth/password/forgot is a free
+# mail-bombing lever pointed at any address someone types, billed to our Resend
+# quota and charged against our sending reputation. In-process (single instance,
+# see MAX_CONCURRENT_SEARCHES).
+#
+# TWO limits, because the two keys guard different attacks and a single number
+# cannot serve both. The ADDRESS limit stops one mailbox being flooded from many
+# clients, and can be tight: nobody legitimately needs six reset links to one
+# address in an hour. The CLIENT limit stops one caller walking a list of
+# addresses, and must be much looser, because an IP is not a person -- a shared
+# office connection or a mobile carrier's CGNAT puts thousands of unrelated
+# users behind one address, and setting this to the per-address number would
+# mean the fifth person on that network to forget their password is refused
+# because of four strangers.
+EMAIL_SEND_MAX_PER_HOUR = int(os.getenv("EMAIL_SEND_MAX_PER_HOUR", "5"))
+EMAIL_SEND_MAX_PER_HOUR_PER_CLIENT = int(os.getenv("EMAIL_SEND_MAX_PER_HOUR_PER_CLIENT", "30"))
 
 # Cost guard: max live searches PER USER, per calendar day (see
 # routers/search.py::_searches_today, which counts a user's own runs only). It
@@ -252,6 +320,29 @@ ATTRIBUTE_TYPES = [
     # postings and blank-company aggregator rows are the two structural cases.
     # See services/sponsors.py for the measured match rate and both limitations.
     "visa_sponsor_only",
+    # Single-value, like max_listing_age/commute_miles: the minimum ANNUAL salary
+    # a role must clear to count as sponsorable, in pounds as a string (e.g.
+    # "41700"). Only ever consulted when visa_sponsor_only is on. "0" is a real
+    # value meaning "no floor" -- no row at all means DEFAULT_VISA_SPONSOR_MIN_
+    # SALARY, same "unset vs. explicit zero" distinction as those two types.
+    #
+    # The Skilled Worker route is NOT a single cutoff -- GBP 41,700 is the general
+    # threshold for a standard applicant, but several categories are sponsorable
+    # well below it: "new entrants" (under 26, a recent Student/Graduate switcher,
+    # or training toward a professional qualification) at 70% of the going rate
+    # (roughly GBP 33,400) for up to four years; PhD holders at GBP 37,500 (GBP
+    # 33,400 for a STEM PhD); roles on the Immigration Salary List at a discounted
+    # floor (~GBP 33,400); and a specific health/education occupation table as low
+    # as GBP 31,300. The Health and Care Worker visa is a separate route entirely,
+    # not governed by any of these figures.
+    #
+    # None of those categories are things this app knows about the candidate
+    # (age, visa-switch history, PhD subject) or the listing (occupation code,
+    # ISL membership), and guessing them from free text would be unreliable on
+    # a HARD filter -- so this is deliberately just the number itself, defaulted
+    # to the standard-applicant floor and left for the candidate to lower if a
+    # reduced category applies to them. See services/sponsors.py.
+    "visa_sponsor_min_salary",
     # Single-value boolean: is the candidate open to roles pitched BELOW their own
     # stated seniority? Value "true"; no row at all -> off, which is the default,
     # because most candidates searching at their level do not want to be shown
@@ -367,6 +458,13 @@ DEFAULT_MAX_LISTING_AGE_DAYS = 30
 # itself.
 DEFAULT_COMMUTE_MILES = 30
 
+# Default floor for visa_sponsor_min_salary: the general Skilled Worker going-rate
+# threshold for a standard applicant (not a new entrant, not a reduced-rate
+# occupation). Only consulted when visa_sponsor_only is on -- see the
+# ATTRIBUTE_TYPES entry above for the categories that qualify for less and why
+# this app doesn't try to detect them automatically.
+DEFAULT_VISA_SPONSOR_MIN_SALARY = 41700
+
 
 def enforcement_for(attr_type: str, value: str | None) -> str:
     """The stored enforcement, or the type's pre-enforcement default.
@@ -443,6 +541,7 @@ ATTRIBUTE_DIRECTION = {
     "max_listing_age": "constraint",
     "commute_miles": "constraint",
     "visa_sponsor_only": "constraint",
+    "visa_sponsor_min_salary": "constraint",
     "allow_overqualified": "constraint",
 }
 

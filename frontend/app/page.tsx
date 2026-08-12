@@ -114,7 +114,15 @@ export default function Home() {
                   they never reached a page that could have counted them.
                   Apple and the email form each render themselves as nothing
                   when the server reports that method unconfigured, so this
-                  block degrades to exactly what it was before. */}
+                  block degrades to exactly what it was before.
+
+                  The divider marks the two groups as ALTERNATIVES, not a
+                  primary and a remainder. The email form used to sit behind a
+                  small link below the buttons, which drew the only path
+                  available to everyone — no third-party account needed — as the
+                  least of the three. "or" rather than a bare rule, because a
+                  rule alone reads as a section break and invites the form below
+                  it to be read as fine print. */}
               <div id="join" className="lp-join">
                 <div className="lp-join-h">Join the beta</div>
                 <p className="lp-join-sub">
@@ -122,6 +130,9 @@ export default function Home() {
                 </p>
                 <GoogleSignInButton onSuccess={onSignedIn} />
                 <AppleSignInButton onSuccess={onSignedIn} />
+                <div className="lp-or">
+                  <span>or</span>
+                </div>
                 <EmailSignUpForm onSuccess={onSignedIn} />
                 <div className="lp-join-fine">
                   Two quick questions after you sign in, then you can run your first search. This

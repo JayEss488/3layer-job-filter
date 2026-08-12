@@ -190,23 +190,43 @@ function unverifiedChip(role: Role): string | null {
 }
 
 /**
- * Licensed visa sponsor, per the Home Office register.
+ * Visa sponsorship, which is TWO different questions and used to be shown as
+ * one badge reading "Visa sponsor":
  *
- * Shown ONLY while the candidate's own sponsors-only filter is on. The backend
- * stamps sponsor_licensed on every run regardless (it is cheap, and the filter
- * can be switched on later), but for a candidate who does not need a visa the
- * badge is an answer to a question they never asked, sitting in the same chip
- * row as facts about the job itself.
+ *   1. Does this EMPLOYER hold a Home Office licence (`sponsor_licensed`)?
+ *   2. Will THIS VACANCY be sponsored (`sponsor_statement`, the listing's own
+ *      words)?
  *
- * Within that, still only ever a positive match: false means "not on the
- * register", which for an agency-posted or vaguely-named listing is not the
- * same as "does not sponsor", and null means there was no employer name to
- * check at all. Neither earns a chip — an absent badge is correctly read as
- * "unknown", a "Not a sponsor" badge would not be.
+ * Only (2) is what the candidate actually needs, and the register can never
+ * answer it: 21 rows in the measured store are a licensed employer whose advert
+ * states it will not sponsor the role, and every one of those carried the old
+ * badge. So the listing's own statement outranks the register in both
+ * directions, and the register's answer is now worded as what it is — a fact
+ * about the employer, not a promise about the job.
+ *
+ * Three states earn a chip; silence earns none:
+ *   "Sponsorship offered"      — the listing says so. Strongest, rare (7 rows).
+ *   "No sponsorship"           — the listing says so. The most valuable of the
+ *                                three: it is the one that saves an application.
+ *   "Employer sponsors visas"  — licensed, listing silent. Deliberately NOT
+ *                                "Visa sponsor": it says whose property this is.
+ *
+ * A false `sponsor_licensed` still earns nothing. "Not on the register" is not
+ * "does not sponsor" for an agency-posted or vaguely-named listing, and null
+ * means there was no employer name to check at all — an absent badge reads
+ * correctly as "unknown", a "Not a sponsor" badge would not. That is why the
+ * negative chip fires on the listing's STATEMENT and never on the register.
+ *
+ * All of it shown ONLY while the candidate's own sponsors-only filter is on.
+ * The backend stamps these every run regardless (they are free, and the filter
+ * can be switched on later), but for a candidate who does not need a visa they
+ * answer a question never asked, in the same row as facts about the job.
  */
 function sponsorChip(role: Role, filterOn: boolean): string | null {
   if (!filterOn) return null;
-  return role.sponsor_licensed === true ? "Visa sponsor" : null;
+  if (role.sponsor_statement === "offered") return "Sponsorship offered";
+  if (role.sponsor_statement === "not_offered") return "No sponsorship";
+  return role.sponsor_licensed === true ? "Employer sponsors visas" : null;
 }
 
 /**
@@ -240,15 +260,36 @@ function useSponsorFilterOn(): boolean {
  *
  * "medium" deliberately does not say "ghost": one ordinary signal is not an
  * accusation, and the card's expandable reasons carry the specifics.
+ *
+ * `hasNotes` is the legacy path, and it exists because the two halves of this
+ * feature reached the database one run apart: roles persisted while
+ * _compose_analysis emitted §ghost but Role.ghost_level was not yet written
+ * carry the reasons ("This advert has been running for over three months") with
+ * no level beside them, so they rendered the explanation for a badge that never
+ * appeared. Those rows fall back to the SOFTER chip even though the missing
+ * level may have been "high": the reasons are recoverable from the stored text,
+ * the tier is not, and understating an accusation about a named employer is the
+ * safe direction to be wrong in. New rows always have a level and never take
+ * this path.
  */
-function ghostChip(role: Role): string | null {
+function ghostChip(role: Role, hasNotes: boolean): string | null {
   if (role.ghost_level === "high") return "Possible ghost listing";
   // Not "posted N ago" — ageChip already says that, from the same date.
   if (role.ghost_level === "medium") return "Long-running listing";
+  if (role.ghost_level == null && hasNotes) return "Long-running listing";
   return null;
 }
 
-function factChips(role: Role, salaryPeriod: SalaryPeriod, sponsorFilterOn: boolean): string[] {
+/** A fact chip. `warn` is a caveat about the listing rather than a fact about
+ *  the job, and is styled apart — see the note in factChips. */
+type FactChip = { text: string; warn?: boolean };
+
+function factChips(
+  role: Role,
+  salaryPeriod: SalaryPeriod,
+  sponsorFilterOn: boolean,
+  hasGhostNotes: boolean,
+): FactChip[] {
   // Mostly what the AI actually read off the listing — a null means the
   // listing was silent, and no chip is better than a guessed one. While
   // provisional, the cheap rank stage's estimate is the only fit signal there
@@ -258,24 +299,36 @@ function factChips(role: Role, salaryPeriod: SalaryPeriod, sponsorFilterOn: bool
   // it is the only fit signal that role will ever have, so hiding it would
   // leave a bare card. ageChip is the one exception: pure date math off the
   // source's own posted_at/expires_at, no AI involved — see ageChip above.
+  //
+  // The ghost chip carries `warn`, and that is the whole reason this returns
+  // objects rather than strings. Every other entry here is a neutral fact about
+  // the job, and rendered in the same grey pill as those, "Long-running
+  // listing" sat between the salary and the work style and did not read as a
+  // flag at all — the user's report was that the only visible trace of a
+  // flagged listing was the explanation inside "Show more". Styling it apart is
+  // what makes the chip do the job the explanation is backing up.
+  const chip = (text: string | null, warn = false): FactChip | null =>
+    text && text.trim() ? { text, warn } : null;
   return [
-    role.rank_score != null && (role.provisional || role.provisional_stage === "rank")
-      ? `Fit estimate ${role.rank_score}/100`
-      : null,
-    ageChip(role),
-    unverifiedChip(role),
+    chip(
+      role.rank_score != null && (role.provisional || role.provisional_stage === "rank")
+        ? `Fit estimate ${role.rank_score}/100`
+        : null,
+    ),
+    chip(ageChip(role)),
+    chip(unverifiedChip(role)),
     // Next to unverifiedChip on purpose: the two answer adjacent questions —
     // "does this listing still exist" and "is there a job behind it".
-    ghostChip(role),
-    sponsorChip(role, sponsorFilterOn),
-    distanceChip(role),
+    chip(ghostChip(role, hasGhostNotes), true),
+    chip(sponsorChip(role, sponsorFilterOn)),
+    chip(distanceChip(role)),
     // Normalised into the user's chosen unit where the backend could parse it,
     // falling back to whatever the employer wrote when it couldn't.
-    formatSalary(role, salaryPeriod),
-    role.work_style,
-    role.seniority_level,
-    role.deadline_text ? `Apply by ${role.deadline_text}` : null,
-  ].filter((v): v is string => !!v && !!v.trim());
+    chip(formatSalary(role, salaryPeriod)),
+    chip(role.work_style ?? null),
+    chip(role.seniority_level ?? null),
+    chip(role.deadline_text ? `Apply by ${role.deadline_text}` : null),
+  ].filter((v): v is FactChip => v !== null);
 }
 
 export function RoleCard({
@@ -312,7 +365,7 @@ export function RoleCard({
       a.aiReasoning.length > 0 ||
       a.ghost.length > 0);
   const hasBody = !!a && (a.notes.length > 0 || a.qualificationVerdict.length > 0 || hasDetail);
-  const facts = factChips(role, salaryPeriod, sponsorFilterOn);
+  const facts = factChips(role, salaryPeriod, sponsorFilterOn, !!a && a.ghost.length > 0);
   const verdict = role.verdict as RoleVerdict | null | undefined;
 
   return (
@@ -325,8 +378,8 @@ export function RoleCard({
           {facts.length > 0 && (
             <div className="card-tags">
               {facts.map((f, i) => (
-                <span className="tag" key={i}>
-                  {f}
+                <span className={f.warn ? "tag tag-warn" : "tag"} key={i}>
+                  {f.warn ? `⚠ ${f.text}` : f.text}
                 </span>
               ))}
             </div>
@@ -364,6 +417,18 @@ export function RoleCard({
           )}
           {hasBody && (
             <div className={`card-analysis${indentActions ? "" : " flush"}`}>
+              {/* The employer's own sentence behind the sponsorship chip.
+                  Shown because a chip asserting something this consequential
+                  should be checkable in one glance — and because "No
+                  sponsorship" is a claim that costs the candidate a role if we
+                  got it wrong, so the words that produced it belong on the
+                  card, not in a log. Same filter gating as the chip itself. */}
+              {sponsorFilterOn && role.sponsor_statement && role.sponsor_statement_quote && (
+                <div className="an-note">
+                  The listing itself says:{" "}
+                  <em>&ldquo;{role.sponsor_statement_quote}&rdquo;</em>
+                </div>
+              )}
               {a.notes.map((n, i) => (
                 <div className="an-note" key={i}>
                   {n}

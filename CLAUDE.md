@@ -120,6 +120,25 @@ with (bar: **zero applied-to roles flagged high**), never on the store-wide hit 
 venv/Scripts/python scripts/backtest_ghost_rules.py
 ```
 
+Characterise the final judge's requirements checklist across every persisted verdict
+(read-only, offline, free) — the cheap half of the judge-prompt regression bar. Read the
+PER-RUN table and its `tok/pick` budget column before the store-wide mean; see the
+judge-checklist section:
+```
+venv/Scripts/python scripts/audit_judge_checklists.py --profile-id 1 --since-run 20
+```
+
+A/B two judge system prompts live over the SAME listings (the expensive half — a couple
+of EXP_MODEL calls per arm; nothing is written and no verdict is persisted). Run BOTH
+samples: the balanced draw, and `--worst-checklists`, which targets the listings whose
+stored checklist was thinnest:
+```
+venv/Scripts/python tests/judge_harness.py --profile-id 1 --sample-size 20 --seed 1
+```
+```
+venv/Scripts/python tests/judge_harness.py --profile-id 1 --worst-checklists
+```
+
 Seed the ATS company-board store (optional, runs automatically once on first boot if
 `company_ats` is empty — see `backend/app/services/seed.py`):
 ```
@@ -957,7 +976,85 @@ of what the last finished run already recorded — see the search-pipeline secti
    domain-defining asks are core by definition and cannot be demoted to secondary
    because the candidate lacks them. Since the rubric reads off the checklist, a padded
    checklist is the way an unearned grade gets produced — fix that before touching the
-   rubric thresholds. v18 adds the two remaining halves of that discipline. (a) Step D's
+   rubric thresholds.
+   **v28 is the checklist-COVERAGE rework, and its first finding is that the checklist
+   had been shrinking run over run while the postings got longer** — 6.00 items (run 20)
+   → 4.33 → 4.33 → 3.75 → 3.67 (run 24). Over 160 persisted checklists the median is 4
+   items / 3 core, only 20 reach step D's own stated "4-10 core, 2-6 secondary", 46
+   carry no secondary item at all, and size barely tracks the posting's length
+   (pearson r = 0.25). Live: a 4,979-char JD naming Node.js/TypeScript, Ruby/Rails, Nuxt,
+   AWS CDK and Salesforce produced a ONE-item checklist ("Full stack / software
+   engineering", met) graded `strong` with zero concerns; another used the job title
+   itself as its only item. Because the rubric reads `core` items ONLY, this does not
+   produce a cautious grade — **it produces an inflated one**, silently.
+   **The cause is OUTPUT PRESSURE, not a wrong rule, and that distinction is the reason
+   to read `scripts/audit_judge_checklists.py`'s `tok/pick` column before its size
+   column.** Judge completion tokens per pick object fell 1305 → 1397 → 665 → 655 → 491
+   across those five runs and checklist size tracks it monotonically: `judge_pool_size`
+   grew 22 → 40 (the cap) and v26 widened `backup` from 3 to `FINAL_PICKS`, roughly
+   doubling the pick objects one call must emit, while completion tokens rose only
+   sub-linearly. Faced with that, the model economised on the one field v27 opened by
+   calling it "internal reasoning only -- not shown to the candidate". That framing is
+   gone; step D now says what the field is (the input `fit_level` and `concerns` are
+   computed from) and names prose as what to shorten first.
+   Four other changes, all measured with `tests/judge_harness.py`: a **shape test**
+   ("could a competent person in this field plausibly FAIL this item?"), **ONE ITEM PER
+   ASK** (a heading like "Full stack / software engineering" is not a capacity, so the
+   v16 rule never caught it), **the posting's own heading decides `core`** (a live pick
+   filed the two asks under "Must have hands on experience with SQL, and data
+   visualisation tools" as *secondary* while promoting two Key-Responsibilities duties to
+   core — which, since the rubric reads core only, made the posting's own stated bar
+   unable to affect the grade), and **the hint is a floor, not a ceiling** (the
+   `[key requirements]` pass reads the truncated opening, i.e. the blurb; a checklist
+   matching the hint and adding nothing is the symptom of skipping the ADD step).
+   > ⚠ **Pushing for a longer checklist without the shape test makes things WORSE, and
+   > the first v28 draft did exactly that.** It raised the checklist on 14 of 14 paired
+   > listings and moved two picks to `very_strong` — on items like "strong attention to
+   > detail" and "ability to work independently", which always come back `met` and which
+   > the rubric then counts toward "every core requirement met". Padding and
+   > under-filling do the same damage by opposite routes. A second draft over-corrected
+   > the other way (a blanket "leave boilerplate off"), *cutting* core items 4.82 → 3.09;
+   > the shipped wording replaces an unfailable item rather than deleting it. The
+   > harness's `unfailable_items` counter exists because of this and should be read on
+   > every step-D change.
+   **What v28 is NOT claimed to do.** The harness could not reproduce production's thin
+   checklists at all: on the identical rows where production stored 1–3 items, the
+   unmodified v27 prompt produces 5–10 today (mean 6.55). So the production symptom is
+   not attributable to the prompt, and no prompt edit should be expected to fix it —
+   the structural lever is the per-call output budget above (`FINAL_EVAL_MAX_JOBS_PER_CALL`,
+   and how many pick objects `backup` asks for). What v28 *is* measured to do, across
+   four paired A/B runs: remove unfailable padding every time (7→1, 5→0, 6→2, 1→0),
+   deflate unearned `very_strong` (all five became `strong` on the worst-row sample),
+   raise core items where there was room (+1.30 on the worst rows, flat on a balanced
+   draw), and never shrink the results page (picks 10→12, 14→14).
+   **The three output-budget levers, measured — two work and one is a no-op.**
+   * **An output-token ceiling is NOT a lever, and the code never had one anyway.**
+     `llm()` set no `max_tokens` at all, so every call ran at the model's default. The
+     question "is that default binding?" is now answered rather than assumed:
+     `_record_llm_usage` counts responses that stopped on `length` instead of `stop`,
+     surfaced as `tokens_{stage}_length_capped` on the run-funnel panel. Measured **0
+     across every judge call**, at both chunk sizes. Nothing was ever being truncated,
+     so raising a ceiling cannot buy room. `FINAL_EVAL_MAX_OUTPUT_TOKENS` (32000) was
+     added anyway as a **guard, not a lever**: a truncated `require_json` reply is a
+     parse failure that vanishes down `_run_final_eval`'s fail-open path, so a future
+     model-default change would look exactly like the model choosing to write less.
+   * **Splitting into smaller calls DOES buy budget, and is FASTER** —
+     `FINAL_EVAL_MAX_JOBS_PER_CALL` 20 → **10**. Same prompt, same 20 listings:
+     587 → **885 completion tokens per pick (+51%)**, wall clock 81.2s → **73.5s**,
+     because chunks run concurrently in a `ThreadPoolExecutor`. It also eases the 90s
+     read timeout the constant exists to protect. Cost is the re-paid ~12k system
+     prefix per extra call, which the 24h prompt cache is there to absorb — measured
+     **63% cache hit** over 2 concurrent calls (production run 24 managed 29%).
+     **`tokens_judge_cached_tokens` is the number to watch**: if that ratio falls, the
+     extra calls are being billed in full and this trade stops paying.
+   * **But the extra budget did not move the checklist** (5.33 → 5.31 items at
+     +51% tokens/pick), which is consistent with the harness never reproducing the
+     production symptom in the first place — there was no suppression there to relieve.
+     So the chunk-size change is kept for the speed, the headroom and the timeout
+     margin, **not** on a claim that it fixes checklist size. `FINAL_PICKS` was left at
+     12 deliberately: it is the only one of the three levers that costs the candidate
+     results, and smaller chunks already cut per-call pick objects without doing that.
+   v18 adds the two remaining halves of that discipline. (a) Step D's
    **fourth** checklist rule, the mirror of the widening error: an ask the posting itself
    says it TRAINS for, labels beneficial/desirable/not essential, or states alongside a
    weaker actual minimum is **secondary**, never core, and may never be the concern that
@@ -1310,10 +1407,12 @@ of what the last finished run already recorded — see the search-pipeline secti
    subtle half: only text that BEATS the snippet is stored, `_has_full_text` must be
    set or the gate cache-key richness marker goes stale, and the DB write is one
    indexed SELECT + commit.
-   *Following* the tracking redirect was tried first and doesn't work — the land URL
-   403s a plain HTTP client and is bot-walled behind the browser too. Pre-gate
-   browser-scraping was considered and rejected separately: ~4-5s/page would add
-   minutes per run.
+   *Following* the tracking redirect doesn't work **for enrichment** — the land URL
+   403s a plain HTTP client. The claim that it is "bot-walled behind the browser too"
+   was **wrong and has been corrected**: headless resolves it in 2-4s, which is what
+   the final-pick liveness check now uses (see the Adzuna liveness note below). It
+   remains useless *here* because pre-gate browser-scraping is rejected on cost —
+   ~4-5s/page would add minutes per run.
 
    **Both enrichers run a SECOND time, on the judge pool.** The pre-gate caps above
    are sized for latency (they sit in front of time-to-first-card) and are spent in
@@ -1505,6 +1604,48 @@ Key cost/reliability guards layered into this pipeline (tune via env vars, see
   `gate_cache`'s text column as a third packed field (`{score}|{note}|{0|1}`); `rank_v15` →
   `rank_v16`, since a v15 score of 15 for a soft-mismatching listing means "preference
   mismatch", not "bad fit", and is not comparable.
+- `STALE_SELECTION_PENALTY` (8.0) / `STALE_SELECTION_PENALTY_DOUBLE` (12.0), stamped by
+  `engine._annotate_stale` — **a SOFT "Maximum listing age" was the one stated preference
+  with no ordering path at all.** Hard is a real drop (`listing_over_max_age`, before any
+  LLM call); Soft got the age tag's wording, `rank_gate`'s STALENESS scoring component
+  (~-10, explicitly unable to outweigh a good function match) and the judge's "push a
+  borderline grade down one step" — and nothing that touched ordering. Measured on a live
+  profile with a **7-day Soft** limit: **18 of 36 shown roles were over it, 9 past double
+  it**, at ranks 1–12 (a 22-day listing was rank 1, a 28-day one rank 5; over-limit mean
+  rank 7.44 vs 5.56 within limit). Deliberately DETERMINISTIC rather than routed through
+  `rank_gate`'s `soft_violation` the way arrangement/salary are: the age is a fact this
+  system already holds, so re-deriving it with a model would be less reliable AND cost a
+  `rank_v` bump for a known answer. Two steps, because "over the limit" and "several times
+  over it" are not the same claim — the doubled step is the "hard cut at double the limit"
+  instinct expressed as a demotion, since Soft means the candidate asked *not* to be
+  excluded on this. Unknown and merely-approximate dates are never penalised, the same
+  rule every other age consumer follows, and the whole thing is a no-op when the
+  preference is Hard. Counted as `stale_soft_demoted`/`_double` and surfaced on the
+  Settings run-funnel panel, which names the Hard setting as the way to exclude instead.
+  **The `_selection_score` half alone could not have reached the page**: it decides the
+  judge POOL, while `fit_rank` is positional in the final assembly, so `_stale_penalty`
+  is also a stable tie-break WITHIN each `_VERDICT_GRADES` bucket there. That tie-break
+  is exactly what the judge's own prompt already asks for ("prefer the fresher role when
+  choosing between two comparable picks") — ordering is decided in code, so until now
+  that instruction had nothing to act on.
+  **Neither of those two is enough on its own, because a demotion in the judge POOL is
+  not a demotion in the RESULTS.** A role over the limit but well above the floor still
+  reaches the judge, and the judge had no rule telling it to care: `_listing_age_tag`
+  emitted only two severities the judge's system prompt describes — `STALE` (open for
+  months, downgrade-only) and `ELIMINATE` (past a HARD maximum → DISQUALIFIER 8) — and a
+  SOFT maximum matched neither, so it was read as ordinary staleness, i.e. "one step down
+  IF the grade is borderline". There is now a **third severity** between them, and it is
+  what makes the grade itself move: `OVER THE CANDIDATE'S STATED MAXIMUM (a preference,
+  not a hard limit)`, and at twice the limit `MORE THAN DOUBLE THE CANDIDATE'S STATED
+  MAXIMUM`. It plugs into the EXISTING mechanical `fit_level` rubric rather than adding a
+  parallel adjustment — over the limit counts as ONE concern touching a core requirement,
+  past double counts as TWO (capping the role at `ok`) — so a demoted grade moves the
+  role down the page for free, since final assembly is grade-tiered. It never excludes,
+  and is explicitly never a reason to move a role out of `backup` into `not_selected`.
+  Keep those two keyword strings in sync between `_listing_age_tag` and the WHAT THE
+  BRACKETED HINTS ARE paragraph; the prompt keys on them literally. Folded into
+  FINAL_EVAL_PROMPT_VERSION 28 rather than taking a 29, because 28 had not yet run in
+  production and so cost no extra store-wide re-judge.
   `full_auto.rank_gate`'s fail-open path (its `llm()` call erroring,
   e.g. an intermittent permission/rate error on `MID_MODEL`) retries once on the same
   model after a short backoff, then falls back to `CHEAP_MODEL`, before giving up; a
@@ -1916,6 +2057,76 @@ renders *"This is an excerpt from Reed. Click apply to see the full job descript
 Reed.co.uk"* in its own body. Note the ceiling: LinkedIn rows arrive only via jsearch and
 were 59 of 9,998 store rows, so this is a correctness fix, not a volume one.
 
+**Adzuna's own pages cannot report closure either, and this one produced BOTH top
+picks of a live run as already-dead listings.** Same shape as the LinkedIn case above,
+on a primary source rather than a marginal one. Measured on the two roles:
+
+* Golden Charter (ad 5831595906, rank 1): `/jobs/details/` returned **200 with 4,489
+  chars** of full job description, no closure phrase, and a JSON-LD `validThrough` of
+  2026-08-23 — still in the future.
+* Connected Health (ad 5832285695, rank 2): likewise a full 6.5k description. Its land
+  redirect resolves to `nijobs.com/job/107811063`, which reads *"This listing went
+  offline. Sorry, the listing that you're looking for is expired."*
+
+So every existing route said ALIVE: `_classify_listing` on the detail page, and all
+three of `fetch_adzuna_details`' dead signals (404/410, passed `validThrough`, closure
+phrase), none of which can fire on a page serving the original description with a
+future expiry. `validThrough` here is Adzuna's own retention window, not the employer's
+closing date.
+
+Three changes, at `_verify_final_picks` only:
+1. **Every Adzuna pick is now handled by the Adzuna branch, both URL forms.** It used to
+   key on the `/jobs/land/ad/` interstitial alone, so a `/jobs/details/` pick fell
+   through to the generic HTTP path — 1,033 of 1,578 store rows are that form (the API
+   returns either in the same response). That is exactly how the rank-1 pick was missed.
+2. **`fetch_adzuna_details` returning a description no longer means alive.** It can still
+   return *dead*; anything else becomes `unverifiable`, so the row is kept and shown but
+   carries the honest "not verified" chip instead of a false checked stamp.
+3. **Land-form rows get one browser attempt at the tracking redirect**
+   (`_verify_via_browser` honours a per-job `_verify_url`), and a **dead verdict is drawn
+   only from the DESTINATION page's content, on a different host.**
+
+> ⚠ **Never reconstruct the land URL from the ad id, and never read Adzuna's status
+> code.** The obvious version of this derived `/jobs/land/ad/{id}` so details-form rows
+> could be verified too. Tested against ads known to be LIVE, it is a false-positive
+> machine:
+>
+> | ad | signed URL | bare (id only) |
+> |---|---|---|
+> | Tarmac (fresh, live) | 404 | 400 |
+> | Sage (fresh, live) | 404 | 400 |
+> | Connected Health (dead) | 200 → nijobs.com | 400 |
+>
+> A bare land URL 400s for **everything** — it reports a missing `se`/`v` signature, not
+> a missing ad — and the signed URLs 404'd two live ads on the same pass a dead one
+> returned 200. Adzuna's status codes degrade under repeated requests and carry no
+> information about the vacancy. `dead_reason` is unrecoverable, so `_adzuna_land_url`
+> returns the stored URL **verbatim or nothing**, and the verdict comes only from where
+> the redirect lands.
+
+Cost is small: 1–5 land-form picks per run across recent runs, against
+`VERIFY_BROWSER_MAX` 12, at 2-4s each gathered concurrently. Coverage is partial by
+design — 34% of Adzuna rows are redirect-verifiable; the other 66% are reported
+unverifiable rather than guessed at. `funnel.final_verify_redirect_routed` counts them
+separately from `final_verify_unverifiable`, because an Adzuna row here is a deliberate
+routing state, not a host that refused to answer, and folding the two together would
+make that counter read as a rising failure rate the moment this shipped.
+
+Relatedly, **`_verify_listings_alive` no longer stamps `_verified_at` on Adzuna rows.**
+It still calls them alive (that pass rations fetches across a ~40-row rank pool, and
+penalising every Adzuna candidate there is a far larger change than the evidence
+supports) — but the stamp would make `_verify_final_picks` SKIP the row, cancelling the
+only check that can answer for it, and would write the `last_verified_at` that badges
+the card as checked.
+
+**`_EXPIRED_LISTING_RE` gained two phrasings** on the back of this: *"this listing went
+offline"* and the **copular** *"the listing … is expired"* (the existing branch wanted
+the auxiliary — "has expired"). Neither is Adzuna-specific; boards write the copular
+form routinely, so this was a general gap. Re-measured over 461 stored scraped pages:
+fires on **1**, exactly as before, i.e. zero new false positives. `is expired` carries a
+`(?![\w-])` guard so it cannot match inside a hyphenated compound
+("expired-air-handling"), which an adversarial probe did hit.
+
 **`_needs_liveness_check` skips known dead-end URLs first.** Adzuna's `/jobs/land/ad/`
 interstitial (`_KNOWN_DEAD_END_URL_RE`) answers every request with a stub, so fetching it
 can only return "unverifiable" — spending a request to learn nothing *and* penalising the
@@ -2039,8 +2250,65 @@ Two limitations are **structural** and no matcher tuning fixes them: **recruitme
 agencies** (the listing names the agency, not the licence holder — `Hays Specialist
 Recruitment` misses even though `Hays PLC` is registered) and **blank-company** aggregator
 rows. Both are dropped under the strict setting, and the funnel counts blank-company drops
-separately so the cost stays visible. `VisaSponsorToggle`'s note under the buttons is the
-only place the UI says this; keep it if the semantics change.
+separately so the cost stays visible.
+
+**The third limitation is the one the register can never answer, and it needed a second
+signal.** The register is EMPLOYER-level: it says an organisation holds a licence, never
+which vacancies it will use it on. A licensed employer routinely advertises roles it will
+not sponsor — **21 rows in the measured store** are exactly that, and every one of them
+carried a "Visa sponsor" badge and passed the sponsors-only filter.
+`sponsors.statement_in_text` reads what the LISTING ITSELF says
+(`"offered" | "not_offered" | None`), and that outranks the register in **both**
+directions: a `not_offered` row is dropped even when the employer is licensed, and an
+`offered` row is kept even when the register cannot resolve the company — which is the
+first thing that has ever closed part of the agency hole above (4 rows in the same store).
+Counted as `sponsor_filter_listing_said_no` / `_said_yes` so the feature's only measurable
+effect doesn't vanish into the totals.
+
+Free, offline and deterministic — **not** an LLM axis. The phrasings are highly formulaic,
+a regex is auditable and re-measurable against the store, adding an axis to `screen_gate`
+would cost a `screen_v` bump (re-screening the whole store for identical answers on the
+untouched majority), and this reads the WHOLE text where the gate sees only the first
+`GATE_LISTING_TEXT_CHARS` — a sponsorship note is almost always near the end
+("Please note, we are unable to provide sponsorship…").
+
+Three things in it are load-bearing, all found by measuring:
+- **The non-visa senses are the majority and are excluded explicitly.** Of 12,273
+  text-bearing rows, 293 mention "sponsor" and most are not about visas at all:
+  "company-sponsored lunches/life insurance", "executive/programme sponsors", "event
+  sponsorship sales", "paired with a sponsor who mentors you", "we sponsor co-working
+  space", and — the one that also blocks a naive positive — "manage visa applications …
+  needed for **sponsoring employees**", which is a JD *duty*. That is why a nearby "visa"
+  is not sufficient context on its own.
+- **Negation must reach the verb by two routes.** The first cut required a second
+  "sponsor" token after the verb, which caught "unable to OFFER SPONSORSHIP" but not
+  "unable to SPONSOR visas" — and the latter then matched the POSITIVE pattern on the
+  "able to sponsor visas" sitting inside "unable to". **Six real listings were classified
+  as offering sponsorship when they said the exact opposite.** `_NEG` is factored out for
+  that reason, and the positive pattern carries `(?<!un)` / `(?<!\bno )` guards
+  independently, because a false "offered" spends someone's application.
+- **Clause-scoped, not document- or sentence-scoped.** A document search pairs a "not
+  eligible" in the benefits section with a "sponsorship" three paragraphs away; sentences
+  aren't enough either, because scraped headers run 300 characters with no full stop. The
+  window is bounded by distance *and* by the nearest clause break, and that window is also
+  the quote the card shows.
+Measured after those fixes: **7 `offered` (all genuine), 120 `not_offered` (all genuine),
+12,146 silent.** Negative wins ties, checked first and returned immediately.
+
+**UI.** The chip is three-state and no longer says "Visa sponsor" — that wording asserted
+a property of the *job* while holding a fact about the *employer*. `"Sponsorship offered"`
+/ `"No sponsorship"` come from the listing; `"Employer sponsors visas"` is the register's
+answer when the listing is silent, worded to say whose property it is. A false
+`sponsor_licensed` still earns **no** chip (absence must read as "unknown"), which is why
+the negative fires on the STATEMENT and never on the register. The employer's own sentence
+renders under the card as `The listing itself says: "…"` — a claim this consequential
+should be checkable in one glance, and "No sponsorship" costs the candidate a role if we
+got it wrong. All of it still gated on the candidate's own filter being on.
+`VisaSponsorToggle`'s note now carries both caveats plus an **info dot** opening a panel
+that states plainly what each badge means and what is and isn't likely to be sponsored in
+practice (pay near the Skilled Worker threshold, short contracts, small never-sponsored
+employers vs permanent roles at larger employers and shortage occupations). It is the only
+place the UI explains any of this; keep it if the semantics change.
 
 **`fetch_ats` now carries the employer name**, threaded from `select_ats_batch_for_run`'s
 `(company, vendor, token)` through `gather_jobs`, which used to discard it. Without it
@@ -2056,10 +2324,14 @@ canonical-URL branch for ATS rows, so no store row is orphaned — but `_family_
 `_dup_key` change shape, so decided-family suppression briefly misses against Role rows
 saved under the old token form.
 
-`Role.sponsor_licensed` is **three-state and the NULL matters**: True/False once checked,
+`Role.sponsor_licensed` and `Role.sponsor_statement` answer **two different questions and
+must not be collapsed** — the employer's licence, and what this listing says about this
+vacancy (`sponsor_statement_quote` carries the sentence). `sponsor_licensed` is
+**three-state and the NULL matters**: True/False once checked,
 NULL when the listing named no employer. The card badges only a positive match — "not on
 the register" is not the same as "does not sponsor" for an agency posting, and an absent
-badge reads correctly as "unknown" where a "Not a sponsor" badge would not. Stamped on
+badge reads correctly as "unknown" where a "Not a sponsor" badge would not. Both are
+stamped on
 every run, not only when the filter is on — but **shown only while the candidate's own
 sponsors-only filter is on** (`RoleCard.useSponsorFilterOn`, reading the same
 `visa_sponsor_only` attribute `VisaSponsorToggle` writes). Keep the two apart: stamping
@@ -2080,6 +2352,32 @@ surfaced for this profile, deduped by normalised key so two slots don't both go 
 **Not doing: a sponsor-seeded domain crawl.** The register carries no domains, so it would
 have to guess them. The charity crawl finds a supported ATS on 1.3% of *known-good*
 domains; guessed domains would be materially worse.
+
+**The salary floor** (`visa_sponsor_min_salary`, single-value like `commute_miles`/
+`max_listing_age`, default `config.DEFAULT_VISA_SPONSOR_MIN_SALARY` = 41700, "0" = no
+floor). The Skilled Worker route is not one cutoff -- GBP 41,700 is the general
+going-rate threshold for a standard applicant, but several categories are sponsorable
+well below it: new entrants (under 26, a recent Student/Graduate visa switcher, or
+training toward a professional qualification) at ~70% of the going rate for up to four
+years, PhD holders, roles on the Immigration Salary List, and a specific health/
+education occupation table -- down to roughly GBP 31,300-37,500 depending which
+applies. The Health and Care Worker visa is a separate route governed by none of these
+figures. None of those categories (age, visa-switch history, PhD subject, occupation
+code, ISL membership) are things this app reliably knows about the candidate or a
+listing, so rather than guess, the floor is just a candidate-editable number --
+`VisaSponsorToggle`'s picker offers the standard rate plus the other named tiers as
+presets, or a free-entry field, and defaults to the standard rate so a candidate who
+does nothing gets the conservative reading.
+
+Enforced in `engine._filter_by_sponsor` as a second, separate test **after** the
+register/statement check (so it applies uniformly to a register match or a listing that
+says "offered" -- both are meant to be a real, sponsorable vacancy). Deliberately does
+**not** inherit the sponsor filter's own "drop on unknown" inversion: salary data is
+sparse (`_filter_by_salary`'s own note), so a job with no parseable stated salary is
+always KEPT, and only a CONFIRMED annual max below the floor is dropped -- the annualised
+comparison via `salary.to_annual` is the same one `_filter_by_salary` already uses.
+Counted separately in the funnel (`sponsor_filter_below_salary_floor`, Settings ›
+run-funnel) so this cost stays as visible as the blank-company one above it.
 
 ### Commute distance (`backend/app/services/geo.py`)
 
@@ -2659,16 +2957,111 @@ everything else NULL. Do **not** extend it to stamp a provider on NULL rows: NUL
 what `beta_started_at` uses to exempt the original cohort from the 7-day window, and the
 two exemptions travel together.
 
-**Email+password has NO verification email, because this deployment has no mail service of
-any kind.** The consequence is recorded rather than hidden: `User.email_verified` stays
-False for those accounts and `GET /admin/signups` reports it, so an address nobody has
-proved they own is never presented there as a confirmed contact. `PASSWORD_MIN_LENGTH` (8)
+`PASSWORD_MIN_LENGTH` (8)
 is the only password rule — composition rules measurably push people toward shorter, more
 guessable passwords, and this account holds a CV and a list of job adverts, not a payment
 method. There *is* an upper bound (1024 chars), which is not cosmetic: pbkdf2 hashes
 whatever it is handed, so an unbounded password field is a free CPU-exhaustion lever
-against an unauthenticated endpoint. Set `EMAIL_SIGNUP_ENABLED=0` to hide the form and
-503 the endpoints.
+against an unauthenticated endpoint. It is enforced by `auth.validate_password`, which is
+split out from `validate_email_and_password` **so the reset route enforces the identical
+rule** — two copies of a password policy is how a reset endpoint quietly ends up accepting
+a 3-character password. Set `EMAIL_SIGNUP_ENABLED=0` to hide the form and 503 the
+endpoints.
+
+### Transactional email (Resend) — verification and password reset
+
+Email+password used to have no verification email and no reset, because the deployment had
+no mail service. Both now exist, through **Resend** (`services/mailer.py`, `RESEND_API_KEY`).
+The reset is the more important half: without it a forgotten password was **permanent
+lockout with no recovery path in the product at all**, which is the concrete sense in which
+the email path was not really a peer of the two provider buttons.
+
+**Two messages exist and there will never be a third without a reason written down**:
+confirm-your-address and reset-your-password. Each is the direct consequence of an action
+the recipient took seconds earlier, which is what keeps this out of consent/unsubscribe
+territory — there is no list and nothing to opt out of.
+
+**Sending can never fail a request.** Every mailer entry point returns a bool and swallows
+its own errors, and every send goes through `BackgroundTasks`. The endpoints that send are
+the endpoints that create accounts and accept sign-ins, and the documented invariant is
+that nothing in the auth path blocks a new user — so a Resend outage must degrade to "no
+email arrived", never to "sign-up is down". **An unset `RESEND_API_KEY` disables sending
+and prints the link to the console** rather than erroring, so a dev box with no Resend
+account still has a completely working sign-up flow.
+
+**`EMAIL_VERIFICATION_REQUIRED` defaults OFF**, and that is the same invariant again: a
+hard gate makes an undelivered email (wrong address, spam folder, unverified sending
+domain, Resend outage) indistinguishable from a broken account. Unverified users are signed
+in and nagged by `VerifyEmailBanner` until they click. Flip it to 1 only once deliverability
+has been *observed* — `GET /admin/analytics`' `verifications` counter against email signups
+is the only end-to-end evidence that mail is actually landing, since Resend accepting a send
+says nothing about it reaching an inbox.
+
+**The tokens are stateless — no issued-links table** — because each carries what makes it
+self-invalidating:
+- **verification** carries the address it was issued for, so it cannot confirm an account
+  whose email later differs, and re-clicking is idempotent (people forward these to
+  themselves and mail clients pre-fetch them; "already used" reads as breakage).
+- **reset** carries a **fingerprint of the password it was minted against**, so completing
+  a reset changes the fingerprint and every outstanding link for that account dies at the
+  same moment. Single-use falls out of the construction rather than out of a `used_at`
+  column somebody has to remember to check, and "I reset my password, now revoke the
+  emails" is handled for free. The cost, which is the correct trade for someone resetting
+  *because* they think a stranger has their password: a reset cannot be undone by re-using
+  the previous link.
+
+Distinct itsdangerous `salt=` values per purpose are what stop one being replayed as the
+other — a verification link accepted as a password reset would be full account takeover via
+an old email. Checked by test: both directions are rejected.
+
+**Both links SIGN THE USER IN** when consumed (`/verify-email`, `/reset-password` return a
+full `LoginOut`). Mail is usually opened on a different device from the one the account was
+created on, so ending at "confirmed — now go and sign in" strands exactly the people who
+clicked. The link is proof of mailbox control, which is what every password-reset flow
+already treats as sufficient to take over an account, so this grants a link-holder nothing
+new. A successful reset also sets `email_verified` for the same reason.
+
+**`POST /auth/password/forgot` always answers identically**, registered or not, sent or not
+— it is not permitted to become a membership oracle. (The registration 409 leaks the same
+fact and is unavoidable, since a signup form must refuse a duplicate somehow; this route has
+no such constraint, so it leaks nothing.) The frontend must keep saying *"if there's an
+account for that address"*; a UI that says "sent!" re-introduces the oracle the backend went
+to trouble to avoid. It silently does nothing for a Google/Apple account — granting one a
+password would create a second credential for an identity meant to have exactly one, i.e.
+the cross-provider linking the `User` model refuses on takeover grounds.
+
+Relatedly, the unverified check in `email_login` runs **after** the password check, never
+before, or the endpoint would tell an anonymous caller "that address exists but isn't
+confirmed" for any address they typed.
+
+**Rate limiting is TWO limits, not one, and this was a real bug caught in testing.**
+`EMAIL_SEND_MAX_PER_HOUR` (5) is per ADDRESS — nobody legitimately needs six reset links to
+one mailbox in an hour. `EMAIL_SEND_MAX_PER_HOUR_PER_CLIENT` (30) is per IP and must stay
+far looser, because **an IP is not a person**: a shared office connection or a mobile
+carrier's CGNAT puts many unrelated users behind one address, and using the tight number
+there refuses the fifth person on that network to forget their password because of four
+strangers. The limiter is consumed *before* any DB lookup, so a throttled caller and an
+unregistered address stay indistinguishable.
+
+**`_post` uses httpx, not the `resend` SDK.** httpx is already a pinned direct dependency
+precisely so the auth path doesn't inherit another package's dependency tree; `POST
+https://api.resend.com/emails` with a Bearer key is the whole API surface used here, and an
+SDK for one JSON POST would add a supply-chain surface to the one part of the app where a
+surprise is an authentication problem. Swapping to `import resend` later is confined to
+that one function.
+
+**`AUTH_SECRET` now signs reset links too.** On the dev default it is regenerated per
+process, so every outstanding link dies on restart — harmless locally, a stream of "this
+link is invalid" reports in production. It was already required to be stable; it is now
+required for a second reason.
+
+`EMAIL_FROM` must be on a domain verified in the Resend dashboard. The default
+(`onboarding@resend.dev`) is Resend's shared test sender and is deliverable **only to the
+address that owns the Resend account** — right for the operator's own testing, silently
+wrong for everyone else, which is why it is named in the deployment checklist rather than
+assumed. `APP_BASE_URL` is the FRONTEND origin the links point at, defaulting to the first
+`FRONTEND_ORIGINS` entry; set it explicitly when several origins are allowed, because the
+first one wins and a link to the wrong one is a dead link in someone's inbox.
 
 `POST /login` is scoped to **`auth_provider IS NULL`**. An email signup does have a real
 password hash and its username is derived from the email's local part, so without that
@@ -2735,10 +3128,23 @@ component returns null on `apple_enabled: false`, deliberately, rather than show
 URL**, or Apple rejects the popup before it opens. Again no client secret and no .p8 key,
 for the reason in the Apple bullet above.
 
-**Deployment checklist — email.** Nothing. It is on by default (`EMAIL_SIGNUP_ENABLED`),
-which is the point: it is the path that needs no third-party account, so requiring an env
-var to enable it would leave the default deployment offering exactly the two providers it
-exists to supplement.
+**Deployment checklist — email sign-up itself.** Nothing. It is on by default
+(`EMAIL_SIGNUP_ENABLED`), which is the point: it is the path that needs no third-party
+account, so requiring an env var to enable it would leave the default deployment offering
+exactly the two providers it exists to supplement.
+
+**Deployment checklist — Resend (the mail behind it).** The sign-up path works without any
+of this; what stops working is verification and password reset (links get printed to the
+server console instead of sent). (1) A Resend account and `RESEND_API_KEY`. (2) **A verified
+sending domain**, added under Resend → Domains with its DKIM/SPF DNS records published —
+this is the step that actually takes time, and until it is done `EMAIL_FROM` can only be
+`onboarding@resend.dev`, which Resend delivers **only to the address that owns the account**.
+Every other recipient is rejected with a 403 that `mailer._post` logs verbatim. (3)
+`EMAIL_FROM` on that domain. (4) `APP_BASE_URL` set to the real site origin if
+`FRONTEND_ORIGINS` lists more than one. (5) A stable `AUTH_SECRET` — it signs reset links,
+so a per-restart value invalidates every link in flight. Optional: `EMAIL_REPLY_TO` (a real
+inbox, since the From address usually isn't one), and `EMAIL_VERIFICATION_REQUIRED=1` once
+the `verifications` counter shows mail is landing.
 
 ### The open beta: a fixed 7-day window
 
@@ -2893,10 +3299,13 @@ access-granting step in between.
 - The `#join` box holds all three sign-up controls. `AppleSignInButton` and
   `EmailSignUpForm` each render as **nothing** when the server reports that method
   unconfigured, so the block degrades to exactly what it was before them. The email form
-  is collapsed behind a link on purpose: the two provider buttons are one click each and a
-  form is four fields' worth of attention, so leading with the form would make the fast
-  paths look like the fallback — but the link has to be visible, because catching the
-  people for whom neither provider is an option is the entire point. The Apple button is
+  **used to be collapsed behind a small link** on the theory that a form is more attention
+  than a one-click button, so leading with it would make the fast paths look like the
+  fallback. The theory was fine and the presentation still argued the opposite of what it
+  should: this is the only path available to *everyone* (no third-party account required)
+  and it was drawn as the least of three. It is now always visible, separated from the two
+  buttons by an `.lp-or` divider — "or" rather than a bare rule, because a rule alone reads
+  as a section break and invites what follows to be read as fine print. The Apple button is
   styled black-on-white, not Apple's black fill: this page's only strong colour is the
   terracotta accent, and a solid black button beside Google's outlined one reads as the
   primary action, which it isn't. Both are sized 320x44 to match what GSI renders at

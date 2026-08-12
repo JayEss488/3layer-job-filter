@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from ..config import (
     DEFAULT_COMMUTE_MILES,
     DEFAULT_MAX_LISTING_AGE_DAYS,
+    DEFAULT_VISA_SPONSOR_MIN_SALARY,
     MAX_ROLE_CLUSTERS,
     PINNED_ROLE_MULT,
     WORK_TYPE_VALUES,
@@ -70,6 +71,21 @@ def _parse_visa_sponsor_only(values: list[str]) -> bool:
     than bool(values) so a stale "false" row left behind by a UI change reads as
     off rather than as on."""
     return bool(values) and str(values[0]).strip().lower() in ("true", "1", "yes")
+
+
+def _parse_visa_sponsor_min_salary(values: list[str]) -> int:
+    """The minimum annual salary (GBP) a role must clear to count as sponsorable,
+    or DEFAULT_VISA_SPONSOR_MIN_SALARY when the candidate has never set it. 0 is
+    a real value (the candidate's own "no floor" choice, e.g. relying on a
+    reduced-rate category this app doesn't try to detect) and must not be
+    confused with "no row at all" -- same rule as _parse_max_listing_age_days /
+    _parse_commute_miles above."""
+    if not values:
+        return DEFAULT_VISA_SPONSOR_MIN_SALARY
+    try:
+        return max(0, int(str(values[0]).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_VISA_SPONSOR_MIN_SALARY
 
 
 def _parse_allow_overqualified(values: list[str]) -> bool:
@@ -539,6 +555,13 @@ def build_snapshot(db: Session, profile_id: int) -> dict:
         # tiering / page depth / sponsor-scoped search terms.
         "visa_sponsor_only": _parse_visa_sponsor_only(
             _values(g.get("visa_sponsor_only", []))),
+        # Minimum annual salary a role must clear to count as sponsorable. Only
+        # ever enforced when visa_sponsor_only is on (engine._filter_by_sponsor);
+        # 0 means the candidate turned the floor off. See config.ATTRIBUTE_TYPES'
+        # visa_sponsor_min_salary entry for the reduced-rate categories this
+        # deliberately does not try to detect on its own.
+        "visa_sponsor_min_salary": _parse_visa_sponsor_min_salary(
+            _values(g.get("visa_sponsor_min_salary", []))),
         # Open to roles pitched BELOW the candidate's own stated seniority.
         # Off by default. Read by engine._heuristic_prescreen (which stops
         # hard-dropping junior-marked titles for a senior profile) and by

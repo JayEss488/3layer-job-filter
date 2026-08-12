@@ -6,10 +6,18 @@ the fourth is legacy and reachable only from the footer:
 * **POST /auth/google** -- verifies a Google Identity Services ID token.
 * **POST /auth/apple** -- verifies a Sign in with Apple ID token.
 * **POST /auth/email/register** + **POST /auth/email/login** -- an email address
-  and a password, no third-party account required.
+  and a password, no third-party account required. Backed by four more routes
+  that are what make it a peer of the providers rather than a fallback:
+  **/auth/email/verify**, **/auth/email/resend**, **/auth/password/forgot** and
+  **/auth/password/reset**. Before those existed nobody had proved they owned
+  the address they signed up with, and a forgotten password was permanent
+  lockout with no recovery path in the product at all.
 * **POST /login** -- the original hand-assigned beta credentials
   (scripts/gen_beta_users.py). Kept working so the first cohort isn't locked out
   by the switch; the frontend only surfaces it from the homepage footer.
+  Deliberately NOT given a reset flow: those accounts have no verified address
+  to send one to, so a reset would email whoever happens to occupy whatever
+  address is on the row.
 
 All three self-serve paths create the account on first sight and return the same
 Bearer token every other route already expects. There is no approval step:
@@ -41,13 +49,16 @@ import re
 import secrets
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import (
+    EMAIL_VERIFICATION_REQUIRED,
+    EMAIL_VERIFY_TOKEN_MAX_AGE_SECONDS,
     EXIT_SURVEY_FEATURE_CHOICES,
     EXIT_SURVEY_SPEED_CHOICES,
+    PASSWORD_RESET_TOKEN_MAX_AGE_SECONDS,
     SIGNUP_PRIORITY_CHOICES,
 )
 from ..database import get_db
@@ -58,23 +69,34 @@ from ..schemas import (
     EmailAuthIn,
     ExitSurveyIn,
     ExitSurveyOut,
+    ForgotPasswordIn,
     GoogleAuthIn,
     LoginIn,
     LoginOut,
     MeOut,
+    MessageOut,
+    ResetPasswordIn,
     SurveyIn,
     SurveyOut,
+    TokenIn,
 )
+from ..services import mailer
 from ..services.analytics import log_event, record_feedback
 from ..services.auth import (
     AppleAuthError,
     EmailAuthError,
     GoogleAuthError,
     hash_password,
+    make_email_verification_token,
+    make_password_reset_token,
     make_token,
     normalize_email,
+    parse_email_verification_token,
+    parse_password_reset_token,
+    password_fingerprint_matches,
     unusable_password,
     validate_email_and_password,
+    validate_password,
     verify_apple_id_token,
     verify_google_id_token,
     verify_password,
@@ -156,6 +178,8 @@ def _login_out(db: Session, user: User, *, is_new: bool = False) -> LoginOut:
         email=user.email or "",
         display_name=user.display_name or "",
         is_new=is_new,
+        email_verified=bool(user.email_verified),
+        auth_provider=user.auth_provider or "",
         **beta_fields(db, user),
     )
 
@@ -210,6 +234,60 @@ def _provider_http_error(e: Exception) -> HTTPException:
     would fail identically."""
     code = 503 if "not configured" in str(e) else 401
     return HTTPException(status_code=code, detail=str(e))
+
+
+# ── Outbound mail ────────────────────────────────────────────────────────────
+# Every send goes through BackgroundTasks, so the HTTP response is never waiting
+# on Resend. That matters most on the route where it is least obvious:
+# registration. A user whose account was created successfully must not watch a
+# spinner for a 10-second mail timeout and conclude sign-up is broken -- the
+# account exists either way, and mailer.send_email swallows its own failures.
+#
+# The rate-limit CHECK, by contrast, is deliberately synchronous and on the
+# request thread: a caller that has exhausted its allowance must be told so, and
+# a limiter consulted inside a background task could only decline silently.
+def _queue_verification_email(tasks: BackgroundTasks, user: User) -> None:
+    """Send this user a fresh confirm-your-address link, if there is anything to
+    confirm. A no-op for an account with no address, or one already verified --
+    re-confirming a confirmed address is a link that does nothing, arriving
+    unprompted."""
+    if not user.email or user.email_verified:
+        return
+    token = make_email_verification_token(user.id, user.email)
+    tasks.add_task(mailer.send_verification_email, user.email, token)
+
+
+def _rate_limit_or_429(address_key: str, request: Request) -> None:
+    """Consume one send allowance against both the address and the caller, or 429.
+
+    Both are checked because they guard different attacks: the ADDRESS key stops
+    one victim's inbox being flooded from many clients, the CLIENT key stops one
+    client walking a list of addresses. Neither alone is enough.
+
+    Their LIMITS are very different and must stay so. An IP is not a person: a
+    shared office connection or a mobile carrier's CGNAT puts many unrelated
+    users behind one address, so a client allowance as tight as the per-address
+    one would refuse the fifth person on that network to forget their password
+    because of four strangers. (This was not hypothetical -- it fell out of
+    testing the moment two flows shared a client.) See
+    config.EMAIL_SEND_MAX_PER_HOUR_PER_CLIENT.
+
+    The message is deliberately about sending, not about accounts -- on
+    /auth/password/forgot even a rate-limit response must not become a way to
+    learn whether an address is registered, and it doesn't: the limiter is
+    consumed before any lookup happens, so it responds identically either way."""
+    ok = mailer.rate_limit_ok(address_key) if address_key else True
+    if ok:
+        ok = mailer.client_rate_limit_ok(_client_key(request))
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many emails requested just now. Please try again in a little while.",
+        )
+
+
+def _client_key(request: Request) -> str:
+    return f"ip:{request.client.host}" if request and request.client else "ip:unknown"
 
 
 # ── Google (self-serve) ──────────────────────────────────────────────────────
@@ -318,14 +396,17 @@ def _require_email_signup_enabled() -> None:
 
 
 @router.post("/auth/email/register", response_model=LoginOut)
-def email_register(body: EmailAuthIn, db: Session = Depends(get_db)):
+def email_register(body: EmailAuthIn, tasks: BackgroundTasks, request: Request,
+                   db: Session = Depends(get_db)):
     """Public: create an account from an email address and a password.
 
-    NOTE, and it is recorded in the response data rather than hidden: there is
-    no verification email, because this deployment has no mail service. The
-    account is created immediately and `User.email_verified` stays False, which
-    GET /admin/signups reports -- so an address nobody has proved they own is
-    never presented as a confirmed contact.
+    The account is created and signed in IMMEDIATELY, and the verification email
+    is a background task whose outcome is not waited on. That ordering is the
+    product invariant this whole router is built around: nothing in the auth
+    path may block a new user. With EMAIL_VERIFICATION_REQUIRED off (the
+    default) an unconfirmed address costs the user only a banner; see
+    config.EMAIL_VERIFICATION_REQUIRED for when to tighten it and why it is not
+    tight by default.
 
     409 on an email already in use, by ANY account and any provider. That is
     what stops the two-accounts-one-person case, and it is deliberately NOT
@@ -341,6 +422,10 @@ def email_register(body: EmailAuthIn, db: Session = Depends(get_db)):
     except EmailAuthError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Before the account is created, so a scripted signup loop cannot spend the
+    # mail quota (or our sending reputation) faster than the limiter allows.
+    _rate_limit_or_429(f"verify:{email}", request)
+
     existing = db.execute(select(User).where(User.email == email)).scalars().first()
     if existing is not None:
         raise HTTPException(
@@ -351,7 +436,9 @@ def email_register(body: EmailAuthIn, db: Session = Depends(get_db)):
 
     user = _new_self_serve_user(db, provider="email", email=email,
                                 email_verified=False, password=body.password)
-    return _finish_login(db, user, is_new=True)
+    out = _finish_login(db, user, is_new=True)
+    _queue_verification_email(tasks, user)
+    return out
 
 
 @router.post("/auth/email/login", response_model=LoginOut)
@@ -364,7 +451,12 @@ def email_login(body: EmailAuthIn, db: Session = Depends(get_db)):
     Scoped to `auth_provider == "email"`. A Google or Apple account stores the
     empty-hash sentinel, so verify_password could never match it anyway -- but
     the scoping makes that a property of the QUERY rather than of a comparison
-    somewhere else, so this stays safe even if the sentinel is ever changed."""
+    somewhere else, so this stays safe even if the sentinel is ever changed.
+
+    The unverified-address check runs AFTER the password check, never before.
+    Reversed, the endpoint would tell an anonymous caller "that address exists
+    but isn't confirmed" for any address they typed -- an account-enumeration
+    oracle bolted onto the one route that goes to lengths to avoid being one."""
     _require_email_signup_enabled()
     email = normalize_email(body.email)
     user = db.execute(
@@ -372,6 +464,189 @@ def email_login(body: EmailAuthIn, db: Session = Depends(get_db)):
     ).scalars().first()
     if not user or not verify_password(body.password or "", user.salt, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    if EMAIL_VERIFICATION_REQUIRED and not user.email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail=("Please confirm your email address first -- check your inbox for the "
+                    "link we sent when you signed up."),
+        )
+    return _finish_login(db, user, is_new=False)
+
+
+# ── Email verification ───────────────────────────────────────────────────────
+# Stateless links: no issued-tokens table, because each token carries what makes
+# it self-invalidating (see services/auth.py). The consequence worth knowing is
+# that a verification link cannot be revoked early -- only expired. That is
+# acceptable for a token whose entire power is to assert "this mailbox
+# received mail", and is emphatically NOT acceptable for the reset token below,
+# which is why that one carries a password fingerprint instead.
+@router.post("/auth/email/verify", response_model=LoginOut)
+def email_verify(body: TokenIn, db: Session = Depends(get_db)):
+    """Public: consume a confirm-your-address link.
+
+    Returns a full LoginOut, i.e. clicking the link SIGNS YOU IN. That is
+    deliberate and it is the difference between a link that works and one that
+    strands people: mail is very often opened on a different device from the one
+    the account was created on, and a bare "confirmed, now go and sign in"
+    ending would send that user to a form to re-type a password they set on
+    their laptop. The link is proof of mailbox control, which is exactly the
+    proof every password-reset flow on the internet already accepts as
+    sufficient to take over an account -- so treating it as sign-in evidence
+    adds no new capability to a holder of the link.
+
+    Public (no token required) for the same reason.
+
+    Idempotent: a second click on an already-confirmed link is success, not an
+    error. People forward these to themselves, mail clients pre-fetch them, and
+    "this link has already been used" is indistinguishable to the reader from
+    "something is broken"."""
+    parsed = parse_email_verification_token(body.token or "", EMAIL_VERIFY_TOKEN_MAX_AGE_SECONDS)
+    if parsed is None:
+        raise HTTPException(
+            status_code=400,
+            detail="That confirmation link is invalid or has expired. Sign in and request a new one.",
+        )
+    uid, email = parsed
+    user = db.get(User, uid)
+    if user is None:
+        raise HTTPException(status_code=400, detail="That confirmation link is no longer valid.")
+
+    # The address is pinned into the token, so a link issued for one address can
+    # never confirm a different one -- the case that matters is an account whose
+    # email changed after the link was sent.
+    if normalize_email(user.email or "") != normalize_email(email):
+        raise HTTPException(
+            status_code=400,
+            detail="That confirmation link was issued for a different email address.",
+        )
+
+    if not user.email_verified:
+        user.email_verified = True
+        log_event(db, user.id, None, "email_verified")
+    return _finish_login(db, user, is_new=False)
+
+
+@router.post("/auth/email/resend", response_model=MessageOut)
+def email_resend_verification(tasks: BackgroundTasks, request: Request,
+                              db: Session = Depends(get_db)):
+    """Send this signed-in user another confirmation link.
+
+    AUTHED, unlike the reset route below, and the asymmetry is the point: here
+    the caller has already proved they hold the account, so there is no address
+    to accept from them and nothing to enumerate. The reset route cannot make
+    that assumption -- its whole purpose is serving someone who has lost their
+    way in."""
+    uid = current_user_id()
+    user = db.get(User, uid)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Unknown user")
+    if user.auth_provider != "email" or not user.email:
+        raise HTTPException(status_code=400, detail="This account has no address to confirm.")
+    if user.email_verified:
+        return MessageOut(message="That address is already confirmed.")
+
+    _rate_limit_or_429(f"verify:{normalize_email(user.email)}", request)
+    _queue_verification_email(tasks, user)
+    return MessageOut(message="Sent. Check your inbox for the confirmation link.")
+
+
+# ── Password reset ───────────────────────────────────────────────────────────
+@router.post("/auth/password/forgot", response_model=MessageOut)
+def password_forgot(body: ForgotPasswordIn, tasks: BackgroundTasks, request: Request,
+                    db: Session = Depends(get_db)):
+    """Public: email a reset link, if that address has a password account.
+
+    **Always answers identically**, whether or not the address is registered and
+    whether or not the send succeeded. An honest 404 here would turn this into a
+    membership oracle for any address someone cares to type -- and unlike the
+    registration 409, which is unavoidable (a signup form has to refuse a
+    duplicate somehow), this route has no such constraint, so there is no reason
+    to leak anything.
+
+    Silently does nothing for a Google or Apple account. Those have no password
+    to reset, and a reset link that granted a password to an account reachable
+    by a provider identity would create a SECOND credential for it -- exactly
+    the cross-provider linking the User model refuses on takeover grounds."""
+    _require_email_signup_enabled()
+    email = normalize_email(body.email)
+    # Consumed before the lookup, so a throttled caller and an unregistered
+    # address are still indistinguishable from each other in timing terms.
+    _rate_limit_or_429(f"reset:{email}", request)
+
+    ack = MessageOut(
+        message="If there's an account for that address, a reset link is on its way.",
+    )
+    if not email:
+        return ack
+
+    user = db.execute(
+        select(User).where(User.email == email, User.auth_provider == "email")
+    ).scalars().first()
+    if user is None:
+        return ack
+
+    token = make_password_reset_token(user.id, user.password_hash, user.salt)
+    tasks.add_task(mailer.send_password_reset_email, user.email, token)
+    log_event(db, user.id, None, "password_reset_requested")
+    db.commit()
+    return ack
+
+
+@router.post("/auth/password/reset", response_model=LoginOut)
+def password_reset(body: ResetPasswordIn, db: Session = Depends(get_db)):
+    """Public: set a new password from a reset link, and sign the user in.
+
+    Single-use falls out of the token's construction rather than out of a
+    `used_at` column: the token carries a fingerprint of the password it was
+    minted against, so completing a reset changes the fingerprint and every
+    outstanding link for that account stops verifying at the same moment. A user
+    who requested three links and used one has not left two live back doors in
+    their inbox.
+
+    One consequence to keep in mind before "improving" this: it also means a
+    reset cannot be undone by re-using the previous link. That is the correct
+    behaviour for the case that matters -- someone resetting BECAUSE they think
+    a stranger has their password -- and it is the reason not to swap the
+    fingerprint for a nonce table that expires links independently.
+
+    Confirming the address as a side effect is safe and not an oversight:
+    holding a link that was delivered to that mailbox is proof of exactly what
+    the verification email asks for, so leaving the account unverified after a
+    successful reset would nag the user about something they just demonstrated.
+    """
+    _require_email_signup_enabled()
+    parsed = parse_password_reset_token(body.token or "", PASSWORD_RESET_TOKEN_MAX_AGE_SECONDS)
+    if parsed is None:
+        raise HTTPException(
+            status_code=400,
+            detail="That reset link is invalid or has expired. Request a new one.",
+        )
+    uid, fingerprint = parsed
+
+    try:
+        validate_password(body.password or "")
+    except EmailAuthError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    user = db.get(User, uid)
+    # The provider check is repeated here rather than trusted from issue time:
+    # tokens are stateless and long-lived relative to a config change, and a
+    # password written onto a provider account would be a second credential for
+    # an identity that is supposed to have exactly one.
+    if user is None or user.auth_provider != "email":
+        raise HTTPException(status_code=400, detail="That reset link is no longer valid.")
+
+    if not password_fingerprint_matches(fingerprint, user.password_hash, user.salt):
+        raise HTTPException(
+            status_code=400,
+            detail="That reset link has already been used. Request a new one if you still need it.",
+        )
+
+    user.password_hash, user.salt = hash_password(body.password)
+    # See the docstring: the link proves mailbox control, which is the same
+    # thing the verification email exists to establish.
+    user.email_verified = True
+    log_event(db, user.id, None, "password_reset")
     return _finish_login(db, user, is_new=False)
 
 
@@ -396,6 +671,16 @@ def auth_config():
         "apple_enabled": bool(APPLE_CLIENT_ID),
         "apple_client_id": APPLE_CLIENT_ID,
         "email_enabled": bool(EMAIL_SIGNUP_ENABLED),
+        # Whether a link will actually be sent. The frontend needs this to avoid
+        # telling someone to "check your inbox" on a deployment with no
+        # RESEND_API_KEY -- a confident instruction to wait for mail that will
+        # never arrive is worse than saying nothing, because the user's next
+        # move is to wait rather than to ask.
+        "mail_enabled": mailer.mail_enabled(),
+        # Whether an unconfirmed address blocks sign-in. Drives the wording on
+        # the sign-up form: "you're straight in" versus "confirm before you can
+        # sign in" are different promises and the form must make the right one.
+        "email_verification_required": bool(EMAIL_VERIFICATION_REQUIRED),
     }
 
 
@@ -452,6 +737,8 @@ def me(db: Session = Depends(get_db)):
         needs_survey=_needs_survey(db, user),
         email=user.email or "",
         display_name=user.display_name or "",
+        email_verified=bool(user.email_verified),
+        auth_provider=user.auth_provider or "",
         **beta_fields(db, user),
     )
 

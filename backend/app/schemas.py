@@ -51,6 +51,11 @@ class LoginOut(BetaWindowOut):
     # True the very first time an account signs in, so the frontend can route a
     # brand-new user to the survey instead of to the app shell.
     is_new: bool = False
+    # Mirrors MeOut -- see there. Carried on the sign-in response too so a
+    # freshly-registered user sees the "confirm your address" banner on the very
+    # first paint, rather than only after the next /me lands.
+    email_verified: bool = False
+    auth_provider: str = ""
 
 
 class GoogleAuthIn(BaseModel):
@@ -82,12 +87,54 @@ class EmailAuthIn(BaseModel):
     password: str
 
 
+class ForgotPasswordIn(BaseModel):
+    """An address to send a reset link to. Deliberately the ONLY field: adding
+    anything the caller could use to narrow the account (a username, a provider)
+    would turn a route that must not confirm whether an address is registered
+    into one that can be probed."""
+
+    email: str
+
+
+class ResetPasswordIn(BaseModel):
+    """A reset link's token plus the new password.
+
+    The token identifies the account -- there is no email field, and there must
+    not be. Taking the address from the request and the authorisation from the
+    token would mean two independent claims about who this is, and a route whose
+    correctness depends on them agreeing."""
+
+    token: str
+    password: str
+
+
+class TokenIn(BaseModel):
+    """A single opaque link token. Used by email verification."""
+
+    token: str
+
+
+class MessageOut(BaseModel):
+    """A plain acknowledgement for the routes that must not report what they
+    actually did (see POST /auth/password/forgot)."""
+
+    ok: bool = True
+    message: str = ""
+
+
 class MeOut(BetaWindowOut):
     user_id: int
     username: str
     needs_survey: bool = False
     email: str = ""
     display_name: str = ""
+    # Both exist so the app shell can decide whether to nag about an unconfirmed
+    # address. It must only ever nag an EMAIL account: a Google or Apple account
+    # can carry email_verified=False (the provider said the address was
+    # unverified, so we dropped it), and there is nothing such a user could
+    # click to fix it.
+    email_verified: bool = False
+    auth_provider: str = ""
 
 
 class SurveyIn(BaseModel):
@@ -291,6 +338,11 @@ class RoleOut(ORMModel):
     # Three-state: True/False once checked, None when the listing named no
     # employer to check against the register. See models.Role.
     sponsor_licensed: Optional[bool] = None
+    # What the listing itself says about sponsoring THIS role: "offered" |
+    # "not_offered" | None (silent). A different question from sponsor_licensed
+    # -- see models.Role -- and the quote is the employer's own sentence.
+    sponsor_statement: Optional[str] = None
+    sponsor_statement_quote: Optional[str] = None
     # When this listing was last directly confirmed to still exist.
     last_verified_at: Optional[datetime] = None
     url: Optional[str] = None
@@ -303,6 +355,9 @@ class RoleOut(ORMModel):
     salary_max: Optional[float] = None
     salary_period: Optional[str] = None
     salary_currency: Optional[str] = None
+    # True when salary_min/max is a modelled estimate (Adzuna's own
+    # salary_is_predicted) rather than an employer/board-stated figure.
+    salary_is_predicted: Optional[bool] = None
     source: Optional[str] = None
     fit_rank: Optional[int] = None
     rank_score: Optional[int] = None

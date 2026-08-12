@@ -736,6 +736,18 @@ export default function SettingsPage() {
                     .
                   </div>
                 )}
+                {runFunnel.stale_soft_demoted > 0 && (
+                  <div className="annotation" style={{ marginTop: 14 }}>
+                    <b>Listing age.</b> Your maximum listing age is set as a preference
+                    rather than a hard limit, so older roles are still shown —{" "}
+                    {runFunnel.stale_soft_demoted} were past it this run
+                    {runFunnel.stale_soft_demoted_double > 0 && (
+                      <> ({runFunnel.stale_soft_demoted_double} past double it)</>
+                    )}{" "}
+                    and were ranked below equally good fresher ones. Set it to a hard
+                    limit in Preferences to exclude them instead.
+                  </div>
+                )}
                 {(runFunnel.final_verify_checked > 0 || runFunnel.verify_checked > 0) && (
                   <div className="annotation" style={{ marginTop: 14 }}>
                     <b>Listing liveness.</b> Every pick shown to you was fetched and
@@ -780,7 +792,15 @@ export default function SettingsPage() {
                       </>
                     )}
                     This is the one filter that drops on unknown, so a role advertised by a
-                    recruitment agency goes too.
+                    recruitment agency goes too.{" "}
+                    {runFunnel.sponsor_filter_below_salary_floor > 0 && (
+                      <>
+                        {runFunnel.sponsor_filter_below_salary_floor} more{" "}
+                        {runFunnel.sponsor_filter_below_salary_floor === 1 ? "was" : "were"}{" "}
+                        dropped for a confirmed salary below the sponsorship floor set on the
+                        Preferences page &mdash; an unpriced listing is never dropped for this.
+                      </>
+                    )}
                   </div>
                 )}
                 {runFunnel.token_usage?.length > 0 && (

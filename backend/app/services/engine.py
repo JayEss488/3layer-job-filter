@@ -344,6 +344,38 @@ SOFT_VIOLATION_SELECTION_PENALTY = 12.0
 # a suspected ghost listing must stay reachable, it should just lose to an
 # equally-good listing with a vacancy behind it.
 GHOST_SELECTION_PENALTY = float(os.getenv("GHOST_SELECTION_PENALTY", "8"))
+# _selection_score demotion for a listing DEFINITELY older than the candidate's
+# own "Maximum listing age" when they left that preference SOFT. Ordering only,
+# never _rank_score -- same rule as the three adjustments above it.
+#
+# Soft max-listing-age was the one stated preference in the profile with no
+# demotion path at all. Hard is a real drop (listing_over_max_age, before any LLM
+# call); Soft got the age TAG's wording, rank_gate's STALENESS scoring component
+# (~-10, and explicitly unable to outweigh a good function match) and the judge's
+# "push a borderline grade down one step" -- and nothing that touches ordering.
+# Measured on a live profile with a 7-day Soft limit: 18 of 36 shown roles were
+# over it, 9 were past DOUBLE it, and they sat at ranks 1-12 (over-limit mean rank
+# 7.44 vs 5.56 within limit, with 6 of the 18 in their run's top five). A 22-day
+# and a 28-day listing were rank 1 and rank 5.
+#
+# Deterministic and Python-side, deliberately: the age is a FACT this system
+# already holds (full_auto.listing_over_max_age reads the same definite date the
+# hard filter does), so asking a model to re-derive it -- the route arrangement
+# and salary take via rank_gate's soft_violation flag -- would be less reliable
+# and would cost a rank_v bump for an answer already known for free.
+#
+# Two steps, because "over the limit" and "several times over it" are not the same
+# claim. The second is the "hard cut at double the limit" instinct expressed as a
+# demotion instead of a drop: Soft means the candidate asked NOT to be excluded on
+# this, so a listing they'd still take must stay reachable -- it just has to lose
+# to a fresher equal. Sized against the neighbours: the base step sits at the ghost
+# penalty (8.0), an inference from a posting date; the doubled step reaches the
+# soft-violation penalty (12.0), since by then the preference is not marginally
+# missed but comfortably so. Never applied when the preference is Hard (the row is
+# already gone) or when the date is unknown or merely approximate -- unknown is
+# never treated as old, the same rule _listing_age_tag follows.
+STALE_SELECTION_PENALTY = float(os.getenv("STALE_SELECTION_PENALTY", "8"))
+STALE_SELECTION_PENALTY_DOUBLE = float(os.getenv("STALE_SELECTION_PENALTY_DOUBLE", "12"))
 # Same-source posting-volume signal (scam/CV-farming detection, see
 # _company_title_counts): a company posting at least this many DIFFERENT
 # titles in one run's discovery is surfaced to the final judge as a hint --
@@ -527,6 +559,65 @@ def _external_id(engine, job: dict) -> str:
 _KNOWN_DEAD_END_URL_RE = re.compile(r"/jobs/land/ad/")
 
 
+def _adzuna_land_url(url: str | None) -> str | None:
+    """Adzuna's /jobs/land/ad/ tracking redirect, **only when the stored URL
+    already is one**, returned verbatim. Never reconstructed. None otherwise.
+
+    This exists because **Adzuna's own pages cannot report that a vacancy has
+    closed, and following the redirect to the real source can.** Measured on the
+    two roles that prompted it, both shown as top picks and both already closed:
+
+    * Golden Charter (ad 5831595906): /jobs/details/ returned **200 with 4,489
+      chars** of full job description, no closure phrase anywhere, and a JSON-LD
+      `validThrough` of 2026-08-23 -- still in the future.
+    * Connected Health (ad 5832285695): /jobs/details/ likewise served a full
+      6.5k description. Its land redirect resolved to `nijobs.com/job/107811063`,
+      whose page reads "This listing went offline. Sorry, the listing that
+      you're looking for is expired."
+
+    So every route the pipeline had said ALIVE -- `_classify_listing` on the
+    detail page, and `fetch_adzuna_details`' three dead signals (404/410, passed
+    validThrough, closure phrase), none of which can fire on a page serving the
+    original description with a future expiry date.
+
+    Following the redirect needs the BROWSER: a plain client gets 403 "Access
+    Denied ... suspicious behaviour" from the land URL. CLAUDE.md previously
+    recorded it as bot-walled behind the browser too; re-measured, headless
+    resolves it in 2-4s.
+
+    **VERBATIM, AND WHY THAT IS THE WHOLE RULE.** The obvious version of this
+    function derived the land URL from the ad id, so that /jobs/details/ rows
+    (1,033 of 1,578 in a measured store -- Adzuna's API returns either form in
+    the same response) could be verified too. That is a false-positive machine
+    and was caught only by testing it against ads known to be LIVE:
+
+        ad                          FULL signed URL      BARE (id only)
+        Tarmac    (fresh, live)     404                  400
+        Sage      (fresh, live)     404                  400
+        Connected Health (DEAD)     200 -> nijobs.com    400
+
+    A bare land URL 400s for **everything**, live or dead -- the 400 reports a
+    missing `se`/`v` signature, not a missing ad. Reading it as death would have
+    marked a large share of live Adzuna listings dead, and `dead_reason` is
+    unrecoverable. Note also that the signed URLs 404'd two live ads on that
+    same pass: Adzuna's status codes degrade under repeated requests, so **no
+    status code from this host is evidence of anything.** Only the DESTINATION
+    page's own content is trusted (see _verify_via_browser), and only when the
+    redirect actually leaves adzuna.co.uk.
+
+    The cost of the verbatim rule is that details-form rows cannot be
+    redirect-verified at all. They are reported `unverifiable` rather than
+    `alive` -- honest, and the same conclusion the LinkedIn case reached.
+
+    Deliberately used ONLY at _verify_final_picks (~12 rows), never at
+    _verify_listings_alive (~40): the pre-judge pass is a fetch-rationing
+    heuristic, the final-pick pass is the promise made to the user, and a
+    browser fetch per rank-pool candidate is not a trade worth making."""
+    if not url or "adzuna." not in url.lower():
+        return None
+    return url if _KNOWN_DEAD_END_URL_RE.search(url) else None
+
+
 def _has_judgeable_text(job: dict) -> bool:
     """Whether this candidate already carries enough real text for the final
     judge to assess it -- a scraped/enriched full_text, an ATS description
@@ -604,12 +695,18 @@ def _selection_score(j: dict) -> float:
     suspicion, not a fact about fit, so it must never touch the number the card
     shows or the floor tests. Set BELOW the soft-violation penalty on purpose:
     a candidate's own stated preference being missed is firmer evidence than an
-    inference from a posting date."""
+    inference from a posting date.
+
+    STALE_SELECTION_PENALTY is the fifth, and closes the one stated preference
+    that had no ordering path at all -- see that constant. It is stamped
+    deterministically by _annotate_stale rather than reported by a model, because
+    the listing's age is a fact this system already holds."""
     return (j.get("_rank_score", 50.0)
             + (RICH_TEXT_SELECTION_BONUS if _has_judgeable_text(j) else 0.0)
             - j.get("_unverified_penalty", 0.0)
             - (SOFT_VIOLATION_SELECTION_PENALTY if j.get("_rank_soft_violation") else 0.0)
-            - (GHOST_SELECTION_PENALTY if j.get("_ghost_level") == "high" else 0.0))
+            - (GHOST_SELECTION_PENALTY if j.get("_ghost_level") == "high" else 0.0)
+            - j.get("_stale_penalty", 0.0))
 
 
 # Free, high-confidence seniority pre-reject: a junior/graduate candidate will never
@@ -909,12 +1006,21 @@ def _parsed_salary(job: dict, text: str | None) -> dict | None:
 
 
 def _role_salary_fields(job: dict, text: str | None) -> dict:
-    """salary_text + the four parsed salary columns for a Role row.
+    """salary_text + the four parsed salary columns for a Role row, plus
+    salary_is_predicted.
 
     All four parsed columns are null together when nothing parseable was stated
     ("Competitive", "Negotiable", "National Minimum Wage") -- the free text is
     still stored and still shown, because what the employer actually wrote beats
-    a blank."""
+    a blank.
+
+    salary_is_predicted carries forward Adzuna's own "this is a modelled
+    estimate, not a stated figure" flag (see full_auto.fetch_adzuna) so the
+    card can label it rather than presenting a guess as fact -- see
+    frontend/lib/salary.ts. It rides alongside the parsed figures rather than
+    suppressing them: an estimate is still useful information, just not a
+    confirmed one (see _filter_by_salary/_filter_by_sponsor, which must not
+    hard-drop a candidate on it)."""
     parsed = _parsed_salary(job, text)
     return {
         "salary_text": text,
@@ -922,6 +1028,7 @@ def _role_salary_fields(job: dict, text: str | None) -> dict:
         "salary_max": parsed["max"] if parsed else None,
         "salary_period": parsed["period"] if parsed else None,
         "salary_currency": parsed["currency"] if parsed else None,
+        "salary_is_predicted": bool(job.get("salary_is_predicted")),
     }
 
 
@@ -1718,13 +1825,17 @@ def _jobseen_salary_fields(job: dict) -> dict:
     produces overwhelmingly false figures (a 15-listing audit of the 4,389
     "salaries" it found in a live store's snippets got 12 wrong -- see
     services/salary.py's module docstring). A missing period is left to
-    magnitude inference, which is safe on a dedicated numeric field."""
+    magnitude inference, which is safe on a dedicated numeric field.
+
+    salary_is_predicted -- see _role_salary_fields's twin note -- rides straight
+    off the discovery dict (only Adzuna ever sets it)."""
     parsed = _parsed_salary(job, None)
     return {
         "salary_min": parsed["min"] if parsed else None,
         "salary_max": parsed["max"] if parsed else None,
         "salary_period": parsed["period"] if parsed else None,
         "salary_currency": parsed["currency"] if parsed else None,
+        "salary_is_predicted": bool(job.get("salary_is_predicted")),
     }
 
 
@@ -2021,6 +2132,7 @@ def _rows_to_dicts(rows: list[JobSeen]) -> list[dict]:
         "salary_max": r.salary_max,
         "salary_period": r.salary_period,
         "salary_currency": r.salary_currency,
+        "salary_is_predicted": bool(r.salary_is_predicted),
         # ISO strings rather than datetimes: these ride into full_auto, which is
         # DB-agnostic and formats them via _listing_age_tag. Often None -- see
         # JobSeen.posted_at on why an unknown date must stay unknown.
@@ -2583,9 +2695,20 @@ def _verify_listings_alive(engine, db: Session, profile_id: int,
     # Stamped on the dict as well as the store row: these are the same dicts
     # that flow through to the final picks, and _verify_final_picks uses this to
     # avoid spending a second fetch on a listing already confirmed this run.
+    #
+    # NOT stamped for Adzuna, and that exclusion is the whole point. An "alive"
+    # here comes from its detail page, which is measurably incapable of
+    # reporting closure (see _adzuna_land_url) -- so the stamp would do the two
+    # things it must not: make _verify_final_picks SKIP the row, cancelling the
+    # redirect check that can actually answer for it, and write a
+    # last_verified_at that badges the card as checked. Left as "alive" rather
+    # than demoted, deliberately: this pass rations fetches across a ~40-row rank
+    # pool, and penalising every Adzuna candidate there is a much larger
+    # behavioural change than the evidence supports.
     _verified_now = datetime.utcnow().isoformat()
     for job, _s, _d, _ld in alive:
-        job["_verified_at"] = _verified_now
+        if "adzuna." not in (job.get("url") or "").lower():
+            job["_verified_at"] = _verified_now
     _persist_dead_scrapes(db, profile_id, [j for j, _r in dead])
     n_enriched = _persist_verified_alive(db, profile_id, alive)
 
@@ -2677,7 +2800,12 @@ async def _verify_via_browser(engine, jobs: list[dict]) -> dict[int, tuple[str, 
 
     Bounded twice over (VERIFY_BROWSER_MAX, VERIFY_BROWSER_BUDGET_SECONDS) and
     fail-open: anything the browser also can't answer for stays unverifiable and
-    is KEPT. Unknown is not dead -- the same invariant the HTTP path holds."""
+    is KEPT. Unknown is not dead -- the same invariant the HTTP path holds.
+
+    The URL to CHECK is not always the URL to SHOW: a job may carry
+    `_verify_url`, and when it does that is fetched instead of `url`. Written
+    for Adzuna, whose own /jobs/land/ad/ tracking redirect is the only thing
+    that knows whether the ad is still live -- see _adzuna_land_url."""
     jobs = jobs[:VERIFY_BROWSER_MAX]
     if not jobs:
         return {}
@@ -2688,9 +2816,10 @@ async def _verify_via_browser(engine, jobs: list[dict]) -> dict[int, tuple[str, 
     out: dict[int, tuple[str, str]] = {}
 
     async def _one(crawler, job: dict) -> None:
+        target = job.get("_verify_url") or job.get("url", "")
         try:
             result = await crawler.arun(
-                url=job.get("url", ""),
+                url=target,
                 config=engine.CrawlerRunConfig(
                     cache_mode=engine.CacheMode.BYPASS,
                     wait_until="networkidle",
@@ -2702,6 +2831,24 @@ async def _verify_via_browser(engine, jobs: list[dict]) -> dict[int, tuple[str, 
         markdown = str(getattr(result, "markdown", "") or "")
         if not markdown.strip():
             return
+        # A REDIRECT check is judged only on where it landed, never on the
+        # aggregator's own status code or its own page. _adzuna_land_url records
+        # the measurement that forces this: Adzuna 400s a bare land URL for live
+        # and dead ads alike, and 404'd two live ads on the same pass a dead one
+        # returned 200. Its status codes carry no information about the vacancy.
+        # So the only conclusion drawn here is from the DESTINATION's own
+        # content, and only once the redirect has actually left the aggregator;
+        # anything still on it (an interstitial, a bot wall, an error page) stays
+        # unverifiable and the row is KEPT.
+        if job.get("_verify_url"):
+            landed = str(getattr(result, "redirected_url", "") or
+                         getattr(result, "url", "") or "")
+            if _listing_host(landed) == _listing_host(job["_verify_url"]):
+                return
+            signal = engine._dead_listing_signal(result, markdown, job.get("title") or "")
+            if signal:
+                out[id(job)] = ("dead", f"source_{signal}")
+            return  # a live-looking destination is not proof; stay unverifiable
         # Exactly the checks _classify_listing runs, in the same order and via
         # the same guarded helpers. _EXPIRED_LISTING_RE must never be called raw
         # here either -- a live posting matches it on its own page furniture.
@@ -2742,7 +2889,7 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
     a full dozen."""
     funnel = {"final_verify_checked": 0, "final_verify_dead": 0,
               "final_verify_unverifiable": 0, "final_verify_browser": 0,
-              "final_verify_backfilled": 0}
+              "final_verify_redirect_routed": 0, "final_verify_backfilled": 0}
     if not (VERIFY_LISTINGS_ENABLED and VERIFY_FINAL_PICKS_ENABLED) or not final:
         return final, funnel
 
@@ -2766,9 +2913,14 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
         verdicts = _verify_ats_picks(engine, todo)
         http_todo = [j for j in todo if id(j) not in verdicts]
 
-        # Adzuna's tracking interstitial can only ever answer "unverifiable";
-        # its real detail page is the route, and carries its own dead detection.
-        adzuna = [j for j in http_todo if _KNOWN_DEAD_END_URL_RE.search(j.get("url") or "")]
+        # ── Adzuna ───────────────────────────────────────────────────────────
+        # Every Adzuna row, both URL forms (545 land / 1,033 details in a
+        # measured store -- the API returns either in the same response). The
+        # old code keyed on the /jobs/land/ad/ interstitial alone, so a
+        # details-form pick fell through to the generic HTTP path and was
+        # checked against a page that CANNOT report closure. That is exactly how
+        # the Golden Charter pick was missed. See _adzuna_land_url.
+        adzuna = [j for j in http_todo if "adzuna." in (j.get("url") or "").lower()]
         if adzuna:
             adzuna_dead: set = set()
             try:
@@ -2779,8 +2931,19 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
             for j in adzuna:
                 if j["url"] in adzuna_dead:
                     verdicts[id(j)] = ("dead", "adzuna_detail_dead")
-                elif j["url"] in got:
-                    verdicts[id(j)] = ("alive", "adzuna_detail_ok")
+                    continue
+                # NOT "alive", even when the detail page served a full
+                # description with a future validThrough -- measured, that is
+                # precisely what a closed Adzuna ad looks like, on both roles
+                # that prompted this. A land-form row gets one browser attempt at
+                # the tracking redirect, which can reach the real source; a
+                # details-form row has no signature to follow and simply stays
+                # unverifiable. Either way the row is KEPT and shown without a
+                # "checked" stamp, never marked dead on Adzuna's word alone.
+                land = _adzuna_land_url(j.get("url"))
+                if land:
+                    j["_verify_url"] = land
+                verdicts[id(j)] = ("unverifiable", "adzuna_needs_redirect")
             http_todo = [j for j in http_todo if id(j) not in verdicts]
 
         if http_todo:
@@ -2790,12 +2953,31 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
                 verdicts[id(j)] = (state, detail)
 
         unresolved = [j for j in todo if verdicts.get(id(j), ("", ""))[0] == "unverifiable"]
-        funnel["final_verify_unverifiable"] += len(unresolved)
-        # A liveness-blind host is excluded from browser ESCALATION but still
-        # counted above: the browser renders the same logged-out page the plain
-        # GET already read, so it can only ever fail open, and VERIFY_BROWSER_MAX
-        # is 12 slots a host that genuinely 403s a plain client can still use.
-        escalate = [j for j in unresolved if not _is_liveness_blind_host(j.get("url"))]
+        # Counted apart from the rest: an Adzuna row here is a deliberate
+        # ROUTING state (we declined to trust its detail page), not a host that
+        # refused to answer, and folding the two together would make
+        # final_verify_unverifiable read as a rising failure rate the moment
+        # this shipped.
+        redirect_routed = sum(1 for j in unresolved
+                              if verdicts.get(id(j), ("", ""))[1] == "adzuna_needs_redirect")
+        funnel["final_verify_redirect_routed"] = (
+            funnel.get("final_verify_redirect_routed", 0) + redirect_routed)
+        funnel["final_verify_unverifiable"] += len(unresolved) - redirect_routed
+        # Escalate only where a browser can add information the plain pass
+        # didn't already have. Two exclusions, both for the same reason -- a
+        # wasted slot out of VERIFY_BROWSER_MAX (12) that a host genuinely
+        # 403ing a plain client could have used:
+        #   * a liveness-blind host (LinkedIn) renders the browser the same
+        #     logged-out page the GET already read, so it can only fail open;
+        #   * an Adzuna row with no `_verify_url` is details-form, and browsing
+        #     that page reaches the same stale copy `fetch_adzuna_details`
+        #     already read -- worse, it would come back "alive" and overwrite
+        #     the honest unverifiable verdict set above.
+        escalate = [
+            j for j in unresolved
+            if not _is_liveness_blind_host(j.get("url"))
+            and (j.get("_verify_url") or "adzuna." not in (j.get("url") or "").lower())
+        ]
         if escalate:
             try:
                 verdicts.update(await _verify_via_browser(engine, escalate))
@@ -3790,7 +3972,9 @@ def _annotate_geo(jobs: list[dict], origin_place: str) -> int:
     return resolved
 
 
-def _filter_by_sponsor(jobs: list[dict], enabled: bool) -> tuple[list[dict], dict]:
+def _filter_by_sponsor(
+    jobs: list[dict], enabled: bool, min_salary: int = 0
+) -> tuple[list[dict], dict]:
     """Keep only listings whose company is on the UK licensed-sponsor register.
 
     THIS IS THE ONE FILTER IN THE PIPELINE THAT DROPS ON UNKNOWN, and that is
@@ -3809,6 +3993,20 @@ def _filter_by_sponsor(jobs: list[dict], enabled: bool) -> tuple[list[dict], dic
     separately in the returned stats so the cost stays visible in the run log
     rather than being inferred from a drop in the totals.
 
+    `min_salary` is a SEPARATE question from the register/statement check
+    above it, and follows the pipeline's ordinary (not sponsorship's inverted)
+    unknown-data rule: a job with no parseable salary is KEPT, never dropped for
+    lacking one, because salary data is sparse (see _filter_by_salary) and a
+    hard filter that also punishes missing data would collapse the sponsor-only
+    result set for a reason unrelated to sponsorship. It only drops a job whose
+    stated annual max is CONFIRMED below the floor. This is a plausibility check
+    ("could this role clear the going-rate bar at all"), not a real eligibility
+    determination -- the actual Skilled Worker floor has several reduced-rate
+    categories (new entrant, PhD, Immigration Salary List, health/education)
+    this app has no reliable way to detect, which is why the floor is a
+    candidate-editable number defaulting to the standard-applicant rate rather
+    than something computed. See config.DEFAULT_VISA_SPONSOR_MIN_SALARY.
+
     Returns (kept, stats) rather than just the list because the blank-company
     count is not derivable afterwards -- those rows are gone."""
     stats = {"before": len(jobs), "after": len(jobs), "blank_company": 0}
@@ -3819,30 +4017,100 @@ def _filter_by_sponsor(jobs: list[dict], enabled: bool) -> tuple[list[dict], dic
 
     kept = []
     blank = 0
+    said_no = 0
+    said_yes = 0
+    below_floor = 0
     for j in jobs:
-        company = (j.get("company") or "").strip()
-        if not company:
-            blank += 1
+        # The listing's OWN words outrank the register in both directions,
+        # because they are the only source that speaks to THIS VACANCY rather
+        # than to the employer's licence (see sponsors.statement_in_text).
+        # Measured on the store: 21 rows are a licensed employer whose advert
+        # says it will not sponsor this role -- those used to pass the filter
+        # and carry a "Visa sponsor" badge -- and 4 are the reverse, a listing
+        # stating sponsorship is available whose employer name the register
+        # cannot resolve, which is precisely the agency/blank-company hole this
+        # filter has always had and could never close from the register alone.
+        statement = _sponsor_statement(j)
+        if statement == "not_offered":
+            said_no += 1
             continue
-        if sponsors.is_sponsor(company):
-            kept.append(j)
+        if statement == "offered":
+            said_yes += 1
+        else:
+            company = (j.get("company") or "").strip()
+            if not company:
+                blank += 1
+                continue
+            if not sponsors.is_sponsor(company):
+                continue
+        # A modelled Adzuna estimate (salary_is_predicted) is not a CONFIRMED
+        # figure -- see _filter_by_salary's twin note -- so it is skipped here
+        # exactly like an unpriced listing rather than risking a visa-blocked
+        # candidate being dropped on a guess.
+        if min_salary > 0 and not j.get("salary_is_predicted"):
+            parsed = _parsed_salary(j, None)
+            annual_max = salary.to_annual(parsed["max"], parsed["period"]) if parsed else None
+            if annual_max is not None and annual_max > 0 and annual_max < min_salary:
+                below_floor += 1
+                continue
+        kept.append(j)
     stats["after"] = len(kept)
     stats["blank_company"] = blank
+    stats["listing_said_no"] = said_no
+    stats["listing_said_yes"] = said_yes
+    stats["below_salary_floor"] = below_floor
     return kept, stats
 
 
-def _role_sponsor_fields(j: dict) -> dict:
-    """sponsor_licensed for a Role row. Three-state on purpose: True/False when
-    there was a company name to check, None when there wasn't -- the card must
-    be able to say "we couldn't tell" rather than render a blank company as a
-    confirmed non-sponsor. Computed for every run, not just when the filter is
-    on, because it is free signal on a card the candidate is deciding from."""
-    company = (j.get("company") or "").strip()
-    if not company:
-        return {"sponsor_licensed": None}
+def _sponsor_statement(j: dict) -> str | None:
+    """"offered" | "not_offered" | None, from the listing's own text.
+
+    Reads full_text when there is one and falls back to the snippet, the same
+    idiom every other text consumer here uses. Worth knowing where this lands in
+    the run: at the DISCOVERY-stage filter most rows still carry only a ~500-char
+    teaser, and a sponsorship note is almost always near the END of a JD, so the
+    filter sees this signal rarely. By the time a Role row is persisted the pick
+    has usually been scraped or enriched, so the CARD sees it far more often.
+    That asymmetry is fine -- both uses are additive and neither invents a
+    verdict from silence."""
     from . import sponsors
 
-    return {"sponsor_licensed": sponsors.is_sponsor(company)}
+    return (lambda s: s[0] if s else None)(
+        sponsors.statement_in_text(j.get("full_text") or j.get("snippet") or "")
+    )
+
+
+def _role_sponsor_fields(j: dict) -> dict:
+    """The two sponsorship answers for a Role row, which are NOT the same
+    question and must not be collapsed:
+
+      sponsor_licensed  -- does this EMPLOYER hold a Home Office licence.
+                           Three-state: True/False when there was a company name
+                           to check, None when there wasn't, so the card can say
+                           "we couldn't tell" rather than render a blank company
+                           as a confirmed non-sponsor.
+      sponsor_statement -- what THIS LISTING says about sponsoring THIS vacancy.
+                           "offered"/"not_offered"/None, None meaning silent.
+
+    The register can only ever answer the first, and a licensed employer
+    routinely advertises roles it will not sponsor -- 21 such rows in the
+    measured store. The statement is the only thing that speaks to the vacancy,
+    so it is stored alongside rather than folded in, and the quote comes with it
+    so the card can show the candidate the employer's own words instead of
+    asking them to trust a badge.
+
+    Both computed on every run regardless of whether the candidate's filter is
+    on: they are free, and a user who switches the filter on later should find
+    their existing rows already answered."""
+    from . import sponsors
+
+    company = (j.get("company") or "").strip()
+    statement = sponsors.statement_in_text(j.get("full_text") or j.get("snippet") or "")
+    return {
+        "sponsor_licensed": sponsors.is_sponsor(company) if company else None,
+        "sponsor_statement": statement[0] if statement else None,
+        "sponsor_statement_quote": statement[1] if statement else None,
+    }
 
 
 def _role_location_fields(j: dict) -> dict:
@@ -3941,6 +4209,38 @@ def _build_ghost_context(db: Session, profile_id: int, store_age_days: float):
     return ctx
 
 
+def _annotate_stale(jobs: list[dict], max_age_days: int | None, hard: bool) -> dict:
+    """Stamp _stale_penalty onto candidates older than a SOFT max listing age.
+
+    Stamped here, on the same dicts and for the same reason as _annotate_geo and
+    _annotate_ghost: the assessment happens once, upstream, and _selection_score
+    just reads it.
+
+    A no-op when the preference is Hard (listing_over_max_age has already dropped
+    the row before any LLM call) or unset. Unknown and merely-approximate dates
+    are never penalised -- listing_over_max_age reads the DEFINITE date only, so
+    "we don't know how old this is" can't be mistaken for "it's old", which is
+    the rule every other age consumer follows.
+
+    See STALE_SELECTION_PENALTY for why this is deterministic rather than an
+    LLM-reported soft_violation, and why the doubled-age step is a demotion
+    rather than the hard cut it might look like it should be."""
+    if hard or not max_age_days:
+        return {"stale_soft_demoted": 0, "stale_soft_demoted_double": 0}
+    import full_auto as fa  # lazy: see run_search_task
+    n_over = n_double = 0
+    for j in jobs:
+        if not fa.listing_over_max_age(j, max_age_days):
+            continue
+        if fa.listing_over_max_age(j, max_age_days * 2):
+            j["_stale_penalty"] = STALE_SELECTION_PENALTY_DOUBLE
+            n_double += 1
+        else:
+            j["_stale_penalty"] = STALE_SELECTION_PENALTY
+        n_over += 1
+    return {"stale_soft_demoted": n_over, "stale_soft_demoted_double": n_double}
+
+
 def _annotate_ghost(jobs: list[dict], ctx) -> dict:
     """Stamp _ghost_level/_ghost_signals onto every candidate, once.
 
@@ -3987,7 +4287,13 @@ def _filter_by_salary(jobs: list[dict], salary_floor: int) -> list[dict]:
     Currency is still compared as-is: converting needs a live FX rate this app
     has no business fetching per search, and GBP/USD/EUR/AUD are close enough
     that a floor check survives it. That is a known coarseness, not an
-    oversight -- but it is now the ONLY unit assumption left here."""
+    oversight -- but it is now the ONLY unit assumption left here.
+
+    A job carrying `salary_is_predicted` (Adzuna's own modelled estimate for a
+    posting that stated no figure -- see full_auto.fetch_adzuna) is treated as
+    unpriced here, same as one with no structured salary at all: this is a HARD
+    DROP, so a guess masquerading as a confirmed figure could silently delete a
+    real role the candidate was never actually priced out of."""
     if not salary_floor or salary_floor <= 0:
         return jobs
     kept = []
@@ -3996,6 +4302,9 @@ def _filter_by_salary(jobs: list[dict], salary_floor: int) -> list[dict]:
         # as _jobseen_salary_fields. This is a HARD DROP, so a number scraped out
         # of prose ("270+ locations and 4,000+ employees") would silently delete
         # real roles at discovery.
+        if j.get("salary_is_predicted"):
+            kept.append(j)
+            continue
         parsed = _parsed_salary(j, None)
         annual_max = salary.to_annual(parsed["max"], parsed["period"]) if parsed else None
         if annual_max is not None and annual_max > 0 and annual_max < salary_floor:
@@ -4536,13 +4845,25 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # settings, so a store-only pass would let pre-existing rows through and a
     # discovery-only pass would let the backlog through.
     sponsor_only = bool(eng_profile.get("visa_sponsor_only"))
+    sponsor_min_salary = int(eng_profile.get("visa_sponsor_min_salary") or 0) if sponsor_only else 0
     if sponsor_only:
-        raw_jobs, s = _filter_by_sponsor(raw_jobs, True)
+        raw_jobs, s = _filter_by_sponsor(raw_jobs, True, sponsor_min_salary)
         funnel["sponsor_filter_raw_before"] = s["before"]
         funnel["sponsor_filter_raw_after"] = s["after"]
         funnel["sponsor_filter_raw_blank_company"] = s["blank_company"]
-        emit(f"[pipeline] licensed-sponsor filter: {s['before']} -> {s['after']} "
-             f"listings ({s['blank_company']} dropped for having no company name)")
+        # Counted separately from the register's own verdict: these are the rows
+        # where the LISTING overrode it, in either direction, and they are the
+        # whole reason the statement scan exists. Folding them into the totals
+        # would make the one measurable effect of the feature invisible.
+        funnel["sponsor_filter_listing_said_no"] = s["listing_said_no"]
+        funnel["sponsor_filter_listing_said_yes"] = s["listing_said_yes"]
+        funnel["sponsor_filter_below_salary_floor"] = s["below_salary_floor"]
+        emit(f"[pipeline] licensed-sponsor filter (min salary={sponsor_min_salary or 'none'}): "
+             f"{s['before']} -> {s['after']} listings "
+             f"({s['blank_company']} dropped for having no company name; "
+             f"{s['listing_said_no']} dropped because the listing itself says no "
+             f"sponsorship, {s['listing_said_yes']} kept because it says yes; "
+             f"{s['below_salary_floor']} dropped for a confirmed salary below the floor)")
 
     local_place = eng_profile.get("local_place") or ""
     # Only enforced at local scope, and only when the Location row is Hard --
@@ -4658,7 +4979,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         emit(f"[pipeline] country filter on candidates {country_codes}: "
              f"{before} -> {len(scored)} rows")
     if sponsor_only:
-        scored, s = _filter_by_sponsor(scored, True)
+        scored, s = _filter_by_sponsor(scored, True, sponsor_min_salary)
         funnel["sponsor_filter_scored_before"] = s["before"]
         funnel["sponsor_filter_scored_after"] = s["after"]
         funnel["sponsor_filter_scored_blank_company"] = s["blank_company"]
@@ -4690,6 +5011,16 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         emit(f"[pipeline] ghost risk: {ghost_counts['ghost_high']} high, "
              f"{ghost_counts['ghost_medium']} medium (rules fired: {fired}; "
              f"observation clock {'open' if ghost_ctx.observation_clock_open else 'not yet open'})")
+    # A SOFT max-listing-age preference, which until now had no effect on
+    # ordering anywhere -- see STALE_SELECTION_PENALTY. Never drops anything.
+    stale_counts = _annotate_stale(scored, eng_profile.get("max_listing_age_days"),
+                                   eng_profile.get("max_listing_age_hard", True))
+    funnel.update(stale_counts)
+    if stale_counts.get("stale_soft_demoted"):
+        emit(f"[pipeline] soft max listing age: demoted "
+             f"{stale_counts['stale_soft_demoted']} candidate(s) past "
+             f"{eng_profile.get('max_listing_age_days')} days "
+             f"({stale_counts['stale_soft_demoted_double']} past double that)")
     # An employer-stated closing date that has already passed is a fact, not a
     # signal to weigh -- drop before anything spends a gate/rank/judge call.
     scored, n_expired = _drop_expired_candidates(scored)
@@ -5420,8 +5751,26 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # fit, and so on down), while each grade's own fair-allocate pass still
     # distributes that grade's slots across clusters fairly. Within one cluster's
     # grade bucket the judge's own ordering is preserved.
+    # Within one cluster's grade bucket the judge's own ordering is preserved,
+    # EXCEPT that a listing demoted for a soft max-listing-age breach sinks below
+    # an equally-graded fresher one (_stale_penalty, stamped by _annotate_stale;
+    # 0.0 and therefore a no-op for every candidate when the preference is Hard,
+    # unset, or the date unknown). A stable sort, so nothing else about the
+    # judge's order moves.
+    #
+    # This is the display half of that preference, and without it the selection
+    # penalty alone could not reach the page: fit_rank is assigned purely by
+    # position in `final`, so a stale pick that survives into a grade bucket can
+    # still land at rank 1 -- which is exactly what a live run showed, a 22-day
+    # and a 28-day listing at ranks 1 and 5 under a 7-day preference. The judge's
+    # own prompt already says to "prefer the fresher role when choosing between
+    # two comparable picks"; ordering is decided here, so until now that
+    # instruction had nothing to act on.
+    def _by_freshness(picks: list[dict]) -> list[dict]:
+        return sorted(picks, key=lambda p: p.get("_stale_penalty", 0.0))
+
     graded_by_cluster: dict[str, dict[int, list[dict]]] = {
-        grade: {idx: [p for p in picks if _verdict_of(p) == grade]
+        grade: {idx: _by_freshness([p for p in picks if _verdict_of(p) == grade])
                 for idx, picks in final_by_cluster.items()}
         for grade in _VERDICT_GRADES
     }
@@ -6257,7 +6606,12 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         # both land after _run_engine_pipeline builds `funnel`, and a rollup that
         # misses those would understate the run's most expensive stage.
         for stage, row in engine.emit_llm_usage_summary().items():
-            for k in ("calls", "prompt_tokens", "cached_tokens", "completion_tokens"):
+            # length_capped rides along for the reason full_auto._record_llm_usage
+            # gives: it is the only thing separating "the model wrote less" from
+            # "we truncated it", and a truncated JSON reply parses as a failure
+            # and vanishes down a fail-open path rather than raising.
+            for k in ("calls", "prompt_tokens", "cached_tokens", "completion_tokens",
+                      "length_capped"):
                 funnel[f"tokens_{stage}_{k}"] = int(row.get(k, 0))
         run.funnel_counts = json.dumps(funnel)
         if warning:

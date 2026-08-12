@@ -8,26 +8,32 @@ import { api } from "@/lib/api";
 import { useProfiles } from "@/lib/ProfileContext";
 
 /**
- * Free-text feedback on the results shown below ("too senior", "stop showing
- * sales roles"), distinct from IntentEditor's intent_text (what the candidate
- * WANTS, which drives target-role generation). Persists to
- * profile.search_feedback and is read by the final judge on the next run --
- * see snapshot.build_snapshot.
+ * One combined feedback box on /search. Used to be two boxes stacked on top
+ * of each other -- a search_feedback textarea ("too senior", "stop showing
+ * sales roles", read by the final judge next run -- see
+ * snapshot.build_snapshot) directly above a near-identical-looking "bug or
+ * idea for the app" textarea (POST /profiles/{id}/comment, team-visible only
+ * via GET /admin/analytics) -- and testers couldn't tell the two apart, so
+ * one of them routinely went unread.
  *
- * Also carries a second, visually distinct box for general beta feedback
- * about the APP (bugs/confusing bits/ideas) -- posts to POST
- * /profiles/{id}/comment and is read back by the owner-only GET
- * /admin/analytics, not by the search pipeline.
+ * Now there's one textarea and one save action that does both jobs
+ * unconditionally: persists to profile.search_feedback (+ best-effort
+ * interpretFeedback, turning an actionable line into a reviewable avoid/
+ * must-have filter, same as before) AND posts the same text to the team via
+ * submitComment. Whichever kind of thing the tester actually typed -- a
+ * preference note or a bug report -- now reaches both audiences; the search
+ * pipeline simply finds nothing actionable in a bug report, the same way it
+ * already tolerated any other feedback with no clear rule in it.
  *
- * When the "Are results what they should be?" prompt is due (`resultsPrompt`,
- * fired by the first cross or apply on a run), it renders IN PLACE OF that
- * bottom box rather than alongside it -- two feedback asks stacked on top of
- * each other is how both get ignored. The bug box comes back the moment the
- * prompt is answered or dismissed.
+ * Distinct from IntentEditor's intent_text (what the candidate WANTS, which
+ * drives target-role generation) -- this is reactive feedback on what was
+ * shown, not a statement of intent.
  *
- * Both of those stay strictly separate from the top box: a beta tester's note
- * about a confusing button must never reach search_feedback, which is read by
- * the LLM judge as if it were a job-search preference.
+ * The "Are results what they should be?" in-run prompt (`resultsPrompt`,
+ * fired by the first cross or apply on a run) still swaps in for the WHOLE
+ * box while due, rather than stacking beside it -- two feedback asks at once
+ * is how both get ignored. The textarea comes back once the prompt is
+ * answered or dismissed.
  */
 export function SearchFeedbackBox({
   profileId,
@@ -47,31 +53,6 @@ export function SearchFeedbackBox({
   const [savedText, setSavedText] = useState(profile?.search_feedback ?? "");
   const [status, setStatus] = useState("");
 
-  // Product feedback about the APP itself (bugs, confusing bits, feature
-  // ideas) -- deliberately a separate field from search_feedback above, which
-  // gets read by the final judge on the next run. Mixing the two would leak a
-  // beta tester's comment about a confusing button into the LLM prompt as if
-  // it were a job-search preference.
-  const [comment, setComment] = useState("");
-  const [commentStatus, setCommentStatus] = useState("");
-  const [sending, setSending] = useState(false);
-
-  async function sendComment() {
-    const v = comment.trim();
-    if (!v || sending) return;
-    setSending(true);
-    setCommentStatus("");
-    try {
-      await api.submitComment(profileId, v);
-      setComment("");
-      setCommentStatus("Thanks — the team will see this.");
-    } catch (e) {
-      setCommentStatus((e as Error).message);
-    } finally {
-      setSending(false);
-    }
-  }
-
   useEffect(() => {
     setText(profile?.search_feedback ?? "");
     setSavedText(profile?.search_feedback ?? "");
@@ -81,18 +62,21 @@ export function SearchFeedbackBox({
 
   async function save() {
     if (!dirty) return;
+    const v = text.trim();
     try {
       await api.updateProfile(profileId, { search_feedback: text });
       await qc.invalidateQueries({ queryKey: ["profiles"] });
       setSavedText(text);
-      setStatus("Saved — will be taken into account next search.");
+      setStatus("Saved — will be taken into account next search, and shared with the team.");
     } catch (e) {
       setStatus((e as Error).message);
       return;
     }
-    // Best-effort: turn actionable feedback into a reviewable avoid/must-have
-    // filter. Kept out of the try/catch above -- the feedback text is already
-    // safely saved either way, so a failure here shouldn't look like a save error.
+    // Team-visible copy, best-effort and silent: the text is already safely
+    // saved above either way, so a failure here shouldn't look like a save error.
+    if (v) api.submitComment(profileId, v).catch(() => {});
+    // Turn an actionable line into a reviewable avoid/must-have filter, also
+    // best-effort for the same reason.
     try {
       const created = await api.interpretFeedback(profileId);
       if (created.length > 0) {
@@ -109,16 +93,31 @@ export function SearchFeedbackBox({
     }
   }
 
+  if (resultsPrompt) {
+    return (
+      <div className="feedback-box">
+        <InRunFeedbackPrompt
+          questionId="results_quality"
+          question="Are these results what they should be?"
+          detailPlaceholder="What went wrong? e.g. 'wrong kind of role', 'all too senior', 'only 2 results'…"
+          profileId={profileId}
+          runId={resultsPrompt.runId}
+          onDone={() => onResultsPromptDone?.()}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="feedback-box">
       <div className="row" style={{ flexDirection: "column", alignItems: "stretch", gap: 6 }}>
         <div className="label" style={{ width: "auto" }}>
-          Feedback on these results
+          Feedback — on these results, or on the app itself
         </div>
         <textarea
           className="textarea-input"
           style={{ minHeight: 48 }}
-          placeholder="e.g. 'these are too senior for me' or 'stop showing sales roles' — used on your next search"
+          placeholder="e.g. 'these are too senior for me', 'stop showing sales roles', or a bug/idea for the app — shapes your next search and goes to the team"
           value={text}
           onChange={(e) => setText(e.target.value)}
           onBlur={save}
@@ -127,53 +126,6 @@ export function SearchFeedbackBox({
           <span style={{ fontSize: 12, opacity: 0.7 }}>
             {dirty ? "Unsaved — click away to save." : status}
           </span>
-        )}
-      </div>
-      <div
-        className="row"
-        style={{
-          flexDirection: "column",
-          alignItems: "stretch",
-          gap: 6,
-          marginTop: 10,
-          paddingTop: 10,
-          borderTop: "1px solid var(--line)",
-        }}
-      >
-        {resultsPrompt ? (
-          <InRunFeedbackPrompt
-            questionId="results_quality"
-            question="Are these results what they should be?"
-            detailPlaceholder="What went wrong? e.g. 'wrong kind of role', 'all too senior', 'only 2 results'…"
-            profileId={profileId}
-            runId={resultsPrompt.runId}
-            onDone={() => onResultsPromptDone?.()}
-          />
-        ) : (
-          <>
-            <div className="label" style={{ width: "auto" }}>
-              Got a bug or an idea for the app? Tell us — it goes straight to the team
-            </div>
-            <textarea
-              className="textarea-input"
-              style={{ minHeight: 40 }}
-              placeholder="Anything about the app itself — bugs, confusing bits, features you'd want…"
-              value={comment}
-              onChange={(e) => setComment(e.target.value)}
-            />
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <button
-                className="btn btn-secondary sm"
-                onClick={sendComment}
-                disabled={!comment.trim() || sending}
-              >
-                {sending ? "Sending…" : "Send feedback"}
-              </button>
-              {commentStatus && (
-                <span style={{ fontSize: 12, opacity: 0.7 }}>{commentStatus}</span>
-              )}
-            </div>
-          </>
         )}
       </div>
     </div>

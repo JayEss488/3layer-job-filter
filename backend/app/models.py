@@ -93,10 +93,18 @@ class User(Base):
     # differently.
     auth_provider = Column(Text, index=True)
     email = Column(Text, index=True)                    # display + admin list only, never matched on
-    # Whether the PROVIDER told us the address is verified. False for every
-    # email+password signup: there is no mail service in this deployment, so
-    # nothing has proved the registrant owns the address. Recorded so the admin
-    # list can say so rather than presenting it as a confirmed contact address.
+    # Whether the address has actually been PROVEN to belong to this account.
+    # Two very different routes set it, and the difference matters when reading
+    # a False:
+    #   * google/apple -- the provider's own `email_verified` claim, taken at
+    #     sign-in. False here is the PROVIDER's verdict and there is nothing the
+    #     user can do about it from inside this app, so nothing should nag them.
+    #   * email -- False at registration and flipped only when the user clicks
+    #     the emailed link (or completes a password reset, which proves the same
+    #     thing). This is the one that is actionable, and the only one
+    #     VerifyEmailBanner is allowed to prompt about.
+    # Either way, GET /admin/signups reports it so an address nobody has proved
+    # they own is never presented there as a confirmed contact.
     email_verified = Column(Boolean, default=False)
     display_name = Column(Text)
     last_login_at = Column(DateTime)
@@ -324,6 +332,12 @@ class Role(Base):
     salary_max = Column(Float)
     salary_period = Column(Text)       # year|month|week|day|hour
     salary_currency = Column(Text)     # ISO code (GBP/USD/...), null when unstated
+    # True when salary_min/max is a MODELLED estimate (currently only Adzuna's
+    # salary_is_predicted) rather than a figure the employer/board actually
+    # stated. Never null-safe to skip: the card must label an estimate rather
+    # than show it as fact, and the salary-floor filters must never hard-drop a
+    # candidate on one. See engine._role_salary_fields.
+    salary_is_predicted = Column(Boolean)
     source = Column(Text)  # board this role was discovered on (see JobSeen.source)
     # Copied straight from JobSeen.posted_at/expires_at/posted_at_approx at every
     # Role-creation/upgrade site (see engine._role_date_fields) -- a display gap,
@@ -356,6 +370,24 @@ class Role(Base):
     # never renders as a confirmed non-sponsor. Stamped on every run, not only
     # when the visa_sponsor_only filter is on.
     sponsor_licensed = Column(Boolean)
+    # What THIS LISTING says about sponsoring THIS vacancy, in its own words:
+    # "offered" | "not_offered" | NULL (the listing was silent, which is the
+    # overwhelmingly common case -- 12,146 of 12,273 text-bearing store rows).
+    #
+    # A DIFFERENT QUESTION from sponsor_licensed above, and the reason this
+    # column exists. The register answers "does this employer hold a licence"
+    # and can never answer "will this vacancy be sponsored" -- 21 rows in the
+    # measured store are a licensed employer whose advert states it will not
+    # sponsor the role, and those used to carry a "Visa sponsor" badge and pass
+    # the sponsors-only filter. Four rows are the reverse: the advert says
+    # sponsorship is available for a company the register cannot resolve, which
+    # is the agency/blank-company hole the register alone can never close.
+    # Never inferred from silence in either direction.
+    sponsor_statement = Column(Text)
+    # The employer's own sentence, so the card can show the words rather than
+    # ask the candidate to trust a badge. Capped at
+    # sponsors.STATEMENT_QUOTE_MAX; NULL exactly when sponsor_statement is.
+    sponsor_statement_quote = Column(Text)
     # When this exact listing was last confirmed to still exist, by a direct
     # fetch of its own URL (or, for an ATS row, by its continued presence in the
     # vendor feed). Every non-provisional row surfaced by a run carries one --
@@ -520,6 +552,11 @@ class JobSeen(Base):
     salary_max = Column(Float)
     salary_period = Column(Text)       # year|month|week|day|hour
     salary_currency = Column(Text)     # ISO code (GBP/USD/...), null when unstated
+    # True when salary_min/max is a MODELLED estimate (Adzuna's own
+    # salary_is_predicted) rather than a figure the employer/board stated -- see
+    # Role.salary_is_predicted, which this backfills onto every Role persisted
+    # from this row.
+    salary_is_predicted = Column(Boolean)
     embedding = Column(Text)           # JSON-encoded vector, cached once per job
     state = Column(Text, nullable=False, default="new")       # new|enriched|shown
     source_updated_at = Column(DateTime)                      # ATS updated_at when present

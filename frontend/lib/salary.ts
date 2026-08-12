@@ -113,6 +113,17 @@ function round(amount: number, period: SalaryPeriod): string {
  * A converted figure is marked with "~" and the source period is named, because
  * the conversion assumes full-time hours the listing never stated: an hourly
  * rate shown as a year is our estimate, not the employer's offer.
+ *
+ * `salary_is_predicted` (currently Adzuna only) means the figure itself is a
+ * modelled guess for a posting that stated no salary at all, not something the
+ * employer/board actually wrote — a live case showed a confident "£54,208 a
+ * year" for a listing whose own text said "Competitive salary". Labelled with
+ * "~" (same marker as a period conversion, for the same reason: it's our best
+ * estimate, not their offer) and "(estimate by job board)" rather than
+ * suppressed, since a ballpark figure is still more useful to the candidate
+ * than nothing. Kept short deliberately — it shares a chip with the figure and
+ * sometimes a second note, and the longer spelling of whose estimate it is
+ * ("not stated by the employer") pushed the chip past the width of the card.
  */
 export function formatSalary(role: Role, display: SalaryPeriod): string | null {
   const stated = role.salary_period;
@@ -135,7 +146,12 @@ export function formatSalary(role: Role, display: SalaryPeriod): string | null {
         : `Up to ${show(max as number)}`;
 
   const converted = stated !== display;
-  return `${converted ? "~" : ""}${body} ${PERIOD_SUFFIX[display]}${
-    converted ? ` (stated ${PERIOD_SUFFIX[stated]})` : ""
+  const estimated = !!role.salary_is_predicted;
+  const note = [
+    converted ? `stated ${PERIOD_SUFFIX[stated]}` : null,
+    estimated ? "estimate by job board" : null,
+  ].filter(Boolean);
+  return `${converted || estimated ? "~" : ""}${body} ${PERIOD_SUFFIX[display]}${
+    note.length ? ` (${note.join("; ")})` : ""
   }`;
 }
