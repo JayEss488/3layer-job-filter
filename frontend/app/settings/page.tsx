@@ -623,6 +623,43 @@ export default function SettingsPage() {
             </div>
             {runFunnel && runFunnel.run_id ? (
               <>
+                {runFunnel.rejection_summary?.length > 0 && (
+                  <div className="reject-summary">
+                    <div className="reject-summary-h">Why roles were turned away</div>
+                    <div className="annotation" style={{ marginBottom: 10 }}>
+                      The biggest causes this run, most common first. These come from
+                      different stages over different sets of listings, and a role can be
+                      turned away for more than one reason — so they don&apos;t add up to a
+                      total, and aren&apos;t meant to.
+                    </div>
+                    {(() => {
+                      const rows = runFunnel.rejection_summary;
+                      const top = rows[0]?.count || 1;
+                      const stageLabel: Record<string, string> = {
+                        free: "free filter",
+                        gate: "cheap screen",
+                        judge: "final review",
+                      };
+                      return rows.map((r) => (
+                        <div className="reject-row" key={r.reason}>
+                          <div className="reject-label">{r.label}</div>
+                          <div className="reject-track">
+                            <div
+                              className={`reject-bar reject-${r.stage}`}
+                              style={{ width: `${Math.max(2, (r.count / top) * 100)}%` }}
+                            />
+                          </div>
+                          <div className="reject-count">
+                            {r.count.toLocaleString()}
+                            <span className="reject-stage">
+                              {stageLabel[r.stage] || r.stage}
+                            </span>
+                          </div>
+                        </div>
+                      ));
+                    })()}
+                  </div>
+                )}
                 <div className="funnel-row funnel-header" style={{ marginTop: 12 }}>
                   <div className="funnel-label" />
                   <div className="funnel-track" />
@@ -747,6 +784,40 @@ export default function SettingsPage() {
                       </>
                     )}
                     .
+                  </div>
+                )}
+                {(!runFunnel.ats_enabled || runFunnel.examine_budget_used > 0) && (
+                  <div className="annotation" style={{ marginTop: 14 }}>
+                    <b>Run shape.</b>{" "}
+                    {runFunnel.ats_enabled ? (
+                      <>
+                        Company ATS boards were included this run (a repeat run today, a
+                        non-UK search, a sponsorship-only search, or your first ever run —
+                        the cases where the job boards alone run thin).
+                      </>
+                    ) : (
+                      <>
+                        Company ATS boards were skipped, and{" "}
+                        {runFunnel.ats_pool_excluded.toLocaleString()} already-stored ATS
+                        listing{runFunnel.ats_pool_excluded === 1 ? " was" : "s were"} held
+                        out of the pool, so the review budget went to the job boards — which
+                        is where effectively all of your matches come from. They come back
+                        automatically on a second search the same day.
+                      </>
+                    )}
+                    {runFunnel.examine_budget_used > 0 && (
+                      <>
+                        {" "}Reviewed up to {runFunnel.examine_budget_used} candidates
+                        {runFunnel.examine_budget_ratio_ref > 0 && (
+                          <>
+                            {" "}(sized from your last search, where{" "}
+                            {(runFunnel.examine_budget_ratio_ref / 10).toFixed(1)}% of what
+                            was examined was worth a full review)
+                          </>
+                        )}
+                        .
+                      </>
+                    )}
                   </div>
                 )}
                 {runFunnel.stale_soft_demoted > 0 && (

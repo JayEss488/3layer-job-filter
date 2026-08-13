@@ -43,6 +43,7 @@ from .profile_intel import ensure_profile_intel
 from .snapshot import build_snapshot, cv_text_for_cluster
 from .moderation import filter_blocked, get_blocked_domains
 from .sources import (
+    ATS_BOARD_PREFIXES,
     ATS_KEYS,
     canonical_key,
     counts_from_breakdown,
@@ -189,6 +190,30 @@ RANK_TARGET_POOL = 80         # run-wide judge-eligible target for the gate+rank
 # not this one: the gate screens the whole budget in one wave (see
 # GATE_ROUND_SIZE), so a wider budget costs more batches, not more serial waves.
 RANK_EXAMINE_BUDGET = 480
+# ...and it is now a CEILING rather than a fixed spend. _adaptive_examine_budget
+# sizes each run from the previous comparable run's selection ratio
+# (judge_eligible_total / rank_scored), on the reasoning that a profile whose gate
+# is passing a healthy fraction does not need to examine 480 candidates to fill a
+# 40-slot judge pool, while a niche one does.
+#
+# The formula is EXAMINE_BUDGET_TARGET_ELIGIBLE / ratio, clamped to
+# [RANK_EXAMINE_BUDGET_MIN, RANK_EXAMINE_BUDGET]. The upper clamp is the whole
+# point and is deliberately today's value: at observed ratios (run 29: 20/520 =
+# 3.8%, run 28: 16/520 = 3.1%) the unclamped formula returns 1,500+, so any
+# ceiling above 480 would simply mean "always the ceiling" -- i.e. a wider gate on
+# every run, paid for by deleting a 15s stage, which is a net loss. Clamped here
+# the scheme can only ever CUT: a healthy profile gets faster, a thin one gets
+# exactly today's behaviour.
+#
+# 60 rather than JUDGE_POOL (40): the mid tier is meant to approve about twice
+# what the judge uses so the expensive stage picks a best-of rather than a
+# whatever-survived (see RANK_TARGET_POOL), and aiming at the pool size itself
+# would size the budget to only just fill it.
+EXAMINE_BUDGET_TARGET_ELIGIBLE = 60
+# Floor of the adaptive range. Half the ceiling: enough that even a profile with a
+# very healthy ratio still examines a real pool, since the ratio is measured on a
+# DIFFERENT day's listings and is only ever an estimate of this run's.
+RANK_EXAMINE_BUDGET_MIN = 240
 # Symmetric FLOOR to the JUDGE_POOL ceiling: an absolute rank cutoff
 # (RANK_REJECT_SCORE_FLOOR) plus per-cluster examine caps can leave the judge with
 # far fewer than JUDGE_POOL candidates even when dozens of gate survivors exist
@@ -198,6 +223,13 @@ RANK_EXAMINE_BUDGET = 480
 # still-open cluster over its next unexamined candidates (best-effort -- only
 # clusters whose first round stopped on a cap, not a genuinely exhausted queue,
 # have anything fresh to examine; see the call site in _run_engine_pipeline).
+#
+# DORMANT: the stage that read this was removed from _run_engine_pipeline on
+# measurement (it fired twice, cost ~31s, and moved judge_pool_size by 0 -- see
+# the comment at its old call site). The floor's purpose is now served up front by
+# _adaptive_examine_budget instead of by a retrospective extra round. Kept as a
+# constant, with JUDGE_POOL_FLOOR_EXTRA_CAP, so restoring the stage is a decision
+# rather than a reconstruction.
 JUDGE_POOL_FLOOR = 25
 # Per-cluster examine cap for that extra round -- deliberately small (one
 # _GATE_BATCH-sized batch) so a shortfall costs at most one more cheap
@@ -252,15 +284,33 @@ RICH_TEXT_SELECTION_BONUS = 3.0
 # text and the deep tail --
 # lower embed-score by construction, and re-scraped by phase 5 anyway if it
 # survives to the judge -- rides its teaser.
-REED_ENRICH_PRE_GATE_CAP = 100
+#
+# Cut 100 -> 40 for latency: this is blocking main-thread HTTP in front of
+# time-to-first-card, and the `enrich` lap it shares with Adzuna measured 9-32s.
+# 40 still covers the head of each cluster's queue -- the slice a screen batch
+# reads first -- so the candidates most likely to become picks keep their real
+# text. What the deep tail loses is gate/rank quality only: the JUDGE still sees
+# full text on everything it reads, because the judge-pool pass below
+# (revalidate=True, bounded by JUDGE_POOL) is unchanged. Raise this back toward
+# 100 if the split `enrich_reed` timing shows Reed was never the expensive half.
+REED_ENRICH_PRE_GATE_CAP = 40
 # The same budget for Adzuna (_enrich_adzuna_full_text), set lower on purpose. Every
 # argument above applies, but each Adzuna fetch is a ~100KB HTML page rather than a
 # small JSON body and the host 429s after a handful of rapid requests, so it runs at
 # ADZUNA_DETAIL_MAX_WORKERS(3) rather than Reed's 12 -- roughly a quarter of the
-# throughput per wave. 40 keeps its worst case comparable to Reed's measured 4.1s
-# while still covering the head of the examine budget plus headroom, which is
-# the slice that actually decides what the user sees first.
-ADZUNA_ENRICH_PRE_GATE_CAP = 40
+# throughput per wave.
+#
+# DISABLED (40 -> 0) on measurement: at 3 workers, 40 fetches of ~100KB HTML is
+# ~14 sequential waves sitting directly in front of first paint, and the yield
+# was `adzuna_enriched` = 0-4 in every recent run. That is the worst cost/benefit
+# ratio anywhere in the pipeline. Nothing about the JUDGE's input changes -- the
+# judge-pool pass (_enrich_adzuna_full_text with revalidate=True, bounded by
+# JUDGE_POOL) is untouched, and it is the pass that matters for Adzuna, whose
+# detail page is its only route to real text at any stage. What is given up is
+# gate/rank quality on Adzuna candidates, which now read their ~500-char teaser.
+# Set > 0 to restore the pre-gate pass; the call site guards on this being
+# positive, so 0 skips it entirely rather than fetching an empty slice.
+ADZUNA_ENRICH_PRE_GATE_CAP = 0
 # A Reed/Adzuna row that already carries full_text (from a prior run, or this
 # run's own pre-gate enrichment above) is normally never re-fetched -- once
 # _has_full_text is set, nothing looks at that URL again, ever. That's a real
@@ -421,8 +471,18 @@ VERIFY_FINAL_PICKS_ENABLED = os.getenv("VERIFY_FINAL_PICKS_ENABLED", "true").low
 # Browser escalation for picks a plain GET couldn't answer for (Cloudflare 403/
 # 202). Bounded hard: this is a second browser launch after Phase 5's has closed,
 # and it sits between the judge finishing and the user seeing results.
+#
+# NOTE: _verify_final_picks no longer escalates (0 dead found across every run it
+# ever ran -- see the comment at the removed block). These two still bound
+# _verify_via_browser itself, which remains in use by
+# scripts/audit_listing_liveness.py, the tool for re-measuring that decision.
 VERIFY_BROWSER_MAX = int(os.getenv("VERIFY_BROWSER_MAX", "12"))
 VERIFY_BROWSER_BUDGET_SECONDS = float(os.getenv("VERIFY_BROWSER_BUDGET_SECONDS", "45"))
+# Distinct ATS vendor boards _verify_ats_picks will re-read in one run. That loop
+# is sequential blocking HTTP at the end of a run; anything past this falls
+# through to the concurrent HTTP path instead. Only ever binds on a thin run,
+# where ATS is back on and the picks can span many different boards.
+_VERIFY_ATS_MAX_BOARDS = int(os.getenv("VERIFY_ATS_MAX_BOARDS", "4"))
 # Ordinary browser UA. These are public job adverts the boards want indexed, and
 # several serve a stub to an unrecognised client -- which would read here as
 # "unverifiable" and lose the check rather than gain anything.
@@ -2125,25 +2185,49 @@ def _store_age_days(db: Session, profile_id: int) -> float:
     return max(0.0, (datetime.utcnow() - oldest).total_seconds() / 86400.0)
 
 
-def _new_rows(db: Session, profile_id: int, limit: int = STORE_SCORE_CAP) -> list[JobSeen]:
+def _exclude_ats_clauses() -> list:
+    """SQL predicates keeping ATS-sourced rows out of a pool query.
+
+    Applied in SQL rather than by filtering the result in Python, because every
+    caller applies a LIMIT: a post-query filter would spend that limit on rows it
+    then throws away, silently shrinking the pool it was meant to leave untouched.
+
+    Derived from the source registry (ATS_BOARD_PREFIXES) so adding a vendor
+    cannot leave a stale literal list behind here."""
+    return [~JobSeen.source.like(f"{p}:%") for p in ATS_BOARD_PREFIXES]
+
+
+def _new_rows(db: Session, profile_id: int, limit: int = STORE_SCORE_CAP,
+              include_ats: bool = True) -> list[JobSeen]:
     """Fresh, unprocessed rows. Freshest first. The limit is the whole-store cap:
     relevance scoring runs over all of them (cheap, since embeddings are cached),
     so a genuinely good role can't be excluded by an arbitrary small slice.
     Excludes rows already confirmed dead/expired (dead_reason set) -- a fact
     about the URL that costs nothing to keep re-checking here since it's an
     indexed-free column filter, and saves every downstream stage from ever
-    seeing a listing already known gone."""
+    seeing a listing already known gone.
+
+    `include_ats=False` additionally holds back every ATS-sourced row. Switching
+    the ATS batch off at DISCOVERY does not do this on its own -- the rows already
+    in the store keep their state='new' and go on competing for examine slots
+    indefinitely (9,246 of them on a measured store, against ~2,700 fresh board
+    rows). Because it is a per-run query filter and not a state change, a thin run
+    re-admits every one of them untouched, which is what makes a second run of the
+    day genuinely deeper rather than merely a re-fetch."""
+    q = select(JobSeen).where(
+        JobSeen.profile_id == profile_id, JobSeen.state == "new",
+        JobSeen.dead_reason.is_(None),
+    )
+    if not include_ats:
+        q = q.where(*_exclude_ats_clauses())
     return db.execute(
-        select(JobSeen)
-        .where(JobSeen.profile_id == profile_id, JobSeen.state == "new",
-               JobSeen.dead_reason.is_(None))
-        .order_by(JobSeen.first_seen.desc())
-        .limit(limit)
+        q.order_by(JobSeen.first_seen.desc()).limit(limit)
     ).scalars().all()
 
 
 def _gate_reopened_rows(
     db: Session, profile_id: int, gate_sig: str, limit: int = STORE_SCORE_CAP,
+    include_ats: bool = True,
 ) -> list[JobSeen]:
     """Rows the CHEAP gate retired under a DIFFERENT profile signature than the one
     this run is using -- i.e. rows whose only reason for being out of the pool is a
@@ -2163,14 +2247,22 @@ def _gate_reopened_rows(
       intent.
     Re-opened rows are cheap: their screen/rank calls are served from gate_cache
     whenever the change didn't actually affect them, and they still have to clear
-    RELEVANCE_FLOOR and win an examine slot on embed score like anything else."""
+    RELEVANCE_FLOOR and win an examine slot on embed score like anything else.
+
+    `include_ats=False` holds ATS rows back, same rule and same reasoning as
+    _new_rows -- and it matters MORE here, because this pull is deliberately
+    uncapped in spirit (it corrects the pool's definition rather than topping it
+    up), so a profile edit would otherwise re-admit the entire retired ATS
+    backlog in one go on exactly the runs meant to be cheapest."""
+    q = select(JobSeen).where(
+        JobSeen.profile_id == profile_id, JobSeen.state == "enriched",
+        JobSeen.dead_reason.is_(None), JobSeen.eval_verdict.is_(None),
+        or_(JobSeen.gate_signature.is_(None), JobSeen.gate_signature != gate_sig),
+    )
+    if not include_ats:
+        q = q.where(*_exclude_ats_clauses())
     return db.execute(
-        select(JobSeen)
-        .where(JobSeen.profile_id == profile_id, JobSeen.state == "enriched",
-               JobSeen.dead_reason.is_(None), JobSeen.eval_verdict.is_(None),
-               or_(JobSeen.gate_signature.is_(None), JobSeen.gate_signature != gate_sig))
-        .order_by(JobSeen.last_seen.desc())
-        .limit(limit)
+        q.order_by(JobSeen.last_seen.desc()).limit(limit)
     ).scalars().all()
 
 
@@ -2185,7 +2277,15 @@ def _backlog_rows(
     the judge already liked -- 'strong'/'backup'); `exclude_rejects` instead keeps
     everything except an expensive-AI 'reject' (used as a thin-run empty-screen
     safety net). Rejects are never resurfaced by default -- re-piping a known reject
-    every run only to have it filtered again at the judge cache wastes pool slots."""
+    every run only to have it filtered again at the judge cache wastes pool slots.
+
+    Deliberately has NO include_ats switch, unlike _new_rows/_gate_reopened_rows.
+    Everything here has already been through the expensive judge, so an ATS row in
+    this pull is one of the handful the judge actually LIKED (5 non-rejects in the
+    store's whole history) -- precisely the rows worth keeping. It is capped at
+    BACKLOG_TOPUP and every candidate is cache-served, so it costs no calls. The
+    ATS exclusion targets the 9k un-examined rows clogging the examine budget, not
+    the few that earned their place."""
     q = select(JobSeen).where(
         JobSeen.profile_id == profile_id, JobSeen.state == "enriched",
         JobSeen.dead_reason.is_(None),
@@ -2855,9 +2955,18 @@ def _verify_ats_picks(engine, picks: list[dict]) -> dict[int, tuple[str, str]]:
             by_board[board].append(j)
     if not by_board:
         return {}
+    # Bounded, because this loop is SEQUENTIAL blocking HTTP on the event loop
+    # thread and sits at the very end of a run with the user waiting. The
+    # docstring's "2-4 boards in practice" holds for an ordinary run -- but on a
+    # thin run (ATS re-enabled, see _thin_run_conditions) the picks can be mostly
+    # ATS and mostly from DIFFERENT boards, which is the one shape that turns this
+    # into a dozen serial vendor calls. Boards beyond the cap simply fall through
+    # to the HTTP path below, which is concurrent.
+    boards = sorted(by_board, key=lambda b: -len(by_board[b]))[:_VERIFY_ATS_MAX_BOARDS]
 
     out: dict[int, tuple[str, str]] = {}
-    for board, jobs in by_board.items():
+    for board in boards:
+        jobs = by_board[board]
         prefix, token = board.split(":", 1)
         vendor = canonical_key(board)
         try:
@@ -2977,29 +3086,23 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
     nothing. The only picks skipped are those a fetch ALREADY read this run
     (_verified_at, stamped by _verify_listings_alive and _persist_scrape).
 
-    `crawler` is the run's Phase 5 browser, borrowed for the escalation pass and
-    never closed here -- see _verify_via_browser.
-
     Three routes to an answer, strongest first -- see _verify_ats_picks for why
     the vendor feed beats fetching the posting, and _needs_liveness_check for
     why Adzuna's /jobs/land/ad/ interstitial must go via fetch_adzuna_details
     rather than being fetched directly.
 
-    A dropped pick's slot is refilled from `reserves` (the graded picks that lost
-    the FINAL_PICKS cut) and the refills are verified too -- once. One extra
-    round, never recursion: the point is to not show a corpse, not to guarantee
-    a full dozen."""
+    ONE cheap round. The browser escalation and the reserve-refill round were both
+    removed on measurement -- see the comments at their old sites for the numbers
+    (33 picks checked across every run this has run, 0 dead, 0 backfilled) and for
+    what each gave up. `reserves` and `crawler` are retained as parameters, unused,
+    so restoring either block is a local edit rather than a signature change
+    rippling back through _run_engine_pipeline's tail."""
     funnel = {"final_verify_checked": 0, "final_verify_dead": 0,
               "final_verify_unverifiable": 0, "final_verify_browser": 0,
               "final_verify_redirect_routed": 0, "final_verify_backfilled": 0}
     if not (VERIFY_LISTINGS_ENABLED and VERIFY_FINAL_PICKS_ENABLED) or not final:
         return final, funnel
 
-    # Identity, not equality: `j not in final` compares dicts field-by-field,
-    # which is both O(n*m) deep compares and wrong -- two distinct listings that
-    # happen to agree on every key would collapse into one.
-    final_ids = {id(j) for j in final}
-    reserve_pool = [j for j in reserves if id(j) not in final_ids]
     dead_all: list[dict] = []
     checked_ids: set[int] = set()
 
@@ -3065,27 +3168,30 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
         funnel["final_verify_redirect_routed"] = (
             funnel.get("final_verify_redirect_routed", 0) + redirect_routed)
         funnel["final_verify_unverifiable"] += len(unresolved) - redirect_routed
-        # Escalate only where a browser can add information the plain pass
-        # didn't already have. Two exclusions, both for the same reason -- a
-        # wasted slot out of VERIFY_BROWSER_MAX (12) that a host genuinely
-        # 403ing a plain client could have used:
-        #   * a liveness-blind host (LinkedIn) renders the browser the same
-        #     logged-out page the GET already read, so it can only fail open;
-        #   * an Adzuna row with no `_verify_url` is details-form, and browsing
-        #     that page reaches the same stale copy `fetch_adzuna_details`
-        #     already read -- worse, it would come back "alive" and overwrite
-        #     the honest unverifiable verdict set above.
-        escalate = [
-            j for j in unresolved
-            if not _is_liveness_blind_host(j.get("url"))
-            and (j.get("_verify_url") or "adzuna." not in (j.get("url") or "").lower())
-        ]
-        if escalate:
-            try:
-                verdicts.update(await _verify_via_browser(engine, escalate, crawler=crawler))
-                funnel["final_verify_browser"] += len(escalate[:VERIFY_BROWSER_MAX])
-            except Exception:
-                pass
+        # BROWSER ESCALATION REMOVED (latency). It used to render every
+        # unverifiable pick in the headless browser, bounded by VERIFY_BROWSER_MAX
+        # (12) and VERIFY_BROWSER_BUDGET_SECONDS (45) -- and, because the refill
+        # round below ran the same code path, that budget could be paid twice in
+        # one run, at the very end, with the user waiting on it.
+        #
+        # Measured across every run this stage has ever run: 33 picks checked,
+        # 11 escalated to the browser, and **0 dead listings found** -- by either
+        # route. That is not because listings don't die: the PRE-judge pass
+        # (_verify_listings_alive) finds 17.8% of what it checks dead, and
+        # listing_host_stats puts the cumulative rate at 16.8%. It is because that
+        # pass already caught them, which is exactly what it is for.
+        #
+        # What is given up is the rare case where a host 403s a plain GET but
+        # renders for a browser. Those picks now stay unverifiable, which means
+        # they are still SHOWN (unknown is never dead -- the fail-open rule is
+        # unchanged) and carry the card's honest "not verified" chip. The residual
+        # risk is a dead listing displayed without a warning; the compensating
+        # control is that _verify_listings_alive is untouched.
+        #
+        # `_verify_via_browser` itself is kept intact and is still used by
+        # scripts/audit_listing_liveness.py, which is the tool for re-measuring
+        # this decision. If that audit shows the shown-role dead rate climbing
+        # above its ~11% baseline, restore the block.
 
         funnel["final_verify_checked"] += len(todo)
         now = datetime.utcnow().isoformat()
@@ -3103,19 +3209,26 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
 
     picks = await _verify(final)
     n_dropped = len(final) - len(picks)
-    if n_dropped and reserve_pool:
-        backfill = await _verify(reserve_pool[:n_dropped])
-        picks += backfill
-        funnel["final_verify_backfilled"] = len(backfill)
+    # REFILL ROUND REMOVED (latency). A dropped pick's slot used to be refilled
+    # from the graded picks that lost the FINAL_PICKS cut, and those refills
+    # verified in a second full pass through _verify -- doubling every bound in
+    # this function. `final_verify_backfilled` has been 0 in every run on record,
+    # which follows directly from final_verify_dead also being 0: with nothing
+    # dropped there is never anything to refill. Kept at a hard 0 rather than
+    # deleted so the Settings funnel panel and run-to-run comparisons don't break
+    # on a vanished key.
+    #
+    # The stated goal was always "not to show a corpse", never "guarantee a full
+    # dozen" -- so on the rare run where a pick IS dropped, the page is one card
+    # shorter instead of one round slower.
+    funnel["final_verify_backfilled"] = 0
 
     funnel["final_verify_dead"] = len(dead_all)
     if dead_all:
         _persist_dead_scrapes(db, profile_id, dead_all)
-        # n_dropped is what the user would have seen; len(dead_all) can be higher
-        # because a reserve pulled in to replace one can itself turn out dead.
         engine.emit(
             f"[pipeline] final-pick liveness: {n_dropped} of {len(final)} pick(s) no "
-            f"longer exist, backfilled {funnel['final_verify_backfilled']} "
+            f"longer exist and were dropped "
             f"({funnel['final_verify_checked']} checked, {len(dead_all)} dead in total)")
     else:
         engine.emit(f"[pipeline] final-pick liveness: all {funnel['final_verify_checked']} "
@@ -3254,6 +3367,152 @@ def _persist_scam_override(db: Session, profile_id: int, identity: str, reason: 
 
 def _is_first_run(db: Session, profile_id: int) -> bool:
     return db.query(JobSeen.id).filter(JobSeen.profile_id == profile_id).first() is None
+
+
+def _completed_runs_today(db: Session, profile_id: int) -> int:
+    """How many runs this profile has already FINISHED today (UTC).
+
+    Deliberately counts only status == "done": a crashed or cancelled run must
+    not flip the profile into thin-run mode for the rest of the day, since it
+    consumed little or nothing of the store's head and the next run is still
+    effectively the day's first."""
+    midnight = datetime.combine(datetime.utcnow().date(), datetime.min.time())
+    return db.execute(
+        select(func.count(SearchRun.id)).where(
+            SearchRun.profile_id == profile_id,
+            SearchRun.status == "done",
+            SearchRun.started_at >= midnight,
+        )
+    ).scalar_one() or 0
+
+
+def _thin_run_conditions(db: Session, profile_id: int, eng_profile: dict) -> list[str]:
+    """The conditions under which this run is expected to be short of candidates,
+    and every latency saving in this module should therefore stand down.
+
+    This is the single decision point behind both the ATS switch and the adaptive
+    examine budget, so the two cannot drift into disagreeing about what "thin"
+    means. Returns the reasons rather than a bool so the log line and the funnel
+    can say WHICH one fired -- a run that got the slow path is only defensible
+    while the reason for it is visible.
+
+    The conditions, all measured rather than assumed:
+
+    * anything other than a UK-only country filter -- the ATS vendor registry is
+      overwhelmingly US-headquartered and only 7% of its rows carry a UK-ish
+      location, so for a gb-filtered candidate it is 93% waste: those rows are
+      fetched, stored, embedded and then dropped by _filter_by_country. That
+      argument depends ENTIRELY on the filter being there to drop them. It
+      inverts outside the UK (Reed is UK-only and Adzuna may not serve the
+      country at all), and it collapses for a Global/International profile, whose
+      empty country_codes means no filter runs and the US rows are genuinely
+      eligible results.
+    * visa_sponsor_only -- the sponsor filter keeps ~10% of rows, so the pool
+      behind it has to be several times deeper to yield the same results.
+    * a second or later completed run today -- the board feeds have already been
+      consumed by the earlier run, which is exactly when the ATS backlog stops
+      being noise and starts being the only unexamined material left.
+    * the profile's first run ever -- nothing in the store, so there is no backlog
+      to fall back on and no reference run to size a budget from."""
+    reasons: list[str] = []
+    # Note the shape: ATS is only switched OFF for a filter that is exactly and
+    # only gb. An empty list means Global/International -- no country filter at
+    # all -- which is the case the "93% waste" measurement does NOT cover, since
+    # nothing downstream drops those rows.
+    if set(eng_profile.get("country_codes") or []) != {"gb"}:
+        reasons.append("country_filter_not_uk_only")
+    if eng_profile.get("visa_sponsor_only"):
+        reasons.append("visa_sponsor_only")
+    if eng_profile.get("first_run"):
+        reasons.append("first_run_ever")
+    elif _completed_runs_today(db, profile_id) >= 1:
+        reasons.append("repeat_run_today")
+    return reasons
+
+
+def _reference_run(db: Session, profile_id: int) -> SearchRun | None:
+    """The finished run whose selection ratio best predicts THIS run's.
+
+    Deliberately the FIRST completed run of a day, not the most recent one. A
+    profile's second and later runs of a day are searching a store the earlier
+    run already consumed the head of, so their ratio collapses -- feeding that
+    forward would size the next day's budget off an artefact of how many times
+    the user pressed search, and would ratchet the budget up (a worse ratio asks
+    for MORE examining) exactly when it should not.
+
+    Prefers today's first run, then falls back to the first run of the most
+    recent day that has one. In practice today's own first run is only ever
+    selected for a LATER run the same day -- and those are pinned to the full
+    budget by _thin_run_conditions before they get here -- so the live path is
+    "the previous day's first run". The today-first ordering is kept because it
+    is the correct answer to the question this function asks, and stays right if
+    the repeat-run-today condition is ever relaxed.
+
+    Returns None when the profile has never finished a run, which pins the budget
+    to RANK_EXAMINE_BUDGET."""
+    rows = db.execute(
+        select(SearchRun)
+        .where(SearchRun.profile_id == profile_id, SearchRun.status == "done",
+               SearchRun.funnel_counts.is_not(None))
+        .order_by(SearchRun.started_at.desc())
+        .limit(60)
+    ).scalars().all()
+    if not rows:
+        return None
+    today = datetime.utcnow().date()
+    # Group by calendar day, newest day first, and take that day's EARLIEST run.
+    by_day: dict[date, list[SearchRun]] = defaultdict(list)
+    for r in rows:
+        if r.started_at:
+            by_day[r.started_at.date()].append(r)
+    if not by_day:
+        return None
+    for day in sorted(by_day, reverse=True):
+        if day > today:
+            continue
+        return min(by_day[day], key=lambda r: r.started_at)
+    return None
+
+
+def _adaptive_examine_budget(db: Session, profile_id: int, thin_run: bool) -> tuple[int, str, int]:
+    """Size this run's examine budget from the last comparable run's selectivity.
+
+    Returns (budget, source, ratio_per_mille) -- the last two purely so the
+    decision lands in funnel_counts and can be audited after the fact rather than
+    re-derived from a log line.
+
+    `selection_ratio` is judge_eligible_total / rank_scored: of everything the
+    cheap+mid gates examined, what fraction came out worth judging. A high ratio
+    means the pool is dense with plausible roles and 480 slots are being spent to
+    find candidates that would have turned up in 240; a low one means the profile
+    is niche and needs the width.
+
+    Pinned to the full RANK_EXAMINE_BUDGET whenever `thin_run` is set -- the same
+    conditions that keep ATS on. A run that is already expected to be short on
+    candidates is the one run that must not also have its budget cut; every
+    saving in this module collapses back to today's behaviour there, on purpose.
+    """
+    if thin_run:
+        return RANK_EXAMINE_BUDGET, "thin_run_pinned", 0
+    ref = _reference_run(db, profile_id)
+    if ref is None:
+        return RANK_EXAMINE_BUDGET, "no_reference_run", 0
+    try:
+        counts = json.loads(ref.funnel_counts or "{}")
+    except (ValueError, TypeError):
+        return RANK_EXAMINE_BUDGET, "reference_run_unreadable", 0
+    examined = counts.get("rank_scored") or 0
+    eligible = counts.get("judge_eligible_total") or 0
+    # A reference run that examined almost nothing (cancelled early, a store that
+    # was empty at the time) carries no information about selectivity. Zero
+    # eligible is NOT treated as "ratio 0 -> examine everything" either: it is
+    # far more likely to mean the run failed than that the profile needs 480.
+    if examined < RANK_EXAMINE_BUDGET_MIN or eligible <= 0:
+        return RANK_EXAMINE_BUDGET, "reference_run_too_thin", 0
+    ratio = eligible / examined
+    budget = int(round(EXAMINE_BUDGET_TARGET_ELIGIBLE / ratio))
+    budget = max(RANK_EXAMINE_BUDGET_MIN, min(RANK_EXAMINE_BUDGET, budget))
+    return budget, f"run_{ref.id}", int(round(ratio * 1000))
 
 
 def _store_counts(db: Session, profile_id: int) -> dict[str, int]:
@@ -3690,6 +3949,13 @@ def _gate_rank_refill_cluster(
     hard_gate_failed: list[dict] = []  # _hard_gate_ok=False, or a candidate-promoted hard axis failed
     judge_eligible: list[dict] = []    # ranked, >= RANK_REJECT_SCORE_FLOOR
     below_rank_floor: list[dict] = []  # ranked, < RANK_REJECT_SCORE_FLOOR
+    # Named, countable reasons this cluster turned listings away, for the
+    # user-facing "why were roles rejected" summary. Keys are stable slugs; the
+    # soft-axis ones are "soft_<axis>" and the promoted-hard ones "hard_<axis>",
+    # both derived from engine.SOFT_GATE_AXES (which already carry a leading
+    # underscore) so a new axis appears here automatically rather than being
+    # silently uncounted.
+    reject_reasons: "defaultdict[str, int]" = defaultdict(int)
 
     # ONE pass over the whole examine budget, not an incremental refill loop.
     #
@@ -3756,6 +4022,7 @@ def _gate_rank_refill_cluster(
                 (too_old if engine.listing_over_max_age(j, max_age_days) else kept).append(j)
             if too_old:
                 hard_gate_failed.extend(too_old)
+                reject_reasons["listing_too_old"] += len(too_old)
                 batch = kept
 
         annotated = engine.screen_gate(batch, cluster_profile)
@@ -3772,10 +4039,33 @@ def _gate_rank_refill_cluster(
         # no real listing underneath to backfill toward, so re-surfacing it via
         # the floor backfill would just show the candidate the same non-job text
         # again.
+        # Attribute each hard drop to a named reason on the way past. These codes
+        # are computed on every run and were then thrown away: the packed
+        # _gate_reason string goes only to gate_cache, which is hash-keyed with no
+        # profile, run or timestamp, so "why did this run reject things" was not
+        # answerable after the fact from anywhere. Counting here is free -- the
+        # decision has already been made -- and ints ride straight out in
+        # funnel_counts. A listing failing several rules is counted under the
+        # FIRST that applies, in the order the pipeline itself applies them, so
+        # the buckets sum to the drop count rather than double-counting.
+        for j in annotated:
+            if _clears_hard(j):
+                continue
+            if not j.get("_listing_ok", True):
+                reject_reasons["not_a_job_posting"] += 1
+            elif not j.get("_hard_gate_ok", True):
+                reject_reasons["your_must_have_or_avoid"] += 1
+            else:
+                # A normally-soft axis the candidate promoted to Hard.
+                failed = next((a for a in hard_axes if not j.get(a, True)), None)
+                reject_reasons[f"hard{failed}" if failed else "hard_axis"] += 1
         hard_gate_failed.extend(j for j in annotated if not _clears_hard(j))
         annotated = [j for j in annotated if _clears_hard(j)]
         in_sector = [j for j in annotated if j.get("_sector_ok", True)]
         off_sector.extend(j for j in annotated if not j.get("_sector_ok", True))
+        n_off_sector = sum(1 for j in annotated if not j.get("_sector_ok", True))
+        if n_off_sector:
+            reject_reasons["wrong_kind_of_role"] += n_off_sector
 
         # Dynamic strictness (engine.dynamic_hard_drop_threshold, shared with
         # screen_gate's own diagnostic log so the two can't disagree): drops
@@ -3806,6 +4096,15 @@ def _gate_rank_refill_cluster(
             for j, fails in zip(chunk, chunk_fails):
                 if fails >= threshold:
                     hard_dropped.append(j)
+                    # Which soft axes actually failed on a listing that was
+                    # dropped for compounding failures. Counted per AXIS, not per
+                    # listing, so these deliberately sum to more than
+                    # hard_dropped -- a drop needs 2 agreeing signals (1 on a
+                    # clean round, see dynamic_hard_drop_threshold) and naming
+                    # only one of them would misreport why it went.
+                    for axis in soft_axes:
+                        if not j.get(axis, True):
+                            reject_reasons[f"soft{axis}"] += 1
                 else:
                     gate_survivors.append(j)
                     round_survivors.append(j)
@@ -3875,6 +4174,10 @@ def _gate_rank_refill_cluster(
     judge_target_trimmed = max(0, len(judge_eligible) - judge_target)
     if judge_target_trimmed:
         judge_eligible = judge_eligible[:judge_target]
+    # Counted here, after both floor backfills, so it reflects what was ACTUALLY
+    # turned away rather than what the raw floor test rejected before promotions.
+    if rank_floor_rejected > 0:
+        reject_reasons["fit_score_too_low"] += rank_floor_rejected
     stats = {
         "examined": examined, "queue_len": len(queue),
         "gate_survivors": len(gate_survivors), "hard_dropped": len(hard_dropped),
@@ -3887,6 +4190,10 @@ def _gate_rank_refill_cluster(
         "hard_gate_dropped": len(hard_gate_failed),
         "judge_eligible": len(judge_eligible), "stop_reason": stop_reason,
         "backfilled": backfilled, "judge_target_trimmed": judge_target_trimmed,
+        # Named drop reasons, summed run-wide by the caller. Note these describe
+        # the CHEAP gate only; the free pre-filters and the final judge report
+        # their own, and the user-facing summary merges all three.
+        "reject_reasons": dict(reject_reasons),
     }
     return judge_eligible, gate_survivors, stats
 
@@ -4883,17 +5190,49 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     eng_profile["first_run"] = _is_first_run(db, profile_id)
     disabled = get_disabled(db)  # per-source toggle (workstream D)
     # The ~40-company ATS rotation batch is the single largest chunk of a run's
-    # discovery calls, fetched fresh with no caching today. Skip it (fall back
-    # to whatever's already in the store/backlog) when the last fetch for this
-    # profile is still within the TTL, so pressing search twice in a row
-    # doesn't always re-query every ATS company's board from scratch.
-    ats_stale = eng_profile["first_run"] or get_ats_batch_stale(db, profile_id, DISCOVERY_ATS_CACHE_TTL_HOURS)
-    if not ats_stale:
+    # discovery calls. It is now OFF by default and switched on only by a
+    # thin-run condition, because it was measured to deliver essentially nothing
+    # on an ordinary UK run: 58.9% of the store (9,919 rows) and 42% of everything
+    # discovered in a recent 4-day window, against 4.0% of real picks and ZERO of
+    # the 20 roles the user has ever saved or applied to. Only 702 of those 9,919
+    # rows (7%) carry a UK-ish location at all.
+    #
+    # It is deactivated, never deleted, and the conditions that bring it back are
+    # exactly the ones where the boards go thin -- see _thin_run_conditions.
+    thin_reasons = _thin_run_conditions(db, profile_id, eng_profile)
+    ats_on = bool(thin_reasons)
+    # An explicit user toggle wins in both directions: a vendor the user has
+    # switched off stays off (it is already in `disabled`), and a user who has
+    # deliberately left ATS sources enabled and asked for them is not overridden
+    # by this policy. `disabled` holds what is OFF, so "the user turned some ATS
+    # source off" is the only explicit signal available here; absent that, policy
+    # decides.
+    if not ats_on:
         disabled = disabled | ATS_KEYS
+        ats_stale = False
+    else:
+        # Only within the ATS-on branch does the TTL still apply, and only as a
+        # tiebreak: back-to-back searches shouldn't re-query every company's board
+        # from scratch. NOTE the ordering trap -- before this change the TTL alone
+        # decided, and it SKIPPED ATS within 4h of the last fetch, i.e. precisely
+        # on the second run of a day, which is the case the policy above now wants
+        # it ON for. The two rules point opposite ways and the policy has to win.
+        ats_stale = eng_profile["first_run"] or get_ats_batch_stale(
+            db, profile_id, DISCOVERY_ATS_CACHE_TTL_HOURS)
+        if not ats_stale:
+            disabled = disabled | ATS_KEYS
     eng_profile["disabled_sources"] = disabled
+    eng_profile["_ats_enabled"] = ats_on
+    funnel["ats_enabled"] = ats_on
+    funnel["ats_thin_run"] = bool(thin_reasons)
+    if ats_on:
+        ats_note = ("querying fresh" if ats_stale else "skipped (cached, within TTL)")
+        ats_note += f"; ATS on because: {', '.join(thin_reasons)}"
+    else:
+        ats_note = "ATS off (ordinary run -- boards only; see _thin_run_conditions)"
     emit(f"[pipeline] discovery start (first_run={eng_profile['first_run']}, "
          f"disabled={sorted(eng_profile['disabled_sources'])}, "
-         f"ats_batch={'querying fresh' if ats_stale else 'skipped (cached, within TTL)'})")
+         f"ats_batch={ats_note})")
     _progress(db, run, "Searching job boards…")
     raw_jobs = engine.gather_jobs(eng_profile)
     # search_terms_batch is set as a side effect of gather_jobs (select_sources_for_run
@@ -5033,7 +5372,22 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # rows fell below TARGET_POOL, which rarely happens on an active profile, so the
     # backlog was effectively write-only. Resurfacing runs every time now; it's cheap
     # because a resurfaced row's gate/rank/judge results are all served from cache.
-    rows = _new_rows(db, profile_id)
+    # ATS rows are held out of the pool on the same runs the ATS batch itself is
+    # switched off -- see _new_rows' include_ats and _thin_run_conditions. Counted
+    # so the cost of that exclusion stays attributable rather than showing up as an
+    # unexplained drop in pool_rows.
+    if not ats_on:
+        ats_in_store = db.execute(
+            select(func.count(JobSeen.id)).where(
+                JobSeen.profile_id == profile_id, JobSeen.state == "new",
+                JobSeen.dead_reason.is_(None),
+                or_(*[JobSeen.source.like(f"{p}:%") for p in ATS_BOARD_PREFIXES]),
+            )
+        ).scalar_one() or 0
+    else:
+        ats_in_store = 0
+    funnel["ats_pool_excluded"] = ats_in_store
+    rows = _new_rows(db, profile_id, include_ats=ats_on)
     seen_ids = {r.identity_hash for r in rows}
     resurfaced = [r for r in _backlog_rows(db, profile_id, BACKLOG_TOPUP, verdicts=("strong", "backup"))
                   if r.identity_hash not in seen_ids]
@@ -5045,7 +5399,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # BACKLOG_TOPUP would silently keep most of the invalidated backlog out. They
     # cost one cosine each here and still have to clear RELEVANCE_FLOOR and out-score
     # everything else for an examine slot.
-    reopened = [r for r in _gate_reopened_rows(db, profile_id, gate_sig)
+    reopened = [r for r in _gate_reopened_rows(db, profile_id, gate_sig, include_ats=ats_on)
                 if r.identity_hash not in seen_ids]
     if reopened:
         rows = rows + reopened
@@ -5063,7 +5417,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         rows = rows + extra
         resurfaced = resurfaced + extra
     emit(f"[pipeline] pool assembled: {n_fresh} fresh 'new' + {len(resurfaced)} "
-         f"resurfaced backlog + {len(reopened)} gate-reopened row(s) -> {len(rows)} total")
+         f"resurfaced backlog + {len(reopened)} gate-reopened row(s) -> {len(rows)} total"
+         + (f" (holding back {ats_in_store} ATS row(s) -- ATS off this run)" if ats_in_store else ""))
     funnel["pool_rows"] = len(rows)
     funnel["pool_resurfaced"] = len(resurfaced)
     _snap("pool", rows)
@@ -5243,6 +5598,7 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     below_rank_floor_all: list[dict] = []
     total_examined = total_gate_survivors = total_judge_eligible = 0
     total_hard_gate_dropped = 0
+    reject_reasons_total: dict[str, int] = {}
     cluster_diagnostics: dict[int, dict] = {}
     num_active_clusters = sum(1 for q in queues.values() if q)
     # Both budgets are run-wide totals split evenly, so the run's cost is the
@@ -5252,8 +5608,21 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # judge will use so the expensive stage picks the best of a real pool rather
     # than judging whatever survived. See RANK_TARGET_POOL / RANK_EXAMINE_BUDGET.
     _n = num_active_clusters or 1
+    # Sized per run rather than read straight off the constant -- see
+    # _adaptive_examine_budget. Held in a local because RANK_EXAMINE_BUDGET is a
+    # module global shared by every concurrent run in the process; mutating it
+    # would let one profile's ratio silently resize another's run.
+    examine_budget, budget_source, budget_ratio = _adaptive_examine_budget(
+        db, profile_id, bool(thin_reasons))
+    funnel["examine_budget_used"] = examine_budget
+    funnel["examine_budget_ratio_ref"] = budget_ratio   # per mille; 0 = no reference
     cluster_judge_target = -(-RANK_TARGET_POOL // _n)
-    cluster_examine_cap = -(-RANK_EXAMINE_BUDGET // _n)
+    cluster_examine_cap = -(-examine_budget // _n)
+    if examine_budget != RANK_EXAMINE_BUDGET:
+        emit(f"[pipeline] examine budget {examine_budget} (ceiling {RANK_EXAMINE_BUDGET}, "
+             f"from {budget_source}: {budget_ratio / 10:.1f}% of examined were judge-eligible)")
+    else:
+        emit(f"[pipeline] examine budget {examine_budget} (full ceiling; {budget_source})")
 
     # Give the cheap stages something real to read first. Scoped to the head of
     # each cluster's queue -- already embed-score-ordered, so this is the slice
@@ -5265,24 +5634,38 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # cluster_examine_cap all the way out to RANK_EXAMINE_BUDGET. Between them these
     # two sources are ~91% of the store's text-starved rows (see the text-supply note
     # in CLAUDE.md). See _enrich_reed_full_text / _enrich_adzuna_full_text.
-    enrich_slice = min(cluster_examine_cap, -(-REED_ENRICH_PRE_GATE_CAP // _n))
-    to_enrich = [j for queue in queues.values() for j in queue[:enrich_slice]]
-    n_enriched = _enrich_reed_full_text(engine, db, profile_id, to_enrich)
+    # Timed as two separate laps, not one `enrich`. The combined lap measured
+    # 9-32s across recent runs while `reed_enriched`/`adzuna_enriched` were 0-57
+    # and 0-4 respectively -- i.e. the cost and the yield could not be attributed
+    # to a source, which is what kept the two caps below un-tunable. They are
+    # cheap to keep apart: /settings/run-timings renders unlabelled phase keys
+    # under their raw name, so neither needed a router change.
+    n_enriched = 0
+    if REED_ENRICH_PRE_GATE_CAP > 0:
+        enrich_slice = min(cluster_examine_cap, -(-REED_ENRICH_PRE_GATE_CAP // _n))
+        to_enrich = [j for queue in queues.values() for j in queue[:enrich_slice]]
+        n_enriched = _enrich_reed_full_text(engine, db, profile_id, to_enrich)
     funnel["reed_enriched"] = n_enriched
+    t0 = _lap("enrich_reed", t0)
     # Adzuna runs on its own, narrower slice -- see ADZUNA_ENRICH_PRE_GATE_CAP. It is
     # the same blocking main-thread HTTP sitting in front of first paint that the Reed
     # cap exists to bound, but each response is a ~100KB page from a host that
-    # rate-limits, so it cannot ride the same budget.
-    adz_slice = min(cluster_examine_cap, -(-ADZUNA_ENRICH_PRE_GATE_CAP // _n))
-    to_enrich_adz = [j for queue in queues.values() for j in queue[:adz_slice]]
-    n_adz = _enrich_adzuna_full_text(engine, db, profile_id, to_enrich_adz)
+    # rate-limits, so it cannot ride the same budget. The cap is 0 by default now,
+    # so this whole block is normally skipped -- the guard is what makes that a
+    # no-op rather than an empty-slice fetch, and what lets the cap be raised
+    # again from config without re-adding code.
+    n_adz = 0
+    if ADZUNA_ENRICH_PRE_GATE_CAP > 0:
+        adz_slice = min(cluster_examine_cap, -(-ADZUNA_ENRICH_PRE_GATE_CAP // _n))
+        to_enrich_adz = [j for queue in queues.values() for j in queue[:adz_slice]]
+        n_adz = _enrich_adzuna_full_text(engine, db, profile_id, to_enrich_adz)
     funnel["adzuna_enriched"] = n_adz
     n_enriched += n_adz
     if n_enriched:
         emit(f"[pipeline] enriched {n_enriched} candidate(s) with their full description "
              f"before gating ({funnel['reed_enriched']} Reed, {n_adz} Adzuna; cached for "
              f"future runs; these now skip phase 5)")
-    t0 = _lap("enrich", t0)
+    t0 = _lap("enrich_adzuna", t0)
 
     # Judge every cluster's queue concurrently. Both budgets above
     # (cluster_judge_target / cluster_examine_cap) are derived from
@@ -5304,10 +5687,6 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # see _gate_rank_refill_cluster's `report` param and _upsert_provisional_rows.
     progress_q: "queue.Queue" = queue.Queue()
     cluster_accum: dict[int, list[dict]] = {idx: [] for idx, _ in active_clusters}
-    # Stashed so a JUDGE_POOL_FLOOR shortfall can re-enter the SAME cluster's
-    # queue with the same profile/context later, instead of only being able to
-    # recycle already-rank-rejected candidates -- see the call site below.
-    cluster_profiles: dict[int, dict] = {}
     if active_clusters:
         with ThreadPoolExecutor(max_workers=len(active_clusters)) as pool:
             futures = {}
@@ -5316,7 +5695,6 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
                 cluster_profile["search_terms"] = (
                     role_clusters[idx].get("roles") or eng_profile.get("search_terms"))
                 cluster_profile["_multi_cluster"] = len(role_clusters) > 1
-                cluster_profiles[idx] = cluster_profile
                 futures[pool.submit(
                     _gate_rank_refill_cluster, cluster_queue, cluster_profile, engine, cancel_check,
                     cluster_judge_target, cluster_examine_cap, _make_progress_reporter(progress_q, idx),
@@ -5361,6 +5739,8 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         total_gate_survivors += stats["gate_survivors"]
         total_judge_eligible += stats["judge_eligible"]
         total_hard_gate_dropped += stats["hard_gate_dropped"]
+        for reason, n in (stats.get("reject_reasons") or {}).items():
+            reject_reasons_total[reason] = reject_reasons_total.get(reason, 0) + n
         if stats["backfilled"]:
             # Same tag/message as the old one-shot design's starvation backfill
             # (see _compose_fallback_warning) -- MIN_RESULTS safety net had to
@@ -5389,73 +5769,38 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             "off_sector": stats["off_sector"], "hard_gate_dropped": stats["hard_gate_dropped"],
             "rank_floor_rejected": stats["rank_floor_rejected"],
             "judge_eligible": stats["judge_eligible"], "stop_reason": stats["stop_reason"],
+            # Was computed in stats and then dropped here. It is the one signal that
+            # separates a cluster the mid tier TRIMMED (it produced more than its
+            # share of RANK_TARGET_POOL) from one it STARVED -- identical
+            # judge_eligible either way, opposite meanings for the examine budget.
+            "judge_target_trimmed": stats.get("judge_target_trimmed", 0),
         }
     t0 = _lap("gate", t0)
 
-    # Judge-pool FLOOR (symmetric to the JUDGE_POOL ceiling): if the gate+rank
-    # funnel left fewer than JUDGE_POOL_FLOOR candidates eligible for the expensive
-    # judge, run one bounded EXTRA gate+rank round per still-open cluster over its
-    # next unexamined candidates, rather than recycling already-rank-rejected jobs
-    # (which, by construction, already scored < RANK_REJECT_SCORE_FLOOR and have no
-    # better shot at the judge than they already had). Only clusters whose first
-    # round stopped on a CAP (target_reached / absolute_pool_cap) -- not a
-    # genuinely exhausted queue -- have anything fresh left; a cluster that already
-    # burned through its whole queue is simply left short, no reject fallback (a
-    # prior version promoted below-floor rejects here instead -- dropped after an
-    # investigation found the judge's own scam-suspicion signals, and a downstream
-    # scam-verify check, were producing false positives on legitimate high-volume
-    # agency listings, making "borderline reject" a much weaker signal of genuine
-    # unfitness than assumed). Runs BEFORE dup-suppression/fair-allocate so those
-    # stages treat any extra-round survivors uniformly with the rest.
-    judge_floor_extra_examined = 0
-    if total_judge_eligible < JUDGE_POOL_FLOOR:
-        need = JUDGE_POOL_FLOOR - total_judge_eligible
-        reopenable = [
-            (idx, cluster_queue) for idx, cluster_queue in active_clusters
-            if cluster_diagnostics[idx]["stop_reason"] != "pool_exhausted"
-            and cluster_diagnostics[idx]["examined"] < len(cluster_queue)
-        ]
-        if reopenable:
-            # Split the shortfall evenly across clusters that can actually supply
-            # more candidates -- same fairness principle as cluster_judge_target.
-            per_cluster_target = -(-need // len(reopenable))
-            with ThreadPoolExecutor(max_workers=len(reopenable)) as pool:
-                extra_futures = {
-                    pool.submit(
-                        _gate_rank_refill_cluster,
-                        cluster_queue[cluster_diagnostics[idx]["examined"]:],
-                        cluster_profiles[idx], engine, cancel_check,
-                        per_cluster_target, JUDGE_POOL_FLOOR_EXTRA_CAP,
-                    ): idx
-                    for idx, cluster_queue in reopenable
-                }
-                for f in extra_futures:
-                    idx = extra_futures[f]
-                    extra_eligible, _extra_survivors, extra_stats = f.result()
-                    rank_by_cluster.setdefault(idx, []).extend(extra_eligible)
-                    rank_by_cluster[idx].sort(key=_selection_score, reverse=True)
-                    below_rank_floor_all.extend(extra_stats["below_rank_floor_jobs"])
-                    judge_floor_extra_examined += extra_stats["examined"]
-                    total_judge_eligible += extra_stats["judge_eligible"]
-                    total_examined += extra_stats["examined"]
-                    total_gate_survivors += extra_stats["gate_survivors"]
-                    emit(f"[pipeline] judge-pool floor: cluster[{idx}] extra round examined "
-                         f"{extra_stats['examined']} more candidate(s) -> "
-                         f"{extra_stats['judge_eligible']} newly judge-eligible "
-                         f"(total now {total_judge_eligible}, floor={JUDGE_POOL_FLOOR})")
-        if total_judge_eligible < JUDGE_POOL_FLOOR:
-            emit(f"[pipeline] judge-pool floor: still {total_judge_eligible} judge-eligible after the "
-                 f"extra round (floor={JUDGE_POOL_FLOOR}) -- no reject fallback, accepting the shortfall")
-    funnel["judge_floor_extra_examined"] = judge_floor_extra_examined
-    # Own lap, split out from "rank" below: this block (when it runs at all) is
-    # a whole extra screen_gate + rank_gate round -- real LLM calls, not
-    # bookkeeping -- and was previously folded into the "rank" timing under the
-    # label "Fair-allocate to the judge pool", which made a single-cluster run
-    # that had to top up its judge pool look like fair-allocate itself (a pure
-    # Python reshuffle of a few dozen dicts) was taking tens of seconds. Zero
-    # candidates examined here still records a real (near-zero) lap rather than
-    # silently folding into the next one.
-    t0 = _lap("judge_floor_topup", t0)
+    # The judge-pool FLOOR top-up used to run here: one bounded extra gate+rank
+    # round per still-open cluster whenever fewer than JUDGE_POOL_FLOOR candidates
+    # came out judge-eligible. REMOVED ON MEASUREMENT -- it fired in runs 28 and 29,
+    # examined 40 extra candidates each time, cost 15.8s and 15.1s, and left
+    # judge_pool_size at 11 on BOTH runs. It was paying two real LLM calls per needy
+    # cluster to move the judge pool by zero.
+    #
+    # Its job -- "don't let the judge starve" -- is now done up front instead, by
+    # sizing the examine budget from the previous comparable run's selection ratio
+    # (see _adaptive_examine_budget). Topping up after the fact was always the more
+    # expensive way round: the extra round re-paid a screen_gate and a rank_gate on
+    # a 20-candidate slice, where a wider first pass costs only more parallel
+    # batches inside calls already being made.
+    #
+    # Two latent bugs went with it: the extra round's survivors never entered
+    # gate_survivor_ids/examined_ids (so they were never marked 'enriched' at the
+    # end of the run, and could be re-examined for free forever), and it never
+    # updated cluster_diagnostics (so per-cluster `examined` under-reported whenever
+    # it fired). JUDGE_POOL_FLOOR / JUDGE_POOL_FLOOR_EXTRA_CAP are kept as constants
+    # so restoring this is a decision rather than an archaeology exercise.
+    #
+    # Held at a hard 0 for one release so the Settings funnel panel and any
+    # run-to-run comparison don't break on a key that simply vanished.
+    funnel["judge_floor_extra_examined"] = 0
 
     # Near-duplicate suppression before the expensive judge: same company, same
     # title, near-identical text (a recruiter template re-posted per city) keeps
@@ -5495,6 +5840,13 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     funnel["judge_eligible_total"] = total_judge_eligible
     funnel["hard_gate_dropped"] = total_hard_gate_dropped
     funnel["judge_pool_size"] = len(selected)
+    # Named cheap-gate drop reasons, flattened as reject_<slug> ints. Prefixed so
+    # the Settings endpoint can discover them without a hand-maintained field per
+    # axis -- the same trick tokens_{stage}_{metric} already uses, and the reason
+    # this needed no schema change. Un-prefix by stripping "reject_", never by
+    # splitting on "_": every slug contains underscores.
+    for reason, n in reject_reasons_total.items():
+        funnel[f"reject_{reason}"] = int(n)
     # Flatten the per-cluster judge-eligible lists for sampling: the Snapshot
     # panel reports the pipeline stage-by-stage, not cluster-by-cluster.
     _snap("judge_eligible", [j for jl in rank_by_cluster.values() for j in jl])

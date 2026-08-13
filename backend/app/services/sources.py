@@ -40,6 +40,14 @@ SOURCES: list[dict] = [
 _PREFIX_TO_KEY = {s["board_prefix"]: s["key"] for s in SOURCES}
 _VALID_KEYS = {s["key"] for s in SOURCES}
 ATS_KEYS = {s["key"] for s in SOURCES if s["kind"] == "ats"}
+# The raw `board`/`source` tag prefixes an ATS row carries in jobs_seen -- i.e.
+# "gh" for greenhouse, matching board_prefix rather than key. Derived from the
+# registry so a vendor added above cannot be missed by a hand-maintained second
+# list. Used by engine._new_rows and friends to keep ATS rows OUT of the
+# candidate pool on runs where the ATS batch itself is switched off: disabling
+# discovery alone leaves the thousands already in the store still competing for
+# the examine budget forever.
+ATS_BOARD_PREFIXES = tuple(s["board_prefix"] for s in SOURCES if s["kind"] == "ats")
 
 
 def canonical_key(board: str | None) -> str | None:

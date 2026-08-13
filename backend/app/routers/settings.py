@@ -80,9 +80,22 @@ class RunTokenStageOut(BaseModel):
     length_capped: int = 0
 
 
+class RunRejectReasonOut(BaseModel):
+    """One named reason listings were turned away this run, in plain language.
+    See _REJECT_REASON_LABELS / _rejection_summary below."""
+    reason: str          # stable slug -- safe to key off in the frontend
+    label: str           # what the user reads
+    count: int
+    stage: str           # "free" | "gate" | "judge" -- how expensive the check was
+
+
 class RunFunnelOut(BaseModel):
     """Cross-stage funnel for the most recent finished search run -- the
     all-together counterpart to SourceStatOut's per-source, all-time view."""
+    # Ranked plain-language causes, biggest first. NOT a partition and must not be
+    # totalled -- see _rejection_summary for why the counts don't add up to
+    # anything meaningful.
+    rejection_summary: list[RunRejectReasonOut] = []
     run_id: int | None = None
     finished_at: datetime | None = None
     entering: int = 0                    # raw_discovered
@@ -130,6 +143,12 @@ class RunFunnelOut(BaseModel):
     final_verify_unverifiable: int = 0
     final_verify_browser: int = 0
     final_verify_backfilled: int = 0     # replacements pulled in for dropped picks
+    # Adzuna picks routed to the tracking-redirect check rather than answered by a
+    # plain GET. Counted apart from final_verify_unverifiable on purpose: this is a
+    # deliberate ROUTING state, not a host refusing to answer, and folding the two
+    # together would make that counter read as a rising failure rate. Written since
+    # the redirect route shipped but never surfaced until now.
+    final_verify_redirect_routed: int = 0
     # Scam / CV-farming flags (engine.py, the scam-verify loop). None of these were
     # surfaced before, which is most of why the stage sat broken unnoticed: it read
     # only `full_text`, which most candidates never carry, so it returned "not
@@ -183,6 +202,19 @@ class RunFunnelOut(BaseModel):
     pool_quality_dropped: int = 0            # total of the two below
     pool_quality_dropped_foreign_location: int = 0
     pool_quality_dropped_junk_listing: int = 0
+    # ATS vendor batch. Off by default and switched back on only by a thin-run
+    # condition (engine._thin_run_conditions) -- it was measured at 58.9% of the
+    # store and 0 of the 20 roles ever saved or applied to. ats_pool_excluded is
+    # the number of already-stored ATS rows held out of the candidate pool, which
+    # is where the examine budget is actually freed; surfaced so a drop in
+    # pool_rows has a visible cause.
+    ats_enabled: bool = True
+    ats_pool_excluded: int = 0
+    # The examine budget this run actually used, and the reference run's selection
+    # ratio (per mille; 0 = no usable reference, budget pinned to the ceiling).
+    # See engine._adaptive_examine_budget.
+    examine_budget_used: int = 0
+    examine_budget_ratio_ref: int = 0
     shown: int = 0                       # final_picks
     examined: int = 0                    # rank_scored -- total examined by the cheap+mid gates
     # final_judge / examined -- a coarse "how niche is this profile" gauge, not
@@ -192,6 +224,73 @@ class RunFunnelOut(BaseModel):
     # examined yet, rather than a misleading 0%.
     filtering_ratio: float | None = None
     token_usage: list[RunTokenStageOut] = []
+
+
+# Slug -> (label, stage), for the "why roles were rejected" summary. Merges three
+# sources that were never presentable together: the free pre-filter counters
+# (already surfaced, as prose), the cheap gate's per-axis codes (computed every
+# run and previously discarded -- see engine.py's reject_reasons) and the final
+# judge's own disqualifications.
+#
+# The labels are written from the CANDIDATE's side, the same rule the judge's own
+# output follows: a shortfall is something the posting asked for, never a
+# deficiency in the reader.
+_REJECT_REASON_LABELS: dict[str, tuple[str, str]] = {
+    # Free, LLM-free checks at pool admission.
+    "heuristic_prescreen_dropped": ("Pitched at a different level, or a student/placement scheme", "free"),
+    "pool_quality_dropped_foreign_location": ("Located outside the countries you search", "free"),
+    "pool_quality_dropped_junk_listing": ("Not a real job posting (board category pages)", "free"),
+    "expired_date_dropped": ("The employer's closing date had already passed", "free"),
+    "training_dropped": ("Paid training or placement schemes, not vacancies", "free"),
+    "salary_filtered": ("Pay stated below your minimum", "free"),
+    "sponsor_filter_scored_after": ("", "free"),  # placeholder, never displayed
+    # The cheap screen gate. reject_* keys written by engine.py.
+    "reject_listing_too_old": ("Older than your maximum listing age", "gate"),
+    "reject_not_a_job_posting": ("Not a real job posting (caught at the screen)", "gate"),
+    "reject_your_must_have_or_avoid": ("Hit one of your must-have or avoid rules", "gate"),
+    "reject_wrong_kind_of_role": ("A different kind of role from the ones you target", "gate"),
+    "reject_soft_seniority_ok": ("Pitched at a different level of seniority", "gate"),
+    "reject_soft_requirements_ok": ("Asked for experience your profile doesn't evidence", "gate"),
+    "reject_soft_skills_ok": ("Little overlap with the skills you list", "gate"),
+    "reject_soft_salary_ok": ("Pay below what you're looking for", "gate"),
+    "reject_soft_work_arrangement_ok": ("Work arrangement doesn't match yours", "gate"),
+    "reject_hard_seniority_ok": ("Wrong seniority (you set this as a hard filter)", "gate"),
+    "reject_hard_requirements_ok": ("Requirements unmet (you set this as a hard filter)", "gate"),
+    "reject_hard_skills_ok": ("Skills mismatch (you set this as a hard filter)", "gate"),
+    "reject_hard_salary_ok": ("Pay too low (you set this as a hard filter)", "gate"),
+    "reject_hard_work_arrangement_ok": ("Work arrangement mismatch (you set this as a hard filter)", "gate"),
+    "reject_fit_score_too_low": ("Scored too low on fit to be worth a full review", "gate"),
+    # The expensive judge.
+    "final_disqualified": ("Ruled out by the final review", "judge"),
+}
+# Counters that exist but must never appear in the summary: they are not
+# rejections (or are already represented by another key), and a reader scanning
+# this list has to be able to trust every row is a listing that went away.
+_REJECT_REASON_SKIP = {"sponsor_filter_scored_after"}
+
+
+def _rejection_summary(counts: dict) -> list[RunRejectReasonOut]:
+    """Every named reason this run turned listings away, biggest first.
+
+    Only non-zero reasons are returned. A list padded with zeroes reads as the
+    feature being broken rather than as nothing having happened, and it buries
+    the two or three reasons that actually explain the run.
+
+    Note the counts are NOT mutually exclusive and do not sum to a meaningful
+    total: they come from different pipeline stages over different populations
+    (the free filters see the whole store, the gate sees only the examine budget),
+    and the soft-axis ones are counted per AXIS, so one listing dropped for two
+    failing axes appears under both. It is a ranked list of causes, not a
+    partition -- the frontend must not total it."""
+    out: list[RunRejectReasonOut] = []
+    for slug, (label, stage) in _REJECT_REASON_LABELS.items():
+        if slug in _REJECT_REASON_SKIP or not label:
+            continue
+        n = counts.get(slug) or 0
+        if isinstance(n, int) and n > 0:
+            out.append(RunRejectReasonOut(reason=slug, label=label, count=n, stage=stage))
+    out.sort(key=lambda r: -r.count)
+    return out
 
 
 class RunPhaseOut(BaseModel):
@@ -216,6 +315,11 @@ class RunClusterOut(BaseModel):
     hard_gate_dropped: int = 0
     rank_floor_rejected: int = 0
     judge_eligible: int = 0
+    # Judge-eligible candidates discarded because the cluster produced MORE than
+    # its share of RANK_TARGET_POOL. Distinguishes a cluster that was TRIMMED from
+    # one that was STARVED -- both end at the same judge_eligible number, and the
+    # adaptive examine budget reads the two very differently.
+    judge_target_trimmed: int = 0
     stop_reason: str = ""
     judged: int = 0
     judge_reused_from_cache: int = 0
@@ -264,13 +368,17 @@ _RUN_PHASE_LABELS = [
     ("category_expand", "Category-page expansion"),
     ("embed", "Embedding new listings"),
     ("score", "Cosine scoring against clusters"),
-    ("enrich", "Fetching full descriptions (Reed)"),
+    ("enrich", "Fetching full descriptions (Reed + Adzuna)"),
+    ("enrich_reed", "Fetching full descriptions (Reed)"),
+    ("enrich_adzuna", "Fetching full descriptions (Adzuna)"),
     ("gate", "Cheap screen + rank gate (per cluster)"),
     ("judge_floor_topup", "Judge-pool floor top-up (extra gate+rank round)"),
+    ("verify_liveness", "Liveness check (rank pool)"),
     ("rank", "Duplicate suppression + fair-allocate to judge pool"),
     ("scrape", "Full-page scraping"),
     ("final_eval", "Final AI judge"),
     ("scrape+judge", "Full-page scrape + final AI judge (overlapped)"),
+    ("verify_final_picks", "Liveness check (final picks)"),
 ]
 
 
@@ -427,6 +535,7 @@ def get_run_funnel(
             length_capped=counts.get(f"tokens_{stage}_length_capped", 0),
         ))
     return RunFunnelOut(
+        rejection_summary=_rejection_summary(counts),
         run_id=run.id,
         finished_at=run.finished_at,
         entering=counts.get("raw_discovered", 0),
@@ -454,6 +563,13 @@ def get_run_funnel(
         final_verify_unverifiable=counts.get("final_verify_unverifiable", 0),
         final_verify_browser=counts.get("final_verify_browser", 0),
         final_verify_backfilled=counts.get("final_verify_backfilled", 0),
+        final_verify_redirect_routed=counts.get("final_verify_redirect_routed", 0),
+        # Default True, not False: runs recorded before the ATS switch existed
+        # carry no key and DID have ATS on, so a missing key must read as on.
+        ats_enabled=bool(counts.get("ats_enabled", True)),
+        ats_pool_excluded=counts.get("ats_pool_excluded", 0),
+        examine_budget_used=counts.get("examine_budget_used", 0),
+        examine_budget_ratio_ref=counts.get("examine_budget_ratio_ref", 0),
         scam_suspect_raised=counts.get("scam_suspect_raised", 0),
         scam_dropped=counts.get("final_scam_verified_dropped", 0),
         scam_verify_no_sentence=counts.get("scam_verify_no_sentence", 0),

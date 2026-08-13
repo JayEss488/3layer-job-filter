@@ -324,6 +324,28 @@ a { color: inherit; }
 .funnel-seg.rf-judge { background: rgba(191,92,58,.65); }
 .funnel-seg.rf-shown { background: var(--accent); }
 
+/* ── "Why roles were turned away" (Settings, top of the run-funnel panel) ──
+   Bars are scaled against the LARGEST reason, not against a run total: the
+   counts come from different stages over different populations and a listing can
+   be counted under several, so there is no total for them to be a share of. */
+.reject-summary { margin: 4px 0 18px; padding-bottom: 14px; border-bottom: 1px solid var(--line-2); }
+.reject-summary-h { font-size: 12.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }
+.reject-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+.reject-label { flex: 1; min-width: 0; font-size: 12.5px; color: var(--ink-2); }
+.reject-track { width: 90px; flex-shrink: 0; height: 8px; background: rgba(127,127,127,.12); border-radius: 4px; overflow: hidden; }
+.reject-bar { height: 100%; border-radius: 4px; }
+/* Shaded by how expensive the check that caught it was -- palest for the free
+   pre-filters, strongest for the final judge. */
+.reject-bar.reject-free { background: rgba(127,127,127,.35); }
+.reject-bar.reject-gate { background: rgba(191,92,58,.5); }
+.reject-bar.reject-judge { background: var(--accent); }
+.reject-count { width: 116px; flex-shrink: 0; display: flex; align-items: baseline; justify-content: flex-end; gap: 6px; font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.reject-stage { width: 62px; text-align: left; color: var(--muted); font-size: 10.5px; }
+@media (max-width: 640px) {
+  .reject-row { flex-wrap: wrap; }
+  .reject-label { flex-basis: 100%; }
+}
+
 /* ── Snapshot (Settings, sample roles per pipeline stage for one run) ────── */
 .snapshot-stage { padding: 8px 0; border-top: 1px solid var(--line-2); }
 .snapshot-stage:first-of-type { border-top: none; }

@@ -60,7 +60,23 @@ export interface SourceStat {
   selected: number;
 }
 
+/** One named reason listings were turned away, for the run-funnel panel's
+ *  summary. Mirrors backend RunRejectReasonOut. */
+export interface RunRejectReason {
+  /** Stable slug — safe to key off; the label wording may change. */
+  reason: string;
+  label: string;
+  count: number;
+  /** Which tier caught it: "free" (no model), "gate" (cheap screen), "judge". */
+  stage: string;
+}
+
 export interface RunFunnel {
+  /** Ranked causes, biggest first, non-zero only. NOT a partition: the counts
+   *  come from different stages over different populations and soft-axis ones
+   *  are counted per axis, so a listing can appear under several. Never total
+   *  this list. */
+  rejection_summary: RunRejectReason[];
   run_id: number | null;
   finished_at?: string | null;
   entering: number;
@@ -88,6 +104,9 @@ export interface RunFunnel {
   final_verify_unverifiable: number;
   final_verify_browser: number;
   final_verify_backfilled: number;
+  /** Adzuna picks routed to the tracking-redirect check — a deliberate routing
+   *  state, not a host that refused to answer. */
+  final_verify_redirect_routed: number;
   /** Scam / CV-farming flags. Read scam_verify_no_sentence first: if it climbs
    *  back toward scam_suspect_raised, the corroboration check has stopped
    *  running rather than stopped finding anything — which is how it sat broken
@@ -120,6 +139,16 @@ export interface RunFunnel {
    *  Always 0 when that preference is Hard — those are dropped instead. */
   stale_soft_demoted: number;
   stale_soft_demoted_double: number;
+  /** ATS vendor batch: off on an ordinary run, back on for a thin one (non-UK,
+   *  sponsor-only, a repeat run the same day, or a first run). ats_pool_excluded
+   *  counts already-stored ATS rows held out of the candidate pool, which is
+   *  where the examine budget is actually freed. */
+  ats_enabled: boolean;
+  ats_pool_excluded: number;
+  /** The examine budget this run used, and the reference run's selection ratio
+   *  in per mille (0 = no usable reference, so the budget sat at its ceiling). */
+  examine_budget_used: number;
+  examine_budget_ratio_ref: number;
   shown: number;
   /** rank_scored — total examined by the cheap+mid gates. */
   examined: number;
@@ -160,6 +189,10 @@ export interface RunCluster {
   hard_gate_dropped: number;
   rank_floor_rejected: number;
   judge_eligible: number;
+  /** Judge-eligible candidates discarded for exceeding this cluster's share of
+   *  RANK_TARGET_POOL. Tells a TRIMMED cluster from a STARVED one — both land on
+   *  the same judge_eligible number. */
+  judge_target_trimmed: number;
   stop_reason: string;
   judged: number;
   judge_reused_from_cache: number;
