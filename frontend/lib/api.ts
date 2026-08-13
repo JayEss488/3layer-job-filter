@@ -104,15 +104,52 @@ function parseErrorBody(body: unknown, fallback: string): { message: string; cod
   return { message: fallback, code: "" };
 }
 
+/**
+ * Client-side ceiling on a CV/notes parse.
+ *
+ * The server has its own budget (config.CV_PARSE_TIMEOUT_SECONDS), and this
+ * sits deliberately above it so a server-side timeout wins and the user gets
+ * the specific message rather than a generic one. What this catches is the
+ * case the server's budget cannot: a stall in the NETWORK rather than in the
+ * request — a dropped connection, a sleeping laptop, a proxy holding the socket
+ * open — where the response never arrives and `fetch` never settles. Before
+ * this, that ended as a spinner with no timeout anywhere in the stack, which is
+ * exactly how a parse was reported "not finishing" with nothing in the console.
+ */
+const PARSE_TIMEOUT_MS = 150_000;
+
+function parseAbortSignal(): AbortSignal {
+  return AbortSignal.timeout(PARSE_TIMEOUT_MS);
+}
+
+/** Turn the abort into something a user can act on; pass anything else through. */
+function asParseTimeout(e: unknown): Error {
+  const name = (e as { name?: string } | null)?.name;
+  if (name === "TimeoutError" || name === "AbortError") {
+    return new Error(
+      "That took too long and was stopped. Nothing was changed — please try again.",
+    );
+  }
+  return e instanceof Error ? e : new Error(String(e));
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeaders(),
-      ...(init?.headers as Record<string, string> | undefined),
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+        ...(init?.headers as Record<string, string> | undefined),
+      },
+    });
+  } catch (e) {
+    // Only reachable for a caller that passed a signal (today: the parse
+    // calls); everything else rethrows unchanged, so this adds no behaviour
+    // anywhere it isn't asked for.
+    throw asParseTimeout(e);
+  }
   if (!res.ok) {
     if (res.status === 401) handleUnauthorized();
     let detail = res.statusText;
@@ -396,20 +433,26 @@ export const api = {
     req<Attribute[]>(`/profiles/${id}/parse-text`, {
       method: "POST",
       body: JSON.stringify({ text }),
+      signal: parseAbortSignal(),
     }),
   parseCv: async (id: number, file: File) => {
     const form = new FormData();
     form.append("file", file);
-    const res = await fetch(`${BASE}/profiles/${id}/parse-cv`, {
-      method: "POST",
-      body: form,
-      headers: authHeaders(),
-    });
-    if (!res.ok) {
-      if (res.status === 401) handleUnauthorized();
-      throw new Error((await res.json()).detail || "Upload failed");
+    try {
+      const res = await fetch(`${BASE}/profiles/${id}/parse-cv`, {
+        method: "POST",
+        body: form,
+        headers: authHeaders(),
+        signal: parseAbortSignal(),
+      });
+      if (!res.ok) {
+        if (res.status === 401) handleUnauthorized();
+        throw new Error((await res.json()).detail || "Upload failed");
+      }
+      return (await res.json()) as Attribute[];
+    } catch (e) {
+      throw asParseTimeout(e);
     }
-    return (await res.json()) as Attribute[];
   },
   suggest: (id: number, type: AttributeType, context?: string) =>
     req<{ suggestions: string[] }>(`/profiles/${id}/suggest`, {

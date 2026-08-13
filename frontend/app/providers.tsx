@@ -39,6 +39,9 @@ const PUBLIC_ROUTES = new Set([
   "/verify-email",
   "/forgot-password",
   "/reset-password",
+  // Standalone Auth0 SDK trial (lib/auth0.ts) -- deliberately outside the
+  // app's real auth system, so it must not be gated by its token.
+  "/auth0-demo",
 ]);
 
 /** Where a logged-in user who still owes us the sign-up survey is held. */
@@ -168,10 +171,19 @@ function AuthGate({ children }: { children: React.ReactNode }) {
   // Above <Nav />, which every app page renders itself. Rendering it here
   // rather than inside Nav is what makes it one edit instead of nine, and keeps
   // it out of the two survey routes above.
+  //
+  // The wrapping div matters: body is `display:flex` (row) to center a single
+  // .app/.screen card via justify-content. Without this wrapper,
+  // VerifyEmailBanner and {children} become TWO direct flex children of body,
+  // which lays them out side by side instead of stacked -- the banner ends up
+  // as a left "column" instead of a bar across the top. See .app-shell in
+  // globals.css.
   return (
     <ProfileProvider>
-      <VerifyEmailBanner />
-      {children}
+      <div className="app-shell">
+        <VerifyEmailBanner />
+        {children}
+      </div>
     </ProfileProvider>
   );
 }

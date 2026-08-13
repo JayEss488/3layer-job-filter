@@ -53,6 +53,31 @@ def capture_llm_calls():
         _llm_trace.reset(token)
 
 
+# Per-attempt read timeout, and how many attempts the SDK makes underneath
+# llm_json's own retry loop. BOTH have to be set explicitly, because the two
+# retry layers MULTIPLY and only one of them was ever visible from this file:
+# llm_json retries once, the SDK defaulted to max_retries=2 (three attempts),
+# and at the old 90s timeout that is 6 x 90s = ~9 minutes of a user-facing CV
+# upload spent inside a call that has already stalled, before anything is
+# raised or logged. That is what an "it just span forever, no console errors"
+# report looks like from the inside.
+#
+# 45s is chosen against the measured distribution rather than as a round number:
+# every caller here is a short, interactive, one-shot call (CV extraction, the
+# summary/families pair, suggestions, family assignment, region inference), and
+# the longest of them -- the ~450-word summary on a 4,400-word CV -- measures
+# ~11s. 45s is four times the slowest normal case, so a legitimate slow day is
+# never cut off, while a genuine stall now fails in time for llm_json's retry to
+# actually be worth having. Worst case is 4 x 45s = 180s, bounded above it by
+# config.CV_PARSE_TIMEOUT_SECONDS on the path where a human is waiting.
+#
+# Do NOT reuse these for the search engine's calls -- full_auto.py keeps its own
+# client at 90s because the final judge legitimately generates thousands of
+# output tokens per call.
+_READ_TIMEOUT_SECONDS = 45.0
+_SDK_MAX_RETRIES = 1
+
+
 @lru_cache(maxsize=1)
 def _client() -> OpenAI:
     # Same fix as full_auto.py's client: an explicit timeout instead of the SDK's
@@ -60,7 +85,11 @@ def _client() -> OpenAI:
     # background task. This client's calls run first in a search (region
     # inference/role clustering, before full_auto is even imported), so a hang
     # here used to happen before anything else in the pipeline even started.
-    return OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=httpx.Timeout(90.0, connect=5.0))
+    return OpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        timeout=httpx.Timeout(_READ_TIMEOUT_SECONDS, connect=5.0),
+        max_retries=_SDK_MAX_RETRIES,
+    )
 
 
 def _clean_json(raw: str) -> str:

@@ -4,6 +4,7 @@ import asyncio
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from ..config import CV_PARSE_TIMEOUT_SECONDS
 from ..database import get_db
 from ..deps import get_profile_or_404
 from ..models import Profile
@@ -116,7 +117,23 @@ async def _run_formation(
     DB-free, so nothing flushes until persist_formation runs its single commit."""
     intent_text = profile.intent_text
     profile.cv_text = text[:40000]
-    extract_data, understand_data = await formation.run_formation_calls(text, intent_text)
+    try:
+        extract_data, understand_data = await asyncio.wait_for(
+            formation.run_formation_calls(text, intent_text),
+            timeout=CV_PARSE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        # An honest, visible failure beats a spinner that never resolves. The
+        # abandoned threads are DB-free (formation's module docstring), so they
+        # touch nothing on their way out; nothing has been committed at this
+        # point either, so the profile is exactly as it was. Retrying is the
+        # right advice and empirically works -- see CV_PARSE_TIMEOUT_SECONDS.
+        raise HTTPException(
+            status_code=504,
+            detail=(f"Reading that {noun} took longer than "
+                    f"{CV_PARSE_TIMEOUT_SECONDS} seconds and was stopped. "
+                    "Nothing was changed — please try again."),
+        ) from None
     try:
         created = await asyncio.to_thread(
             formation.persist_formation, db, profile.id, text, source, extract_data, understand_data

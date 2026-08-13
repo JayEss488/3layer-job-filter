@@ -5811,12 +5811,30 @@ _KNOWN_JOB_AGGREGATOR_FRAGMENTS = (
     "jooble", "trovit", "jobrapido", "whatjobs", "simplyhired", "linkedin",
     "monster", "talent.com", "jobisjob", "jobted", "mitula", "neuvoo",
     "learn4good", "adzuna", "reed.co.uk", "jora.com", "receptix",
+    # studysmarter republishes other employers' ads under garbled attribution
+    # (a measured 19 rows across 14 companies included a yoga studio recorded as
+    # hiring a Tableau BI lead). It is a scraper-aggregator like the rest of this
+    # list, so a hit there corroborates nothing -- and without it, teaching this
+    # check to read snippets (below) would newly "corroborate" perfectly ordinary
+    # postings off a studysmarter mirror.
+    "studysmarter",
 )
 
 
 def _is_known_job_aggregator(host: str) -> bool:
     host = (host or "").lower()
     return any(frag in host for frag in _KNOWN_JOB_AGGREGATOR_FRAGMENTS)
+
+
+def listing_search_sentence(job: dict) -> str | None:
+    """The sentence verify_not_duplicated would search for this listing, or None
+    if it has no searchable text. Public so engine.py can tell "we searched and
+    found nothing" apart from "there was nothing to search" when reporting an
+    uncorroborated scam flag -- two outcomes that look identical from a None
+    return but mean opposite things. Kept as the single definition of which text
+    the check reads, so the caller's diagnostic can't drift from the check."""
+    return (_distinctive_sentence(job.get("full_text", ""))
+            or _distinctive_sentence(job.get("snippet", "")))
 
 
 def verify_not_duplicated(job: dict, country_code: str = "gb") -> str | None:
@@ -5828,8 +5846,19 @@ def verify_not_duplicated(job: dict, country_code: str = "gb") -> str | None:
     The caller (engine.py) gates this to only the rare already-suspicious pick,
     bounded by SCAM_VERIFY_MAX_PER_RUN, since it spends a real search call. Fails
     open: any search/parse issue, or no distinctive sentence available, returns
-    None -- never itself a disqualifier."""
-    sentence = _distinctive_sentence(job.get("full_text", ""))
+    None -- never itself a disqualifier.
+
+    Reads `full_text` first and falls back to `snippet`. That fallback is the
+    whole check working at all rather than a nicety: this used to read full_text
+    ALONE, and phase 5 only scrapes a fraction of candidates, so for every
+    teaser-only listing -- the majority of the store, per the text-supply notes
+    in CLAUDE.md -- there was no text, no sentence, and an immediate fail-open
+    return before a search was ever issued. The listing that surfaced this
+    (Pimlico Enterprises "Graduate Data Analyst", flagged scam_suspect by the
+    judge and shown at rank 1 as Very strong fit) had 0 bytes of full_text and
+    3,999 chars of perfectly searchable body sitting in snippet. A snippet is
+    the listing's own text either way, which is all this check needs."""
+    sentence = listing_search_sentence(job)
     if not sentence:
         return None
     orig_host = _scrape_host(job.get("url", ""))
@@ -6239,7 +6268,29 @@ async def expand_category_pages(
 # through for every candidate, whatever they had stated -- and NO LOCATION COMMENTARY
 # forbade even mentioning it in "concerns", so the judge could neither reject nor flag
 # it. A v20 verdict was reached under a rule that could not fail a remote role.
-FINAL_EVAL_PROMPT_VERSION = 28
+#
+# 29 (from 28): the OUTPUT-ORDER rework. Three connected changes.
+#   (a) The item shape now emits "requirements" and "filters_on" BEFORE "concerns",
+#       "fit_level" and "can_do_fit". The rubric has said since v16 that the grade is
+#       derived mechanically from the checklist, but the schema asked for the grade
+#       four fields earlier -- so the model necessarily formed an impression, wrote
+#       the verdict, and only then built the checklist the verdict was supposed to
+#       come from. Field order in a JSON schema IS generation order; it was
+#       contradicting the rule it sat beside.
+#   (b) "filters_on" became a requirement -> evidence MAPPING (objects, not strings),
+#       and "highlight" shrank to one optional framing sentence. The pair used to be
+#       a comma-joined list of asks followed by a paragraph of prose that re-named
+#       the same evidence in a different order, so the reader had to do the join
+#       themselves. Same information, one line per ask, and a named gap where the
+#       candidate has nothing -- which also gives the model a per-requirement place
+#       to notice it has no evidence, BEFORE it grades.
+#   (c) "summary" may now run to two sentences for a role whose work genuinely
+#       cannot be made concrete in one. The one-sentence cap was being met by
+#       abstraction rather than by brevity on exactly the complex/unfamiliar roles
+#       where the candidate most needs the plain-language read.
+# Pre-29 verdicts keep rendering: _sanitize_filters_on and the card still accept the
+# old flat-string form.
+FINAL_EVAL_PROMPT_VERSION = 29
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -6460,8 +6511,8 @@ be a stretch because the role expects X" states the same fact as a verdict on th
 have listed X as essential", "this one leans more on X than your evidence covers". Where the candidate
 genuinely does clear a bar, say so plainly in the same register.
 
-WORDING: When you reference the candidate's OWN background in "summary", "highlight" or
-"concerns", never state a leadership or founder title (e.g. president, chair, founder, co-founder,
+WORDING: When you reference the candidate's OWN background in "summary", "highlight", the "evidence"
+side of "filters_on", "strengths" or "concerns", never state a leadership or founder title (e.g. president, chair, founder, co-founder,
 cofounder, CEO, director, co-lead) on its own. If such a title came from a student club, society, campaign
 group, fellowship, or other informal/unpaid activity, name the SPECIFIC organisation or activity it belongs
 to, exactly as given in the candidate's profile (e.g. "co-lead of the Oxford AI Safety Society", "president
@@ -6480,8 +6531,23 @@ halves of one thought rather than two independent descriptions. Avoid listing-st
 translate it into what that actually means in practice. Do not let "summary" restate "role_type" in
 different words - see reasoning step F for the no-overlap rule between them.
 
+WHEN THE ROLE IS COMPLICATED, SPEND MORE WORDS -- NOT MORE ABSTRACT ONES. Most roles fit in one short
+sentence and should stay there. But some -- regulatory, oversight, policy, market-design, multi-party or
+otherwise unfamiliar work -- cannot be compressed that far, and compressing them anyway produces a
+sentence assembled entirely out of abstractions. "You would investigate market performance and use
+findings to improve customer outcomes and collaboration between participants" is the failure: every
+noun in it is a category, so the candidate finishes the sentence knowing no more than the job title told
+them. For a role like that, use TWO sentences and spend them on the concrete nouns the abstractions were
+standing in for -- WHO the other parties actually are, WHAT specifically gets looked at, and WHAT the
+person hands over at the end of it (a report, a recommendation, a decision, a dataset, a rule change, a
+fixed record). Test it before moving on: could someone outside this field say back, in their own words,
+what this person does on an ordinary Tuesday? If not, you have described the field, not the job. Never
+more than two sentences, and never buy the extra concreteness by importing the JD's jargon -- if you find
+yourself keeping a phrase like "stakeholder engagement" or "customer outcomes" because the plain version
+would take longer, write the longer plain version.
+
 NO LOCATION COMMENTARY: never mention location, remote/hybrid/on-site arrangement, relocation, or visa
-status in "summary", "role_type", "can_do_fit", "concerns", or "highlight" - that's already shown
+status in "summary", "role_type", "can_do_fit", "concerns", "filters_on", or "highlight" - that's already shown
 to the candidate via the work_style fact and handled by the LOCATION/VISA/RELOCATION disqualifier above,
 so repeating it in prose is redundant noise, not a fit signal."""
 
@@ -6525,7 +6591,8 @@ _FINAL_EVAL_STRONG_RULES = """8. EVIDENCE STRENGTH: The candidate's background p
    soft-skill/reliability anecdote (e.g. safety-critical responsibility, leadership of an unrelated
    activity, an Informal-tagged role, or a Self-directed/Academic/AI-assisted-tagged skill), that is NOT
    evidence the requirement is met unless the connection to the requirement is direct and explicitly
-   stated - do not present it as satisfying the requirement in "can_do_fit" or "highlight". Put
+   stated - do not present it as satisfying the requirement in "can_do_fit", "filters_on" or
+   "highlight". Put
    any such gap in "concerns" instead, naming the specific origin/depth limitation (e.g. "Salesforce
    experience is self-directed/sandbox, not production or paid use").
    Also weigh CUMULATIVE nice-to-have gaps: several compounding smaller gaps (e.g. no fintech background
@@ -6535,6 +6602,22 @@ _FINAL_EVAL_STRONG_RULES = """8. EVIDENCE STRENGTH: The candidate's background p
 _FINAL_EVAL_REASONING = """HOW TO JUDGE EACH ROLE -- work through this reasoning before deciding which list a role belongs in.
 This is a genuine fit assessment, NOT a keyword/similarity check: presence of a matching word is not
 evidence the requirement is met.
+
+THE LETTERS BELOW ARE FOR CROSS-REFERENCE, NOT THE ORDER OF WORK, AND THE ORDER OF WORK IS
+LOAD-BEARING. Work each role in this order, which is exactly the field order the schema asks you to
+emit and which you should follow literally: read the job (A) -> describe it (F: "role_type", "summary")
+-> build the requirements checklist (D: "requirements") -> map each screened-on requirement to the
+candidate's actual evidence for it (E: "filters_on", "highlight") -> list the gaps (C: "concerns") ->
+only THEN grade it ("fit_level", by the schema's rubric) and write the qualification verdict (B:
+"can_do_fit") -> then "strengths" (G).
+Why this order and not the reverse: "fit_level" and "concerns" are derived MECHANICALLY from the
+checklist, and going requirement-by-requirement through the candidate's evidence is what tells you
+which asks they can actually speak to. Do that work first and the grade falls out of it. Reach the
+grade first and everything after it becomes a justification -- the checklist gets drafted at whatever
+level of abstraction agrees with the verdict you already wrote, which is the single most common way
+this judgment goes wrong (see step D). If, having built the checklist and the evidence mapping, the
+role reads differently to you than it did on first impression, the checklist is right and the
+impression was wrong.
 A. READ THE JOB on three axes, not at face value (it is a marketing document as much as a spec):
    - Required vs nice-to-have: separate the genuinely mandatory requirements from the wish-list. Use the
      [key requirements] hint where present, and also read the full text -- listings pad their requirements.
@@ -6574,13 +6657,19 @@ C. List the notable gaps in "concerns", ONE item per gap (a missing requirement,
    "no evidence of X" for an X the employer has said it will teach reads to the candidate as a rejection
    on a requirement that was never asked of them, and it is the fastest way to talk a viable application
    out of an honest fit.
-D. Build a REQUIREMENTS CHECKLIST. This list is not shown to the candidate, but it is NOT optional
-   working-out and it is never the field to economise on: "fit_level" and "concerns" are both derived
-   MECHANICALLY from it (see the rubric in the schema), so an ask you leave off the checklist cannot
-   become a concern and cannot move the grade, however plainly the posting states it. Dropping an item
-   does not simplify your answer -- it silently changes it, always in the direction of flattering the
-   role. When you are judging many postings at once and the response is getting long, shorten "summary",
-   "highlight" and your other prose FIRST; the checklist is the one thing every other field depends on.
+D. Build a REQUIREMENTS CHECKLIST. This is the field every other field depends on, and it is never the
+   one to economise on. "fit_level" and "concerns" are both derived MECHANICALLY from it (see the rubric
+   in the schema), so an ask you leave off the checklist cannot become a concern and cannot move the
+   grade, however plainly the posting states it. Dropping an item does not simplify your answer -- it
+   silently changes it, always in the direction of flattering the role.
+   PART OF THIS LIST REACHES THE CANDIDATE. Step E turns the asks this employer will actually screen on
+   into the "what this role filters on, and what you have for each" block on their result card. So an
+   ask you never wrote down is not merely missing from your working-out: it is a bar this application
+   will be judged against that the candidate is never told about, and cannot prepare for. When the
+   response is running long, shorten "summary", "highlight", the "evidence" side of "filters_on" and
+   your other prose FIRST. Never the checklist, and in particular never trade checklist items for
+   "filters_on" pairs: that field is built FROM this list (step E), so the trade buys nothing and
+   costs twice.
    List the JD's individually-judgeable requirements (both explicitly
    stated and clearly implied), each tagged "core" (the requirements identified as genuinely mandatory in
    axis A -- the JD's "required" asks, or anything that would independently sink the application if
@@ -6696,39 +6785,65 @@ D. Build a REQUIREMENTS CHECKLIST. This list is not shown to the candidate, but 
    SEE. So a checklist that matches the hint and adds nothing is the expected symptom of skipping the
    ADD step, not evidence that the posting asked for little. Before you move on from a listing, re-read
    its requirements/responsibilities section once and check that every distinctly-judgeable ask in it is
-   either on your checklist or consciously excluded under one of the rules above. Two specific things go
-   missing this way and both belong on the list: a named platform, tool, language or dataset the role
-   runs on ("Google Cloud Platform, including BigQuery"), and a stated experience bar ("around 1-2 years
-   of development experience"). A stated years-of-experience bar is never optional to record.
+   either on your checklist or consciously excluded under one of the rules above. Three specific things
+   go missing this way and all three belong on the list: a named platform, tool, language or dataset the
+   role runs on ("Google Cloud Platform, including BigQuery"); a stated experience bar ("around 1-2
+   years of development experience"); and -- the one most often skipped -- an experience bar phrased as
+   a LIST OF EQUIVALENT JOB TITLES, e.g. "3-5 years' experience in a project-focused environment, such
+   as Project Assistant, Project Coordinator, Junior Project Manager, or similar roles". That last shape
+   slips past because its named titles sound close to what the candidate has done, so it reads as a
+   friendly note on who should apply -- but it is a quantified bar on prior PAID work of a specific
+   kind, and normally the first thing this employer screens on. Record it in the JD's own words, with
+   both the years and the kind of post. A stated years-of-experience bar is never optional to record,
+   in any of its phrasings.
    This sweep is a search for FAILABLE asks you missed, never a licence to lengthen the list: it does
    not override the governing test above, and an item added here that no candidate could fail has made
    the checklist worse, not more complete.
-E. APPLICATION GUIDANCE -- write "filters_on" and "highlight". This is the one part of the output whose
-   job is not to explain your verdict but to tell the candidate what to DO with this posting, so write it
-   as advice, not as a rationale. Do NOT restate the grade, do NOT argue the role is a good or bad fit,
-   and do NOT summarise "concerns" -- all three are already on the card.
-   - "filters_on": 2-4 items from your step-D checklist that this employer will actually screen this
-     application on AND that the candidate has some genuine evidence for. Take them from the "core" items
-     first, in the JD's own words and at the JD's own specificity ("Power BI", "advanced Excel", "SQL
-     against a production warehouse", "3+ years in a commercial analytics team") -- never a capacity or
-     an attitude, never a vague competency ("analytical thinking", "attention to detail"). Include an
-     item whose evidence is partial or indirect where it is clearly load-bearing for this posting, since
-     that is precisely the one the candidate has to argue for. EXCLUDE anything the candidate has NO
-     evidence for at all -- an item they cannot speak to is a gap, and gaps belong in "concerns"; this
-     field is only for what they can put on the page.
-   - "highlight": 2-3 sentences, SECOND PERSON, naming which of the candidate's OWN specific evidence to
-     lead with against those items -- the named project, tool, employer, dataset, report or result from
-     their profile, not a restatement of the skill tag. "Hence lead with the customer-churn pipeline you
-     built in Python and the Power BI dashboard you shipped for the ops team" is the register; "hence
-     highlight your data skills" is not. Where the strongest evidence for one of the "filters_on" items
-     is weak, self-directed, academic or AI-assisted, say how to frame it honestly rather than pretending
-     it is commercial (e.g. "your Salesforce work is self-directed, so pitch it as the reporting problem
-     you solved with it rather than as production experience"). Name at most one thing to leave out or
-     de-emphasise, and only when it would actively distract.
-   If the candidate's evidence is so thin that you cannot
-   name two real things for them to lead with, return the one or two you can and stop; do not invent
-   evidence that is not in their profile, and never name a project, employer or tool the profile does
-   not mention.
+E. THE EVIDENCE MAPPING -- write "filters_on", then optionally "highlight". This is the one part of the
+   output whose job is not to explain your verdict but to tell the candidate what to DO with this
+   posting, and it is ALSO the pass that makes the verdict honest: walking the checklist ask-by-ask and
+   naming what the candidate has for each is how you find out whether they can actually speak to this
+   posting, one requirement at a time, before you grade it. Do it here, not after.
+   "filters_on" is a LIST OF PAIRS -- one screened-on requirement, and the candidate's own evidence for
+   that specific requirement. 3-5 pairs, most-screened-on first. It is not a rationale: do NOT restate
+   the grade, do NOT argue the role is a good or bad fit, do NOT summarise "concerns".
+   EVERY "requirement" HERE MUST ALREADY BE ON YOUR STEP-D CHECKLIST, WORD FOR WORD. This field selects
+   from that list; it never introduces an ask, and it is not a second, shorter pass over the posting. So
+   if you reach for an ask here that you did not write down in step D, you have not found a shortcut --
+   you have found a hole in the checklist. Stop, go back, add it there with its core/secondary tag and
+   its "met" judgement, and only then map it. That is the point of doing this step here rather than at
+   the end: it is the pass that catches a checklist which quietly stopped short of what the posting
+   actually asks for. NEVER economise on the checklist to make room for this field -- the checklist is
+   this field's own source, so a thin one leaves you nothing worth mapping, and both come out worse.
+   - "requirement": one item taken from your step-D checklist -- an ask this employer will really screen
+     this application on. Take "core" items first, in the JD's own words and at the JD's own specificity
+     ("Power BI", "advanced Excel", "SQL against a production warehouse", "3-5 years in a project-focused
+     role"). Never a capacity or an attitude, never a vague competency ("analytical thinking", "attention
+     to detail") -- the same test as the checklist itself. Keep it SHORT: this renders as the left-hand
+     side of one line on a card, so compress the JD's phrasing rather than quoting a whole clause.
+   - "evidence": the candidate's OWN specific evidence for THAT requirement and no other -- the named
+     project, tool, employer, dataset, report or result from their profile, in second person and as
+     briefly as it can be said ("your Player Analytics case study -- Python/SQL extraction, Excel
+     cleaning, Power BI reporting"). Not a restatement of the requirement, not a skill tag, and never a
+     project, employer or tool the profile does not mention. Where the best evidence for that ask is
+     weak, self-directed, academic or AI-assisted, SAY SO in the same breath rather than letting it read
+     as commercial ("your Salesforce work, though self-directed rather than production use").
+   - A GAP IS AN ALLOWED, AND SOMETIMES REQUIRED, ANSWER: set "evidence" to null when the candidate has
+     nothing real for that requirement. Do not silently drop the requirement instead -- an ask this
+     employer screens on is worth the candidate knowing about whether or not they can answer it, and the
+     honest map of a posting includes the parts they cannot cover. But at most TWO of the pairs may be
+     gaps, and never the first one: the block's job is still to tell them what to lead with, and a list
+     that opens on a gap reads as a rejection notice. If more than two core asks come back empty, that
+     is the checklist telling you the grade, so leave the surplus gaps to "concerns" and let "fit_level"
+     carry it.
+   - NEVER INVENT AN EVIDENCE MATCH TO AVOID WRITING A GAP. Stretching an unrelated anecdote to cover an
+     ask ("your night-supervisor role shows you can handle compliance") is worse than the gap: it is
+     wrong, the candidate may repeat it in an application, and it is the exact move the EVIDENCE
+     STRENGTH rule forbids. A null is the correct answer whenever the connection is not direct.
+   - "highlight": OPTIONAL, and at most ONE short second-person sentence. The pairs above already say
+     what to lead with, so this exists only for something they cannot carry: how to frame the weakest
+     item honestly, or the one thing worth leaving out because it would actively distract. Omit it
+     entirely -- do not pad it, and never use it to re-list the evidence you just mapped.
 F. Classify the FUNCTIONAL NATURE of the day-to-day work in "role_type" -- one short sentence naming the
    kind of role this is (e.g. "This is a programme delivery role featuring admin and facilitation tasks",
    "This is a technical individual-contributor engineering role", "This is a client-facing sales role").
@@ -6741,21 +6856,31 @@ F. Classify the FUNCTIONAL NATURE of the day-to-day work in "role_type" -- one s
    support for colleagues" (that's the same functional-category information "role_type" already gave) -
    it should instead name the concrete duties/mission, e.g. "You would keep service records accurate,
    analyse outcomes, and turn evidence into reports for funders and partners."
-G. STRENGTHS -- required for any pick you grade "ok" or "stretch", omitted for "very_strong"/"strong".
-   Those two grades are shown to the candidate with their gaps listed and NOTHING alongside them, which
-   misrepresents a role they are being told is worth applying to. Write 1-3 "strengths" items: the
-   specific things the candidate genuinely DOES bring to THIS posting, each naming a real requirement
-   from your step-D checklist marked "met": true and the candidate's own concrete evidence for it (a
-   named tool, project, employer, dataset or result from their profile). Same discipline as "concerns":
-   one item each, most persuasive first, concrete rather than generic ("you have built Power BI
-   dashboards used by an ops team, which is the reporting stack this role runs on" -- not "you have
-   strong analytical skills"), and never evidence the profile does not actually contain. Where the best
-   evidence for an item is self-directed, academic or AI-assisted, say so in the same breath rather than
-   letting it read as commercial. If you genuinely cannot name one real strength for a role, that role
-   should not be in either list at all -- reconsider whether it belongs in "not_selected".
-   Give at least as many "strengths" as "concerns" where the evidence honestly supports it; a card
-   showing three gaps and one strength for a role you graded worth applying to is usually a sign the
-   checklist was written to fail rather than to judge."""
+G. STRENGTHS -- for a pick you grade "ok" or "stretch" only; always omitted for "very_strong"/"strong".
+   Those two grades are shown to the candidate with their gaps listed, and a card that lists gaps with
+   nothing alongside them misrepresents a role they are being told is worth applying to.
+   WRITE THIS ONLY WHERE IT ADDS SOMETHING STEP E's MAPPING DOES NOT. That mapping already shows the
+   candidate, ask by ask, what they have for this posting, so a "strengths" list that renames the same
+   evidence a second time is not reassurance -- it is the same card saying the same thing twice, which
+   is what the reader notices instead of the content. Use it for a genuine strength the mapping had no
+   room for: an asset this employer will value that is not one of the 3-5 asks you mapped, or the wider
+   context behind a mapped item that makes it more persuasive than its one-line form could show. If
+   everything worth saying is already in the mapping, return no "strengths" at all -- that is the
+   expected outcome for most ok/stretch picks, not a failure to find any.
+   Where you do write it: 1-3 items, the specific things the candidate genuinely DOES bring to THIS
+   posting, each resting on a step-D checklist item marked "met": true that you did NOT already map in
+   step E, plus the candidate's own concrete evidence for it (a named tool, project, employer, dataset
+   or result from their profile). Same discipline as "concerns": one item each, most persuasive first,
+   concrete rather than generic ("you have built Power BI dashboards used by an ops team, which is the
+   reporting stack this role runs on" -- not "you have strong analytical skills"), and never evidence
+   the profile does not actually contain. Where the best evidence for an item is self-directed, academic
+   or AI-assisted, say so in the same breath rather than letting it read as commercial.
+   ONE CHECK ACROSS BOTH FIELDS, and it is about step E rather than this one: if your step-E mapping is
+   ALSO mostly gaps while "concerns" runs to three, the card you are producing gives the candidate
+   almost nothing they can act on for a role you are telling them to apply to. That is nearly always a
+   checklist written to fail rather than to judge -- go back to step D and check you have not held them
+   to bars the posting never set. If the checklist survives that re-read honestly, the role probably
+   belongs in "not_selected" instead."""
 
 _FINAL_EVAL_SCHEMA = """Output ONLY a valid JSON object (no markdown), with two required lists and one
 optional list, using this item shape for "strong"/"backup":
@@ -6763,14 +6888,14 @@ optional list, using this item shape for "strong"/"backup":
   {
     "job_number": 1, "title": "...", "company": "...", "url": "...",
     "role_type": "1 short sentence classifying the FUNCTIONAL NATURE of the day-to-day work -- see reasoning step F. Written FIRST, since it's shown immediately before \\"summary\\" as one continuous sentence pair.",
-    "summary": "1 concise, PLAIN-LANGUAGE sentence on what this specific role/project/mission actually involves (not why it fits the candidate) -- see PLAIN LANGUAGE and NO LOCATION COMMENTARY above. Must add information NOT already given by \\"role_type\\" -- never restate its functional-category classification (see reasoning step F's no-overlap rule).",
+    "summary": "1 short PLAIN-LANGUAGE sentence on what this specific role/project/mission actually involves (not why it fits the candidate) -- or TWO sentences where the work genuinely cannot be made concrete in one, which is the right choice for an unfamiliar or many-sided role; see PLAIN LANGUAGE and NO LOCATION COMMENTARY above. Must add information NOT already given by \\"role_type\\" -- never restate its functional-category classification (see reasoning step F's no-overlap rule).",
+    "requirements": [{"text": "ONE JD requirement, short and concrete and in the JD's own words -- never a heading covering several, never a capacity anyone would pass; see reasoning step D", "category": "core" | "secondary", "met": true}],
+    "filters_on": [{"requirement": "ONE ask this employer will really screen on, short, from the checklist above -- see reasoning step E", "evidence": "the candidate's own specific evidence for THAT ask, second person and brief; null when they genuinely have none (max 2 nulls, never the first item)"}],
+    "highlight": "OPTIONAL single second-person sentence -- only how to frame the weakest item honestly, or the one thing to leave out. Omit rather than pad; never re-list the evidence above. See reasoning step E.",
+    "concerns": ["the notable gaps, one per item, most sink-worthy first, AT MOST 3 -- see reasoning step C; [] if none"],
     "fit_level": "very_strong" | "strong" | "ok" | "stretch",
     "can_do_fit": "a direct, second-person qualification verdict -- see reasoning step B.",
-    "filters_on": ["2-4 concrete things this employer will screen on that the candidate CAN evidence, in the JD's own words -- see reasoning step E"],
-    "highlight": "2-3 second-person sentences naming which of the candidate's own specific projects/tools/results to lead with against those -- see reasoning step E.",
-    "requirements": [{"text": "ONE JD requirement, short and concrete and in the JD's own words -- never a heading covering several, never a capacity anyone would pass; see reasoning step D", "category": "core" | "secondary", "met": true}],
-    "strengths": ["1-3 concrete things the candidate DOES bring to this posting, strongest first -- REQUIRED when \\"fit_level\\" is \\"ok\\" or \\"stretch\\", omit otherwise; see reasoning step G"],
-    "concerns": ["the notable gaps, one per item, most sink-worthy first, AT MOST 3 -- see reasoning step C; [] if none"],
+    "strengths": ["0-3 concrete things the candidate brings that \\"filters_on\\" above did NOT already carry, strongest first -- only for an \\"ok\\"/\\"stretch\\" \\"fit_level\\", omitted entirely otherwise and whenever the mapping already covers it; see reasoning step G"],
     "role_salary": "the salary or range THIS posting's own description states, verbatim and short (e.g. \\"GBP 35,000-42,000\\"); null if this posting states none -- even when other salary figures appear elsewhere in the supplied text (a \\"Similar jobs\\" list or salary histogram, see SCOPE OF EACH POSTING'S TEXT)",
     "work_style": "Remote" | "Hybrid" | "On-site" | null,
     "role_seniority": "the role's REAL seniority bar from axis A (e.g. \\"Graduate\\", \\"Junior\\", \\"Mid\\", \\"Senior\\"); null if you genuinely can't tell",
@@ -6785,6 +6910,14 @@ optional list, using this item shape for "strong"/"backup":
  "not_selected": [
    {"job_number": 7, "reason": "one short phrase naming the main thing that kept this out of both lists, quoting the JD clause it rests on where one exists"}
  ]}
+EMIT THE FIELDS IN THE ORDER LISTED ABOVE. That order is not cosmetic and is not a formatting
+preference -- it is the order of the reasoning (see THE LETTERS BELOW ARE FOR CROSS-REFERENCE at the top
+of HOW TO JUDGE EACH ROLE). "requirements" and "filters_on" come before "concerns", "fit_level" and
+"can_do_fit" because the last three are derived from the first two. Writing the grade or the
+qualification verdict first, and the checklist afterwards, means the checklist is written to agree with a
+verdict you have already committed to -- which produces a clean-looking list of requirements for a role
+the candidate could not do.
+
 Include a "disqualified" entry for every job you excluded from BOTH lists above because it failed one of
 the DISQUALIFIERS rules. The "reason" must contain the exact quoted clause from QUOTE-THEN-CLASSIFY, not
 just a paraphrase of the rule name, so a misfire can be checked against the listing text afterward.
@@ -6808,10 +6941,10 @@ beaten from one that was quietly misread, which a blank reject cannot distinguis
 raised exactly ONE flag on this listing (not enough alone to disqualify it into the list above); false
 otherwise. Omit or leave false when you saw none of those signals.
 
-"strengths" (on "strong"/"backup" items only): see reasoning step G. REQUIRED whenever "fit_level" is
-"ok" or "stretch" -- those are the grades whose card would otherwise show the candidate a list of gaps
-and nothing else for a role you are telling them to apply to. Omit it for "very_strong"/"strong", where
-the grade and "can_do_fit" already say the candidate clears the bar.
+"strengths" (on "strong"/"backup" items only): see reasoning step G. Only ever for an "ok" or "stretch"
+"fit_level", and only for a strength your "filters_on" mapping did not already carry -- omit it whenever
+that mapping covers what the candidate brings, which is the usual case. Always omit it for
+"very_strong"/"strong", where the grade and "can_do_fit" already say the candidate clears the bar.
 
 "fit_level" is used internally to ORDER the picks the candidate sees; it is not printed as a
 label on their card, so grade it honestly rather than protectively -- an accurate "ok" costs
@@ -6844,11 +6977,14 @@ payload (see SCOPE OF EACH POSTING'S TEXT). For "work_style" apply the same clas
 LOCATION/VISA/RELOCATION rule -- a stated office location with no remote/hybrid/work-from-home
 wording anywhere is "On-site", not null and not "Remote".
 
-"can_do_fit", "filters_on" and "highlight" are shown directly to the candidate -- "can_do_fit" as the
-headline "are you qualified", and "filters_on"/"highlight" together as a "Highlight when applying"
-block reading "This role likely filters on: <filters_on>." followed by your "highlight" sentences. Write
-them to read that way: short, plain-language, standing alone without the rest of the analysis, and with
-"highlight" continuing naturally from the filters_on list rather than repeating it."""
+"can_do_fit", "filters_on" and "highlight" are shown directly to the candidate. "can_do_fit" is the
+headline "are you qualified". "filters_on" renders as a "What this role filters on" block, ONE LINE PER
+PAIR, as "<requirement> -- <evidence>", with a null "evidence" printed as a plain "no evidence in your
+profile yet". Your optional "highlight" sentence follows underneath. Write them to read that way: each
+side of a pair short enough to sit on one line, plain-language, and standing alone without the rest of
+the analysis. In particular the "evidence" side is read directly against its own "requirement" and
+nothing else, so it must answer THAT ask specifically -- an evidence string that would fit equally well
+next to any of the other requirements is not specific enough to be useful."""
 
 # Static system prefix -- identical across every cluster/call, so it's a stable
 # (prompt-cache-friendly) prefix instead of being rebuilt into each user prompt. It
@@ -7031,19 +7167,101 @@ def _final_eval_job_block(i: int, j: dict, store_age_days: float | None = None,
             f"{j.get('full_text','')[:FINAL_EVAL_JOB_TEXT_CHARS]}")
 
 
-def _sanitize_filters_on(raw) -> list[str]:
-    """Validate/cap the judge's "filters_on" list (reasoning step E) -- at most 4
-    short strings, so a malformed or runaway response can't corrupt the persisted
-    verdict or spill a paragraph into the card's one-line "This role likely filters
-    on: ..." lead."""
+# How many "filters_on" pairs survive sanitisation, and how many of them may be a
+# gap (null "evidence"). Both are asked for in reasoning step E; enforced here for
+# the usual reason -- a prompt-only cap is a request, and a malformed reply must not
+# be able to corrupt a persisted verdict. The gap cap is the load-bearing one: the
+# block's job is still to tell the candidate what to LEAD WITH, and a mapping that
+# is mostly "no evidence in your profile yet" has turned into a second, longer
+# "concerns" list under a heading that promises the opposite.
+_FILTERS_ON_MAX = 5
+_FILTERS_ON_GAP_MAX = 2
+
+
+def _sanitize_filters_on(raw) -> list:
+    """Validate/cap the judge's "filters_on" list (reasoning step E).
+
+    Since FINAL_EVAL_PROMPT_VERSION 29 each entry is a requirement -> evidence PAIR
+    (`{"requirement": str, "evidence": str | None}`), where a null/blank "evidence"
+    means the candidate has no real evidence for that ask and the card prints a
+    gap line for it.
+
+    Verdicts judged under 28 or earlier are served from `JobSeen.eval_analysis`
+    forever (until the profile changes), and there "filters_on" is a flat list of
+    strings meaning "asks the candidate CAN evidence" -- the opposite of a gap. So
+    the old form is passed through AS STRINGS rather than coerced into pairs with a
+    null evidence side, which would silently relabel every one of them as a gap.
+    engine._compose_analysis branches on the item type and renders each form the way
+    its own prompt version meant it.
+    """
     if not isinstance(raw, list):
         return []
-    out = []
-    for r in raw[:4]:
-        item = str(r).strip()
-        if item:
-            out.append(item[:80])
+    out: list = []
+    gaps = 0
+    for r in raw:
+        if len(out) >= _FILTERS_ON_MAX:
+            break
+        if isinstance(r, dict):
+            requirement = str(r.get("requirement") or "").strip()
+            if not requirement:
+                continue
+            evidence = r.get("evidence")
+            evidence = "" if evidence is None else str(evidence).strip()
+            if not evidence:
+                if gaps >= _FILTERS_ON_GAP_MAX:
+                    continue
+                gaps += 1
+            out.append({"requirement": requirement[:90], "evidence": evidence[:220] or None})
+        elif isinstance(r, str):
+            # Pre-v29 flat string. Kept in its own form -- see the docstring.
+            item = r.strip()
+            if item:
+                out.append(item[:80])
+        # Anything else (a bare null, a number) is malformed under both forms and is
+        # dropped rather than str()'d, which would put the literal "None" on a card.
     return out
+
+
+# What the card prints on the evidence side of a "filters_on" pair whose "evidence"
+# came back null -- i.e. an ask this employer screens on that the candidate has
+# nothing for. Deliberately a FIXED string rather than something the model writes:
+# the judge is barred from stating a shortfall as a property of the candidate (see
+# _FINAL_EVAL_WORDING), and letting it phrase this line freely is the one place that
+# rule would be hardest to hold, since the field is literally "what you have here".
+FILTERS_ON_GAP_TEXT = "no evidence in your profile yet"
+
+
+def format_filters_on(raw) -> list[str]:
+    """Render a sanitised "filters_on" value as the card's display lines.
+
+    Lives here, beside _sanitize_filters_on and the prompt that produces the field,
+    so the shape is described in exactly one place -- engine._compose_analysis (the
+    card) and the CLI's emit/markdown output all call this rather than each
+    re-deriving the layout.
+
+    Two forms, because a pre-v29 verdict is served from cache indefinitely:
+      * v29+ pairs render one line per ask, "- <requirement> -- <evidence>".
+      * pre-v29 flat strings render as the single "This role likely filters on: ..."
+        lead they were written for. They mean "asks the candidate CAN evidence", so
+        they must never be printed with the gap text.
+    """
+    if not raw:
+        return []
+    pairs = [r for r in raw if isinstance(r, dict)]
+    legacy = [str(r).strip() for r in raw if not isinstance(r, dict) and str(r).strip()]
+    lines: list[str] = []
+    if not pairs and legacy:
+        return [f"This role likely filters on: {', '.join(legacy)}."]
+    for pair in pairs:
+        requirement = str(pair.get("requirement") or "").strip()
+        if not requirement:
+            continue
+        evidence = str(pair.get("evidence") or "").strip()
+        lines.append(f"- {requirement} — {evidence or FILTERS_ON_GAP_TEXT}")
+    # Only reachable from a malformed mixed reply; printed without an evidence side
+    # rather than being labelled a gap it was never claimed to be.
+    lines.extend(f"- {item}" for item in legacy)
+    return lines
 
 
 # Both bullet lists the card renders ("concerns" and its new "strengths" twin) are
@@ -7110,6 +7328,14 @@ def _run_final_eval(jobs: list[dict], cv_text: str | None,
     if cv_text is None:
         cv_text = open(CV_PATH, encoding="utf-8").read()
     cv_text = cv_text[:5000]
+
+    # Assume unaccounted-for until this call proves otherwise, so EVERY failure
+    # path below (API error, unparseable reply, a chunk that never runs) leaves
+    # the flag set without having to remember to set it. engine._persist_verdicts
+    # refuses to write a verdict for a job still carrying it -- see the note
+    # there. Cleared per job_number the model actually returns.
+    for j in jobs:
+        j["_judge_unaccounted"] = True
 
     jobs_block = "\n\n---\n\n".join(
         _final_eval_job_block(i, j, store_age_days, max_age_days, hard) for i, j in enumerate(jobs))
@@ -7194,19 +7420,21 @@ Jobs Payload:
         emit(f"[phase 6] Final generation evaluation failed to parse: {e}")
         return None, None, None
 
-    def _merge(entries, cap):
+    def _merge(entries, cap, source: list[dict] | None = None):
+        source = jobs if source is None else source
         out = []
         for entry in (entries or [])[:cap]:
             idx = entry.get("job_number", 1) - 1
-            if 0 <= idx < len(jobs):
-                merged = jobs[idx].copy()
+            if 0 <= idx < len(source):
+                merged = source[idx].copy()
                 merged.update(entry)
                 merged["requirements"] = _sanitize_requirements_checklist(merged.get("requirements"))
                 # Application guidance (reasoning step E), which replaced the old
                 # first-person top_match_reason narrative in FINAL_EVAL_PROMPT_VERSION
-                # 23. Same 700-char runaway guard the narrative had; filters_on is
-                # capped at 4 short items to match what step E asks for and to keep
-                # the card's one-line "This role likely filters on: ..." readable.
+                # 23. Same 700-char runaway guard the narrative had -- still a
+                # runaway guard rather than a length budget, even though v29 cut
+                # "highlight" to one optional sentence. filters_on caps live in
+                # _sanitize_filters_on.
                 merged["filters_on"] = _sanitize_filters_on(merged.get("filters_on"))
                 merged["highlight"] = str(merged.get("highlight") or "").strip()[:700]
                 # "concerns" is capped here as well as asked for in the prompt: it is
@@ -7236,6 +7464,103 @@ Jobs Payload:
             continue
         d["_disqualifier"] = False
         excluded.append(d)
+    # ── Account for every job_number, and re-ask for the ones it dropped ──────
+    #
+    # The prompt demands that all N job numbers appear in exactly one of the four
+    # lists, and the model has started quietly not doing it: measured across three
+    # live runs the shortfall went 0 -> 3 -> 5 jobs, worst in the largest cluster.
+    # That is the same failure screen_gate already has (see its own re-ask), and
+    # it is worse here, because an omitted job used to fall through
+    # engine._persist_verdicts' final `else` and be written as a REJECT with a
+    # blank reason, keyed on the eval signature -- so a job the model merely
+    # forgot to mention was excluded from every future run with nothing recorded
+    # anywhere. Store-wide that was 101 of 313 reject rows carrying no reason.
+    #
+    # Read the numbers off the RAW lists, not the merged output: `strong` and
+    # `backup` are capped at FINAL_PICKS by _merge, so a job named beyond the cap
+    # was accounted for by the model even though it isn't in the returned list.
+    def _numbers(entries, bound: int | None = None) -> set[int]:
+        bound = len(jobs) if bound is None else bound
+        out = set()
+        for e in (entries or []):
+            n = e.get("job_number")
+            if isinstance(n, int) and 1 <= n <= bound:
+                out.add(n)
+        return out
+
+    accounted = (_numbers(data.get("strong")) | _numbers(data.get("backup"))
+                 | _numbers(data.get("disqualified")) | _numbers(data.get("not_selected")))
+    for n in accounted:
+        jobs[n - 1]["_judge_unaccounted"] = False
+
+    missing = [i for i in range(len(jobs)) if (i + 1) not in accounted]
+    if missing:
+        emit(f"[phase 6] {len(missing)} of {len(jobs)} job(s) missing from every output list; "
+             f"re-asking for those only.")
+        # Deliberately asks ONLY for the two exclusion lists, not for a fresh
+        # selection. `strong` and `backup` were chosen across the whole payload
+        # and are frequently AT their cap (the run that surfaced this returned 12
+        # backups out of 12), so an omitted job's honest remaining states are
+        # "hard-excluded" or "out-competed". Re-opening selection over a handful
+        # of leftovers would be a materially easier question than the one the
+        # picks were decided under, and would let a job promote itself into the
+        # results purely by having been dropped from the accounting.
+        #
+        # Same system prompt and cache key as the primary call: the exclusion
+        # vocabulary and the not_selected discipline live there, and the ~12k
+        # prefix is already resident under the 24h retention, so reusing it is
+        # both cheaper and the only way the answers stay comparable.
+        sub = [jobs[i] for i in missing]
+        sub_block = "\n\n---\n\n".join(
+            _final_eval_job_block(k, j, store_age_days, max_age_days, hard)
+            for k, j in enumerate(sub))
+        retry_prompt = f"""Today's date: {today_str}
+
+Candidate Background Profile:
+{cv_text}
+
+The {len(sub)} job postings below were reviewed and were NOT selected for this candidate.
+Account for each of them: add it to "disqualified" with a short reason (quoting the clause)
+if a DISQUALIFIERS rule excludes it, otherwise to "not_selected" with a short reason held to
+the same standard as any other rejection reason. Return only those two lists. All {len(sub)}
+job numbers must appear in exactly one of them.
+
+Jobs Payload:
+{sub_block}"""
+        try:
+            retry_raw = llm(retry_prompt, system=_FINAL_EVAL_SYSTEM, model=EXP_MODEL,
+                            require_json=True, temperature=temperature, stage="judge",
+                            cache_key=_FINAL_EVAL_CACHE_KEY, cache_retention="24h",
+                            max_output_tokens=FINAL_EVAL_MAX_OUTPUT_TOKENS)
+            retry_data = json.loads(clean_json(retry_raw))
+        except Exception as e:
+            emit(f"[phase 6] re-ask for omitted jobs failed: {e}")
+            retry_data = {}
+
+        retry_seen = {d.get("_identity") for d in excluded}
+        for key, is_dq in (("disqualified", True), ("not_selected", False)):
+            for d in _merge(retry_data.get(key), len(sub), sub):
+                if d.get("_identity") in retry_seen:
+                    continue
+                retry_seen.add(d.get("_identity"))
+                d["_disqualifier"] = is_dq
+                excluded.append(d)
+        # Renumbered 1..M for the re-ask, so map each position back through
+        # `missing` to the index it holds in the caller's own list.
+        for pos in (_numbers(retry_data.get("disqualified"), len(sub))
+                    | _numbers(retry_data.get("not_selected"), len(sub))):
+            jobs[missing[pos - 1]]["_judge_unaccounted"] = False
+
+        still = [i for i in missing if jobs[i].get("_judge_unaccounted")]
+        if still:
+            # NOT recorded as a rejection. A verdict is a claim that the model
+            # looked and said no; nothing here supports that claim, and the
+            # verdict would be permanent. Left unwritten, the job simply stays
+            # 'new' and re-competes on a later run -- exactly what screen_gate
+            # does with a listing still unjudged after its own retry.
+            emit(f"[phase 6] {len(still)} job(s) still unaccounted for after the re-ask; "
+                 f"NOT persisting a verdict for them.")
+
     # Both lists capped at FINAL_PICKS. "backup" used to be capped at 3 ("least-bad
     # survivors"), which made it a last-resort filler rather than the second half of
     # the result set -- and pushed every other perfectly-applicable role into
@@ -7274,7 +7599,15 @@ def final_evaluation_split(jobs: list[dict], profile: dict, cv_text: str | None 
     before any chunking happened, giving the cluster a single true best-first order
     end to end. A chunk that fails simply contributes nothing (its jobs get no verdict
     this run, retried next run) rather than failing the whole cluster, as long as at
-    least one other chunk succeeded."""
+    least one other chunk succeeded.
+
+    That last sentence only became TRUE with `_judge_unaccounted`. A failed chunk in an
+    otherwise-successful cluster returns a non-None result to engine.py, which therefore
+    saw call_failed=False and persisted a verdict for every job it had handed over --
+    so the failed chunk's jobs were written as blank rejects, permanently, exactly the
+    outcome the sentence promised they'd escape. _run_final_eval flags its jobs
+    unaccounted-for on entry and clears the flag only per job_number the model returns,
+    so a chunk that never completes leaves them flagged with no extra plumbing here."""
     store_age_days = (profile or {}).get("store_age_days")
     max_age_days = (profile or {}).get("max_listing_age_days")
     age_hard = (profile or {}).get("max_listing_age_hard", True)
@@ -7340,8 +7673,8 @@ def save_and_display(results: list[dict]):
     conn = get_db()
     for i, job in enumerate(results, 1):
         emit(f"\n#{i}  {job['title']}\n    {job['company']}\n    {job['url']}\n\n    {job.get('summary', '')}")
-        if job.get("filters_on"):
-            emit(f"    ✓  Likely filters on: {', '.join(job['filters_on'])}")
+        for line in format_filters_on(job.get("filters_on")):
+            emit(f"    ✓  {line}")
         if job.get("highlight"):
             emit(f"    ✓  {job['highlight']}")
         for c in job.get("concerns", []):
@@ -7370,8 +7703,8 @@ def save_and_display(results: list[dict]):
         f.write(f"*Generated Pipeline Sync: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n")
         for i, job in enumerate(results, 1):
             f.write(f"## {i}. {job['title']} — {job['company']}\n\n**Link:** {job['url']}\n\n{job.get('summary', '')}\n\n")
-            if job.get("filters_on"):
-                f.write(f"- ✓ Likely filters on: {', '.join(job['filters_on'])}\n")
+            for line in format_filters_on(job.get("filters_on")):
+                f.write(f"- ✓ {line}\n")
             if job.get("highlight"):
                 f.write(f"- ✓ {job['highlight']}\n")
             for c in job.get("concerns", []):

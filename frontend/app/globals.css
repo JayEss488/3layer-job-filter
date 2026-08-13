@@ -55,6 +55,11 @@ button { font-family: inherit; cursor: pointer; }
 a { color: inherit; }
 
 /* ── App shell ────────────────────────────────────────────────────────────── */
+/* Wraps VerifyEmailBanner + the page's .app/.screen card so both are a SINGLE
+   flex child of body (see providers.tsx's AuthGate) -- stacks them vertically
+   and re-centers .app/.screen horizontally, which body's own justify-content
+   only did correctly when .app/.screen was body's sole child. */
+.app-shell { display: flex; flex-direction: column; align-items: center; width: 100%; }
 .app, .screen {
   width: 100%;
   max-width: 900px;
@@ -363,7 +368,10 @@ a { color: inherit; }
 .search-progress-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
 .search-progress-step { display: flex; gap: 8px; align-items: baseline; opacity: 0.55; }
 .search-progress-step.is-done, .search-progress-step.is-active { opacity: 1; }
-.search-progress-mark { width: 12px; flex: none; text-align: center; }
+/* Square, with the glyph centred in it -- this mark alternates ✓/◴/○ so it keeps
+   its glyph rather than becoming a drawn ring like .spinner, and a square box is
+   what stops the active ◴ orbiting its own line box (see .spinner's note). */
+.search-progress-mark { width: 12px; height: 12px; line-height: 12px; flex: none; text-align: center; }
 .search-progress-step.is-active .search-progress-mark { display: inline-block; animation: spin 1s linear infinite; }
 .search-progress-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .search-progress-label { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
@@ -441,6 +449,11 @@ a { color: inherit; }
 .card-analysis.flush { padding-left: 16px; }
 .card-analysis .concern { color: var(--muted); }
 .an-sub { padding-left: 12px; color: var(--muted); }
+/* One "<requirement> — <your evidence>" line of the "What this role filters on"
+   mapping. Indented like .an-sub but NOT muted: these lines are that block's whole
+   content, not sub-points under a lead sentence, so greying them out would dim the
+   only part of the card that says what to put in the application. */
+.an-map { padding-left: 12px; text-indent: -12px; }
 .an-note { font-style: italic; color: var(--muted); }
 .an-sec { display: flex; flex-direction: column; gap: 2px; }
 .an-h {
@@ -482,8 +495,34 @@ a { color: inherit; }
 /* ── Misc ────────────────────────────────────────────────────────────────── */
 .muted-text { color: var(--muted); font-size: 12px; }
 .center-pad { padding: 40px; text-align: center; color: var(--faint); }
-.spinner { display: inline-block; animation: spin 1s linear infinite; color: var(--accent); }
+/* Spinner. Drawn as a ring rather than spun as a glyph, because a rotated TEXT
+   character orbits instead of spinning: `transform: rotate()` turns about the
+   centre of the element's BOX, and a glyph's box is the line box -- taller than
+   the glyph and with the ink sitting above its middle, on the baseline. So the
+   ◴ this used to spin traced a small circle, which reads on screen as an
+   ellipse wobbling about an off-centre point rather than as something loading.
+   There is no font-metric fix: the offset differs per typeface.
+   The call sites still write <span className="spinner">◴</span>, so the glyph
+   is hidden (transparent + clipped) and the visible mark is the border ring --
+   which is genuinely rotationally symmetric and so spins cleanly. */
+.spinner {
+  display: inline-block;
+  box-sizing: border-box;
+  width: .85em;
+  height: .85em;
+  border: 2px solid var(--accent);
+  border-top-color: transparent;
+  border-radius: 50%;
+  vertical-align: -.1em;
+  color: transparent;
+  overflow: hidden;
+  line-height: 0;
+  animation: spin .8s linear infinite;
+}
 @keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .spinner, .search-progress-step.is-active .search-progress-mark { animation: none; }
+}
 .divider { border: none; border-top: 1px dashed var(--line-dash); }
 
 /* ── Mobile ──────────────────────────────────────────────────────────────
@@ -760,6 +799,7 @@ body:has(.lp-home) {
    pointless, and non-dismissible would punish someone mid-task. */
 .verify-banner {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  width: 100%;
   padding: 9px 16px; font-size: 12.5px; line-height: 1.45;
   color: var(--ink); background: var(--accent-tint);
   border-bottom: 1px solid var(--accent-tint-bd);

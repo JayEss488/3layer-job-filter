@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 
+import { apiTime } from "@/lib/dates";
+
 /**
  * The three-stage timeline shown while a search is running.
  *
@@ -30,8 +32,8 @@ const STAGES = [
     key: "embed",
     label: "Early matches",
     detail: "keyword + semantic similarity only — no AI has read these",
-    targetSeconds: 45,
-    targetLabel: "~45s",
+    targetSeconds: 90,
+    targetLabel: "~1 min 30s",
   },
   {
     key: "rank",
@@ -44,19 +46,17 @@ const STAGES = [
     key: "final",
     label: "Full AI review",
     detail: "the deep review that decides your final picks",
-    targetSeconds: 330,
-    targetLabel: "~5 min 30s",
+    targetSeconds: 360,
+    targetLabel: "~6 min",
   },
 ] as const;
 
 /** Server timestamps are naive UTC (no offset suffix, sometimes space-separated).
  *  `new Date()` would read those as LOCAL time, so elapsed would be out by the
- *  viewer's UTC offset — an hour of phantom progress in British Summer Time. */
-function parseServerTime(iso: string): number {
-  const normalized = iso.replace(" ", "T");
-  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(normalized);
-  return new Date(hasZone ? normalized : `${normalized}Z`).getTime();
-}
+ *  viewer's UTC offset — an hour of phantom progress in British Summer Time.
+ *  This rule now lives in lib/dates (three other call sites needed it and did
+ *  not have it); the alias is kept so the reader here still sees why. */
+const parseServerTime = apiTime;
 
 function formatElapsed(seconds: number): string {
   const m = Math.floor(seconds / 60);

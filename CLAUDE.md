@@ -1027,6 +1027,76 @@ of what the last finished run already recorded — see the search-pipeline secti
    deflate unearned `very_strong` (all five became `strong` on the worst-row sample),
    raise core items where there was room (+1.30 on the worst rows, flat on a balanced
    draw), and never shrink the results page (picks 10→12, 14→14).
+   **v29 is the output-ORDER rework, and its premise is that field order in a JSON
+   schema IS generation order.** The rubric has said since v16 that `fit_level` is
+   derived mechanically from the step-D checklist — while the schema asked for
+   `fit_level` and `can_do_fit` *four fields before* `requirements`. So the model
+   necessarily formed an impression, wrote the verdict, and only then built the
+   checklist the verdict was supposed to come from, which is precisely the
+   "checklist drafted AFTER an impression has already formed" failure step D spends
+   a page warning against. The item shape now emits `role_type`/`summary` →
+   `requirements` → `filters_on` → `concerns` → `fit_level` → `can_do_fit` →
+   `strengths`, `_FINAL_EVAL_REASONING` opens with an explicit ORDER OF WORK note
+   (the A–G letters are cross-references, never the order), and the schema carries a
+   matching EMIT THE FIELDS IN THE ORDER LISTED paragraph. Nothing parses key order,
+   so this is free.
+   * **`filters_on` became a requirement → evidence MAPPING** — a list of
+     `{requirement, evidence}` pairs (3–5, most-screened-on first) rendered one line
+     per ask as `- <requirement> — <your evidence>`, replacing a comma-joined list of
+     asks followed by a prose paragraph naming the same evidence in a different
+     order. Same information; the join is now done by the party that actually knows
+     which evidence was meant for which ask. **A null `evidence` is an allowed and
+     sometimes required answer**, printed as `full_auto.FILTERS_ON_GAP_TEXT` — capped
+     at `_FILTERS_ON_GAP_MAX` (2) so the block can't become a second, longer
+     `concerns` list under a heading promising the opposite. The gap slot is also
+     what gives the model a per-requirement place to *notice* it has no evidence,
+     before it grades. `highlight` shrank to one optional framing sentence.
+   * **`strengths` is now usually omitted.** It was added in v26 because an
+     `ok`/`stretch` card showed gaps and nothing alongside them — which the mapping
+     now supplies for every grade, tied to the posting's actual asks. Step G asks for
+     it only where it carries something the mapping could not, so leaving it in as-is
+     would have put the same evidence on the card twice. Note this *frees* output
+     budget (v28's real lever): `highlight` drops from 2–3 sentences to ≤1 and
+     `strengths` mostly disappears, both in favour of the checklist.
+   * **`summary` may now run to two sentences.** The one-sentence cap was being met
+     by abstraction rather than brevity on exactly the complex/unfamiliar roles where
+     the plain-language read matters most — a live card described a role as
+     "investigate market performance and use findings to improve customer outcomes
+     and collaboration between participants", every noun a category. PLAIN LANGUAGE
+     now says to spend the extra words on the concrete nouns the abstractions stood
+     in for (who the other parties are, what gets looked at, what the person hands
+     over) and never to buy concision with the JD's jargon.
+   > ⚠ **The first v29 draft REGRESSED checklist coverage, and the cause is the one
+   > v28 already documented.** Measured with `tests/judge_harness.py` against a frozen
+   > v28 baseline (`tests/judge_prompt_baseline_v28.txt`), on the rows BOTH arms
+   > picked: required-ask coverage 80.0% → **70.0%**, core items 5.57 → **4.29**, and
+   > an unfailable core item appeared (0 → 1). Per-pick completion tokens were flat
+   > (1285 → 1293) — so the mapping's output cost came straight out of the checklist,
+   > exactly the "under output pressure the checklist is what shrinks" dynamic v28
+   > found. Every missed ask in both arms was one the judge had to ADD from the full
+   > text; none were dropped from the `[key requirements]` hint.
+   > The fix was NOT more budget and NOT a push for a longer list (v28 records that
+   > pushing length without the shape test just adds unfailable items — and this draft
+   > was already showing one). It was to make the mapping **source strictly from the
+   > checklist**: step E now says every `requirement` must already be on the step-D
+   > list word for word, and that reaching for an ask that isn't there is proof of a
+   > hole to go back and fill, not a shortcut. That turns the mapping from a
+   > competitor for output budget into a *check on* coverage — a thin checklist leaves
+   > nothing worth mapping. Re-measured on the same seed: coverage **77.3% vs the
+   > baseline's 72.7%**, core 5.14 vs 5.43, unfailable core back to 0.
+   > **Read those numbers with the variance in mind**: the *baseline* arm — same
+   > prompt, same seed, same listings — scored 80.0% on one run and 72.7% on the next.
+   > So v29 is measured as *no longer regressing*, not as a coverage win; the honest
+   > claim is parity on the balanced draw plus a clear gain on the thin-checklist draw
+   > (core 5.00 → 6.67, coverage 100% → 100%, +1 pick). One residual to watch on the
+   > next audit: `required_asks_mistiered_secondary` went 0 → 2, i.e. required asks
+   > filed as secondary, which the rubric reads past entirely.
+   * The `_sanitize_filters_on` / `full_auto.format_filters_on` pair still reads the
+     **pre-v29 flat-string form**, which is served out of `JobSeen.eval_analysis` for
+     as long as a row's `eval_signature` holds. Those strings meant "asks the
+     candidate CAN evidence" — the opposite of a gap — so they are passed through as
+     strings and rendered as the old single lead line, never coerced into pairs with
+     a null evidence side.
    **The three output-budget levers, measured — two work and one is a no-op.**
    * **An output-token ceiling is NOT a lever, and the code never had one anyway.**
      `llm()` set no `max_tokens` at all, so every call ran at the model's default. The
@@ -1074,10 +1144,14 @@ of what the last finished run already recorded — see the search-pipeline secti
    `filters_on` (2–4 of the step-D checklist items this employer will actually screen
    on **and** the candidate can evidence, in the JD's own words) plus `highlight` (2–3
    second-person sentences naming which of the candidate's own projects/tools/results to
-   lead with against them). The card renders both under a **"Highlight when applying"**
+   lead with against them). The card rendered both under a "Highlight when applying"
    heading as `This role likely filters on: …` followed by the guidance
    (`engine._compose_analysis` → `§apply-highlights`; the retired `§ai-reasoning` marker
    is still parsed by `RoleCard.tsx` so pre-v23 rows keep rendering until re-judged).
+   **Both fields were reshaped at v29 (above) and the heading is now "What this role
+   filters on"** — the shapes described in this paragraph are what a pre-v29 verdict
+   still carries, not what the judge is asked for today; read the v29 note for the
+   current contract.
    The narrative was cut because it was the fourth thing on the same card arguing the
    same verdict — after the grade badge, the `role_type`+`summary` headline and the
    `can_do_fit` line — and the one output field that gave the candidate nothing to act
@@ -1160,7 +1234,9 @@ of what the last finished run already recorded — see the search-pipeline secti
      (`services/harvest.py` picks ATS-harvest keywords from them, which is how a
      charity-sector candidate reaches charity employers at all). Nothing the candidate
      reads is derived from them.
-   * **Step G is now STRENGTHS**, required for an `ok`/`stretch` pick and omitted for
+   * **Step G is now STRENGTHS** — required at v26 for an `ok`/`stretch` pick (v29
+     made it conditional: asked for only where the `filters_on` mapping doesn't
+     already carry it, so it is usually absent) and omitted for
      `very_strong`/`strong`: 1–3 concrete things the candidate genuinely DOES bring,
      each naming a step-D item marked `met: true` and the candidate's own evidence for
      it. Those two grades' cards previously showed a list of gaps and **nothing
@@ -1941,9 +2017,17 @@ and the refills are verified too — **once**. One extra round, never recursion:
 not to show a corpse, not to guarantee a full dozen.
 
 **Browser escalation** (`_verify_via_browser`) covers the ~20% of checks where the host
-declines to answer a plain request. It is a second `AsyncWebCrawler` launch (Phase 5's has
-closed by then), bounded by `VERIFY_BROWSER_MAX` and `VERIFY_BROWSER_BUDGET_SECONDS`, and
-**fail-open** — anything it also can't answer for is KEPT, because unknown is not dead.
+declines to answer a plain request. Bounded by `VERIFY_BROWSER_MAX` and
+`VERIFY_BROWSER_BUDGET_SECONDS`, and **fail-open** — anything it also can't answer for is
+KEPT, because unknown is not dead. It **borrows Phase 5's browser** rather than launching a
+second one: `_run_engine_pipeline` holds one `tail_crawler` open across the whole tail
+(started with `.start()`, not an `async with`, because Phase 5 and this call sit either
+side of ~300 lines of main-thread DB work, and the picks this verifies do not exist until
+after the judge — so the scope has to reach the verify rather than the verify moving into
+the scope). **The `try`/`finally` around that region is what keeps it safe** and must stay:
+it is the only thing closing the browser on a cancellation raised mid-tail. `crawler` is
+BORROWED — `_verify_via_browser` must never close it — and stays None when nothing needed
+scraping, in which case that function launches and closes its own exactly as before.
 Measured over 45 surfaced roles with `scripts/audit_listing_liveness.py`: plain HTTP gave
 66.7% alive / 11.1% dead / **22.2% unverifiable**; with the browser, 80.0% / 15.6% /
 **4.4%** — i.e. it converted 8 of 10 shrugs into a definite answer and found 2 more dead

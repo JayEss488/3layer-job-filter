@@ -6,3 +6,10 @@ next-env.d.ts
 
 # Local env (NEXT_PUBLIC_API_URL) -- deployed value is set in Vercel, not here
 .env*.local
+
+# Auth0 credentials
+.env.local
+
+.auth0-mcp-state.json
+
+.auth0-mcp-writes.log

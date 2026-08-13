@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 
+import { calendarDaysBetween, parseApiDate } from "@/lib/dates";
 import { useAttributes } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
 import { formatSalary, useSalaryPeriod } from "@/lib/salary";
@@ -31,6 +32,7 @@ const QUALIFICATION = "§qualification";
 const AI_REASONING = "§ai-reasoning";
 const APPLY_HIGHLIGHTS = "§apply-highlights";
 const GHOST = "§ghost";
+const CAUTION = "§caution";
 
 interface Analysis {
   /** The judge's role-type + summary sentence pair, joined into one headline. */
@@ -44,7 +46,10 @@ interface Analysis {
   qualificationVerdict: string[];
   /** Concern count + bullets ("⚠ ..."/"- ..." lines) — behind "Show more". */
   qualification: string[];
-  /** What this employer screens on + what to lead with — behind "Show more". */
+  /** What this employer screens on, mapped one line per ask to the candidate's own
+   *  evidence for it (a named gap where they have none), plus an optional framing
+   *  sentence — behind "Show more". Rows judged before FINAL_EVAL_PROMPT_VERSION 29
+   *  carry the older single "This role likely filters on: …" lead instead. */
   applyHighlights: string[];
   /** Pre-v23 narrative paragraph — behind "Show more". Replaced by
    *  `applyHighlights`; only ever populated on a not-yet-re-judged row. */
@@ -53,6 +58,12 @@ interface Analysis {
    *  unexplainable accusation about a named employer, so it must always be
    *  backed by the specific facts. */
   ghost: string[];
+  /** Why the caution chip fired — behind "Show more". Same contract as `ghost`:
+   *  the chip alone is an unexplainable accusation about a named employer, so it
+   *  is only ever shown backed by a sentence saying what was actually checked.
+   *  Set when the judge flagged a possible CV-farming/lead-gen listing and
+   *  cross-site corroboration came back inconclusive — which is not clearance. */
+  caution: string[];
 }
 
 /**
@@ -72,9 +83,10 @@ interface Analysis {
 function parseAnalysis(text: string): Analysis {
   const out: Analysis = {
     headline: null, notes: [], legacy: [], qualificationVerdict: [], qualification: [],
-    applyHighlights: [], aiReasoning: [], ghost: [],
+    applyHighlights: [], aiReasoning: [], ghost: [], caution: [],
   };
-  let bucket: "lead" | "qualification" | "applyHighlights" | "aiReasoning" | "ghost" = "lead";
+  let bucket: "lead" | "qualification" | "applyHighlights" | "aiReasoning" | "ghost"
+    | "caution" = "lead";
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
@@ -86,6 +98,8 @@ function parseAnalysis(text: string): Analysis {
       bucket = "aiReasoning";
     } else if (line === GHOST) {
       bucket = "ghost";
+    } else if (line === CAUTION) {
+      bucket = "caution";
     } else if (bucket === "lead" && line.startsWith("§")) {
       // A marker from a retired format -- skip rather than show it as text.
       continue;
@@ -129,24 +143,40 @@ function humaniseDays(days: number): string {
  * imminent); otherwise falls back to posting age. Null on both means the
  * source stated no date at all, which is common and must render as no chip,
  * never a guessed one.
+ *
+ * WHAT THIS STILL CANNOT FIX, and should not pretend to: the chip is only ever
+ * as good as the date the source claimed. An aggregator's date is when IT
+ * ingested the ad, not when the employer posted it -- Adzuna reported 12 Aug
+ * for a posting the employer's own page dates 11 Aug. Nothing here can recover
+ * the employer's date, so the chip is deliberately worded as a plain day count
+ * and never as a precise date the reader could check against the advert.
  */
 function ageChip(role: Role): string | null {
-  const now = Date.now();
+  const now = new Date();
   if (role.expires_at) {
-    const daysLeft = Math.floor((new Date(role.expires_at).getTime() - now) / 86400000);
-    if (daysLeft < 0) return "Closing date passed";
-    if (daysLeft <= 7) return `Closes in ${daysLeft} day${daysLeft === 1 ? "" : "s"}`;
+    const expires = parseApiDate(role.expires_at);
+    // Calendar days, so an ad closing "on the 13th" is still open all of the
+    // 13th rather than reading as passed from one minute after midnight.
+    const daysLeft = expires ? calendarDaysBetween(now, expires) : null;
+    if (daysLeft !== null) {
+      if (daysLeft < 0) return "Closing date passed";
+      if (daysLeft === 0) return "Closes today";
+      if (daysLeft === 1) return "Closes tomorrow";
+      if (daysLeft <= 7) return `Closes in ${daysLeft} days`;
+    }
   }
   if (role.posted_at) {
-    const daysAgo = Math.floor((now - new Date(role.posted_at).getTime()) / 86400000);
+    const posted = parseApiDate(role.posted_at);
+    if (!posted) return null;
+    const daysAgo = calendarDaysBetween(posted, now);
     if (daysAgo < 0) return null; // clock skew or a future-dated source value -- say nothing rather than guess
-    const humanised = humaniseDays(daysAgo);
-    if (role.posted_at_approx) {
-      // Greenhouse etc.: this is the board's last-updated time, not a stated
-      // posting date -- must never claim "posted", see Role.posted_at_approx.
-      return daysAgo === 0 ? "Updated today" : `Updated ~${humanised} ago`;
-    }
-    return daysAgo === 0 ? "Posted today" : `Posted ${humanised} ago`;
+    const approx = !!role.posted_at_approx;
+    // Greenhouse etc.: this is the board's last-updated time, not a stated
+    // posting date -- must never claim "posted", see Role.posted_at_approx.
+    const verb = approx ? "Updated" : "Posted";
+    if (daysAgo === 0) return `${verb} today`;
+    if (daysAgo === 1) return `${verb} yesterday`;
+    return `${verb} ${approx ? "~" : ""}${humaniseDays(daysAgo)} ago`;
   }
   return null;
 }
@@ -280,6 +310,25 @@ function ghostChip(role: Role, hasNotes: boolean): string | null {
   return null;
 }
 
+/**
+ * The judge flagged this listing as a possible CV-farming / lead-generation
+ * posting rather than a real vacancy, and cross-site corroboration came back
+ * inconclusive. Inconclusive is NOT clearance — before this chip existed such a
+ * listing was shown with no trace of the flag at all, and one reached the user
+ * at fit_rank 1 badged "Very strong fit".
+ *
+ * Driven off the presence of the §caution block rather than a column, because
+ * the block IS the payload: the chip is an accusation about a named employer and
+ * may never appear without the sentence explaining what was actually checked.
+ * Same contract as ghostChip's `hasNotes` path above.
+ *
+ * Wording states only what we failed to establish. A listing that was genuinely
+ * corroborated as a scam never gets here — it is dropped upstream.
+ */
+function cautionChip(hasCautionNotes: boolean): string | null {
+  return hasCautionNotes ? "Employer not verified" : null;
+}
+
 /** A fact chip. `warn` is a caveat about the listing rather than a fact about
  *  the job, and is styled apart — see the note in factChips. */
 type FactChip = { text: string; warn?: boolean };
@@ -289,6 +338,7 @@ function factChips(
   salaryPeriod: SalaryPeriod,
   sponsorFilterOn: boolean,
   hasGhostNotes: boolean,
+  hasCautionNotes: boolean,
 ): FactChip[] {
   // Mostly what the AI actually read off the listing — a null means the
   // listing was silent, and no chip is better than a guessed one. While
@@ -320,6 +370,10 @@ function factChips(
     // Next to unverifiedChip on purpose: the two answer adjacent questions —
     // "does this listing still exist" and "is there a job behind it".
     chip(ghostChip(role, hasGhostNotes), true),
+    // Beside the ghost chip for the same reason it sits beside unverifiedChip:
+    // all three are caveats about whether the listing is what it appears to be,
+    // and they should read as one group rather than be scattered among the facts.
+    chip(cautionChip(hasCautionNotes), true),
     chip(sponsorChip(role, sponsorFilterOn)),
     chip(distanceChip(role)),
     // Normalised into the user's chosen unit where the backend could parse it,
@@ -356,16 +410,21 @@ export function RoleCard({
       a.qualification.length > 0 ||
       a.applyHighlights.length > 0 ||
       a.aiReasoning.length > 0 ||
-      a.ghost.length > 0);
+      a.ghost.length > 0 ||
+      a.caution.length > 0);
   const hasDetail =
     !!a &&
     (a.legacy.length > 0 ||
       a.qualification.length > 0 ||
       a.applyHighlights.length > 0 ||
       a.aiReasoning.length > 0 ||
-      a.ghost.length > 0);
+      a.ghost.length > 0 ||
+      a.caution.length > 0);
   const hasBody = !!a && (a.notes.length > 0 || a.qualificationVerdict.length > 0 || hasDetail);
-  const facts = factChips(role, salaryPeriod, sponsorFilterOn, !!a && a.ghost.length > 0);
+  const facts = factChips(
+    role, salaryPeriod, sponsorFilterOn,
+    !!a && a.ghost.length > 0, !!a && a.caution.length > 0,
+  );
   const verdict = role.verdict as RoleVerdict | null | undefined;
 
   return (
@@ -469,9 +528,18 @@ export function RoleCard({
                   )}
                   {a.applyHighlights.length > 0 && (
                     <div className="an-sec">
-                      <div className="an-h">Highlight when applying</div>
+                      <div className="an-h">What this role filters on</div>
                       {a.applyHighlights.map((l, i) => (
-                        <div key={i}>{l}</div>
+                        // Since FINAL_EVAL_PROMPT_VERSION 29 this block is one
+                        // "- <requirement> — <evidence>" line per ask; the
+                        // optional framing sentence, and every pre-v29 row's
+                        // flat "This role likely filters on: …" lead, arrive
+                        // unprefixed and render as plain paragraphs. Same
+                        // "- " convention the qualification block uses, but
+                        // .an-map rather than .an-sub — see globals.css.
+                        <div key={i} className={l.startsWith("- ") ? "an-map" : undefined}>
+                          {l}
+                        </div>
                       ))}
                     </div>
                   )}
@@ -487,6 +555,16 @@ export function RoleCard({
                     <div className="an-sec">
                       <div className="an-h">Why this was flagged</div>
                       {a.ghost.map((l, i) => (
+                        <div key={i} className="concern">
+                          {l}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {a.caution.length > 0 && (
+                    <div className="an-sec">
+                      <div className="an-h">Before you apply</div>
+                      {a.caution.map((l, i) => (
                         <div key={i} className="concern">
                           {l}
                         </div>

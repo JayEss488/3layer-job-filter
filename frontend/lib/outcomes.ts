@@ -1,3 +1,4 @@
+import { calendarDaysBetween, parseApiDate } from "@/lib/dates";
 import type { ApplicationStatus } from "@/lib/types";
 
 /**
@@ -33,9 +34,15 @@ export const PRIMARY_OUTCOMES: ApplicationStatus[] = [
  */
 export const NO_RESPONSE_PROMPT_DAYS = 21;
 
+/** Calendar days since an API timestamp, 0 when unknown.
+ *
+ *  Calendar days rather than elapsed/86400000 for the reason lib/dates gives:
+ *  this feeds a "you applied N days ago" line and the NO_RESPONSE_PROMPT_DAYS
+ *  trigger, and a user who applied yesterday afternoon should read "1 day",
+ *  not "0". Unknown stays 0 so a missing applied_at never trips the prompt. */
 export function daysSince(iso?: string | null): number {
-  if (!iso) return 0;
-  return Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+  const d = parseApiDate(iso);
+  return d ? Math.max(0, calendarDaysBetween(d, new Date())) : 0;
 }
 
 /** An applied role that has sat at "pending" long enough to be worth asking

@@ -680,7 +680,20 @@ export default function SettingsPage() {
                             thin-cluster backfill retries)
                           </>
                         )}
-                        .
+                        , {runFunnel.final_judge_reject_reasoned} of them with a recorded
+                        reason.
+                        {runFunnel.judge_unaccounted > 0 && (
+                          <>
+                            {" "}<b>
+                              {runFunnel.judge_unaccounted} job
+                              {runFunnel.judge_unaccounted === 1 ? " was" : "s were"} left out
+                              of the review&apos;s own output entirely
+                            </b>{" "}
+                            — no verdict was stored for {runFunnel.judge_unaccounted === 1
+                              ? "it" : "them"}, so {runFunnel.judge_unaccounted === 1
+                              ? "it comes" : "they come"} back into contention next run.
+                          </>
+                        )}
                         {runFunnel.judge_dupes_suppressed > 0 && (
                           <>
                             {" "}{runFunnel.judge_dupes_suppressed} near-duplicate posting
@@ -770,6 +783,37 @@ export default function SettingsPage() {
                         {" "}Earlier, {runFunnel.verify_dead} of {runFunnel.verify_checked}{" "}
                         candidates were dropped as dead before the expensive judge read
                         them.
+                      </>
+                    )}
+                  </div>
+                )}
+                {runFunnel.scam_suspect_raised > 0 && (
+                  <div className="annotation" style={{ marginTop: 14 }}>
+                    <b>Possible CV-farming listings.</b> The final AI flagged{" "}
+                    {runFunnel.scam_suspect_raised} pick
+                    {runFunnel.scam_suspect_raised === 1 ? "" : "s"} as possibly advertising
+                    no real vacancy.{" "}
+                    {runFunnel.scam_known_agency_cleared > 0 && (
+                      <>
+                        {runFunnel.scam_known_agency_cleared} of those named an
+                        established agency we can identify, where an anonymised client
+                        and a high posting volume are ordinary practice — cleared without
+                        a check.{" "}
+                      </>
+                    )}
+                    The rest are searched for their own text on unrelated sites:{" "}
+                    <b>{runFunnel.scam_dropped} corroborated and removed</b>.{" "}
+                    {runFunnel.scam_shown_with_caution > 0 && (
+                      <>
+                        {runFunnel.scam_shown_with_caution} could not be corroborated
+                        {runFunnel.scam_verify_no_sentence > 0 && (
+                          <>
+                            {" "}({runFunnel.scam_verify_no_sentence} had no searchable text)
+                          </>
+                        )}
+                        . Those are still shown — a flag on its own has been wrong before,
+                        on legitimate high-volume agency listings — but ranked below
+                        confident picks and marked &ldquo;Employer not verified&rdquo;.
                       </>
                     )}
                   </div>

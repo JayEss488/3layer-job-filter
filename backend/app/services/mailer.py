@@ -1,10 +1,41 @@
-"""Transactional email, via Resend.
+"""Transactional email, via Resend or Gmail SMTP.
 
 Two messages exist and there will never be a third without a reason written
 down here: **verify your address** and **reset your password**. Both are the
 direct consequence of an action the recipient just took seconds earlier, which
 is what keeps this out of marketing-consent and unsubscribe territory — there is
 no list, no digest and nothing to opt out of.
+
+**Two providers, chosen by which credentials are set** (`_active_provider`).
+Gmail SMTP wins when `GMAIL_SMTP_ADDRESS`/`GMAIL_SMTP_APP_PASSWORD` are both
+set, because it is the one that actually solves the problem that motivated it:
+Resend's sandbox sender (`onboarding@resend.dev`) only delivers to the Resend
+account owner until a domain is verified, which blocks testing with any other
+address. Gmail SMTP delivers to any recipient immediately — it IS a real
+mailbox, not a sandbox — at the cost of being a materially weaker provider for
+anything beyond low-volume testing:
+
+* **Rate limit.** A consumer Gmail account is capped at roughly 500
+  recipients/24h (2000 on Workspace). `EMAIL_SEND_MAX_PER_HOUR` (5/address) and
+  `_PER_CLIENT` (30/IP) already sit well under that, so normal use won't hit
+  it, but a burst (e.g. re-sending to a list) could.
+* **No delivery feedback.** `smtplib` only confirms Gmail's server accepted
+  the message for relay — nothing tells this app about a later bounce or a
+  spam-folder landing, unlike Resend's API. A `True` return here is weaker
+  evidence of delivery than the same return from `_post`.
+* **Sender identity.** Mail arrives From the raw Gmail address (with the
+  product name as display name), not a branded domain — fine for MVP/testing,
+  not what a real launch wants.
+* **Google's own risk tolerance.** Automated, programmatic sending through a
+  consumer account's SMTP relay is exactly the pattern Google's abuse
+  detection watches for; low, human-triggered volume (a few verification/reset
+  emails a day) is unlikely to trip it, but there is no guarantee, and a
+  flagged account can be rate-limited or challenged with no warning. This is a
+  workaround for local/small-scale use, not a production email service.
+
+Resend remains the durable fix once a domain is verified (resend.com/domains)
+— see EMAIL_FROM below — and stays available as a fallback when Gmail isn't
+configured, so nothing about the Resend path was removed.
 
 Three properties are load-bearing and each is a decision, not an accident:
 
@@ -31,8 +62,11 @@ alternative measurably improves spam scoring, and the link must stay usable in
 a client that strips the markup.
 """
 import re
+import smtplib
 import threading
 import time
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from html import escape
 from urllib.parse import quote
 
@@ -44,8 +78,13 @@ from ..config import (
     EMAIL_REPLY_TO,
     EMAIL_SEND_MAX_PER_HOUR,
     EMAIL_SEND_MAX_PER_HOUR_PER_CLIENT,
+    GMAIL_SMTP_ADDRESS,
+    GMAIL_SMTP_APP_PASSWORD,
     RESEND_API_KEY,
 )
+
+_GMAIL_SMTP_HOST = "smtp.gmail.com"
+_GMAIL_SMTP_PORT = 465
 
 _RESEND_URL = "https://api.resend.com/emails"
 _TIMEOUT = 10.0
@@ -54,13 +93,18 @@ _TIMEOUT = 10.0
 _PRODUCT = "Four in a Thousand"
 
 
+def _gmail_configured() -> bool:
+    return bool(GMAIL_SMTP_ADDRESS and GMAIL_SMTP_APP_PASSWORD)
+
+
 def mail_enabled() -> bool:
-    """Whether a send will actually reach Resend.
+    """Whether a send will actually reach a real mail provider (Gmail SMTP or
+    Resend).
 
     Reported by GET /auth/config so the frontend can word itself honestly: with
     no mail service, telling someone to "check your inbox" is a lie that costs
     them a support round-trip."""
-    return bool(RESEND_API_KEY)
+    return _gmail_configured() or bool(RESEND_API_KEY)
 
 
 # ── Abuse guard ──────────────────────────────────────────────────────────────
@@ -132,25 +176,68 @@ def _post(payload: dict) -> bool:
     return True
 
 
-def send_email(to: str, subject: str, html: str, text: str) -> bool:
-    """Send one message. Never raises. Returns whether Resend accepted it.
+def _send_via_gmail(to: str, subject: str, html: str, text: str) -> bool:
+    """Send one message through a Gmail account's own SMTP relay.
 
-    Acceptance is not delivery — Resend queues, and a bounce arrives later and
-    out of band. No caller may therefore treat True as proof the person received
-    anything, which is exactly why the flows built on this never *depend* on the
-    mail arriving."""
+    Never raises — same contract as _post: a caller-visible False is the only
+    signal, so an SMTP/network failure here must degrade exactly like a
+    rejected Resend call does."""
+    msg = MIMEMultipart("alternative")
+    # Deliberately GMAIL_SMTP_ADDRESS here, never EMAIL_FROM -- Gmail's SMTP
+    # relay only accepts sending as the authenticated account (or a verified
+    # alias of it), so EMAIL_FROM would be silently overridden or rejected.
+    msg["From"] = f"{_PRODUCT} <{GMAIL_SMTP_ADDRESS}>"
+    msg["To"] = to
+    msg["Subject"] = subject
+    if EMAIL_REPLY_TO:
+        msg["Reply-To"] = EMAIL_REPLY_TO
+    # Plain text part first: clients that support multipart/alternative use
+    # the LAST part they understand, so html (the richer one) must come second.
+    msg.attach(MIMEText(text, "plain"))
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP_SSL(_GMAIL_SMTP_HOST, _GMAIL_SMTP_PORT, timeout=_TIMEOUT) as server:
+            server.login(GMAIL_SMTP_ADDRESS, GMAIL_SMTP_APP_PASSWORD)
+            server.sendmail(GMAIL_SMTP_ADDRESS, [to], msg.as_string())
+        return True
+    except smtplib.SMTPAuthenticationError:
+        # By far the most common failure: GMAIL_SMTP_APP_PASSWORD is either the
+        # account's real login password (SMTP auth rejects it outright) or a
+        # stale/revoked App Password. Named explicitly so it doesn't read as a
+        # generic network blip.
+        print(
+            "[mail] gmail smtp auth rejected -- GMAIL_SMTP_APP_PASSWORD must be an "
+            "App Password (myaccount.google.com/apppasswords), not the account password"
+        )
+        return False
+    except (smtplib.SMTPException, OSError) as e:
+        print(f"[mail] gmail smtp send failed: {type(e).__name__}: {e}")
+        return False
+
+
+def send_email(to: str, subject: str, html: str, text: str) -> bool:
+    """Send one message. Never raises. Returns whether the provider accepted it.
+
+    Acceptance is not delivery — both providers queue/relay, and a bounce
+    arrives later and out of band. No caller may therefore treat True as proof
+    the person received anything, which is exactly why the flows built on this
+    never *depend* on the mail arriving."""
     to = (to or "").strip()
     if not to:
         return False
 
     if not mail_enabled():
         # The link is the whole payload of both messages, so printing it keeps
-        # local development completely functional with no Resend account.
+        # local development completely functional with no mail provider set up.
         link = _first_link(text)
-        print(f"[mail] RESEND_API_KEY unset -- not sending {subject!r} to {to}")
+        print(f"[mail] no mail provider configured -- not sending {subject!r} to {to}")
         if link:
             print(f"[mail]   link: {link}")
         return False
+
+    if _gmail_configured():
+        return _send_via_gmail(to, subject, html, text)
 
     payload = {"from": EMAIL_FROM, "to": [to], "subject": subject, "html": html, "text": text}
     if EMAIL_REPLY_TO:

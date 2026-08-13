@@ -90,6 +90,14 @@ class RunFunnelOut(BaseModel):
     passed_gates: int = 0                # gate_survivors_total
     final_judge: int = 0                 # final_strong + final_backup
     final_judge_rejected: int = 0        # final_fresh_judged - final_strong - final_backup
+    # Of those rejects, how many carry the judge's own reason. The prompt requires
+    # every job_number to land in exactly one of four lists, and the model had
+    # started dropping some -- which used to be written as a permanent REJECT with
+    # a blank reason. full_auto now re-asks for the omitted ones; whatever still
+    # can't be accounted for is left unwritten and counted here, so
+    # judge_unaccounted should read 0 and reasoned should equal rejected.
+    final_judge_reject_reasoned: int = 0
+    judge_unaccounted: int = 0
     judge_pool_size: int = 0             # initial judge pool, capped at JUDGE_POOL (engine.py)
     judge_dupes_suppressed: int = 0      # near-duplicate postings dropped pre-judge (engine.py::_suppress_judge_duplicates)
     # Cross-run family suppression (engine.py::_decided_role_keys). Kept separate
@@ -122,6 +130,25 @@ class RunFunnelOut(BaseModel):
     final_verify_unverifiable: int = 0
     final_verify_browser: int = 0
     final_verify_backfilled: int = 0     # replacements pulled in for dropped picks
+    # Scam / CV-farming flags (engine.py, the scam-verify loop). None of these were
+    # surfaced before, which is most of why the stage sat broken unnoticed: it read
+    # only `full_text`, which most candidates never carry, so it returned "not
+    # corroborated" without ever issuing a search and the flag simply evaporated.
+    # Read scam_verify_no_sentence FIRST -- if it climbs back toward
+    # scam_suspect_raised, the check has stopped running again rather than stopped
+    # finding anything. scam_dropped is the only one that removes a listing; the
+    # cautioned ones are still shown, capped to a lower grade and carrying a chip.
+    scam_suspect_raised: int = 0
+    scam_dropped: int = 0                # corroborated -> verdict overridden to reject
+    scam_verify_no_sentence: int = 0     # nothing searchable in the listing text
+    scam_verify_inconclusive: int = 0    # searched, nothing corroborating found
+    scam_shown_with_caution: int = 0     # shown, grade capped, chip on the card
+    # Flags cleared without a search because the employer is a NAMED established
+    # agency (ghost.is_known_agency). Surfaced rather than folded away because an
+    # exemption that removes a user-facing warning has to stay measurable: this
+    # climbing while scam_shown_with_caution sits at zero means the check is now
+    # only ever exempting, which is worth noticing.
+    scam_known_agency_cleared: int = 0
     # Licensed visa-sponsor filter (engine.py::_filter_by_sponsor), only non-zero
     # when the profile has the preference on. THE ONE FILTER THAT DROPS ON
     # UNKNOWN -- _blank_company counts rows dropped purely for naming no
@@ -410,6 +437,8 @@ def get_run_funnel(
             counts.get("final_fresh_judged", 0) - counts.get("final_strong", 0)
             - counts.get("final_backup", 0)
         ),
+        final_judge_reject_reasoned=counts.get("final_reject_reasoned", 0),
+        judge_unaccounted=counts.get("final_judge_unaccounted", 0),
         judge_pool_size=counts.get("judge_pool_size", 0),
         judge_dupes_suppressed=counts.get("judge_dupes_suppressed", 0),
         decided_family_keys=counts.get("decided_family_keys", 0),
@@ -425,6 +454,12 @@ def get_run_funnel(
         final_verify_unverifiable=counts.get("final_verify_unverifiable", 0),
         final_verify_browser=counts.get("final_verify_browser", 0),
         final_verify_backfilled=counts.get("final_verify_backfilled", 0),
+        scam_suspect_raised=counts.get("scam_suspect_raised", 0),
+        scam_dropped=counts.get("final_scam_verified_dropped", 0),
+        scam_verify_no_sentence=counts.get("scam_verify_no_sentence", 0),
+        scam_verify_inconclusive=counts.get("scam_verify_inconclusive", 0),
+        scam_shown_with_caution=counts.get("scam_flagged_shown_with_caution", 0),
+        scam_known_agency_cleared=counts.get("scam_suspect_known_agency", 0),
         sponsor_filter_raw_before=counts.get("sponsor_filter_raw_before", 0),
         sponsor_filter_raw_after=counts.get("sponsor_filter_raw_after", 0),
         sponsor_filter_raw_blank_company=counts.get("sponsor_filter_raw_blank_company", 0),

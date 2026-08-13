@@ -705,7 +705,19 @@ function jobDetailHtml(j) {
       html += '<div style="margin-top:6px"><b>Summary:</b> ' + esc(d.summary) + '</div>';
       html += '<div><b>Role type:</b> ' + esc(d.role_type) + '</div>';
       html += '<div><b>Can-do fit:</b> ' + esc(d.can_do_fit) + '</div>';
-      html += '<div><b>Likely filters on:</b> ' + esc((d.filters_on || []).join(', ')) + '</div>';
+      // Since FINAL_EVAL_PROMPT_VERSION 29 each entry is a {requirement, evidence}
+      // pair (evidence null = a gap); pre-29 verdicts served from cache are still
+      // flat strings. A plain join() printed "[object Object]" for the new form.
+      html += '<div><b>Filters on:</b><ul>';
+      (d.filters_on || []).forEach(function(f) {
+        if (f && typeof f === 'object') {
+          html += '<li>' + esc(f.requirement) + ' &mdash; ' +
+            (f.evidence ? esc(f.evidence) : '<i>no evidence in profile</i>') + '</li>';
+        } else {
+          html += '<li>' + esc(f) + '</li>';
+        }
+      });
+      html += '</ul></div>';
       html += '<div><b>Highlight when applying:</b> ' + esc(d.highlight) + '</div>';
       html += '<div><b>Facts:</b> salary=' + esc(d.role_salary) + ', work_style=' + esc(d.work_style) +
         ', seniority=' + esc(d.role_seniority) + ', deadline=' + esc(d.deadline) +

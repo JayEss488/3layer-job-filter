@@ -328,8 +328,8 @@ export default function SearchPage() {
             </div>
             <div className="annotation" style={{ padding: "0 0 8px" }}>
               Quick-scored by AI (about 3 minutes in). These are provisional — anything you
-              don&apos;t Keep will disappear once the full review finishes, at around 5 and a
-              half minutes, if it doesn&apos;t make the final cut.
+              don&apos;t Keep will disappear once the full review finishes, at around 6
+              minutes, if it doesn&apos;t make the final cut.
             </div>
             {verifying.map((role) => {
               const kept = role.status === "saved";
@@ -375,7 +375,7 @@ export default function SearchPage() {
               Early matches — found by keyword/semantic similarity, not yet reviewed
             </div>
             <div className="annotation" style={{ padding: "0 0 8px" }}>
-              No AI has read these yet — they land first (about 1 minute 15 in) precisely
+              No AI has read these yet — they land first (about 1 minute 30 in) precisely
               because nothing has reviewed them. They&apos;re here so you can see what the
               search picked up straight away; most will be replaced above as the review
               progresses.

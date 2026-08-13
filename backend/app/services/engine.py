@@ -465,6 +465,17 @@ MIRROR_BRANDS = frozenset({
     # an excerpt from Reed. Click apply to see the full job description ... on
     # Reed.co.uk" in its own body.
     "linkedin",
+    # talents.studysmarter.co.uk, arriving via jsearch. Measured on the live
+    # store: 19 rows, 14 companies, and full_text retrievable on ZERO of them --
+    # it serves a snippet and nothing a scrape can improve on. Attribution is
+    # garbled too (one row records a yoga studio as hiring a Tableau BI lead,
+    # another names the employer in the title and a different company in the
+    # company field). 3 of the 4 that ever reached the user were junk they had
+    # to clear by hand. Listing it here is not a drop list -- it buys the three
+    # things this module already does with a mirror: prioritise it for a
+    # liveness fetch, apply UNVERIFIED_RANK_PENALTY when unverifiable, and
+    # decline to spend a judge call on a mirror row with no readable text.
+    "studysmarter",
 })
 MIRROR_HOSTS = frozenset({
     "talent.com", "recruit.net", "tarta.ai",
@@ -1090,6 +1101,46 @@ def _verdict_of(entry: dict) -> str | None:
     return None
 
 
+# The grade a listing is held to once the judge flagged it as a possible
+# CV-farming/lead-gen posting and corroboration came back inconclusive. Capping
+# rather than dropping, because these signals have false-positived on legitimate
+# high-volume agency listings before; capping in CODE rather than by a prompt
+# rule, for the reason STALE_SELECTION_PENALTY gives -- this is a fact the
+# system already holds, and re-deriving it with a model would cost a
+# FINAL_EVAL_PROMPT_VERSION bump (re-judging the whole store) for a known answer.
+_SCAM_CAUTION_MAX_GRADE = "ok"
+
+# Deliberately says what was and wasn't established, and never asserts a scam.
+# This is an accusation about a named company on a card the candidate reads, and
+# the honest claim is only that we could not corroborate it -- see the same
+# discipline on the "not verified" chip and on ghost.SIGNAL_TEXT.
+_SCAM_CAUTION_TEXT = (
+    "We could not independently verify the employer behind this listing. "
+    "Check who is actually hiring, and be cautious about sending a CV or "
+    "personal details until you can confirm it."
+)
+
+
+def _apply_scam_caution(entry: dict) -> None:
+    """Mark a judge-flagged pick whose scam suspicion could not be corroborated.
+
+    Two effects, and the grade cap is doing three jobs at once: it removes the
+    verdict badge (per FINAL_EVAL v26 `ok`/`stretch` are deliberately unlabelled
+    in the frontend's VERDICT_LABEL, so a flagged listing can no longer lead with
+    "Very strong fit"), and because the run's final assembly is grade-tiered over
+    _VERDICT_GRADES it also demotes the role below every very_strong/strong pick
+    -- which is why no separate _selection_score penalty is needed here, and
+    could not have worked anyway: that score picks the judge POOL, and this flag
+    only exists after the judge has run.
+
+    Caps, never raises: an already-`stretch` pick keeps `stretch`."""
+    current = _verdict_of(entry)
+    cap_at = _VERDICT_GRADES.index(_SCAM_CAUTION_MAX_GRADE)
+    if current is None or _VERDICT_GRADES.index(current) < cap_at:
+        entry["fit_level"] = _SCAM_CAUTION_MAX_GRADE
+    entry["_scam_caution"] = _SCAM_CAUTION_TEXT
+
+
 def _compose_analysis(entry: dict) -> str:
     """The card's analysis text. RoleCard.tsx splits on the §-prefixed markers.
 
@@ -1113,6 +1164,16 @@ def _compose_analysis(entry: dict) -> str:
     named projects/tools to lead with against them. Rows judged under 22 or
     earlier still carry `§ai-reasoning` and keep rendering (RoleCard.tsx
     parses both) until they're next re-judged.
+
+    At FINAL_EVAL_PROMPT_VERSION 29 that block became a requirement -> evidence
+    MAPPING (one line per ask) rather than a comma-joined list of asks followed
+    by a paragraph of prose naming the same evidence in a different order. The
+    two carried the same information, but the reader had to do the join
+    themselves -- work the judge is far better placed to do, since it is the one
+    that knows which piece of evidence was meant for which ask. Gaps are printed
+    as gaps rather than omitted, so the block is an honest map of what this
+    employer screens on instead of only its flattering half. `highlight` shrank
+    to one optional framing sentence underneath.
 
     `role_type` used to render as its own always-visible `§role-type` block
     after the `summary` headline -- the two are independently-generated model
@@ -1151,8 +1212,10 @@ def _compose_analysis(entry: dict) -> str:
     # "strengths" is only generated for an ok/stretch pick (full_auto reasoning step
     # G) -- a very_strong/strong card's grade and can_do_fit line already say the
     # candidate clears the bar, so listing what they bring there is restatement.
-    # For the lower two grades it is the missing half: those cards used to show a
-    # bare list of gaps for a role the judge was recommending.
+    # Often absent even on those two grades since v29: the §apply-highlights
+    # mapping below now names what the candidate has for each of the posting's
+    # asks, which is what this field was added in v26 to supply, so it is asked
+    # for only where it carries something that mapping could not.
     strengths = [str(s).strip() for s in (entry.get("strengths") or []) if str(s).strip()]
     if strengths:
         qualification.append("✓ You have:")
@@ -1169,14 +1232,18 @@ def _compose_analysis(entry: dict) -> str:
         parts.append("§qualification")
         parts.extend(qualification)
 
-    # Two model fields rendered as one block: the screened-on list becomes the
-    # lead sentence, the guidance continues from it (the judge writes them
-    # knowing they display that way -- see _FINAL_EVAL_SCHEMA's closing note).
-    # Either may be absent on its own without suppressing the other.
-    highlights: list[str] = []
-    filters_on = [str(f).strip() for f in (entry.get("filters_on") or []) if str(f).strip()]
-    if filters_on:
-        highlights.append(f"This role likely filters on: {', '.join(filters_on)}.")
+    # Two model fields rendered as one block: the requirement -> evidence mapping
+    # first, then the optional framing sentence (the judge writes them knowing
+    # they display that way -- see _FINAL_EVAL_SCHEMA's closing note). Either may
+    # be absent on its own without suppressing the other.
+    #
+    # The layout of the mapping itself is full_auto.format_filters_on's, not this
+    # function's: it has to agree with the shape the prompt asks for and with the
+    # pre-v29 flat-string form still being served out of the verdict cache, and
+    # two modules independently deciding how to print a gap is how the card ends
+    # up claiming the candidate has no evidence for an ask the older prompt only
+    # ever emitted BECAUSE they had some.
+    highlights: list[str] = _fa_module().format_filters_on(entry.get("filters_on"))
     if entry.get("highlight"):
         highlights.append(entry["highlight"].strip())
     if highlights:
@@ -1197,12 +1264,30 @@ def _compose_analysis(entry: dict) -> str:
         parts.append("§ghost")
         parts.extend(f"- {line}" for line in ghost_lines)
 
+    # Why the caution chip fired -- same contract as the ghost block above: the
+    # chip on its own is an unexplainable accusation about a named employer, so
+    # it must always be backed by a sentence saying what we actually checked.
+    # Rides in ai_analysis rather than a new Role column precisely because the
+    # reason is the payload; the chip fires off this block's presence, the way
+    # ghostChip already falls back to §ghost notes when ghost_level is unset.
+    if entry.get("_scam_caution"):
+        parts.append("§caution")
+        parts.append(entry["_scam_caution"])
+
     return "\n".join(p for p in parts if p)
 
 
 def _ghost_module():
     from . import ghost
     return ghost
+
+
+def _fa_module():
+    """Lazy `full_auto` handle, same contract as _ghost_module above -- the import
+    stays lazy so importing this module never drags in crawl4ai/playwright (see
+    run_search_task)."""
+    import full_auto
+    return full_auto
 
 
 # Fallback tags that are recorded but never rendered as a banner. Kept as a set
@@ -2789,7 +2874,8 @@ def _verify_ats_picks(engine, picks: list[dict]) -> dict[int, tuple[str, str]]:
     return out
 
 
-async def _verify_via_browser(engine, jobs: list[dict]) -> dict[int, tuple[str, str]]:
+async def _verify_via_browser(engine, jobs: list[dict],
+                              crawler=None) -> dict[int, tuple[str, str]]:
     """Second opinion for picks a plain GET couldn't answer for.
 
     Cloudflare and friends answer an unrecognised client with a 202/403 and no
@@ -2805,20 +2891,24 @@ async def _verify_via_browser(engine, jobs: list[dict]) -> dict[int, tuple[str, 
     The URL to CHECK is not always the URL to SHOW: a job may carry
     `_verify_url`, and when it does that is fetched instead of `url`. Written
     for Adzuna, whose own /jobs/land/ad/ tracking redirect is the only thing
-    that knows whether the ad is still live -- see _adzuna_land_url."""
+    that knows whether the ad is still live -- see _adzuna_land_url.
+
+    `crawler`, when given, is the run's already-running Phase 5 browser (see the
+    tail_crawler note in _run_engine_pipeline) and is BORROWED, not owned -- this
+    function must not close it, because the caller's own finally still has to. It
+    used to launch a second Chromium of its own a few seconds after the first one
+    closed, which is pure duplicated startup. None (a run where nothing needed
+    scraping) keeps the original behaviour: launch one here, close it on the way
+    out."""
     jobs = jobs[:VERIFY_BROWSER_MAX]
     if not jobs:
         return {}
-    browser_config = engine.BrowserConfig(
-        headless=True, verbose=False, viewport_width=1280, viewport_height=800,
-        user_agent_mode="random",
-    )
     out: dict[int, tuple[str, str]] = {}
 
-    async def _one(crawler, job: dict) -> None:
+    async def _one(browser, job: dict) -> None:
         target = job.get("_verify_url") or job.get("url", "")
         try:
-            result = await crawler.arun(
+            result = await browser.arun(
                 url=target,
                 config=engine.CrawlerRunConfig(
                     cache_mode=engine.CacheMode.BYPASS,
@@ -2855,19 +2945,28 @@ async def _verify_via_browser(engine, jobs: list[dict]) -> dict[int, tuple[str, 
         signal = engine._dead_listing_signal(result, markdown, job.get("title") or "")
         out[id(job)] = ("dead", signal) if signal else ("alive", "browser_ok")
 
+    async def _run(browser) -> None:
+        await asyncio.wait_for(
+            asyncio.gather(*[_one(browser, j) for j in jobs], return_exceptions=True),
+            timeout=VERIFY_BROWSER_BUDGET_SECONDS)
+
     try:
-        async with engine.AsyncWebCrawler(config=browser_config) as crawler:
-            await asyncio.wait_for(
-                asyncio.gather(*[_one(crawler, j) for j in jobs],
-                               return_exceptions=True),
-                timeout=VERIFY_BROWSER_BUDGET_SECONDS)
+        if crawler is not None:
+            await _run(crawler)          # borrowed: the caller closes it
+        else:
+            browser_config = engine.BrowserConfig(
+                headless=True, verbose=False, viewport_width=1280, viewport_height=800,
+                user_agent_mode="random",
+            )
+            async with engine.AsyncWebCrawler(config=browser_config) as own:
+                await _run(own)
     except (asyncio.TimeoutError, Exception):
         pass  # whatever resolved before the budget ran out still counts
     return out
 
 
 async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[dict],
-                              reserves: list[dict]) -> tuple[list[dict], dict]:
+                              reserves: list[dict], crawler=None) -> tuple[list[dict], dict]:
     """Confirm every pick about to be shown still exists. Returns (picks, funnel).
 
     This is the guarantee behind the results page, and it is deliberately NOT
@@ -2877,6 +2976,9 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
     pre-judge pass, skips Phase 5, and would be shown having been checked by
     nothing. The only picks skipped are those a fetch ALREADY read this run
     (_verified_at, stamped by _verify_listings_alive and _persist_scrape).
+
+    `crawler` is the run's Phase 5 browser, borrowed for the escalation pass and
+    never closed here -- see _verify_via_browser.
 
     Three routes to an answer, strongest first -- see _verify_ats_picks for why
     the vendor feed beats fetching the posting, and _needs_liveness_check for
@@ -2980,7 +3082,7 @@ async def _verify_final_picks(engine, db: Session, profile_id: int, final: list[
         ]
         if escalate:
             try:
-                verdicts.update(await _verify_via_browser(engine, escalate))
+                verdicts.update(await _verify_via_browser(engine, escalate, crawler=crawler))
                 funnel["final_verify_browser"] += len(escalate[:VERIFY_BROWSER_MAX])
             except Exception:
                 pass
@@ -3046,6 +3148,17 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
         ident = j.get("_identity")
         if not ident:
             continue
+        # The model never accounted for this job -- it appeared in none of the four
+        # output lists, and survived full_auto's bounded re-ask (or sat in a chunk
+        # whose call failed while a sibling chunk succeeded). Write NOTHING. The
+        # `else` branch below would record it as a permanent reject with a blank
+        # analysis, which is a claim that the judge looked and said no; nothing here
+        # supports that claim, and eval_verdict is keyed on eval_signature so it
+        # would never be revisited while the profile stands. Left unwritten, the row
+        # stays 'new' (see the judged_ids note at the end of _run_engine_pipeline)
+        # and re-competes on a later run.
+        if j.get("_judge_unaccounted"):
+            continue
         if ident in strong_ids:
             verdict, src = "strong", next(s for s in strong if s.get("_identity") == ident)
         elif ident in backup_by:
@@ -3059,10 +3172,14 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             "role_type": src.get("role_type", ""),
             # The judge's explicit reasoning split (see full_auto's
             # _FINAL_EVAL_REASONING): can-do-fit is judged separately from
-            # want-fit. filters_on/highlight are reasoning step E's application
-            # guidance, which replaced the old top_match_reason narrative in
-            # FINAL_EVAL_PROMPT_VERSION 23. Persisted alongside the rest so a
-            # cache-served verdict renders identically to a freshly-judged one.
+            # want-fit. filters_on/highlight are reasoning step E's evidence
+            # mapping, which replaced the old top_match_reason narrative in
+            # FINAL_EVAL_PROMPT_VERSION 23 and became requirement -> evidence
+            # pairs in 29. Persisted alongside the rest so a cache-served verdict
+            # renders identically to a freshly-judged one -- note that means rows
+            # judged before 29 keep the flat-string form in this column for as
+            # long as their eval_signature holds, which is why
+            # full_auto.format_filters_on still reads both.
             "can_do_fit": src.get("can_do_fit", ""),
             "filters_on": src.get("filters_on") or [],
             "highlight": src.get("highlight", ""),
@@ -5557,6 +5674,23 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     final_fresh_judged = final_reused_from_cache = 0
     final_strong = final_backup = final_disqualified = final_reject_reasoned = 0
     final_scam_verified_dropped = 0
+    final_judge_unaccounted = 0
+    # The four branches a judge-flagged pick can take. Broken out rather than
+    # summed because they diagnose completely different things, and because the
+    # absence of exactly these counters is why this stage sat broken unnoticed:
+    # scam-verify read only `full_text`, which most candidates never carry, so it
+    # returned "not corroborated" without issuing a search. `scam_verify_no_sentence`
+    # is the counter that makes that self-reporting -- if it ever climbs back to
+    # roughly equal `scam_suspect_raised`, this check has stopped running again.
+    scam_suspect_raised = 0
+    scam_verify_no_sentence = 0
+    scam_verify_inconclusive = 0
+    scam_flagged_shown_with_caution = 0
+    # Counted rather than silently subtracted from scam_suspect_raised: an
+    # exemption that removes a warning is exactly the kind of rule that should
+    # stay measurable, so "how often does the judge flag a named agency" is a
+    # number someone can read off the funnel panel rather than infer.
+    scam_suspect_known_agency = 0
 
     def _hard_dq(entries) -> int:
         """Judge exclusions that fired a DISQUALIFIERS rule, as opposed to jobs that
@@ -5576,89 +5710,211 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             *[_scrape_then_judge(idxs, crawler) for idxs in judge_groups]
         ))
 
-    # Only pay for a browser launch when something actually needs fetching.
+    # ONE browser for the whole tail, explicitly lifecycled rather than held by an
+    # `async with`, because the two things that want it sit either side of ~300
+    # lines of main-thread DB work: Phase 5's page fetches here, and the
+    # final-pick liveness escalation after the judge has run (_verify_via_browser,
+    # which used to launch a second Chromium of its own a few seconds after this
+    # one closed). The picks do not exist until the judge has finished, so the
+    # verify cannot move inside a scope that ends here -- the scope has to reach
+    # it instead. The try/finally below is what keeps that safe: every path out of
+    # the tail, including a cancellation raised mid-way, closes the browser.
+    #
+    # Still lazy: `tail_crawler` stays None when nothing needs scraping, and
+    # _verify_final_picks then launches its own exactly as before -- so a run that
+    # never needs a page still never pays for a browser.
+    tail_crawler = None
     if scrape_enabled and any(_needs_full_scrape(j) for j in selected):
         browser_config = engine.BrowserConfig(
             headless=True, verbose=False, viewport_width=1280, viewport_height=800,
             user_agent_mode="random",
         )
-        async with engine.AsyncWebCrawler(config=browser_config) as crawler:
-            results = await _run_all(crawler)
-    else:
-        results = await _run_all(None)
+        tail_crawler = await engine.AsyncWebCrawler(config=browser_config).start()
+    try:
+        results = await _run_all(tail_crawler)
 
-    to_evaluate = [j for r in results for j in r["_evaluated"]]
+        to_evaluate = [j for r in results for j in r["_evaluated"]]
 
-    # Scrape persistence stays on the main thread (these touch the request
-    # session): remember the page text so a resurfacing job isn't re-scraped, and
-    # record confirmed-dead listings so no future run considers them at all.
-    if scraped_all:
-        _persist_scrape(db, profile_id, scraped_all)
-        _persist_dead_scrapes(db, profile_id, dead_all)
-    if scrape_enabled:
-        funnel["scrape_needed"] = scrape_counts["needed"]
-        funnel["scrape_already_ready"] = scrape_counts["already_ready"]
-        funnel["dead_dropped"] = len(dead_all)
-    _snap("scraped", to_evaluate)
+        # Scrape persistence stays on the main thread (these touch the request
+        # session): remember the page text so a resurfacing job isn't re-scraped, and
+        # record confirmed-dead listings so no future run considers them at all.
+        if scraped_all:
+            _persist_scrape(db, profile_id, scraped_all)
+            _persist_dead_scrapes(db, profile_id, dead_all)
+        if scrape_enabled:
+            funnel["scrape_needed"] = scrape_counts["needed"]
+            funnel["scrape_already_ready"] = scrape_counts["already_ready"]
+            funnel["dead_dropped"] = len(dead_all)
+        _snap("scraped", to_evaluate)
 
-    # One iteration per JUDGE GROUP, not per cluster: everything in this block --
-    # verdict persistence, the run-wide counters, and the shared scam-verify
-    # budget -- is per-CALL work, and a merged group made exactly one call. The
-    # per-cluster bookkeeping (final_by_cluster, fallback_notes, the diagnostics
-    # row) is split back out at the end of the block by each entry's own
-    # `_cluster`, which every job dict has carried since the embedding stage.
-    for r in results:
-        idxs: list[int] = r["idxs"]
-        final_fresh_judged += len(r["fresh"])
-        final_reused_from_cache += r["reused_from_cache"]
-        if r["fresh"] and not r["call_failed"]:
-            _persist_verdicts(db, profile_id, r["fresh"], r["strong"], r["backup"], r["disqualified"], r["eval_sig"])
-        final_strong += len(r["strong"])
-        final_backup += len(r["backup"])
-        final_disqualified += _hard_dq(r["disqualified"])
-        final_reject_reasoned += len(r["disqualified"])
+        # One iteration per JUDGE GROUP, not per cluster: everything in this block --
+        # verdict persistence, the run-wide counters, and the shared scam-verify
+        # budget -- is per-CALL work, and a merged group made exactly one call. The
+        # per-cluster bookkeeping (final_by_cluster, fallback_notes, the diagnostics
+        # row) is split back out at the end of the block by each entry's own
+        # `_cluster`, which every job dict has carried since the embedding stage.
+        for r in results:
+            idxs: list[int] = r["idxs"]
+            final_fresh_judged += len(r["fresh"])
+            # Sent to the judge and never accounted for, even after its re-ask. Counted
+            # rather than quietly subtracted from final_fresh_judged, because the
+            # standing accounting check reads
+            # `final_reject_reasoned == final_fresh_judged - strong - backup`, and
+            # netting these off would make that identity hold again by hiding exactly
+            # the shortfall it exists to expose. With the re-ask working this should
+            # sit at 0; a non-zero value means jobs went unjudged AND unwritten.
+            final_judge_unaccounted += sum(
+                1 for j in (*r["fresh"], *r["extras_fresh"]) if j.get("_judge_unaccounted"))
+            final_reused_from_cache += r["reused_from_cache"]
+            if r["fresh"] and not r["call_failed"]:
+                _persist_verdicts(db, profile_id, r["fresh"], r["strong"], r["backup"], r["disqualified"], r["eval_sig"])
+            final_strong += len(r["strong"])
+            final_backup += len(r["backup"])
+            final_disqualified += _hard_dq(r["disqualified"])
+            final_reject_reasoned += len(r["disqualified"])
 
-        if r["extras_for_to_evaluate"]:
-            # So judged_ids (computed from to_evaluate after this loop, used to
-            # mark JobSeen rows "enriched") picks these up same as any other
-            # judged job -- otherwise a backfilled-and-judged extra would keep
-            # reappearing in next run's "new, unprocessed" pool despite already
-            # carrying a persisted verdict.
-            to_evaluate.extend(r["extras_for_to_evaluate"])
-            final_reused_from_cache += r["backfill_reused_from_cache"]
-        if r["backfill_call_succeeded"]:
-            _persist_verdicts(db, profile_id, r["extras_fresh"], r["b_strong"], r["b_backup"],
-                               r["b_disqualified"], r["eval_sig"])
-            final_fresh_judged += len(r["extras_fresh"])
-            final_strong += len(r["b_strong"])
-            final_backup += len(r["b_backup"])
-            final_disqualified += _hard_dq(r["b_disqualified"])
-            final_reject_reasoned += len(r["b_disqualified"])
+            if r["extras_for_to_evaluate"]:
+                # So judged_ids (computed from to_evaluate after this loop, used to
+                # mark JobSeen rows "enriched") picks these up same as any other
+                # judged job -- otherwise a backfilled-and-judged extra would keep
+                # reappearing in next run's "new, unprocessed" pool despite already
+                # carrying a persisted verdict.
+                to_evaluate.extend(r["extras_for_to_evaluate"])
+                final_reused_from_cache += r["backfill_reused_from_cache"]
+            if r["backfill_call_succeeded"]:
+                _persist_verdicts(db, profile_id, r["extras_fresh"], r["b_strong"], r["b_backup"],
+                                   r["b_disqualified"], r["eval_sig"])
+                final_fresh_judged += len(r["extras_fresh"])
+                final_strong += len(r["b_strong"])
+                final_backup += len(r["b_backup"])
+                final_disqualified += _hard_dq(r["b_disqualified"])
+                final_reject_reasoned += len(r["b_disqualified"])
 
-        for idx in idxs:
-            fallback_notes[idx].update(r["fallback_tags"])
+            for idx in idxs:
+                fallback_notes[idx].update(r["fallback_tags"])
 
-        # Cross-site duplicate-content corroboration for judge-flagged scam_suspect
-        # picks (see full_auto.verify_not_duplicated) -- gated to only picks about to
-        # be shown this run and a small shared budget, since it spends a real search
-        # call per check. A corroborated pick is pulled from output and its
-        # persisted verdict overridden to reject so it never resurfaces. Sequential
-        # across clusters (not part of the concurrent judging above) since it
-        # decrements one shared per-run budget.
-        picks = r["picks"]
-        if scam_verify_budget[0] > 0:
+            # Cross-site duplicate-content corroboration for judge-flagged scam_suspect
+            # picks (see full_auto.verify_not_duplicated) -- gated to only picks about to
+            # be shown this run and a small shared budget, since it spends a real search
+            # call per check. Sequential across GROUPS (not part of the concurrent
+            # judging above) since it decrements one shared per-run budget; within a
+            # group the searches themselves run concurrently -- see below.
+            #
+            # THREE outcomes, and the middle one is the whole point of this shape.
+            # Corroborated -> pulled from output, persisted verdict overridden to reject
+            # so it never resurfaces. Not corroborated -> still shown, but grade-capped
+            # and carrying a card chip (_apply_scam_caution). Never dropped on suspicion
+            # alone.
+            #
+            # This used to be two outcomes, corroborated or nothing, and "nothing" was
+            # the same object the judge handed over, so a flagged listing was
+            # indistinguishable from an unflagged one at every later stage. Combined
+            # with verify_not_duplicated reading only `full_text` -- which 96% of the
+            # store does not carry, so the search was never issued -- the practical
+            # behaviour was that scam_suspect did nothing at all.
+            picks = r["picks"]
+
+            # Two passes, because the searches are the slow part and they are
+            # independent of each other. This block sits INSIDE the scrape+judge
+            # timing, after its concurrent work has finished, so anything serial here
+            # is pure added wall clock on the run's longest phase -- a live run spent
+            # 5 back-to-back searches there. Pass 1 decides what to search (and spends
+            # the shared budget, in pick order, so which picks get a search stays
+            # deterministic); pass 2 runs those searches concurrently; pass 3 applies
+            # the outcomes in the original order. Only the search runs on a worker --
+            # every DB write (_persist_scam_override) stays on this thread, the same
+            # rule the gate/scrape stages follow.
+            to_search = [p for p in picks if p.get("scam_suspect")
+                         and p.get("_identity")
+                         and not _ghost_module().is_known_agency(p.get("company") or "")]
+            searched_ids: set[str] = set()
+            for p in to_search:
+                if scam_verify_budget[0] <= 0:
+                    break
+                scam_verify_budget[0] -= 1
+                searched_ids.add(p["_identity"])
+            dup_reasons: dict[str, str | None] = {}
+            if searched_ids:
+                _cc = eng_profile.get("adzuna_country_code", "gb")
+                _batch = [p for p in to_search if p["_identity"] in searched_ids]
+                # Narrow pool: these are search-API calls and a burst risks a
+                # short-window rate cap, the same reason _GATE_MAX_WORKERS is 4.
+                with ThreadPoolExecutor(max_workers=min(4, len(_batch))) as _ex:
+                    for _p, _reason in zip(_batch, _ex.map(
+                            lambda j: engine.verify_not_duplicated(j, _cc), _batch)):
+                        dup_reasons[_p["_identity"]] = _reason
+
             verified_picks = []
             for p in picks:
-                if (scam_verify_budget[0] > 0 and p.get("scam_suspect") and p.get("_identity")):
-                    scam_verify_budget[0] -= 1
-                    dup_reason = engine.verify_not_duplicated(
-                        p, eng_profile.get("adzuna_country_code", "gb"))
-                    if dup_reason:
-                        _persist_scam_override(db, profile_id, p["_identity"], dup_reason, r["eval_sig"])
-                        final_scam_verified_dropped += 1
-                        emit(f"[pipeline] scam-verify: dropped {p.get('title')} @ "
-                             f"{p.get('company')} -- {dup_reason}")
-                        continue
+                if not p.get("scam_suspect"):
+                    verified_picks.append(p)
+                    continue
+                scam_suspect_raised += 1
+                # NAMED, ESTABLISHED AGENCY -> the flag is cleared outright: no
+                # search spent, no grade cap, no chip.
+                #
+                # The judge's softer signals are, for an agency, a description of
+                # normal practice: an anonymised "one of our clients" framing, a
+                # company blurb that names no product because the agency doesn't
+                # build one, and a high same-run posting volume because advertising
+                # many similar roles at once IS the business. Its own prompt already
+                # carves this out for a listing arriving through a registered ATS
+                # account -- that note reasons from "a real operating company holds
+                # this account", and naming the firm establishes the same thing by a
+                # route that doesn't depend on which feed the listing came down.
+                #
+                # A live run cautioned two Reed roles posted by Reed's own agency ON
+                # reed.co.uk, capping both to `ok` (ranks 9 and 10). Reed is not an
+                # anonymous third party with nothing to look up, and a chip saying
+                # we could not verify the employer is simply false about it.
+                #
+                # The SEARCH is skipped too, not merely its caution. Its one other
+                # outcome is a drop on verbatim content found off-aggregator, and
+                # _KNOWN_JOB_AGGREGATOR_FRAGMENTS cannot enumerate every small board
+                # a national agency syndicates to -- so for exactly these employers
+                # the drop path is likelier to misfire than to catch anything, and
+                # dropping a real role is the worse error of the two.
+                if _ghost_module().is_known_agency(p.get("company") or ""):
+                    scam_suspect_known_agency += 1
+                    emit(f"[pipeline] scam-verify: cleared {p.get('title')} @ "
+                         f"{p.get('company')} -- named established agency")
+                    verified_picks.append(p)
+                    continue
+                # Only the SEARCH is budget-gated. The outer guard used to skip this
+                # whole block once the budget was spent, which silently un-flagged
+                # every later pick in the run -- so a pick with no search still falls
+                # through to the caution below rather than out of the check.
+                searched = p.get("_identity") in searched_ids
+                dup_reason = dup_reasons.get(p.get("_identity"))
+                if dup_reason:
+                    _persist_scam_override(db, profile_id, p["_identity"], dup_reason, r["eval_sig"])
+                    final_scam_verified_dropped += 1
+                    emit(f"[pipeline] scam-verify: dropped {p.get('title')} @ "
+                         f"{p.get('company')} -- {dup_reason}")
+                    continue
+                # Flagged, and corroboration did not come back. That is NOT clearance:
+                # it means we could not establish anything either way, and until this
+                # was written it was indistinguishable from never having been flagged
+                # -- no chip, no demotion, no counter. A live run shipped a templated
+                # CV-farming listing at fit_rank 1 badged "Very strong fit" with the
+                # judge's own scam_suspect sitting in its persisted verdict.
+                #
+                # It is never dropped on this alone: engine's own history (see the
+                # rank-floor promotion note above) records these signals
+                # false-positiving on legitimate high-volume agency listings, so the
+                # user overrules us rather than the other way round.
+                if not searched:
+                    why = "not checked (verify budget spent for this run)"
+                elif engine.listing_search_sentence(p):
+                    why = "searched, nothing corroborating found"
+                    scam_verify_inconclusive += 1
+                else:
+                    why = "no searchable sentence in the listing text"
+                    scam_verify_no_sentence += 1
+                _apply_scam_caution(p)
+                scam_flagged_shown_with_caution += 1
+                emit(f"[pipeline] scam-verify: cautioned {p.get('title')} @ "
+                     f"{p.get('company')} -- {why}")
                 verified_picks.append(p)
             # No backup-tier fallback here any more. It existed because the backup
             # tier was DISCARDED whenever a cluster had strong picks, so a cluster
@@ -5669,136 +5925,146 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
             # listings just corroborated as scam and persisted as reject overrides.
             picks = verified_picks
 
-        # Split this group's output back per cluster. Every entry the judge
-        # returned is a copy of a candidate dict, so it still carries the
-        # `_cluster` the embedding stage assigned -- which is what keeps the
-        # downstream grade-ordered _fair_allocate genuinely fair across clusters
-        # even when two of them shared a call. A group of one behaves exactly as
-        # before.
-        def _mine(entries, idx: int) -> list[dict]:
-            return [e for e in (entries or []) if e.get("_cluster") == idx]
+            # Split this group's output back per cluster. Every entry the judge
+            # returned is a copy of a candidate dict, so it still carries the
+            # `_cluster` the embedding stage assigned -- which is what keeps the
+            # downstream grade-ordered _fair_allocate genuinely fair across clusters
+            # even when two of them shared a call. A group of one behaves exactly as
+            # before.
+            def _mine(entries, idx: int) -> list[dict]:
+                return [e for e in (entries or []) if e.get("_cluster") == idx]
 
-        for idx in idxs:
-            cluster_picks = _mine(picks, idx) if len(idxs) > 1 else picks
-            final_by_cluster[idx] = cluster_picks
-            # Judge-side half of this cluster's diagnostics row (the gate stage
-            # filled in the other half). A cluster that reaches the judge with a
-            # healthy pool and still returns nothing strong is the shape a
-            # run-wide funnel can't show -- see the Settings "Search run timings"
-            # panel. Attributed per cluster rather than reported per call, so a
-            # merged group doesn't blank out the very per-cluster view this row
-            # exists to give.
-            diag = cluster_diagnostics.get(idx)
-            if diag is None:
-                continue
-            if len(idxs) > 1:
-                fresh_n = len(_mine(r["fresh"], idx)) + len(_mine(r["extras_fresh"], idx))
-                strong_n = len(_mine(r["strong"], idx)) + len(_mine(r["b_strong"], idx))
-                backup_n = len(_mine(r["backup"], idx)) + len(_mine(r["b_backup"], idx))
-                dq_n = _hard_dq(_mine(r["disqualified"], idx)) + _hard_dq(_mine(r["b_disqualified"], idx))
-                reasoned_n = len(_mine(r["disqualified"], idx)) + len(_mine(r["b_disqualified"], idx))
-                # Not attributable per cluster: these count rows served from cache,
-                # which are keyed by identity rather than split by list.
-                reused_n = None
-            else:
-                fresh_n = len(r["fresh"]) + len(r["extras_fresh"])
-                strong_n = len(r["strong"]) + len(r["b_strong"])
-                backup_n = len(r["backup"]) + len(r["b_backup"])
-                dq_n = _hard_dq(r["disqualified"]) + _hard_dq(r["b_disqualified"])
-                reasoned_n = len(r["disqualified"]) + len(r["b_disqualified"])
-                reused_n = r["reused_from_cache"] + r["backfill_reused_from_cache"]
-            diag.update({
-                "judged": fresh_n,
-                "judge_strong": strong_n,
-                "judge_backup": backup_n,
-                "judge_disqualified": dq_n,
-                "judge_reject_reasoned": reasoned_n,
-                "picks": len(cluster_picks),
-                "fallbacks": sorted(fallback_notes[idx]),
-                "judge_call_shared_with": [i for i in idxs if i != idx],
-            })
-            if reused_n is not None:
-                diag["judge_reused_from_cache"] = reused_n
+            for idx in idxs:
+                cluster_picks = _mine(picks, idx) if len(idxs) > 1 else picks
+                final_by_cluster[idx] = cluster_picks
+                # Judge-side half of this cluster's diagnostics row (the gate stage
+                # filled in the other half). A cluster that reaches the judge with a
+                # healthy pool and still returns nothing strong is the shape a
+                # run-wide funnel can't show -- see the Settings "Search run timings"
+                # panel. Attributed per cluster rather than reported per call, so a
+                # merged group doesn't blank out the very per-cluster view this row
+                # exists to give.
+                diag = cluster_diagnostics.get(idx)
+                if diag is None:
+                    continue
+                if len(idxs) > 1:
+                    fresh_n = len(_mine(r["fresh"], idx)) + len(_mine(r["extras_fresh"], idx))
+                    strong_n = len(_mine(r["strong"], idx)) + len(_mine(r["b_strong"], idx))
+                    backup_n = len(_mine(r["backup"], idx)) + len(_mine(r["b_backup"], idx))
+                    dq_n = _hard_dq(_mine(r["disqualified"], idx)) + _hard_dq(_mine(r["b_disqualified"], idx))
+                    reasoned_n = len(_mine(r["disqualified"], idx)) + len(_mine(r["b_disqualified"], idx))
+                    # Not attributable per cluster: these count rows served from cache,
+                    # which are keyed by identity rather than split by list.
+                    reused_n = None
+                else:
+                    fresh_n = len(r["fresh"]) + len(r["extras_fresh"])
+                    strong_n = len(r["strong"]) + len(r["b_strong"])
+                    backup_n = len(r["backup"]) + len(r["b_backup"])
+                    dq_n = _hard_dq(r["disqualified"]) + _hard_dq(r["b_disqualified"])
+                    reasoned_n = len(r["disqualified"]) + len(r["b_disqualified"])
+                    reused_n = r["reused_from_cache"] + r["backfill_reused_from_cache"]
+                diag.update({
+                    "judged": fresh_n,
+                    "judge_strong": strong_n,
+                    "judge_backup": backup_n,
+                    "judge_disqualified": dq_n,
+                    "judge_reject_reasoned": reasoned_n,
+                    "picks": len(cluster_picks),
+                    "fallbacks": sorted(fallback_notes[idx]),
+                    "judge_call_shared_with": [i for i in idxs if i != idx],
+                })
+                if reused_n is not None:
+                    diag["judge_reused_from_cache"] = reused_n
 
-    funnel["final_fresh_judged"] = final_fresh_judged
-    funnel["final_reused_from_cache"] = final_reused_from_cache
-    funnel["final_strong"] = final_strong
-    funnel["final_backup"] = final_backup
-    funnel["final_disqualified"] = final_disqualified
-    # Every judged job that didn't make a list should now carry the AI's own reason.
-    # Watching this against final_fresh_judged - strong - backup is how a regression
-    # in the judge honouring "account for every job_number" stays visible.
-    funnel["final_reject_reasoned"] = final_reject_reasoned
-    funnel["final_scam_verified_dropped"] = final_scam_verified_dropped
+        funnel["final_fresh_judged"] = final_fresh_judged
+        funnel["final_reused_from_cache"] = final_reused_from_cache
+        funnel["final_strong"] = final_strong
+        funnel["final_backup"] = final_backup
+        funnel["final_disqualified"] = final_disqualified
+        # Every judged job that didn't make a list should now carry the AI's own reason.
+        # Watching this against final_fresh_judged - strong - backup is how a regression
+        # in the judge honouring "account for every job_number" stays visible.
+        funnel["final_reject_reasoned"] = final_reject_reasoned
+        funnel["final_judge_unaccounted"] = final_judge_unaccounted
+        funnel["final_scam_verified_dropped"] = final_scam_verified_dropped
+        funnel["scam_suspect_raised"] = scam_suspect_raised
+        funnel["scam_verify_no_sentence"] = scam_verify_no_sentence
+        funnel["scam_verify_inconclusive"] = scam_verify_inconclusive
+        funnel["scam_flagged_shown_with_caution"] = scam_flagged_shown_with_caution
+        funnel["scam_suspect_known_agency"] = scam_suspect_known_agency
 
-    # Same fair-allocation logic as pooling/top-N: total output stays capped at
-    # FINAL_PICKS, redistributed across clusters rather than added per cluster.
-    # Allocated one VERDICT GRADE at a time rather than one pass over each
-    # cluster's already tier-ordered list -- a single pass takes each cluster's
-    # WHOLE share in cluster order, so a cluster with zero strong picks could
-    # contribute its backup-tier filler ahead of a later cluster's genuine strong
-    # picks. fit_rank (below) is assigned purely by position in `final`, and
-    # nothing downstream re-sorts by verdict, so any ordering slip here rides all
-    # the way to the UI.
-    #
-    # This used to split on the `strong_fit` BOOLEAN only (which list the judge
-    # put the pick in), which guaranteed strong-before-backup but left the finer
-    # fit_level grade -- the very thing the card's badge shows -- doing nothing at
-    # all: a live run ranked four "Strong fit" picks above two "Very strong fit"
-    # ones purely because they came from the cluster that happened to be first in
-    # `final_by_cluster`. Splitting per _VERDICT_GRADES instead makes the badge
-    # order and the rank order agree (every Very strong fit above every Strong
-    # fit, and so on down), while each grade's own fair-allocate pass still
-    # distributes that grade's slots across clusters fairly. Within one cluster's
-    # grade bucket the judge's own ordering is preserved.
-    # Within one cluster's grade bucket the judge's own ordering is preserved,
-    # EXCEPT that a listing demoted for a soft max-listing-age breach sinks below
-    # an equally-graded fresher one (_stale_penalty, stamped by _annotate_stale;
-    # 0.0 and therefore a no-op for every candidate when the preference is Hard,
-    # unset, or the date unknown). A stable sort, so nothing else about the
-    # judge's order moves.
-    #
-    # This is the display half of that preference, and without it the selection
-    # penalty alone could not reach the page: fit_rank is assigned purely by
-    # position in `final`, so a stale pick that survives into a grade bucket can
-    # still land at rank 1 -- which is exactly what a live run showed, a 22-day
-    # and a 28-day listing at ranks 1 and 5 under a 7-day preference. The judge's
-    # own prompt already says to "prefer the fresher role when choosing between
-    # two comparable picks"; ordering is decided here, so until now that
-    # instruction had nothing to act on.
-    def _by_freshness(picks: list[dict]) -> list[dict]:
-        return sorted(picks, key=lambda p: p.get("_stale_penalty", 0.0))
+        # Same fair-allocation logic as pooling/top-N: total output stays capped at
+        # FINAL_PICKS, redistributed across clusters rather than added per cluster.
+        # Allocated one VERDICT GRADE at a time rather than one pass over each
+        # cluster's already tier-ordered list -- a single pass takes each cluster's
+        # WHOLE share in cluster order, so a cluster with zero strong picks could
+        # contribute its backup-tier filler ahead of a later cluster's genuine strong
+        # picks. fit_rank (below) is assigned purely by position in `final`, and
+        # nothing downstream re-sorts by verdict, so any ordering slip here rides all
+        # the way to the UI.
+        #
+        # This used to split on the `strong_fit` BOOLEAN only (which list the judge
+        # put the pick in), which guaranteed strong-before-backup but left the finer
+        # fit_level grade -- the very thing the card's badge shows -- doing nothing at
+        # all: a live run ranked four "Strong fit" picks above two "Very strong fit"
+        # ones purely because they came from the cluster that happened to be first in
+        # `final_by_cluster`. Splitting per _VERDICT_GRADES instead makes the badge
+        # order and the rank order agree (every Very strong fit above every Strong
+        # fit, and so on down), while each grade's own fair-allocate pass still
+        # distributes that grade's slots across clusters fairly. Within one cluster's
+        # grade bucket the judge's own ordering is preserved.
+        # Within one cluster's grade bucket the judge's own ordering is preserved,
+        # EXCEPT that a listing demoted for a soft max-listing-age breach sinks below
+        # an equally-graded fresher one (_stale_penalty, stamped by _annotate_stale;
+        # 0.0 and therefore a no-op for every candidate when the preference is Hard,
+        # unset, or the date unknown). A stable sort, so nothing else about the
+        # judge's order moves.
+        #
+        # This is the display half of that preference, and without it the selection
+        # penalty alone could not reach the page: fit_rank is assigned purely by
+        # position in `final`, so a stale pick that survives into a grade bucket can
+        # still land at rank 1 -- which is exactly what a live run showed, a 22-day
+        # and a 28-day listing at ranks 1 and 5 under a 7-day preference. The judge's
+        # own prompt already says to "prefer the fresher role when choosing between
+        # two comparable picks"; ordering is decided here, so until now that
+        # instruction had nothing to act on.
+        def _by_freshness(picks: list[dict]) -> list[dict]:
+            return sorted(picks, key=lambda p: p.get("_stale_penalty", 0.0))
 
-    graded_by_cluster: dict[str, dict[int, list[dict]]] = {
-        grade: {idx: _by_freshness([p for p in picks if _verdict_of(p) == grade])
-                for idx, picks in final_by_cluster.items()}
-        for grade in _VERDICT_GRADES
-    }
-    # A pick the judge graded with something we don't recognise (or didn't grade
-    # at all -- e.g. an inconclusive-call fallback) still has to land somewhere:
-    # keep it behind every graded pick rather than dropping it.
-    ungraded_by_cluster = {idx: [p for p in picks if _verdict_of(p) not in _VERDICT_GRADES]
-                           for idx, picks in final_by_cluster.items()}
-    final: list[dict] = []
-    for by_cluster in (*(graded_by_cluster[g] for g in _VERDICT_GRADES), ungraded_by_cluster):
-        if len(final) >= engine.FINAL_PICKS:
-            break
-        final += _fair_allocate(by_cluster, engine.FINAL_PICKS - len(final))
-    # One lap, not the old separate "scrape" + "final_eval": phases 5 and 6 now
-    # overlap per cluster (see _scrape_then_judge), so there is no longer a
-    # wall-clock boundary between them to measure.
-    t0 = _lap("scrape+judge", t0)
+        graded_by_cluster: dict[str, dict[int, list[dict]]] = {
+            grade: {idx: _by_freshness([p for p in picks if _verdict_of(p) == grade])
+                    for idx, picks in final_by_cluster.items()}
+            for grade in _VERDICT_GRADES
+        }
+        # A pick the judge graded with something we don't recognise (or didn't grade
+        # at all -- e.g. an inconclusive-call fallback) still has to land somewhere:
+        # keep it behind every graded pick rather than dropping it.
+        ungraded_by_cluster = {idx: [p for p in picks if _verdict_of(p) not in _VERDICT_GRADES]
+                               for idx, picks in final_by_cluster.items()}
+        final: list[dict] = []
+        for by_cluster in (*(graded_by_cluster[g] for g in _VERDICT_GRADES), ungraded_by_cluster):
+            if len(final) >= engine.FINAL_PICKS:
+                break
+            final += _fair_allocate(by_cluster, engine.FINAL_PICKS - len(final))
+        # One lap, not the old separate "scrape" + "final_eval": phases 5 and 6 now
+        # overlap per cluster (see _scrape_then_judge), so there is no longer a
+        # wall-clock boundary between them to measure.
+        t0 = _lap("scrape+judge", t0)
 
-    # Last gate before anything is written: confirm the picks still exist. The
-    # reserves are every judged pick that lost the FINAL_PICKS cut, in the same
-    # grade order, so a dropped corpse's slot is refilled by the next-best real
-    # role rather than simply vanishing.
-    _progress(db, run, "Checking the top picks are still live…")
-    reserves = [p for by_cluster in (*(graded_by_cluster[g] for g in _VERDICT_GRADES),
-                                     ungraded_by_cluster)
-                for picks in by_cluster.values() for p in picks]
-    final, verify_funnel = await _verify_final_picks(engine, db, profile_id, final, reserves)
-    funnel.update(verify_funnel)
+        # Last gate before anything is written: confirm the picks still exist. The
+        # reserves are every judged pick that lost the FINAL_PICKS cut, in the same
+        # grade order, so a dropped corpse's slot is refilled by the next-best real
+        # role rather than simply vanishing.
+        _progress(db, run, "Checking the top picks are still live…")
+        reserves = [p for by_cluster in (*(graded_by_cluster[g] for g in _VERDICT_GRADES),
+                                         ungraded_by_cluster)
+                    for picks in by_cluster.values() for p in picks]
+        final, verify_funnel = await _verify_final_picks(
+            engine, db, profile_id, final, reserves, crawler=tail_crawler)
+        funnel.update(verify_funnel)
+    finally:
+        if tail_crawler is not None:
+            await tail_crawler.close()
     t0 = _lap("verify_final_picks", t0)
     funnel["final_picks"] = len(final)
     _snap("final_picks", final)
@@ -5829,7 +6095,13 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
     # refill loop above (gate_survivors -- every cluster's <2-soft-axis-failure
     # in-sector candidates across all rounds -- and the exact examined subset of each
     # cluster's queue, respectively).
-    judged_ids = {j["_identity"] for j in to_evaluate}
+    # A job the judge never accounted for is NOT judged, however far it travelled:
+    # no verdict was persisted for it (see _persist_verdicts), so counting it here
+    # would retire the row as 'enriched' with nothing cached -- the worst of both,
+    # since it would neither be re-judged nor ever re-enter the pool. Excluding it
+    # leaves it 'new' to re-compete, which is the same treatment a gate survivor
+    # trimmed by the judge budget already gets.
+    judged_ids = {j["_identity"] for j in to_evaluate if not j.get("_judge_unaccounted")}
     processed_ids = [
         identity for identity in examined_ids
         if identity in judged_ids or identity not in gate_survivor_ids

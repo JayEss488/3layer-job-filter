@@ -7,6 +7,7 @@ import { Nav } from "@/components/Nav";
 import { RoleCard } from "@/components/RoleCard";
 import { SalaryPeriodToggle } from "@/components/SalaryPeriodToggle";
 import { api } from "@/lib/api";
+import { apiTime, parseApiDate } from "@/lib/dates";
 import { useRoles } from "@/lib/hooks";
 import { NO_RESPONSE_PROMPT_DAYS, PRIMARY_OUTCOMES, daysSince } from "@/lib/outcomes";
 import { useProfiles } from "@/lib/ProfileContext";
@@ -14,9 +15,13 @@ import type { ApplicationStatus, Role } from "@/lib/types";
 
 type Tab = "saved" | "inbox" | "deleted" | "applied";
 
+/** Server timestamps are naive UTC — parsed as local, an applied_at of
+ *  23:30 UTC would print as the wrong DAY for anyone east of Greenwich (see
+ *  lib/dates). This renders a date, so an hour's error is a whole day's error. */
 function fmtDate(iso?: string | null) {
-  if (!iso) return "";
-  return new Date(iso).toLocaleDateString("en-GB", {
+  const d = parseApiDate(iso);
+  if (!d) return "";
+  return d.toLocaleDateString("en-GB", {
     day: "numeric",
     month: "short",
     year: "numeric",
@@ -56,7 +61,7 @@ export default function MyRolesPage() {
     return <div className="app"><Nav /><div className="center-pad">Loading…</div></div>;
   }
 
-  const byDateDesc = (a: string, b: string) => new Date(b).getTime() - new Date(a).getTime();
+  const byDateDesc = (a: string, b: string) => apiTime(b) - apiTime(a);
 
   const lists: Record<Tab, Role[]> = {
     saved: saved.data ?? [],

@@ -68,6 +68,11 @@ export interface RunFunnel {
   passed_gates: number;
   final_judge: number;
   final_judge_rejected: number;
+  /** How many of those rejects carry the judge's own reason, and how many jobs it
+   *  left out of all four of its output lists. judge_unaccounted should be 0 —
+   *  anything else went unjudged AND unwritten, and re-competes next run. */
+  final_judge_reject_reasoned: number;
+  judge_unaccounted: number;
   judge_pool_size: number;
   judge_dupes_suppressed: number;
   decided_family_keys: number;
@@ -83,6 +88,18 @@ export interface RunFunnel {
   final_verify_unverifiable: number;
   final_verify_browser: number;
   final_verify_backfilled: number;
+  /** Scam / CV-farming flags. Read scam_verify_no_sentence first: if it climbs
+   *  back toward scam_suspect_raised, the corroboration check has stopped
+   *  running rather than stopped finding anything — which is how it sat broken
+   *  unnoticed once already. Only scam_dropped removes a listing. */
+  scam_suspect_raised: number;
+  scam_dropped: number;
+  scam_verify_no_sentence: number;
+  scam_verify_inconclusive: number;
+  scam_shown_with_caution: number;
+  /** Flags cleared with no check because the employer is a named, established
+   *  agency — the traits the judge flags on are that trade's normal practice. */
+  scam_known_agency_cleared: number;
   /** Licensed visa-sponsor filter; all zero unless the preference is on. */
   sponsor_filter_raw_before: number;
   sponsor_filter_raw_after: number;

@@ -176,6 +176,19 @@ FRONTEND_ORIGINS = os.getenv(
 # sign-up with a link printed to the console (see services/mailer.py).
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 
+# Alternative provider: a Gmail account's own SMTP relay + an App Password,
+# instead of Resend. Exists because Resend's sandbox sender (see EMAIL_FROM
+# below) only delivers to the Resend account owner until a domain is verified
+# -- Gmail SMTP delivers to any recipient immediately, no domain needed, which
+# makes it the faster path for local dev and small-scale testing. See
+# mailer.py for how the two providers are chosen between and Gmail's own
+# limits (roughly 500 messages/day on a consumer account, no bounce feedback).
+# Requires 2-Step Verification on the Gmail account and a generated App
+# Password (myaccount.google.com/apppasswords) -- NOT the account's login
+# password, which SMTP auth will reject.
+GMAIL_SMTP_ADDRESS = os.getenv("GMAIL_SMTP_ADDRESS", "")
+GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "")
+
 # The From address. MUST be on a domain verified in the Resend dashboard, with
 # one exception: `onboarding@resend.dev` is Resend's shared testing sender,
 # which is deliverable ONLY to the email address that owns the Resend account.
@@ -186,6 +199,18 @@ EMAIL_FROM = os.getenv("EMAIL_FROM", "Four in a Thousand <onboarding@resend.dev>
 # Where replies go. Optional; when set it is usually a real inbox, since the
 # From above frequently is not.
 EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "")
+
+# Loud on purpose, same reasoning as the AUTH_SECRET warning above: these vars
+# are read once at process start, so editing .env alone (without a process
+# restart -- uvicorn --reload only reacts to .py changes) silently keeps the
+# OLD provider active. A visible startup line is what makes that self-evident
+# instead of a confusing "nothing arrived" a run later.
+if GMAIL_SMTP_ADDRESS and GMAIL_SMTP_APP_PASSWORD:
+    print(f"[config] mail: Gmail SMTP ({GMAIL_SMTP_ADDRESS})")
+elif RESEND_API_KEY:
+    print(f"[config] mail: Resend (from={EMAIL_FROM})")
+else:
+    print("[config] mail: no provider configured -- verification/reset links print to console")
 
 # The public origin the links in those emails point at -- the FRONTEND's origin,
 # not the API's. Defaults to the first CORS origin, which is right in dev and
@@ -412,6 +437,31 @@ CV_SHORT_WORD_THRESHOLD = 750
 # so even a reply that does overrun can no longer end mid-word.
 CV_SUMMARY_RAW_MAX_CHARS = 6000
 CV_SUMMARY_MAX_CHARS = 4000
+
+# Wall-clock ceiling on the whole CV/notes parse (services/formation.py), after
+# which the request gives up and says so.
+#
+# WHY THIS HAS TO EXIST. The parse fans out to three concurrent llm_json calls,
+# and NOTHING upstream bounded the block. llm_json retries once on its own, and
+# the OpenAI SDK retries twice underneath that, against a 90s read timeout -- so
+# one stalled call could occupy the request for ~9 minutes before raising
+# anything, and llm_json's failure path returns {} rather than logging loudly.
+# What that looks like from the outside is precisely what was reported: a
+# spinner that never resolves, no error in the console, and a second attempt
+# seconds later that succeeds in ten. An unbounded wait is not a safer wait --
+# it just moves the failure somewhere the user cannot see it.
+#
+# Sized off the real distribution, not guessed: the block's critical path is the
+# ~450-word summary call, measured at ~11s on a 4,400-word CV, and the Settings
+# "CV parse timing" panel reports the same shape. 120s is roughly ten times that
+# -- generous enough that no honest slow parse is cut short, short enough that a
+# stall surfaces as an error while the user is still watching.
+#
+# Abandoning the in-flight threads is safe here BY CONSTRUCTION and not by luck:
+# formation's three calls are deliberately DB-free (see its module docstring) so
+# they share no session, hold no transaction, and touch nothing when they
+# eventually return into a request that has gone.
+CV_PARSE_TIMEOUT_SECONDS = 120
 
 # ── Hard/soft enforcement ───────────────────────────────────────────────────
 # How literally a constraint row is applied. "hard" = an unconditional drop the
