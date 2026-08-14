@@ -6,7 +6,7 @@ import { calendarDaysBetween, parseApiDate } from "@/lib/dates";
 import { useAttributes } from "@/lib/hooks";
 import { useProfiles } from "@/lib/ProfileContext";
 import { formatSalary, useSalaryPeriod } from "@/lib/salary";
-import { VERDICT_LABEL } from "@/lib/types";
+import { VERDICT_DOTS } from "@/lib/types";
 import type { Role, RoleVerdict, SalaryPeriod } from "@/lib/types";
 
 interface Props {
@@ -26,26 +26,42 @@ interface Props {
 }
 
 /** Section markers emitted by engine._compose_analysis. */
+const SIGNAL = "§signal";
 const QUALIFICATION = "§qualification";
 /** Retired at FINAL_EVAL_PROMPT_VERSION 23 — still parsed so verdicts judged
  *  under 22 or earlier keep rendering their narrative until re-judged. */
 const AI_REASONING = "§ai-reasoning";
 const APPLY_HIGHLIGHTS = "§apply-highlights";
 const REQUIREMENTS = "§requirements";
+const THE_ROLE = "§the-role";
 const GHOST = "§ghost";
 const CAUTION = "§caution";
 
 interface Analysis {
-  /** The judge's role-type + summary sentence pair, joined into one headline. */
+  /** The judge's role-type + summary sentence pair, joined into one headline.
+   *  Never rendered by the card-redesign layout, not even behind "Show more"
+   *  — see the component below. Kept parsed only because it's free to keep
+   *  parsing and a future design might want it back. */
   headline: string | null;
   /** Cluster note / "closest available match" warning — always precede the headline. */
   notes: string[];
   /** Un-sectioned body lines from a verdict judged before these markers existed
    *  (or under a retired marker, e.g. the old separately-shown role-type block). */
   legacy: string[];
-  /** Qualified-or-not verdict ("✓ ..." line) — always visible, no expand. */
+  /** "+ .../- ..." pair (FINAL_EVAL_PROMPT_VERSION 31) — short compressions of
+   *  can_do_fit and the first concerns item, written by the judge itself for
+   *  exactly this line. The card's always-visible +/- line pair reads from
+   *  here first; see posText/negText in the component below for the fallback
+   *  on a pre-31 row that has no `§signal` block. */
+  signal: string[];
+  /** Qualified-or-not verdict ("✓ ..." line). Never rendered by the
+   *  card-redesign layout (see `signal` above) — kept parsed for the same
+   *  reason as `headline`. */
   qualificationVerdict: string[];
-  /** Concern count + bullets ("⚠ ..."/"- ..." lines) — behind "Show more". */
+  /** Concern count + bullets ("⚠ ..."/"- ..." lines), plus the strengths list
+   *  when present. Never rendered by the card-redesign layout — kept parsed
+   *  as the fallback source for `negText` on a pre-31 row, see
+   *  splitQualification below. */
   qualification: string[];
   /** What this employer screens on, mapped one line per ask to the candidate's own
    *  evidence for it (a named gap where they have none), plus an optional framing
@@ -53,11 +69,16 @@ interface Analysis {
    *  carry the older single "This role likely filters on: …" lead instead. */
   applyHighlights: string[];
   /** The judge's full requirements checklist as "✓ ..."/"✗ ..." lines, one per ask
-   *  — behind "Show more". Distinct from `applyHighlights`, which is capped at 5 and
-   *  pairs an ask with the candidate's evidence: this is the inventory, so a reader
-   *  can see what was found rather than inferring it from a truncated mapping.
-   *  Absent on rows judged before the marker existed, which simply don't render it. */
+   *  — the card's always-visible "fit checklist" column. Distinct from
+   *  `applyHighlights`, which is capped at 5 and pairs an ask with the candidate's
+   *  evidence: this is the inventory, so a reader can see what was found rather
+   *  than inferring it from a truncated mapping. Absent on rows judged before the
+   *  marker existed, which simply don't render it. */
   requirements: string[];
+  /** 2-3 short duty phrases (FINAL_EVAL_PROMPT_VERSION 30) — the card's
+   *  always-visible "the role" column, beside `requirements`. Absent on any row
+   *  judged before 30. */
+  roleDuties: string[];
   /** Pre-v23 narrative paragraph — behind "Show more". Replaced by
    *  `applyHighlights`; only ever populated on a not-yet-re-judged row. */
   aiReasoning: string[];
@@ -89,20 +110,24 @@ interface Analysis {
  */
 function parseAnalysis(text: string): Analysis {
   const out: Analysis = {
-    headline: null, notes: [], legacy: [], qualificationVerdict: [], qualification: [],
-    applyHighlights: [], requirements: [], aiReasoning: [], ghost: [], caution: [],
+    headline: null, notes: [], legacy: [], signal: [], qualificationVerdict: [], qualification: [],
+    applyHighlights: [], requirements: [], roleDuties: [], aiReasoning: [], ghost: [], caution: [],
   };
-  let bucket: "lead" | "qualification" | "applyHighlights" | "requirements"
+  let bucket: "lead" | "signal" | "qualification" | "applyHighlights" | "requirements" | "roleDuties"
     | "aiReasoning" | "ghost" | "caution" = "lead";
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
-    if (line === QUALIFICATION) {
+    if (line === SIGNAL) {
+      bucket = "signal";
+    } else if (line === QUALIFICATION) {
       bucket = "qualification";
     } else if (line === APPLY_HIGHLIGHTS) {
       bucket = "applyHighlights";
     } else if (line === REQUIREMENTS) {
       bucket = "requirements";
+    } else if (line === THE_ROLE) {
+      bucket = "roleDuties";
     } else if (line === AI_REASONING) {
       bucket = "aiReasoning";
     } else if (line === GHOST) {
@@ -136,6 +161,36 @@ function parseAnalysis(text: string): Analysis {
     }
   }
   return out;
+}
+
+/**
+ * Splits `Analysis.qualification` (the flat "✓ You have: / - .. / ⚠ Note
+ * that: / - .." sequence engine._compose_analysis emits) back into its two
+ * source lists. Done here rather than by adding new §-markers on the backend
+ * because a marker split would only cover rows judged AFTER the change —
+ * every already-persisted verdict would still arrive in this flat shape, so
+ * the parsing has to handle it either way. `concerns[0]` is what feeds the
+ * card's always-visible "-" line (see negText in the component below); the
+ * full lists still render behind "Show more" exactly as before, so the top
+ * concern is deliberately shown twice rather than sliced out of the detail
+ * view.
+ */
+function splitQualification(qualification: string[]): { strengths: string[]; concerns: string[] } {
+  const strengths: string[] = [];
+  const concerns: string[] = [];
+  let bucket: "none" | "strengths" | "concerns" = "none";
+  for (const line of qualification) {
+    if (line === "✓ You have:") {
+      bucket = "strengths";
+    } else if (line === "⚠ Note that:") {
+      bucket = "concerns";
+    } else if (line.startsWith("- ")) {
+      (bucket === "strengths" ? strengths : bucket === "concerns" ? concerns : null)?.push(
+        line.slice(2),
+      );
+    }
+  }
+  return { strengths, concerns };
 }
 
 /** Mirrors full_auto._humanise_days: plain day count under 2 months, else months. */
@@ -386,6 +441,38 @@ function factChips(
   ].filter((v): v is FactChip => v !== null);
 }
 
+/** Screen-reader-only text for FitDots below. Unlike VERDICT_LABEL this covers
+ *  all four grades -- withholding a word for "ok"/"stretch" is specifically
+ *  about not putting a discouraging label in front of a sighted reader
+ *  alongside the role; it was never about hiding the grade from assistive
+ *  tech, which has no such effect to avoid. */
+const FIT_DOTS_LABEL: Record<RoleVerdict, string> = {
+  very_strong: "Very strong fit",
+  strong: "Strong fit",
+  ok: "Ok fit",
+  stretch: "Stretch fit",
+};
+
+/**
+ * Non-verbal fit-grade meter — replaces the old text badge (VERDICT_LABEL)
+ * in the card corner. VERDICT_LABEL deliberately has no text for "ok"/
+ * "stretch" (a printed "Ok fit"/"Stretch fit" told the candidate to discount
+ * a role the judge had just verified as worth applying to), which left those
+ * two grades with nothing at all in the corner. A filled-dot count conveys
+ * the same graded signal for all four grades without a word to read as
+ * discouraging.
+ */
+function FitDots({ verdict }: { verdict: RoleVerdict }) {
+  const filled = VERDICT_DOTS[verdict];
+  return (
+    <div className="fit-dots" role="img" aria-label={FIT_DOTS_LABEL[verdict]}>
+      {[0, 1, 2, 3].map((i) => (
+        <span key={i} className={`fit-dot${i < filled ? " filled" : ""}`} />
+      ))}
+    </div>
+  );
+}
+
 export function RoleCard({
   role,
   showRank = false,
@@ -407,28 +494,62 @@ export function RoleCard({
   const a = role.ai_analysis ? parseAnalysis(role.ai_analysis) : null;
   const hasNewSections =
     !!a &&
-    (a.qualificationVerdict.length > 0 ||
+    (a.signal.length > 0 ||
+      a.qualificationVerdict.length > 0 ||
       a.qualification.length > 0 ||
       a.applyHighlights.length > 0 ||
       a.requirements.length > 0 ||
+      a.roleDuties.length > 0 ||
       a.aiReasoning.length > 0 ||
       a.ghost.length > 0 ||
       a.caution.length > 0);
-  const hasDetail =
+  // What's left for the "Show more" toggle: everything the card-redesign layout
+  // doesn't show up front. `requirements`/`roleDuties` are the always-visible
+  // columns and `headline`/`qualification` are never shown at all (not even
+  // here) -- see the render below and RoleCard's module docstring notes on
+  // `signal`/`qualificationVerdict`/`qualification` above.
+  const hasExpandable =
     !!a &&
     (a.legacy.length > 0 ||
-      a.qualification.length > 0 ||
       a.applyHighlights.length > 0 ||
-      a.requirements.length > 0 ||
       a.aiReasoning.length > 0 ||
       a.ghost.length > 0 ||
       a.caution.length > 0);
-  const hasBody = !!a && (a.notes.length > 0 || a.qualificationVerdict.length > 0 || hasDetail);
+  const hasSponsorNote =
+    sponsorFilterOn && !!role.sponsor_statement && !!role.sponsor_statement_quote;
+  const hasNotes = !!a && (hasSponsorNote || a.notes.length > 0);
   const facts = factChips(
     role, salaryPeriod, sponsorFilterOn,
     !!a && a.ghost.length > 0, !!a && a.caution.length > 0,
   );
   const verdict = role.verdict as RoleVerdict | null | undefined;
+  // The +/- line pair. Preferred source is `§signal` (FINAL_EVAL_PROMPT_VERSION
+  // 31) -- short "+ .../- ..." lines the judge wrote FOR this line, already
+  // short enough to read as a headline. A pre-31 row has no `§signal` block, so
+  // falls back to deriving a (longer) pair from `qualificationVerdict`
+  // (can_do_fit) and the first `qualification` concern -- see
+  // splitQualification's docstring.
+  const signalPos = a?.signal.find((l) => l.startsWith("+ "));
+  const signalNeg = a?.signal.find((l) => l.startsWith("- "));
+  const posText =
+    signalPos?.slice(2).trim() ||
+    a?.qualificationVerdict[0]?.replace(/^✓\s*/, "").trim() ||
+    null;
+  const negText =
+    signalNeg?.slice(2).trim() ||
+    (a ? splitQualification(a.qualification).concerns[0] : null) ||
+    null;
+  // How much bigger one line reads than the other: a very_strong/strong grade
+  // means the positive clearly outweighs the negative (fit_level is derived
+  // mechanically from the same checklist that drives this, see full_auto's
+  // rubric), "ok" is a genuine toss-up, and "stretch" means the concern is the
+  // dominant fact about the role.
+  const signalDominance: "pos" | "neg" | "equal" =
+    verdict === "very_strong" || verdict === "strong"
+      ? "pos"
+      : verdict === "stretch"
+        ? "neg"
+        : "equal";
 
   return (
     <div className={`card${variant ? ` ${variant}` : ""}`}>
@@ -463,10 +584,7 @@ export function RoleCard({
           ) : role.provisional_stage === "rank" ? (
             <span className="verdict v-verifying">Quick-scored only</span>
           ) : (
-            verdict &&
-            VERDICT_LABEL[verdict] && (
-              <span className={`verdict v-${verdict}`}>{VERDICT_LABEL[verdict]}</span>
-            )
+            verdict && <FitDots verdict={verdict} />
           )}
           {meta && <div className="applied-meta">{meta}</div>}
         </div>
@@ -474,18 +592,16 @@ export function RoleCard({
 
       {showAnalysis && a && (
         <>
-          {a.headline && (
-            <div className={`card-headline${indentActions ? "" : " flush"}`}>{a.headline}</div>
-          )}
-          {hasBody && (
-            <div className={`card-analysis${indentActions ? "" : " flush"}`}>
-              {/* The employer's own sentence behind the sponsorship chip.
-                  Shown because a chip asserting something this consequential
-                  should be checkable in one glance — and because "No
-                  sponsorship" is a claim that costs the candidate a role if we
-                  got it wrong, so the words that produced it belong on the
-                  card, not in a log. Same filter gating as the chip itself. */}
-              {sponsorFilterOn && role.sponsor_statement && role.sponsor_statement_quote && (
+          {/* The employer's own sentence behind the sponsorship chip, plus any
+              cluster-label/closest-match notes — always visible, never behind
+              "Show more". Shown because a chip asserting something this
+              consequential should be checkable in one glance, and because "No
+              sponsorship" is a claim that costs the candidate a role if we got
+              it wrong, so the words that produced it belong on the card, not
+              in a log. Same filter gating as the chip itself. */}
+          {hasNotes && (
+            <div className={`card-notes${indentActions ? "" : " flush"}`}>
+              {hasSponsorNote && (
                 <div className="an-note">
                   The listing itself says:{" "}
                   <em>&ldquo;{role.sponsor_statement_quote}&rdquo;</em>
@@ -496,34 +612,96 @@ export function RoleCard({
                   {n}
                 </div>
               ))}
-              {a.qualificationVerdict.length > 0 && (
-                <div className="an-sec">
-                  <div className="an-h">Qualification</div>
-                  {a.qualificationVerdict.map((l, i) => (
-                    <div key={i}>{l}</div>
+            </div>
+          )}
+
+          {/* The card's headline read: what's going for it, then what isn't.
+              "+" is the qualification verdict; "-" is the single most
+              sink-worthy concern. Sized by how one-sided the grade is — a
+              very_strong/strong pick makes the positive the bigger line, a
+              stretch pick makes the negative the bigger line, and "ok" (a
+              genuine toss-up) keeps them equal. See signalDominance above. */}
+          {(posText || negText) && (
+            <div className={`card-signals${indentActions ? "" : " flush"}`}>
+              {posText && (
+                <div
+                  className={`signal-line signal-pos${
+                    signalDominance === "pos" ? " emph" : signalDominance === "neg" ? " mute" : ""
+                  }`}
+                >
+                  <span className="signal-icon" aria-hidden="true">+</span> {posText}
+                </div>
+              )}
+              {negText && (
+                <div
+                  className={`signal-line signal-neg${
+                    signalDominance === "neg" ? " emph" : signalDominance === "pos" ? " mute" : ""
+                  }`}
+                >
+                  <span className="signal-icon" aria-hidden="true">−</span> {negText}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* "fit checklist" mirrors §requirements (the judge's step-D checklist,
+              ✓/✗ per ask) and "the role" is §the-role (role_duties,
+              FINAL_EVAL_PROMPT_VERSION 30) — the two always-visible columns the
+              card-redesign is built around. Either can be empty on its own
+              (an older row has no role_duties; a row with no parseable
+              checklist has no requirements) without suppressing the other. */}
+          {(a.requirements.length > 0 || a.roleDuties.length > 0) && (
+            <div
+              className={`card-columns${indentActions ? "" : " flush"}${
+                a.requirements.length > 0 && a.roleDuties.length > 0 ? "" : " single"
+              }`}
+            >
+              {a.requirements.length > 0 && (
+                <div className="card-col">
+                  {/* Deliberately headed "found in the posting", not "everything
+                      the posting asks for". This is the judge's extraction, and
+                      it is not guaranteed complete -- the heading should not
+                      make a claim the list can't keep. */}
+                  <div className="an-h">Fit checklist</div>
+                  {a.requirements.map((l, i) => {
+                    // engine.requirements_block always emits "✓ "/"✗ " as the
+                    // first two characters -- split that off into its own
+                    // coloured span so a met/unmet ask reads at a glance (green
+                    // check, red cross) while the rest of the line stays plain
+                    // ink, same as the mockup. No count or ratio is rendered
+                    // here or in engine._compose_analysis -- see the
+                    // §requirements block there for why.
+                    const met = l.startsWith("✓");
+                    return (
+                      <div key={i}>
+                        <span className={`req-icon${met ? " req-icon-ok" : " req-icon-bad"}`} aria-hidden="true">
+                          {l.charAt(0)}
+                        </span>{" "}
+                        {l.slice(1).trim()}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {a.roleDuties.length > 0 && (
+                <div className="card-col">
+                  <div className="an-h">The role</div>
+                  {a.roleDuties.map((l, i) => (
+                    <div key={i}>{l.startsWith("- ") ? l.slice(2) : l}</div>
                   ))}
                 </div>
               )}
+            </div>
+          )}
+
+          {hasExpandable && (
+            <div className={`card-analysis${indentActions ? "" : " flush"}`}>
               {(!hasNewSections || expanded) && (
                 <>
                   {a.legacy.length > 0 && (
                     <div className="an-sec">
                       {a.legacy.map((l, i) => (
                         <div key={i} className={l.startsWith("⚠") ? "concern" : undefined}>
-                          {l}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {a.qualification.length > 0 && (
-                    <div className="an-sec">
-                      {a.qualification.map((l, i) => (
-                        <div
-                          key={i}
-                          className={
-                            l.startsWith("⚠") ? "concern" : l.startsWith("- ") ? "an-sub" : undefined
-                          }
-                        >
                           {l}
                         </div>
                       ))}
@@ -537,28 +715,9 @@ export function RoleCard({
                         // "- <requirement> — <evidence>" line per ask; the
                         // optional framing sentence, and every pre-v29 row's
                         // flat "This role likely filters on: …" lead, arrive
-                        // unprefixed and render as plain paragraphs. Same
-                        // "- " convention the qualification block uses, but
-                        // .an-map rather than .an-sub — see globals.css.
+                        // unprefixed and render as plain paragraphs -- see
+                        // globals.css's .an-map.
                         <div key={i} className={l.startsWith("- ") ? "an-map" : undefined}>
-                          {l}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {a.requirements.length > 0 && (
-                    <div className="an-sec">
-                      {/* Deliberately headed "found in the posting", not
-                          "everything the posting asks for". This is the judge's
-                          extraction, and it is not guaranteed complete -- the
-                          heading should not make a claim the list can't keep. */}
-                      <div className="an-h">Requirements found in the posting</div>
-                      {a.requirements.map((l, i) => (
-                        // "✗" lines carry .concern so an unmet ask reads as one at
-                        // a glance; met asks stay neutral. No count or ratio is
-                        // rendered here or in engine._compose_analysis -- see the
-                        // §requirements block there for why.
-                        <div key={i} className={l.startsWith("✗") ? "concern" : undefined}>
                           {l}
                         </div>
                       ))}
@@ -594,7 +753,7 @@ export function RoleCard({
                   )}
                 </>
               )}
-              {hasNewSections && hasDetail && (
+              {hasNewSections && hasExpandable && (
                 <button
                   type="button"
                   className="ghost tiny"

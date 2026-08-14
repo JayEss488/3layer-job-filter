@@ -46,3 +46,4 @@ beta_credentials_prod.txt
 
 # Dev-only crawl cache for scripts/gen_uk_geo.py (the generated module is committed)
 scripts/.uk_geo_crawl_cache.json
+Four_in_a_Thousand_Privacy_Policy.docx

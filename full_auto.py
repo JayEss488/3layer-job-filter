@@ -6418,7 +6418,26 @@ async def expand_category_pages(
 #       where the candidate most needs the plain-language read.
 # Pre-29 verdicts keep rendering: _sanitize_filters_on and the card still accept the
 # old flat-string form.
-FINAL_EVAL_PROMPT_VERSION = 29
+#
+# 30 (from 29): added "role_duties" -- 2-3 short verb-first task phrases from the
+# JD's own responsibilities section, for a new "the role" list on the result card
+# (see reasoning step F). Distinct from "summary": that field is one or two
+# PROSE sentences read as part of the headline, this is a short bulletable list
+# with its own card slot, so the two are allowed to overlap in content. A row
+# judged before 30 simply carries no "the role" section until it's re-judged --
+# RoleCard.tsx already treats an absent §the-role block as "nothing to show", the
+# same convention every other optional section here follows.
+#
+# 31 (from 30): added "headline_strength"/"headline_concern" -- short (~8-word)
+# noun-phrase compressions of "can_do_fit" and the first "concerns" item, written
+# LAST (reasoning step H) once both already exist. These, not "can_do_fit" and
+# "concerns", are now the card's lead +/- line pair; "can_do_fit"/"concerns" are
+# unchanged in what's asked of them and still matter for the fit_level rubric and
+# as the compression source, they simply aren't rendered verbatim any more. Also
+# tightened step F's "[] when nothing concrete" escape on "role_duties" -- it was
+# being read too liberally, and an empty list costs the card its whole second
+# column, not just a sentence.
+FINAL_EVAL_PROMPT_VERSION = 31
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -6733,11 +6752,12 @@ evidence the requirement is met.
 
 THE LETTERS BELOW ARE FOR CROSS-REFERENCE, NOT THE ORDER OF WORK, AND THE ORDER OF WORK IS
 LOAD-BEARING. Work each role in this order, which is exactly the field order the schema asks you to
-emit and which you should follow literally: read the job (A) -> describe it (F: "role_type", "summary")
--> build the requirements checklist (D: "requirements") -> map each screened-on requirement to the
+emit and which you should follow literally: read the job (A) -> describe it (F: "role_type", "summary",
+"role_duties") -> build the requirements checklist (D: "requirements") -> map each screened-on requirement to the
 candidate's actual evidence for it (E: "filters_on", "highlight") -> list the gaps (C: "concerns") ->
 only THEN grade it ("fit_level", by the schema's rubric) and write the qualification verdict (B:
-"can_do_fit") -> then "strengths" (G).
+"can_do_fit") -> compress the two lead lines (H: "headline_strength", "headline_concern") -> then
+"strengths" (G).
 Why this order and not the reverse: "fit_level" and "concerns" are derived MECHANICALLY from the
 checklist, and going requirement-by-requirement through the candidate's evidence is what tells you
 which asks they can actually speak to. Do that work first and the grade falls out of it. Reach the
@@ -6794,8 +6814,8 @@ D. Build a REQUIREMENTS CHECKLIST. This is the field every other field depends o
    into the "what this role filters on, and what you have for each" block on their result card. So an
    ask you never wrote down is not merely missing from your working-out: it is a bar this application
    will be judged against that the candidate is never told about, and cannot prepare for. When the
-   response is running long, shorten "summary", "highlight", the "evidence" side of "filters_on" and
-   your other prose FIRST. Never the checklist, and in particular never trade checklist items for
+   response is running long, shorten "summary", "role_duties", "highlight", the "evidence" side of
+   "filters_on" and your other prose FIRST. Never the checklist, and in particular never trade checklist items for
    "filters_on" pairs: that field is built FROM this list (step E), so the trade buys nothing and
    costs twice.
    List the JD's individually-judgeable requirements (both explicitly
@@ -6984,6 +7004,22 @@ F. Classify the FUNCTIONAL NATURE of the day-to-day work in "role_type" -- one s
    support for colleagues" (that's the same functional-category information "role_type" already gave) -
    it should instead name the concrete duties/mission, e.g. "You would keep service records accurate,
    analyse outcomes, and turn evidence into reports for funders and partners."
+   Also write "role_duties": 2-3 SHORT task phrases (not full sentences) naming the concrete day-to-day
+   work, taken from the JD's own responsibilities/duties section -- e.g. "Keep CRM records accurate",
+   "Answer customer enquiries". These render as their own short list on the result card, separate from
+   "summary"'s prose, so overlapping with "summary" in content is fine; keep them SHORT (a handful of
+   words each, verb-first) since the card has no room for a full sentence.
+   WRITE THIS FOR NEARLY EVERY PICK -- an empty list costs the card its whole second column, which is a
+   real loss even on a posting that leads with mission/impact framing rather than a bulleted duties list.
+   Almost every posting names SOME concrete activity somewhere -- in a "Responsibilities"/"What you'll
+   do" section if it has one, but failing that, in the body prose too: "you'll work with the finance team
+   to reconcile monthly accounts" is a duty ("Reconcile monthly accounts with finance") even inside a
+   paragraph about the mission. Read the FULL text for this, not just the opening you may have used for
+   "summary". [] is reserved for the genuinely rare posting that states no activity at all, anywhere --
+   e.g. a one-paragraph teaser that is pure "join our mission to change the world" with nothing about
+   what the person would actually do. That is a property of the POSTING, not a fallback for when writing
+   this list is inconvenient; do not reach for [] merely because the phrasing takes rewording. Never
+   invent a task the text doesn't support, but do extract and compress what it genuinely says.
 G. STRENGTHS -- for a pick you grade "ok" or "stretch" only; always omitted for "very_strong"/"strong".
    Those two grades are shown to the candidate with their gaps listed, and a card that lists gaps with
    nothing alongside them misrepresents a role they are being told is worth applying to.
@@ -7008,7 +7044,23 @@ G. STRENGTHS -- for a pick you grade "ok" or "stretch" only; always omitted for 
    almost nothing they can act on for a role you are telling them to apply to. That is nearly always a
    checklist written to fail rather than to judge -- go back to step D and check you have not held them
    to bars the posting never set. If the checklist survives that re-read honestly, the role probably
-   belongs in "not_selected" instead."""
+   belongs in "not_selected" instead.
+H. Write "headline_strength" and "headline_concern" -- the card's two LEAD lines, read before anything
+   else on the page, including before "role_type"/"summary". These are COMPRESSIONS of what you already
+   wrote: "headline_strength" compresses "can_do_fit", "headline_concern" compresses the first item of
+   "concerns". Do this LAST, once both already exist -- there is nothing to compress before then.
+   Each is a SHORT NOUN PHRASE, not a sentence: no "You are/have/lack", no subject or verb needed, under
+   about 8 words. Compress by cutting words, not by rewriting the claim -- if "can_do_fit" says the
+   candidate's CRM and customer-service work covers this role well, "headline_strength" is "Strong CRM
+   and customer-service evidence", not a new, softer or stronger claim of your own. Two examples of the
+   pair together: "Strong CRM and customer-service evidence" / "No admin experience, and it's a short
+   assignment"; "Directly relevant Python and SQL pipeline work" / "No experience with the specific ETL
+   tool this role names".
+   "headline_strength" is REQUIRED whenever "can_do_fit" says anything positive about the candidate --
+   which is essentially always, since even a "stretch" pick has SOME genuine basis for being shown at
+   all. Omit it only on the rare pick where "can_do_fit" is wholly negative with nothing to compress.
+   "headline_concern" is REQUIRED whenever "concerns" is non-empty, and omitted only when "concerns" is
+   genuinely empty (a clean "very_strong" pick with nothing worth flagging)."""
 
 _FINAL_EVAL_SCHEMA = """Output ONLY a valid JSON object (no markdown), with two required lists and one
 optional list, using this item shape for "strong"/"backup":
@@ -7017,12 +7069,15 @@ optional list, using this item shape for "strong"/"backup":
     "job_number": 1, "title": "...", "company": "...", "url": "...",
     "role_type": "1 short sentence classifying the FUNCTIONAL NATURE of the day-to-day work -- see reasoning step F. Written FIRST, since it's shown immediately before \\"summary\\" as one continuous sentence pair.",
     "summary": "1 short PLAIN-LANGUAGE sentence on what this specific role/project/mission actually involves (not why it fits the candidate) -- or TWO sentences where the work genuinely cannot be made concrete in one, which is the right choice for an unfamiliar or many-sided role; see PLAIN LANGUAGE and NO LOCATION COMMENTARY above. Must add information NOT already given by \\"role_type\\" -- never restate its functional-category classification (see reasoning step F's no-overlap rule).",
+    "role_duties": ["2-3 SHORT verb-first task phrases naming concrete day-to-day work, from the JD's own responsibilities section -- see reasoning step F. [] if the JD states nothing concrete."],
     "requirements": [{"text": "ONE JD requirement, short and concrete and in the JD's own words -- never a heading covering several, never a capacity anyone would pass; see reasoning step D", "category": "core" | "secondary", "met": true}],
     "filters_on": [{"requirement": "ONE ask this employer will really screen on, short, from the checklist above -- see reasoning step E", "evidence": "the candidate's own specific evidence for THAT ask, second person and brief; null when they genuinely have none (max 2 nulls, never the first item)"}],
     "highlight": "OPTIONAL single second-person sentence -- only how to frame the weakest item honestly, or the one thing to leave out. Omit rather than pad; never re-list the evidence above. See reasoning step E.",
     "concerns": ["the notable gaps, one per item, most sink-worthy first, AT MOST 3 -- see reasoning step C; [] if none"],
     "fit_level": "very_strong" | "strong" | "ok" | "stretch",
     "can_do_fit": "a direct, second-person qualification verdict -- see reasoning step B.",
+    "headline_strength": "a SHORT noun-phrase compression of can_do_fit, under ~8 words -- the card's lead '+' line, written LAST once can_do_fit exists -- see reasoning step H. Omit only if can_do_fit has nothing positive to compress.",
+    "headline_concern": "a SHORT noun-phrase compression of the first item of concerns, under ~8 words -- the card's lead '-' line -- see reasoning step H. Omit only if concerns is empty.",
     "strengths": ["0-3 concrete things the candidate brings that \\"filters_on\\" above did NOT already carry, strongest first -- only for an \\"ok\\"/\\"stretch\\" \\"fit_level\\", omitted entirely otherwise and whenever the mapping already covers it; see reasoning step G"],
     "role_salary": "the salary or range THIS posting's own description states, verbatim and short (e.g. \\"GBP 35,000-42,000\\"); null if this posting states none -- even when other salary figures appear elsewhere in the supplied text (a \\"Similar jobs\\" list or salary histogram, see SCOPE OF EACH POSTING'S TEXT)",
     "work_style": "Remote" | "Hybrid" | "On-site" | null,
@@ -7105,14 +7160,28 @@ payload (see SCOPE OF EACH POSTING'S TEXT). For "work_style" apply the same clas
 LOCATION/VISA/RELOCATION rule -- a stated office location with no remote/hybrid/work-from-home
 wording anywhere is "On-site", not null and not "Remote".
 
-"can_do_fit", "filters_on" and "highlight" are shown directly to the candidate. "can_do_fit" is the
-headline "are you qualified". "filters_on" renders as a "What this role filters on" block, ONE LINE PER
-PAIR, as "<requirement> -- <evidence>", with a null "evidence" printed as a plain "no evidence in your
-profile yet". Your optional "highlight" sentence follows underneath. Write them to read that way: each
-side of a pair short enough to sit on one line, plain-language, and standing alone without the rest of
-the analysis. In particular the "evidence" side is read directly against its own "requirement" and
-nothing else, so it must answer THAT ask specifically -- an evidence string that would fit equally well
-next to any of the other requirements is not specific enough to be useful."""
+"headline_strength" and "headline_concern" are the FIRST thing the candidate reads on the card, above
+everything else -- read reasoning step H before writing them. "can_do_fit" and "concerns" are no longer
+shown verbatim; they are the internal reasoning "headline_strength"/"headline_concern" compress, and
+still matter for that reason (and because "concerns" also feeds the "fit_level" rubric), but write them
+as the full, careful statements reasoning steps B/C ask for -- do not shorten THEM to save yourself the
+compression step, or the pair you compress from will be too thin to compress well.
+
+"filters_on" and "highlight" are also shown directly to the candidate. "filters_on" renders as a "What
+this role filters on" block, ONE LINE PER PAIR, as "<requirement> -- <evidence>", with a null "evidence"
+printed as a plain "no evidence in your profile yet". Your optional "highlight" sentence follows
+underneath. Write them to read that way: each side of a pair short enough to sit on one line,
+plain-language, and standing alone without the rest of the analysis. In particular the "evidence" side is
+read directly against its own "requirement" and nothing else, so it must answer THAT ask specifically --
+an evidence string that would fit equally well next to any of the other requirements is not specific
+enough to be useful.
+
+"role_duties" is also shown directly to the candidate, as its own short "the role" list alongside the
+requirements checklist -- see reasoning step F. Each item renders on its own line with no room for a full
+sentence, so keep every item to a handful of words. WRITE SOMETHING HERE FOR NEARLY EVERY PICK: an empty
+list means the card shows only one column instead of two, which is a materially worse result than a
+list of two or three plainly-stated tasks even from a mission-heavy posting -- see reasoning step F for
+how to find them when the posting leads with impact language rather than a duties list."""
 
 # Static system prefix -- identical across every cluster/call, so it's a stable
 # (prompt-cache-friendly) prefix instead of being rebuilt into each user prompt. It
@@ -7678,6 +7747,16 @@ Jobs Payload:
                 # never show more of one than the other by accident.
                 merged["concerns"] = _sanitize_bullets(merged.get("concerns"))
                 merged["strengths"] = _sanitize_bullets(merged.get("strengths"))
+                # Same cap/length guard as concerns/strengths -- reasoning step F
+                # already asks for 2-3 short items, this is just the defensive
+                # ceiling on a model that ignores it.
+                merged["role_duties"] = _sanitize_bullets(merged.get("role_duties"))
+                # The card's lead +/- line pair (reasoning step H). 160 chars is a
+                # runaway-reply guard, not the target -- the prompt asks for ~8
+                # words, this just stops a model that ignores that from producing
+                # a line the card can't lay out on one row.
+                merged["headline_strength"] = str(merged.get("headline_strength") or "").strip()[:160]
+                merged["headline_concern"] = str(merged.get("headline_concern") or "").strip()[:160]
                 out.append(merged)
         return out
 

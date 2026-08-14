@@ -410,6 +410,22 @@ export const VERDICT_LABEL: Partial<Record<RoleVerdict, string>> = {
   strong: "Strong fit",
 };
 
+/**
+ * How many of 4 dots are filled for the card-corner fit indicator — the
+ * non-verbal counterpart to VERDICT_LABEL above, and the reason that map is
+ * allowed to stay silent on "ok"/"stretch": a filled-dot count conveys the same
+ * graded signal without a word that reads as telling the candidate not to
+ * bother. Replaces the text badge outright rather than sitting beside it —
+ * two badges arguing the same grade in different vocabularies is noise, not
+ * more information.
+ */
+export const VERDICT_DOTS: Record<RoleVerdict, number> = {
+  very_strong: 4,
+  strong: 3,
+  ok: 2,
+  stretch: 1,
+};
+
 export interface Role {
   id: number;
   profile_id: number;

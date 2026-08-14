@@ -1259,15 +1259,33 @@ def requirements_block(requirements) -> list[str]:
 def _compose_analysis(entry: dict) -> str:
     """The card's analysis text. RoleCard.tsx splits on the §-prefixed markers.
 
-    Always visible (no marker): the cluster-label/closest-match notes, then
+    Unmarked (no §-prefix): the cluster-label/closest-match notes, then
     the headline -- `role_type` (functional classification) and `summary`
     (this specific role's mission/duties) joined into ONE sentence pair, in
     that order, per full_auto's step F no-overlap rule (they're written by the
     model knowing they'll be displayed together, so `summary` adds new
-    information rather than restating `role_type`). Behind the "Show more"
-    toggle: `§qualification` (a direct qualified-or-not verdict, then a
-    concern count and its bullets) and `§apply-highlights` (what to put in
-    front of this specific employer).
+    information rather than restating `role_type`). `§signal` is
+    `headline_strength`/`headline_concern` (FINAL_EVAL_PROMPT_VERSION 31) as a
+    short "+ .../- ..." pair. `§the-role` is `role_duties`
+    (FINAL_EVAL_PROMPT_VERSION 30) as short bullets, distinct content from the
+    headline's prose even though both describe the role. `§qualification` is
+    the full-length `can_do_fit` verdict plus a concern count and its bullets
+    (what `§signal` compresses FROM), and `§apply-highlights` is what to put in
+    front of this specific employer.
+
+    Which of these render at all, let alone always-visible vs. behind
+    RoleCard's "Show more" toggle, is a RENDERING choice, not something this
+    function decides -- it just composes the text and the §-markers that split
+    it into sections. As of the card redesign, RoleCard always shows the
+    `§signal` +/- pair (falling back to a longer pair derived from
+    `qualificationVerdict`/`qualification` on a pre-31 row with no `§signal`)
+    plus the `§requirements` checklist and `§the-role` list side by side, and
+    NEVER renders the headline or `§qualification` at all -- not even behind
+    the toggle, which is reserved for `§apply-highlights`/`§ghost`/`§caution`
+    and the pre-marker `legacy` fallback text. See RoleCard.tsx. This function
+    still emits both, since they cost nothing to compose and a future card
+    design may want them back -- but nothing currently reads them past
+    `§signal`'s fallback path.
 
     `§apply-highlights` replaced `§ai-reasoning` at FINAL_EVAL_PROMPT_VERSION
     23. The old block rendered `top_match_reason`, a narrative arguing why the
@@ -1317,11 +1335,36 @@ def _compose_analysis(entry: dict) -> str:
     # routine outcome rather than a warning -- and it framed a role the judge had
     # just verified as worth applying to as a consolation prize.
 
+    # The card's lead +/- line pair -- short compressions of can_do_fit and the
+    # first concerns item, written by the judge itself (full_auto reasoning step
+    # H / FINAL_EVAL_PROMPT_VERSION 31) rather than truncated here, since a good
+    # compression needs to choose WHICH words matter, not just cut a sentence
+    # short. Absent on any row judged before 31; RoleCard.tsx falls back to
+    # deriving a (longer) pair from can_do_fit/concerns for those rows.
+    signal_strength = str(entry.get("headline_strength") or "").strip()
+    signal_concern = str(entry.get("headline_concern") or "").strip()
+    if signal_strength or signal_concern:
+        parts.append("§signal")
+        if signal_strength:
+            parts.append(f"+ {signal_strength}")
+        if signal_concern:
+            parts.append(f"- {signal_concern}")
+
     headline = " ".join(
         p.strip() for p in (entry.get("role_type"), entry.get("summary")) if p and p.strip()
     )
     if headline:
         parts.append(headline)
+
+    # 2-3 short duty phrases for the card's "the role" list, distinct from the
+    # headline's prose (see full_auto reasoning step F / FINAL_EVAL_PROMPT_VERSION
+    # 30). Absent on any row judged before 30 -- RoleCard.tsx treats a missing
+    # §the-role block as nothing to show, same convention as every other
+    # optional section here.
+    duties = [str(d).strip() for d in (entry.get("role_duties") or []) if str(d).strip()]
+    if duties:
+        parts.append("§the-role")
+        parts.extend(f"- {d}" for d in duties)
 
     qualification: list[str] = []
     if entry.get("can_do_fit"):
@@ -3353,9 +3396,21 @@ def _persist_verdicts(db: Session, profile_id: int, judged: list[dict],
             # long as their eval_signature holds, which is why
             # full_auto.format_filters_on still reads both.
             "can_do_fit": src.get("can_do_fit", ""),
+            # The card's lead +/- line pair -- short compressions of can_do_fit
+            # and the first concerns item, written last (full_auto reasoning
+            # step H / FINAL_EVAL_PROMPT_VERSION 31). can_do_fit/concerns above
+            # are kept as the full statements (they still feed fit_level and are
+            # what these compress from) but are no longer rendered verbatim.
+            "headline_strength": src.get("headline_strength", ""),
+            "headline_concern": src.get("headline_concern", ""),
             "filters_on": src.get("filters_on") or [],
             "highlight": src.get("highlight", ""),
             "requirements": src.get("requirements") or [],
+            # 2-3 short duty phrases for the card's "the role" list -- see
+            # full_auto reasoning step F / FINAL_EVAL_PROMPT_VERSION 30. Persisted
+            # for the same reason as everything else here: a cache-served pick
+            # must render identically to a freshly-judged one.
+            "role_duties": src.get("role_duties") or [],
             "concerns": src.get("concerns", []),
             # The "what you do bring" half of the card, generated only for an
             # ok/stretch pick (full_auto reasoning step G). Persisted for the same

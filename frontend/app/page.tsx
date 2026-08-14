@@ -143,10 +143,11 @@ export default function Home() {
             </div>
 
             {/* ── the demo card ─────────────────────────────────────────
-                Built from the app's own .card / .tag / .verdict styles rather
-                than bespoke landing-page markup, so what a visitor is shown here
-                is literally the component they get after signing in. If the real
-                card changes, this changes with it. */}
+                Built from the app's own .card / .tag / .fit-dots / .signal-line /
+                .card-columns styles rather than bespoke landing-page markup, so
+                what a visitor is shown here is literally the component they get
+                after signing in. If the real card changes, this changes with it —
+                see RoleCard.tsx for the component this replicates. */}
             <div>
               <div className="lp-eyebrow">What you&rsquo;ll actually see</div>
               <div className="lp-cardwrap">
@@ -162,25 +163,46 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="card-corner">
-                      <span className="verdict v-strong">Strong fit</span>
+                      <div className="fit-dots" role="img" aria-label="Strong fit">
+                        <span className="fit-dot filled" />
+                        <span className="fit-dot filled" />
+                        <span className="fit-dot filled" />
+                        <span className="fit-dot" />
+                      </div>
                     </div>
                   </div>
 
-                  <div className="card-headline flush">
-                    This is a junior reporting and analysis role. You would query debt-portfolio
-                    data, analyse it in spreadsheets and build Power BI reports.
+                  <div className="card-notes flush">
+                    <div className="an-note">Matched via: BI/Data Analyst track</div>
+                  </div>
+
+                  <div className="card-signals flush">
+                    <div className="signal-line signal-pos emph">
+                      <span className="signal-icon" aria-hidden="true">+</span>
+                      Strong SQL, Excel and Power BI evidence
+                    </div>
+                    <div className="signal-line signal-neg mute">
+                      <span className="signal-icon" aria-hidden="true">−</span>
+                      SQL authorship was AI-assisted, not commercial
+                    </div>
+                  </div>
+
+                  <div className="card-columns flush">
+                    <div className="card-col">
+                      <div className="an-h">Fit checklist</div>
+                      <div><span className="req-icon req-icon-ok" aria-hidden="true">✓</span> SQL querying</div>
+                      <div><span className="req-icon req-icon-ok" aria-hidden="true">✓</span> Excel analysis</div>
+                      <div><span className="req-icon req-icon-ok" aria-hidden="true">✓</span> Power BI reporting</div>
+                    </div>
+                    <div className="card-col">
+                      <div className="an-h">The role</div>
+                      <div>Query debt-portfolio data</div>
+                      <div>Analyse it in spreadsheets</div>
+                      <div>Build Power BI reports</div>
+                    </div>
                   </div>
 
                   <div className="card-analysis flush">
-                    <div className="an-note">Matched via: BI/Data Analyst track</div>
-                    <div className="an-sec">
-                      <div className="an-h">Qualification</div>
-                      <div>
-                        ✓ You&rsquo;re well qualified for this junior role: your SQL, Excel and
-                        Power BI case-study work maps directly to its day-to-day reporting tasks,
-                        with the main caveat that your SQL authorship was AI-assisted.
-                      </div>
-                    </div>
                     <span className="lp-fauxbtn">Show more</span>
                   </div>
 
