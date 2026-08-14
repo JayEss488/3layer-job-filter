@@ -10,7 +10,7 @@ WORKDIR /app
 # 1. Install OS dependencies, curl, and Supercronic early (optimized layer caching)
 ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.29/supercronic-linux-amd64 \
     SUPERCRONIC=supercronic-linux-amd64 \
-    SUPERCRONIC_SHA1SUM=cd48d45c4a1013f570beb4ed8665b536884f19d6
+    SUPERCRONIC_SHA1SUM=cd48d45c4b10f3f0bfdd3a57d054cd05ac96812b
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && curl -fsSLO "$SUPERCRONIC_URL" \
