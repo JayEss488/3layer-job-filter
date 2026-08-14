@@ -167,53 +167,26 @@ def parse_args():
 # Deliberately crude and deliberately symmetric. See the module docstring: the
 # delta between two arms is the finding, not the absolute rate, and every miss is
 # reported verbatim so the number can be checked rather than believed.
+#
+# THESE NOW LIVE IN full_auto AND ARE IMPORTED, NOT REDEFINED. The same matcher is
+# what _sanitize_requirements_checklist uses to promote a required ask the judge
+# filed as "secondary" back to "core" -- so the harness is measuring a decision
+# made with this exact function. A local copy would let the fix and the metric for
+# the fix drift apart and still agree with each other, which is the one way this
+# measurement could go quietly wrong. Same reasoning as SOFT_GATE_AXES having one
+# home. Do not re-inline them here to "decouple the test": the coupling IS the
+# point, and the thing being measured (does the promotion fire on the right items)
+# is not the matcher's own behaviour.
+#
+# Imported at module scope. main() imports full_auto again as a local and passes it
+# into _run_arm -- that stays exactly as it is. Safe here only because the sys.path
+# inserts near the top already ran; keep this below them.
+import full_auto as _fa_match
 
-_STOP = {
-    "a", "an", "and", "or", "of", "the", "to", "in", "with", "for", "on", "at", "as",
-    "is", "are", "be", "by", "from", "using", "use", "used", "experience", "experienced",
-    "strong", "good", "solid", "excellent", "ability", "able", "skills", "skill",
-    "knowledge", "working", "work", "understanding", "familiarity", "familiar",
-    "proven", "demonstrable", "hands", "level", "such", "including", "etc", "some",
-    "least", "plus", "years", "year",
-}
-
-
-def _tokens(s):
-    return [t for t in re.findall(r"[a-z0-9+#\.]+", (s or "").lower())
-            if t not in _STOP and len(t) > 1]
-
-
-def _content_set(s):
-    return set(_tokens(s))
-
-
-def _ask_is_covered(ask, checklist_items):
-    """Is this candidate-blind JD ask represented anywhere in the judge's checklist?
-
-    Returns the matching item (or None). Matches on containment of CONTENT tokens
-    in either direction, which is the right asymmetry to allow: the judge is
-    explicitly told to carry a hint item into the checklist "in the JD's own
-    words", so a genuine carry-over is normally an exact or near-exact restatement,
-    while the failure being measured is the item vanishing altogether. Widening
-    ("SQL" -> "data querying") is scored as covered here on purpose; it is a
-    DIFFERENT defect with its own rule in the prompt, and folding it in would make
-    one number answer two questions."""
-    a = _content_set(ask)
-    if not a:
-        return None
-    best, best_score = None, 0.0
-    for item in checklist_items:
-        text = (item or {}).get("text") or ""
-        b = _content_set(text)
-        if not b:
-            continue
-        shared = len(a & b)
-        if not shared:
-            continue
-        score = shared / min(len(a), len(b))
-        if score >= 0.5 and score > best_score:
-            best, best_score = item, score
-    return best
+_STOP = _fa_match._ASK_MATCH_STOP
+_tokens = _fa_match.ask_tokens
+_content_set = _fa_match.ask_content_set
+_ask_is_covered = _fa_match.ask_is_covered
 
 
 # A checklist item that names the ROLE'S WHOLE DOMAIN rather than an individual

@@ -8,6 +8,14 @@ import type { Attribute, RoleFamily } from "@/lib/types";
 const REGENERATE_TITLE =
   "Regenerate suggested roles for this family from its name — pinned roles are kept.";
 
+// A family's reserve pool can hold up to FAMILY_TITLE_RESERVE_TARGET (15)
+// titles server-side (see backend services/families.top_up_family_titles) —
+// that pool is what a weak search run's wider discovery window draws from,
+// not what's shown here by default. Capping the card's default view keeps it
+// from turning into a wall of chips; `roles` already arrives weight-sorted,
+// so a plain slice keeps the most-relevant titles visible when collapsed.
+const VISIBLE_ROLE_CAP = 8;
+
 /**
  * One role family = one stream the search engine runs independently (scored,
  * gated, and judged on its own — see CLAUDE.md's search-pipeline section). The
@@ -36,6 +44,10 @@ export function RoleFamilyCard({
   const fam = useFamilyMutations(profileId);
   const [name, setName] = useState(family.name);
   const [draft, setDraft] = useState("");
+  const [expanded, setExpanded] = useState(false);
+
+  const hiddenCount = Math.max(0, roles.length - VISIBLE_ROLE_CAP);
+  const visibleRoles = expanded ? roles : roles.slice(0, VISIBLE_ROLE_CAP);
 
   // Keep the input honest when the family is renamed elsewhere (or a refetch
   // lands): local state would otherwise pin the stale name on screen.
@@ -123,7 +135,7 @@ export function RoleFamilyCard({
 
       <div className="fam-sub">Such as</div>
       <div className="fam-roles">
-        {roles.map((r) => (
+        {visibleRoles.map((r) => (
           <span key={r.id} className={`chip${r.pinned ? " tinted" : ""}`}>
             <button
               className={`fam-pin${r.pinned ? " on" : ""}`}
@@ -148,6 +160,24 @@ export function RoleFamilyCard({
             </span>
           </span>
         ))}
+        {hiddenCount > 0 && !expanded && (
+          <button
+            type="button"
+            className="ghost tiny fam-more"
+            onClick={() => setExpanded(true)}
+          >
+            +{hiddenCount} more
+          </button>
+        )}
+        {expanded && roles.length > VISIBLE_ROLE_CAP && (
+          <button
+            type="button"
+            className="ghost tiny fam-more"
+            onClick={() => setExpanded(false)}
+          >
+            Show less
+          </button>
+        )}
         <span className="fam-add">
           <input
             value={draft}

@@ -573,6 +573,23 @@ MAX_USER_ROLE_FAMILIES = 4
 # own discovery pool for no reason when the theme plausibly supports more.
 FAMILY_REGEN_TARGET_COUNT = 8
 
+# The reserve pool size services/families.top_up_family_titles tops a family
+# up to (additively -- existing titles, pinned or not, are never touched or
+# replaced). Bigger than FAMILY_REGEN_TARGET_COUNT on purpose: this is the
+# pool a weak search run's wider discovery-term window (see
+# engine._weak_reference_run / full_auto.TERMS_PER_RUN_WIDE) draws from, not
+# what's shown by default -- RoleFamilyCard.tsx caps the UI to 8 chips
+# regardless of how many titles a family actually holds.
+FAMILY_TITLE_RESERVE_TARGET = 15
+
+# Below this many roles shown, the PREVIOUS first-run-of-the-day (see
+# engine._reference_run) counts as a "weak" run: this run's discovery term
+# window widens from TERMS_PER_RUN to TERMS_PER_RUN_WIDE (full_auto.py) to
+# give the boards more distinct titles to search against. A run returning at
+# or above this is left on the normal, faster window -- see
+# engine._weak_reference_run.
+WEAK_RUN_RESULT_THRESHOLD = 6
+
 # Direction is used by the engine mapping + weighting.
 ATTRIBUTE_DIRECTION = {
     "past_role": "background",

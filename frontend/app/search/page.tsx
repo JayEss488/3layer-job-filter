@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 
 import { Nav } from "@/components/Nav";
@@ -20,6 +20,15 @@ export default function SearchPage() {
   const qc = useQueryClient();
   const { data: status } = useSearchStatus(activeId);
   const running = status?.status === "running";
+  // Drives the stage-target estimates in SearchProgress — the previous
+  // finished run's own phase timings, so "about 1 min / 2 mins / 4 mins"
+  // reflects this profile's actual pipeline rather than a fixed guess.
+  // Only fetched while a run is in progress (that's the only time it's read).
+  const { data: lastRunTimings } = useQuery({
+    queryKey: ["runTimings", activeId],
+    queryFn: () => api.runTimings(activeId!),
+    enabled: !!activeId && running,
+  });
   // Collapsed by default: these are de-prioritised, not deleted, and the count
   // in the heading is the point — the user should know they exist without
   // having to scroll past them.
@@ -247,6 +256,8 @@ export default function SearchPage() {
               startedAt={status?.started_at}
               stage1Done={earlyMatches.length > 0 || verifying.length > 0}
               stage2Done={verifying.length > 0}
+              lastRunPhases={lastRunTimings?.phases}
+              lastRunTotalSeconds={lastRunTimings?.total_seconds}
             />
             <div className="warning-banner-row search-progress-foot">
               <span>{status?.message || "Starting up…"}</span>

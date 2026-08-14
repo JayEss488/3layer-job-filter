@@ -23,7 +23,12 @@ from functools import lru_cache
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..config import FAMILY_REGEN_TARGET_COUNT, FAMILY_TIER_DEFAULT, MAX_ROLE_CLUSTERS
+from ..config import (
+    FAMILY_REGEN_TARGET_COUNT,
+    FAMILY_TIER_DEFAULT,
+    FAMILY_TITLE_RESERVE_TARGET,
+    MAX_ROLE_CLUSTERS,
+)
 from ..models import Profile, ProfileAttribute, RoleFamily
 from .llm import CHEAP_MODEL, MID_MODEL, llm_json
 from .profile_intel import _BACKGROUND_TYPES, _TARGET_ROLE_GUIDANCE, _background_text, _grouped_values
@@ -551,6 +556,132 @@ Output ONLY JSON: {{"target_roles": ["..."]}}""",
     for a in new_attrs:
         db.refresh(a)
     return new_attrs
+
+
+# Reed/Adzuna do literal keyword matching on a title, not semantic search --
+# measured on a real profile (title_breadth_test2.py), short generic
+# 2-word titles fuzzy-matched into unrelated professions ("Analytics Analyst"
+# pulled "Analytical Chemist"/"Shift Analytical Chemist"; "MI Analyst" pulled
+# a "Compliance Associate"; "CRM Analyst" pulled "Senior CRM Manager"/"Sales
+# Support Admin"), while longer, more qualified phrasings stayed ~90%+
+# on-topic ("Data Insight Analyst", "Junior Data Analyst", "Data & Insights
+# Analyst"). This rule exists specifically to steer top_up_family_titles away
+# from the precision cost that test found, not a general style preference.
+_TITLE_SPECIFICITY_RULE = (
+    "These titles are used as literal keyword search terms against job boards that do "
+    "plain text matching, not semantic search -- a short, generic 1-2-word title (e.g. "
+    "\"Analytics Analyst\", \"CRM Analyst\", \"MI Analyst\") measurably pulls in unrelated "
+    "professions that happen to share a word (analytical chemistry, CRM management, "
+    "compliance). Prefer longer, more specific, still board-standard phrasings that stay "
+    "unambiguous as a search term (e.g. \"Data Insight Analyst\", \"Junior Data Analyst\")."
+)
+
+
+def top_up_family_titles(
+    db: Session, family: RoleFamily, target: int | None = None
+) -> list[ProfileAttribute]:
+    """Additively top up ONE family's target roles toward a reserve pool
+    (default FAMILY_TITLE_RESERVE_TARGET), without touching any existing
+    title -- pinned or not. The ADDITIVE counterpart to regenerate_family
+    above, which replaces every un-pinned title; this exists so a weak search
+    run's wider discovery term window (full_auto.TERMS_PER_RUN_WIDE, see
+    engine._weak_reference_run) has more titles to draw from, without
+    disturbing titles the candidate or an earlier regenerate already chose.
+
+    Idempotent and cheap once a family is at target: a single COUNT-shaped
+    SELECT and an early return, no LLM call. Called on every search run
+    (engine.run_search_task, before build_snapshot) and once in the
+    background right after CV parsing (see top_up_new_families_bg) --
+    both are safe to call repeatedly for exactly this reason."""
+    target = target or FAMILY_TITLE_RESERVE_TARGET
+    existing = db.execute(
+        select(ProfileAttribute).where(
+            ProfileAttribute.profile_id == family.profile_id,
+            ProfileAttribute.type == "target_role",
+            ProfileAttribute.family_id == family.id,
+        )
+    ).scalars().all()
+    need = target - len(existing)
+    if need <= 0:
+        return []
+
+    background = _background_text(_grouped_values(db, family.profile_id, _BACKGROUND_TYPES))
+    existing_block = (
+        "Titles already in this family -- do not repeat or reword them, only propose "
+        "distinct ADDITIONAL titles that also fit the theme below:\n"
+        + "\n".join(f"- {a.value}" for a in existing)
+        if existing else "None yet."
+    )
+    data = llm_json(
+        f"""Candidate background:
+{background or 'No background on file yet.'}
+
+This is ONE role family (search stream) the candidate is running, titled "{family.name}"
+-- propose NEW job titles that fit specifically THIS theme, to ADD to the ones it already
+has (not replace them). The candidate may have other, unrelated interests elsewhere; you
+are only shown this one family, so don't hedge toward a generic blend, commit to this
+theme.
+
+{existing_block}
+
+Propose up to {need} distinct, meaningfully different, board-standard job titles that
+genuinely fit this family's theme and aren't already covered above. Cover seniority
+phrasings and closely-adjacent specialisations that plausibly belong here. Don't pad with
+near-duplicate titles just to hit the count -- fewer genuinely distinct titles is fine.
+{_TITLE_SPECIFICITY_RULE}
+{_TARGET_ROLE_GUIDANCE}
+Output ONLY JSON: {{"target_roles": ["..."]}}""",
+        model=MID_MODEL,
+    )
+    proposed = data.get("target_roles") if isinstance(data.get("target_roles"), list) else []
+    proposed = [str(t).strip() for t in proposed if str(t).strip()][:need]
+    if not proposed:
+        return []  # transient call failure -- leave the family untouched
+
+    kept_lower = {a.value.strip().lower() for a in existing}
+    new_attrs: list[ProfileAttribute] = []
+    for value in proposed:
+        if value.lower() in kept_lower:
+            continue
+        kept_lower.add(value.lower())
+        attr = ProfileAttribute(
+            profile_id=family.profile_id, type="target_role", value=value,
+            family_id=family.id, source="ai_suggested", confirmed=False, pinned=False,
+        )
+        db.add(attr)
+        new_attrs.append(attr)
+
+    if not new_attrs:
+        return []
+    db.commit()
+    for a in new_attrs:
+        db.refresh(a)
+    return new_attrs
+
+
+def top_up_new_families_bg(profile_id: int) -> None:
+    """Background-task entrypoint for top_up_family_titles, run right after a
+    CV parse (see routers/onboarding.py::_run_formation). The request's own
+    db session is already closed by the time a FastAPI BackgroundTask runs,
+    so this opens a fresh one -- same pattern as
+    reconcile_summary_after_family_change_bg.
+
+    Deliberately NOT called inline in formation.persist_formation: that
+    function runs synchronously on the parse-cv/parse-text request, and
+    CLAUDE.md documents real prior effort spent cutting formation latency --
+    adding a blocking MID_MODEL call per family there would undo it. The
+    candidate sees their initial titles immediately; the reserve pool fills
+    in a few seconds later, invisibly. (A thin family that predates this
+    feature, or one hand-edited down, is still covered -- see the top-up call
+    in engine.run_search_task, which runs synchronously so THAT run benefits.)"""
+    from ..database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        for f in ordered_for_engine(list_families(db, profile_id)):
+            top_up_family_titles(db, f)
+    finally:
+        db.close()
 
 
 def ordered_for_engine(families: list[RoleFamily]) -> list[RoleFamily]:

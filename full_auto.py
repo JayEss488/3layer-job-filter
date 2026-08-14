@@ -153,18 +153,47 @@ REED_DETAIL_MAX_PER_RUN = int(os.getenv("REED_DETAIL_MAX_PER_RUN", "150"))
 # The fix is not to follow that redirect -- the land URL 403s a plain HTTP client and
 # is bot-walled behind the browser too. Adzuna's own detail page for the same ad id
 # (/details/{id} on the same host) returns 200 to an ordinary GET and carries the
-# whole description in a JSON-LD JobPosting block: measured 5,675 chars for the Avara
-# listing against its 500-char teaser, including the "Proven experience working as a
-# Data Analyst" clause the judge needed and never saw.
+# whole description: measured 5,675 chars for the Avara listing against its 500-char
+# teaser, including the "Proven experience working as a Data Analyst" clause the judge
+# needed and never saw.
+#
+# ADZUNA NO LONGER PUBLISHES A JSON-LD JobPosting ON THAT PAGE, and the failure was
+# SILENT for as long as it took to notice results getting worse. A live /details/ page
+# now carries exactly one application/ld+json script whose top-level JSON is a list of
+# two BreadcrumbList objects -- no JobPosting anywhere -- so _jobposting_from_html
+# correctly found nothing and fetch_adzuna_details returned text for ZERO urls on every
+# 200 it got. Nothing anywhere reported it: an empty parse is indistinguishable from a
+# listing that simply has no description, and the run funnel's adzuna_enriched=0 reads
+# the same as "the cap is 0". Measured consequence on this store: 74 of 241 judged
+# Adzuna rows had no full_text at all, and BOTH the rank 1 and rank 2 picks of a live
+# run were graded on a 500-char teaser -- the rank 1 card's headline concern was a
+# requirement ("2-4 years' professional software development experience") sitting in
+# plain text on the detail page it never read. See _jobposting_from_html for the scoped
+# markup fallback that closes it.
 #
 # Tuned far more conservatively than the Reed equivalent above, for two measured
 # reasons: the response is a ~100KB HTML page rather than a small JSON body, and the
-# host starts returning 429 after only a handful of rapid requests -- so this uses a
-# narrow pool and abandons the whole batch on repeated 429s rather than hammering a
-# host we depend on for discovery.
+# host rate-limits hard. THREE WORKERS IS ENOUGH TO TRIP IT -- 12 urls at
+# max_workers=3 returned "0/12 (rate-limited, batch cut short)" in 4.8s, while the
+# same urls fetched one at a time with a short delay returned 200 on 6 of 6. Past the
+# 429s Adzuna's CloudFront eventually serves a hard 403 for the WHOLE HOST, which is
+# the one outcome worth spending real latency to avoid: discovery (fetch_adzuna) runs
+# against the same host, so being blocked out of it costs far more than the text is
+# worth. Hence serial-by-default with a deliberate inter-request delay, a wall-clock
+# budget so a slow batch can't stretch the run's tail, and the pre-existing
+# abandon-on-repeated-429s behaviour on top.
 ADZUNA_DETAIL_ENRICH_ENABLED = os.getenv("ADZUNA_DETAIL_ENRICH_ENABLED", "true").lower() == "true"
 ADZUNA_DETAIL_MAX_PER_RUN = int(os.getenv("ADZUNA_DETAIL_MAX_PER_RUN", "80"))
-ADZUNA_DETAIL_MAX_WORKERS = int(os.getenv("ADZUNA_DETAIL_MAX_WORKERS", "3"))
+ADZUNA_DETAIL_MAX_WORKERS = int(os.getenv("ADZUNA_DETAIL_MAX_WORKERS", "1"))
+# Seconds to wait between consecutive detail fetches. Only meaningful while the pool
+# is serial (with N workers it is a per-worker delay, i.e. the effective rate is
+# N/delay); at 1 worker this IS the request rate.
+ADZUNA_DETAIL_DELAY_SECONDS = float(os.getenv("ADZUNA_DETAIL_DELAY_SECONDS", "2.0"))
+# Wall-clock ceiling for one batch. A serial fetcher has no natural bound, and this
+# sits in the run's tail (the judge-pool enrichment pass), so an unresponsive host
+# would otherwise add minutes. Whatever hasn't been fetched when this expires simply
+# keeps its teaser -- the same fail-soft contract as every other path in here.
+ADZUNA_DETAIL_BUDGET_SECONDS = float(os.getenv("ADZUNA_DETAIL_BUDGET_SECONDS", "45"))
 
 # Pages fetched per (source, term) by gather_jobs' per-run discovery. One page
 # returns up to 100 (Reed) / 50 (Adzuna) results per term. The fetchers emit a
@@ -834,28 +863,72 @@ def _adzuna_detail_url(url: str) -> str | None:
     return f"https://{host}/details/{ad_id}" if host else None
 
 
-def _jobposting_from_html(page: str) -> dict:
-    """Pull the schema.org JobPosting description (+ datePosted/validThrough,
-    when present) out of any HTML page that publishes one.
+# The container Adzuna renders one posting's own description into, now that its
+# JSON-LD JobPosting is gone (see ADZUNA_DETAIL_ENRICH_ENABLED). Deliberately a
+# SCOPED read of one element rather than _visible_text over the whole document:
+# the page continues past the description into "Stats for this job", "Receive
+# similar jobs by email" and then a "Similar jobs" list of OTHER postings, which
+# is exactly the contamination the final judge's SCOPE OF EACH POSTING'S TEXT rule
+# exists to warn about. Feeding the judge a blend of four listings' requirements
+# would be worse than the teaser starvation this is fixing -- a starved judge says
+# it cannot tell, a contaminated one is confidently wrong.
+_ADZUNA_BODY_OPEN_RE = re.compile(r'<section[^>]*\badp-body\b[^>]*>', re.I)
+_SECTION_TAG_RE = re.compile(r'<section\b|</section\s*>', re.I)
+# Below this, treat the extraction as a failure rather than a description. A
+# markup change that leaves the class on a now-empty wrapper would otherwise
+# store a fragment, and _enrich_pre_gate's beats-the-snippet guard only compares
+# LENGTH -- it cannot tell a 600-char fragment from a 600-char description.
+_ADZUNA_BODY_MIN_CHARS = 200
 
-    Written for Adzuna's detail pages, but there is nothing Adzuna-specific in
-    it -- JobPosting is a public schema every board that wants to be indexed by
-    Google for Jobs publishes, so the same reader serves the listing-liveness
-    verification pass too (see engine._verify_listings_alive), where
-    validThrough is the one FORWARD-looking expiry signal available without
+
+def _scoped_section_html(page: str, open_re: re.Pattern) -> str:
+    """Inner HTML of the first element `open_re` matches, closed DEPTH-AWARE.
+
+    A non-greedy `.*?</section>` would stop at the first nested close tag and
+    silently truncate the description mid-way -- the same shape of bug as a
+    length cap cutting a CV summary mid-sentence, and just as invisible
+    afterwards, since the result still reads like a description that simply
+    ended."""
+    m = open_re.search(page or "")
+    if not m:
+        return ""
+    rest = page[m.end():]
+    depth = 1
+    for tag in _SECTION_TAG_RE.finditer(rest):
+        depth += 1 if tag.group(0).lower().startswith("<section") else -1
+        if depth == 0:
+            return rest[:tag.start()]
+    return ""
+
+
+def _jobposting_from_html(page: str) -> dict:
+    """Pull a job posting's description (+ datePosted/validThrough, when present)
+    out of an HTML page, preferring the page's schema.org JobPosting block and
+    falling back to a scoped read of Adzuna's own description container.
+
+    Written for Adzuna's detail pages, but the JSON-LD half is not
+    Adzuna-specific -- JobPosting is a public schema every board that wants to be
+    indexed by Google for Jobs publishes, so the same reader serves the
+    listing-liveness verification pass too (see engine._verify_listings_alive),
+    where validThrough is the one FORWARD-looking expiry signal available without
     asking the employer.
 
-    Read from the page's JSON-LD rather than by scraping its rendered markup: the
-    schema.org block is a stable contract the site maintains for search engines,
-    while the surrounding HTML is ordinary site chrome that redesigns freely. It
-    also arrives already scoped to THIS posting, so none of the board's "similar
-    jobs" list can leak in -- the exact contamination the final judge's SCOPE OF
-    EACH POSTING'S TEXT rule exists to warn about.
+    JSON-LD IS STILL TRIED FIRST and its behaviour is unchanged, because it is
+    still the better source where it exists: it is a contract the site maintains
+    for search engines, it arrives already scoped to THIS posting, and it carries
+    the two dates. The markup fallback only runs when no JobPosting block is
+    found at all -- so every other caller and every other board sees exactly what
+    it saw before.
 
-    datePosted/validThrough ride along in the SAME block already being parsed for
-    description -- free to read, no extra fetch. Adzuna's own search API supplies
-    `created` (-> posted_at) but never an expiry, so validThrough is the only
-    source of expires_at this pipeline has for Adzuna at all."""
+    The fallback exists because that contract turned out not to be as stable as
+    this docstring used to claim: Adzuna dropped the JobPosting block entirely,
+    which took the parser to a permanent silent zero (see
+    ADZUNA_DETAIL_ENRICH_ENABLED for the measured damage). Note what the fallback
+    cannot do: rendered markup carries no datePosted/validThrough, so a
+    fallback-sourced result has no dates and Adzuna therefore has no expires_at
+    source at all again. That is a real loss and worth restoring if Adzuna ever
+    publishes structured dates elsewhere on the page -- but a description with no
+    dates beats 500 chars of company blurb with no dates."""
     for m in re.finditer(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>',
                          page or "", re.S | re.I):
         try:
@@ -871,6 +944,16 @@ def _jobposting_from_html(page: str) -> dict:
                         "posted_at": _loose_date_to_iso(item.get("datePosted")),
                         "expires_at": _loose_date_to_iso(item.get("validThrough")),
                     }
+
+    inner = _scoped_section_html(page, _ADZUNA_BODY_OPEN_RE)
+    if inner:
+        # _visible_text, not _strip_html: this is a fragment of a JS-framework
+        # document, so any inlined <script>/<style> contents inside it must be
+        # dropped rather than kept as prose -- the exact distinction that let a
+        # dead listing read as alive (see _looks_like_expired_listing).
+        text = re.sub(r"[ \t]*\n[ \t]*", "\n", _visible_text(inner)).strip()
+        if len(text) >= _ADZUNA_BODY_MIN_CHARS:
+            return {"description": text, "posted_at": None, "expires_at": None}
     return {}
 
 
@@ -922,14 +1005,39 @@ def fetch_adzuna_details(urls: List[str], dead_out: set | None = None) -> Dict[s
     throttled = [0]        # consecutive-ish 429 count, shared across workers
     _THROTTLE_GIVE_UP = 3
     now_iso = datetime.utcnow().isoformat()
+    deadline = time.monotonic() + max(1.0, ADZUNA_DETAIL_BUDGET_SECONDS)
+    expired_budget = [False]
+    last_request = [0.0]
+    rate_lock = threading.Lock()
+
+    def _await_slot() -> None:
+        """Space requests out. Held across the request itself so the delay is
+        between REQUESTS, not merely between the moments workers decide to
+        start -- without that, N workers all wait, all wake, and all fire at
+        once, which is the burst that trips the 429 in the first place."""
+        if ADZUNA_DETAIL_DELAY_SECONDS <= 0:
+            return
+        with rate_lock:
+            gap = time.monotonic() - last_request[0]
+            if last_request[0] and gap < ADZUNA_DETAIL_DELAY_SECONDS:
+                time.sleep(ADZUNA_DETAIL_DELAY_SECONDS - gap)
+            last_request[0] = time.monotonic()
 
     def _one(target: tuple[str, str]) -> tuple[str, dict, bool]:
         original, detail_url = target
         if throttled[0] >= _THROTTLE_GIVE_UP:
             return original, {}, False
+        if time.monotonic() >= deadline:
+            expired_budget[0] = True
+            return original, {}, False
+        _await_slot()
         try:
             r = requests.get(detail_url, headers=headers, timeout=15)
-            if r.status_code == 429:
+            # 403 as well as 429: past a burst of 429s Adzuna's CDN escalates to a
+            # blanket 403 for the host, and continuing to hammer it from here is
+            # what would take discovery down with it. Neither says anything about
+            # whether the vacancy exists, so neither is ever a dead signal.
+            if r.status_code in (429, 403):
                 throttled[0] += 1
                 return original, {}, False
             if r.status_code != 200:
@@ -960,7 +1068,11 @@ def fetch_adzuna_details(urls: List[str], dead_out: set | None = None) -> Dict[s
            for u, p, dead in results if p and not dead}
     if dead_out is not None:
         dead_out.update(u for u, _p, dead in results if dead)
-    note = " (rate-limited, batch cut short)" if throttled[0] >= _THROTTLE_GIVE_UP else ""
+    note = ""
+    if throttled[0] >= _THROTTLE_GIVE_UP:
+        note = " (rate-limited, batch cut short)"
+    elif expired_budget[0]:
+        note = f" (budget {ADZUNA_DETAIL_BUDGET_SECONDS:.0f}s spent, batch cut short)"
     emit(f"   [adzuna] full descriptions fetched for {len(out)}/{len(targets)} listing(s){note}")
     return out
 
@@ -2538,6 +2650,16 @@ def _save_cursor(profile: Dict, cursor: int) -> None:
 
 TERMS_PER_RUN = 6   # size of the rotating term window queried each run
 
+# Widened window used only when engine._weak_reference_run flags the profile's
+# previous first-run-of-the-day as thin (see backend config.WEAK_RUN_RESULT_
+# THRESHOLD) -- select_sources_for_run reads profile["terms_per_run_override"]
+# for this, set by engine.py before gather_jobs runs. Doubling the window
+# only pays off if a family actually has more titles to widen into -- see
+# services/families.top_up_family_titles, which keeps a 15-title reserve pool
+# per family for exactly this. Env-overridable like the other per-run knobs
+# in this file (SPONSOR_TERMS_PER_RUN, DISCOVERY_MAX_WORKERS).
+TERMS_PER_RUN_WIDE = int(os.getenv("TERMS_PER_RUN_WIDE", "12"))
+
 
 def _interleave_by_cluster(terms: List[str], role_clusters: List[Dict]) -> List[str]:
     """Reorder search terms so consecutive terms come from different role
@@ -2612,22 +2734,28 @@ def select_sources_for_run(profile: Dict) -> List[JobSource]:
     cur = _load_cursor(profile)
     # Slide a window over the term list so successive runs explore different
     # terms, and add one rotating broad source -- including on the first run.
-    # cur=0 naturally selects terms[:TERMS_PER_RUN] and rotation[0] (JSearch),
+    # cur=0 naturally selects terms[:terms_per_run] and rotation[0] (JSearch),
     # so no special-casing is needed there; this used to hard-return `always`
     # only on first_run, which meant a niche/non-tech profile (whose ATS batch
     # is mostly irrelevant, see the always-on comment above) got zero benefit
     # from JSearch/Remotive on the one run that most needs the extra breadth.
     # Wrap the window with modulo indexing rather than a plain slice -- a slice
-    # near the tail of `terms` silently returns fewer than TERMS_PER_RUN terms
-    # (the `or terms[:TERMS_PER_RUN]` fallback below only fires when the slice
+    # near the tail of `terms` silently returns fewer than terms_per_run terms
+    # (the `or terms[:terms_per_run]` fallback below only fires when the slice
     # is fully empty, not merely short), so a run could under-query without
     # any signal.
+    #
+    # terms_per_run_override is set by engine.py (via _weak_reference_run)
+    # when the profile's previous first-run-of-the-day came back thin -- see
+    # TERMS_PER_RUN_WIDE above. Normal runs leave it unset and get today's
+    # behaviour exactly.
+    terms_per_run = profile.get("terms_per_run_override") or TERMS_PER_RUN
     n = len(terms)
-    if n <= TERMS_PER_RUN:
+    if n <= terms_per_run:
         profile["search_terms_batch"] = list(terms)
     else:
-        start = (cur * TERMS_PER_RUN) % n
-        profile["search_terms_batch"] = [terms[(start + i) % n] for i in range(TERMS_PER_RUN)]
+        start = (cur * terms_per_run) % n
+        profile["search_terms_batch"] = [terms[(start + i) % n] for i in range(terms_per_run)]
     profile["search_terms_batch"] += _sponsor_scoped_terms(
         profile, profile["search_terms_batch"], cur)
     picked = always + [rotation[cur % len(rotation)]]
@@ -7287,11 +7415,101 @@ def _sanitize_bullets(raw) -> list[str]:
     return out
 
 
-def _sanitize_requirements_checklist(raw) -> list[dict]:
+# ── ask/checklist-item matching ──────────────────────────────────────────────────
+# Lives here rather than in tests/judge_harness.py (its original home) because
+# _sanitize_requirements_checklist now uses it to make a real decision, and the
+# harness MEASURES that decision -- two copies of the matcher would let the fix and
+# the metric for the fix drift apart and agree with each other while both being
+# wrong. Same single-source-of-truth reasoning as SOFT_GATE_AXES. The harness
+# imports these four names; keep them exported.
+#
+# Deliberately crude and deliberately symmetric.
+_ASK_MATCH_STOP = {
+    "a", "an", "and", "or", "of", "the", "to", "in", "with", "for", "on", "at", "as",
+    "is", "are", "be", "by", "from", "using", "use", "used", "experience", "experienced",
+    "strong", "good", "solid", "excellent", "ability", "able", "skills", "skill",
+    "knowledge", "working", "work", "understanding", "familiarity", "familiar",
+    "proven", "demonstrable", "hands", "level", "such", "including", "etc", "some",
+    "least", "plus", "years", "year",
+}
+
+
+def ask_tokens(s):
+    return [t for t in re.findall(r"[a-z0-9+#\.]+", (s or "").lower())
+            if t not in _ASK_MATCH_STOP and len(t) > 1]
+
+
+def ask_content_set(s):
+    return set(ask_tokens(s))
+
+
+def ask_is_covered(ask, checklist_items):
+    """Is this candidate-blind JD ask represented anywhere in the judge's checklist?
+
+    Returns the matching item (or None). Matches on containment of CONTENT tokens
+    in either direction, which is the right asymmetry to allow: the judge is
+    explicitly told to carry a hint item into the checklist "in the JD's own
+    words", so a genuine carry-over is normally an exact or near-exact restatement,
+    while the failure being measured is the item vanishing altogether. Widening
+    ("SQL" -> "data querying") is scored as covered here on purpose; it is a
+    DIFFERENT defect with its own rule in the prompt, and folding it in would make
+    one number answer two questions."""
+    a = ask_content_set(ask)
+    if not a:
+        return None
+    best, best_score = None, 0.0
+    for item in checklist_items:
+        text = (item or {}).get("text") or ""
+        b = ask_content_set(text)
+        if not b:
+            continue
+        shared = len(a & b)
+        if not shared:
+            continue
+        score = shared / min(len(a), len(b))
+        if score >= 0.5 and score > best_score:
+            best, best_score = item, score
+    return best
+
+
+def _sanitize_requirements_checklist(raw, key_requirements=None) -> list[dict]:
     """Validate/cap the final judge's requirements-checklist output (see reasoning
     step D / _FINAL_EVAL_SCHEMA) -- at most 12 items, each normalised to a fixed
     shape, so a malformed or oversized response can't corrupt the persisted verdict
-    or the card's core/secondary counts."""
+    or the card's core/secondary counts.
+
+    ALSO RE-TIERS, and that half is a correctness fix rather than hygiene. The
+    fit_level rubric reads "core" items ONLY, so an ask the posting genuinely
+    screens on that gets filed "secondary" cannot lower the grade however plainly
+    it is unmet -- it is the same silent failure as leaving the item off the
+    checklist altogether, one step later, and much harder to see because the item
+    is right there on the list. Measured over 218 persisted verdicts on this store:
+    22% of them filed a stated ask (experience/degree/years/certification
+    vocabulary) as secondary, and 34% promoted a Responsibilities DUTY to core in
+    its place. A live pick took the first line of a posting's "About You" section
+    ("Previous experience in a Data Analyst, Reporting Analyst, BI Analyst or
+    similar role", unmet) as secondary while making five "Key responsibilities"
+    duties core -- so the one bar that would have moved the grade counted for
+    nothing, and the card led with duties.
+
+    `key_requirements` is screen_gate's extracted asks with their required /
+    nice_to_have tag (see _sanitize_key_requirements). An item matching one tagged
+    "required" is promoted to core. That list is the right authority for this and
+    the reason is worth keeping: it was extracted by a pass that HAD NEVER SEEN THE
+    CANDIDATE, so unlike the judge's own tiering it cannot have been bent to fit
+    them -- which is exactly the failure step D's rules exist to prevent. It is
+    also why this is done mechanically here rather than by pushing harder on the
+    prompt: the rule step D already states ("THE POSTING'S OWN HEADING DECIDES
+    core") is correct and is being ignored, not missing, and CLAUDE.md records that
+    leaning harder on step D adds unfailable padding rather than accuracy.
+
+    Deliberately ONE-DIRECTIONAL -- it promotes, never demotes. A nice_to_have tag
+    from a pass that read a ~455-char teaser is weak evidence that an ask ISN'T
+    core (it may simply not have reached the qualifying wording), while a
+    "required" tag is a positive reading of text it did see. Same
+    unknown-is-never-a-penalty discipline the rest of the pipeline follows. Costs
+    no prompt-version bump: this is post-hoc sanitisation of the model's output,
+    not a change to what the model was asked."""
     if not isinstance(raw, list):
         return []
     out = []
@@ -7307,6 +7525,18 @@ def _sanitize_requirements_checklist(raw) -> list[dict]:
             "category": category,
             "met": bool(r.get("met", False)),
         })
+
+    secondaries = [i for i in out if i["category"] == "secondary"]
+    if secondaries:
+        for req in (key_requirements or []):
+            if not isinstance(req, dict) or req.get("necessity") != "required":
+                continue
+            hit = ask_is_covered(req.get("item"), secondaries)
+            if hit is not None:
+                hit["category"] = "core"
+                secondaries.remove(hit)
+                if not secondaries:
+                    break
     return out
 
 
@@ -7428,7 +7658,11 @@ Jobs Payload:
             if 0 <= idx < len(source):
                 merged = source[idx].copy()
                 merged.update(entry)
-                merged["requirements"] = _sanitize_requirements_checklist(merged.get("requirements"))
+                # `merged` starts as the JOB dict, so _key_requirements (screen_gate's
+                # candidate-blind extraction, annotated on in screen_gate) is already
+                # here -- the re-tiering below needs no extra plumbing.
+                merged["requirements"] = _sanitize_requirements_checklist(
+                    merged.get("requirements"), merged.get("_key_requirements"))
                 # Application guidance (reasoning step E), which replaced the old
                 # first-person top_match_reason narrative in FINAL_EVAL_PROMPT_VERSION
                 # 23. Same 700-char runaway guard the narrative had -- still a

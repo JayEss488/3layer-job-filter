@@ -34,11 +34,16 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..config import CATEGORY_EXPAND_ENABLED, DISCOVERY_ATS_CACHE_TTL_HOURS, ROLE_STALE_DAYS
+from ..config import (
+    CATEGORY_EXPAND_ENABLED,
+    DISCOVERY_ATS_CACHE_TTL_HOURS,
+    ROLE_STALE_DAYS,
+    WEAK_RUN_RESULT_THRESHOLD,
+)
 from ..database import SessionLocal
 from ..models import ListingHostStat, Role, SearchRun, JobSeen, JobEmbedding
 from . import geo, salary
-from .families import ensure_families
+from .families import ensure_families, list_families, ordered_for_engine, top_up_family_titles
 from .profile_intel import ensure_profile_intel
 from .snapshot import build_snapshot, cv_text_for_cluster
 from .moderation import filter_blocked, get_blocked_domains
@@ -561,10 +566,12 @@ MIRROR_HOSTS = frozenset({
 #
 # The verdict is "unverifiable", never "dead": nothing here is evidence the
 # vacancy has closed either, and dead_reason is unrecoverable. What that buys is
-# the three things the pipeline already does with an unverifiable row -- the
-# UNVERIFIED_RANK_PENALTY demotion, the card's honest "not verified" chip (which
-# only fires while last_verified_at is null), and the mirror-with-no-text drop --
-# instead of the false "checked live" the row carried before.
+# the two things the pipeline still does with an unverifiable row -- the
+# UNVERIFIED_RANK_PENALTY demotion and the mirror-with-no-text drop -- instead of
+# the false "checked live" the row carried before. (There used to be a third: a
+# "not verified" chip on the card. That is gone -- see CLAUDE.md's listing-liveness
+# section for why neither polarity of it earned a slot. The demotion is now the
+# whole of the consequence, which is also the reason it must keep working.)
 _LIVENESS_BLIND_HOSTS = frozenset({"linkedin.com"})
 
 
@@ -1201,6 +1208,54 @@ def _apply_scam_caution(entry: dict) -> None:
     entry["_scam_caution"] = _SCAM_CAUTION_TEXT
 
 
+def requirements_block(requirements) -> list[str]:
+    """The judge's step-D checklist rendered as a §requirements tick/cross block,
+    or [] when there is nothing to show.
+
+    Public (no leading underscore) because scripts/backfill_role_requirements_block.py
+    appends exactly this block to roles surfaced before the marker existed. That
+    script must NOT re-run _compose_analysis to get it: this function's caller also
+    reads _cluster_label, _ghost_signals and _scam_caution, which live on the run's
+    in-memory job dict and never reach eval_analysis, so a wholesale re-compose would
+    silently drop the ghost and caution explanations -- leaving those chips as the
+    unexplainable accusations they are specifically never allowed to be.
+
+    NO RATIO OR COUNT IS EMITTED, and one must not be added back. A "Matches N/M core
+    requirements" headline used to exist and was removed because a bare total doesn't
+    correlate with the fit_level badge beside it (see _compose_analysis' docstring).
+    That objection is about a NUMBER and does not carry to a list of named items:
+    "8/12" next to "Strong fit" is uninterpretable, while "✗ SC clearance or
+    eligibility for SC clearance" is something the reader checks against themselves
+    in one second.
+
+    Two things also changed since that removal. FINAL_EVAL_PROMPT_VERSION 28's step D
+    now states outright that part of this list reaches the candidate (via
+    filters_on), so it is already half-public; and v16 made fit_level derive
+    MECHANICALLY from these items, so the list and the badge can no longer disagree
+    the way they could when the checklist was a free-floating scaffold.
+
+    What it fixes: filters_on is capped at full_auto._FILTERS_ON_MAX (5) and is a
+    requirement -> evidence MAPPING, not an inventory. Measured over 218 persisted
+    verdicts, 157 (72%) hold more checklist items than the card could show -- mean
+    4.52 found against 2.28 rendered -- so a reader takes the capped block for the
+    list of requirements found and concludes the ones below the cut were missed. On
+    the listing that prompted this, all 12 requirements were correctly on the
+    checklist, including the degree reported as missing, and five reached the card."""
+    lines: list[str] = []
+    for r in (requirements or []):
+        if not isinstance(r, dict):
+            continue
+        text = str(r.get("text") or "").strip()
+        if not text:
+            continue
+        # "desirable", not "secondary": the candidate is being shown the posting's
+        # own must-have/nice-to-have distinction, and "secondary" is this pipeline's
+        # internal word for it, not one any job advert uses.
+        tier = "" if r.get("category") == "core" else " (desirable)"
+        lines.append(f"{'✓' if r.get('met') else '✗'} {text}{tier}")
+    return ["§requirements", *lines] if lines else []
+
+
 def _compose_analysis(entry: dict) -> str:
     """The card's analysis text. RoleCard.tsx splits on the §-prefixed markers.
 
@@ -1249,8 +1304,10 @@ def _compose_analysis(entry: dict) -> str:
     which was unreliable -- the judge freely re-enumerates a fresh
     requirements checklist per job (see full_auto's reasoning step D), with a
     total that doesn't correlate with the fit_level verdict badge shown right
-    next to it. `requirements` is still generated as a reasoning scaffold but
-    deliberately never surfaced here."""
+    next to it. That RATIO is still gone and must stay gone. The checklist
+    ITEMS are now rendered, as a tick/cross list under `§requirements` -- see
+    the block at the end of this function for why a list of named asks is a
+    different proposition from a bare total."""
     parts = []
     if entry.get("_cluster_label"):
         parts.append(f"Matched via: {entry['_cluster_label']} track")
@@ -1314,6 +1371,8 @@ def _compose_analysis(entry: dict) -> str:
         # dropping the only reasoning text such a row has.
         parts.append("§ai-reasoning")
         parts.append(entry["top_match_reason"].strip())
+
+    parts.extend(requirements_block(entry.get("requirements")))
 
     # Why the ghost chip fired, in the listing's own terms. The chip alone is an
     # unexplainable accusation about a named employer, so it must always be
@@ -3430,6 +3489,27 @@ def _thin_run_conditions(db: Session, profile_id: int, eng_profile: dict) -> lis
     return reasons
 
 
+def _weak_reference_run(db: Session, profile_id: int) -> tuple[bool, str]:
+    """Was the previous first-run-of-the-day (see _reference_run) thin on
+    actual results? A third consumer of _reference_run alongside
+    _thin_run_conditions/ats_on and _adaptive_examine_budget, but a
+    deliberately different signal: this one reads what the candidate actually
+    SAW (SearchRun.result_count, i.e. roles shown -- run.result_count =
+    len(final), see run_search_task), not a structural property of the
+    profile. Drives full_auto.select_sources_for_run's discovery term window
+    for this run (see TERMS_PER_RUN_WIDE) -- a run that already returns a
+    healthy result count is left on the normal, faster window.
+
+    Returns (weak, reason) so the decision lands in funnel_counts and the
+    console log, same posture as _thin_run_conditions' reasons list."""
+    ref = _reference_run(db, profile_id)
+    if ref is None:
+        return False, "no_reference_run"
+    if (ref.result_count or 0) < WEAK_RUN_RESULT_THRESHOLD:
+        return True, f"run_{ref.id}_result_count_{ref.result_count}"
+    return False, f"run_{ref.id}_ok_{ref.result_count}"
+
+
 def _reference_run(db: Session, profile_id: int) -> SearchRun | None:
     """The finished run whose selection ratio best predicts THIS run's.
 
@@ -5230,9 +5310,20 @@ async def _run_engine_pipeline(engine, eng_profile, weighted_text, cv_text_base,
         ats_note += f"; ATS on because: {', '.join(thin_reasons)}"
     else:
         ats_note = "ATS off (ordinary run -- boards only; see _thin_run_conditions)"
+
+    # Discovery term-window widening -- a different signal from thin_reasons
+    # above (actual last-run yield, not a structural profile property). See
+    # _weak_reference_run.
+    weak_ref, weak_reason = _weak_reference_run(db, profile_id)
+    eng_profile["terms_per_run_override"] = engine.TERMS_PER_RUN_WIDE if weak_ref else None
+    funnel["terms_widened"] = weak_ref
+    funnel["terms_widen_reason"] = weak_reason
+    terms_note = (f"WIDE ({engine.TERMS_PER_RUN_WIDE}) -- {weak_reason}" if weak_ref
+                  else f"normal ({engine.TERMS_PER_RUN}) -- {weak_reason}")
+
     emit(f"[pipeline] discovery start (first_run={eng_profile['first_run']}, "
          f"disabled={sorted(eng_profile['disabled_sources'])}, "
-         f"ats_batch={ats_note})")
+         f"ats_batch={ats_note}, terms_window={terms_note})")
     _progress(db, run, "Searching job boards…")
     raw_jobs = engine.gather_jobs(eng_profile)
     # search_terms_batch is set as a side effect of gather_jobs (select_sources_for_run
@@ -7035,6 +7126,15 @@ def run_search_task(profile_id: int, run_id: int) -> None:
         # creates ungrouped roles) rather than leaving snapshot._role_groups to
         # fall back to its own from-scratch, family-unaware clustering.
         ensure_families(db, profile_id)
+        # Additive top-up (never replaces/regenerates existing titles) toward
+        # FAMILY_TITLE_RESERVE_TARGET -- a no-op, no-LLM-call COUNT query for
+        # any family already at target. Must run before build_snapshot below
+        # so a thin family (an old profile predating the background top-up on
+        # CV parse, or one hand-edited down) gets its extra titles in time for
+        # THIS run's discovery, not a future one -- see
+        # services/families.top_up_family_titles.
+        for f in ordered_for_engine(list_families(db, profile_id)):
+            top_up_family_titles(db, f)
 
         snap = build_snapshot(db, profile_id)
 

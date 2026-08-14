@@ -1091,6 +1091,62 @@ of what the last finished run already recorded — see the search-pipeline secti
    > (core 5.00 → 6.67, coverage 100% → 100%, +1 pick). One residual to watch on the
    > next audit: `required_asks_mistiered_secondary` went 0 → 2, i.e. required asks
    > filed as secondary, which the rubric reads past entirely.
+   **That residual turned out to be the bigger of the two tiering faults, and it is
+   now fixed MECHANICALLY rather than by more prompt words.** Measured over 218
+   persisted verdicts on a live store: **22% filed a stated ask** (experience /
+   degree / years / certification vocabulary) **as `secondary`**, and **34% promoted a
+   Responsibilities DUTY to `core`** in its place. Since the `fit_level` rubric reads
+   `core` items ONLY, a required ask filed secondary cannot lower the grade however
+   plainly it is unmet — the same silent failure as leaving it off the checklist, one
+   step later and much harder to see, because the item is right there on the list. A
+   live pick took the first line of a posting's "About You" section (*"Previous
+   experience in a Data Analyst, Reporting Analyst, BI Analyst or similar role"*,
+   unmet) as secondary while making five "Key responsibilities" duties core, so the
+   one bar that would have moved the grade counted for nothing and the card led with
+   duties.
+   `_sanitize_requirements_checklist` now takes the `[key requirements]` hint and
+   **promotes** any checklist item filed `secondary` that matches a hint item tagged
+   `required`. Three things about it:
+   * **The hint is the right authority** for exactly the reason step D already gives
+     for anchoring on it: it was extracted by a pass that **had never seen the
+     candidate**, so unlike the judge's own tiering it cannot have been bent to fit
+     them.
+   * **One-directional — it promotes, never demotes.** A `nice_to_have` tag from a
+     pass that read a ~455-char teaser is weak evidence that an ask *isn't* core (it
+     may simply not have reached the qualifying wording), while a `required` tag is a
+     positive reading of text it did see. Same unknown-is-never-a-penalty discipline
+     as every other stage.
+   * **It costs no prompt-version bump** — this is post-hoc sanitisation of the
+     model's output, not a change to what the model was asked. Deliberately mechanical
+     rather than a step-D edit: the rule step D already states ("THE POSTING'S OWN
+     HEADING DECIDES core") is correct and is being *ignored*, not missing, and the
+     v28 note above records that leaning harder on step D adds unfailable padding
+     rather than accuracy.
+   > **Its reach is bounded by the hint, and the hint is bounded by the TEXT
+   > `screen_gate` read — not by the 4-item cap.** Measured with the harness on a live
+   > listing (Gamma, "Graduate / Early Career Reporting Analyst"): the judge filed
+   > *"Experience of databases and SQL"* and *"Experience with Python and Power BI"* as
+   > secondary. Fed the hint built from the FULL text (`SQL`, `Power BI`, both
+   > `required`) the promotion corrects **both**; fed the hint production actually sent
+   > — built from the ~500-char snippet, and reading in its entirety *"Graduate / early
+   > career reporting analyst"* and *"Reporting (likely dashboards/insights)"* — it
+   > correctly promotes **nothing**, because neither tool is named in it. The matcher is
+   > not the limit and the cap is not the limit (that hint returned 2 asks against a cap
+   > of 4): the limit is that `screen_gate` runs BEFORE enrichment, so for any source
+   > whose pre-gate cap is 0 it is extracting the posting's requirements from the
+   > company blurb. Raising `_sanitize_key_requirements`' `raw[:4]` would not have
+   > touched this case. **If this fix ever needs to reach further, the lever is
+   > `*_ENRICH_PRE_GATE_CAP`, not the cap and not the prompt** — and that trade is
+   > latency in front of first paint, which is why it is a deliberate open choice
+   > rather than an oversight.
+   The token-overlap matcher (`full_auto.ask_is_covered` / `ask_tokens` /
+   `ask_content_set` / `_ASK_MATCH_STOP`) **moved out of `tests/judge_harness.py` into
+   `full_auto.py`, and the harness now imports it.** That coupling is deliberate and
+   must not be undone "to decouple the test": the harness's
+   `required_asks_mistiered_secondary` metric measures a decision this exact function
+   makes, so two copies would let the fix and the metric for the fix drift apart and
+   agree with each other while both were wrong. Same single-home reasoning as
+   `SOFT_GATE_AXES`.
    * The `_sanitize_filters_on` / `full_auto.format_filters_on` pair still reads the
      **pre-v29 flat-string form**, which is served out of `JobSeen.eval_analysis` for
      as long as a row's `eval_signature` holds. Those strings meant "asks the
@@ -1264,6 +1320,38 @@ of what the last finished run already recorded — see the search-pipeline secti
    `§qualification` parse rule: a `✓` line ENDING IN A COLON is a bullet-list heading
    (collapsible, with its bullets), a `✓` line that doesn't is the always-visible
    `can_do_fit` verdict.
+   **`§requirements` — the step-D checklist in full, as a tick/cross list**
+   (`engine.requirements_block`, rendered under "Requirements found in the posting").
+   This partly reverses the earlier removal of a *"Matches N/M core requirements"*
+   headline, and the reversal is deliberately narrow: what was wrong with that was a
+   bare TOTAL not correlating with the `fit_level` badge beside it, and that objection
+   does not carry to a list of NAMED items — "8/12" next to "Strong fit" is
+   uninterpretable, while `✗ SC clearance or eligibility for SC clearance` is something
+   the reader checks against themselves in a second. So the items render and **no ratio
+   or count is emitted anywhere**; don't add one back. Two things also changed since
+   that removal: v28's step D now states outright that part of this list reaches the
+   candidate (via `filters_on`), so it was already half-public, and v16 made
+   `fit_level` derive *mechanically* from these items, so the list and the badge can no
+   longer disagree the way they could when the checklist was a free-floating scaffold.
+   What it fixes is a **display** gap that reads as an extraction failure: `filters_on`
+   is capped at `_FILTERS_ON_MAX` (5) and is a requirement→evidence MAPPING, not an
+   inventory, so over 218 persisted verdicts **157 (72%) held more checklist items than
+   the card could show** — mean 4.52 found against 2.28 rendered. On the listing that
+   prompted this, all 12 requirements *including* the "Bachelors degree in Computer
+   Science" reported as missing were correctly on the checklist, and five reached the
+   card. `secondary` prints as "(desirable)" — the posting's own vocabulary, not this
+   pipeline's internal word — and `✗` lines carry `.concern` so an unmet ask reads as
+   one at a glance. The heading says "found in the posting", never "everything the
+   posting asks for": this is the judge's extraction and is not guaranteed complete.
+   Note the limit on retrofitting it: `Role.ai_analysis` is FLATTENED at persist time,
+   so roles surfaced before the marker existed do not gain it from the stored verdict
+   on their own. `scripts/backfill_role_requirements_block.py` (offline, free,
+   idempotent, `--dry-run`) appends it to those rows. It **appends and never
+   re-composes** — `_compose_analysis` also reads `_cluster_label`, `_ghost_signals`
+   and `_scam_caution`, which live on the run's in-memory job dict and never reach
+   `eval_analysis`, so a wholesale re-compose would silently drop the ghost and caution
+   explanations and leave those chips as the unexplainable accusations they are
+   specifically never allowed to be.
    **Tier hand-off — what the cheap/mid stages pass forward so the judge re-derives
    less** (`full_auto._final_eval_job_block`, all as bracketed notes in each job block;
    the judge's system prompt has a `WHAT THE BRACKETED HINTS IN A JOB BLOCK ARE`
@@ -1471,15 +1559,55 @@ of what the last finished run already recorded — see the search-pipeline secti
    description in a JSON-LD `JobPosting` block. Measured 4,792 chars for the Avara
    Foods listing that prompted this, against its 500-char teaser, including the
    "Proven experience working as a Data Analyst" clause the judge needed and never
-   saw. Read from the JSON-LD rather than the rendered markup: it's a stable
-   schema.org contract, and it arrives already scoped to this posting so the board's
-   "similar jobs" list can't leak in.
-   Throttled much harder than the Reed twin — `ADZUNA_DETAIL_MAX_WORKERS` (3, vs
-   Reed's 12) and `ADZUNA_ENRICH_PRE_GATE_CAP` (40, vs 100) — because each response
-   is a ~100KB HTML page and the host starts returning 429 after a handful of rapid
-   requests; on repeated 429s the batch is abandoned outright rather than retried,
-   since being rate-limited out of *discovery* (same host) would cost far more than
-   the text is worth. Both enrichers share `engine._enrich_pre_gate`, which owns the
+   saw.
+   > ⚠ **That JSON-LD block is GONE, and its disappearance was silent for weeks.**
+   > A live `/details/{id}` now carries exactly one `application/ld+json` script whose
+   > top-level JSON is a **list of two `BreadcrumbList` objects** — no `JobPosting`
+   > anywhere. `_jobposting_from_html` correctly found nothing, so
+   > `fetch_adzuna_details` returned text for **zero** urls on every 200 it got, and
+   > nothing anywhere reported it: an empty parse is indistinguishable from a listing
+   > with no description, and `adzuna_enriched=0` in the run funnel reads exactly like
+   > "the cap is 0". Measured damage before the fix: **74 of 241 judged Adzuna rows
+   > had no `full_text` at all**, and both the **rank 1 and rank 2** picks of a live
+   > run were graded on a 500-char teaser — the rank-1 card's headline concern was a
+   > requirement (*"2-4 years' professional software development experience"*) sitting
+   > in plain text on the detail page it never read.
+   >
+   > The description is still on the page, in `<section class="adp-body …">`.
+   > `_jobposting_from_html` now falls back to a **scoped** read of that element
+   > (`_scoped_section_html` + `_visible_text`) when no `JobPosting` block is found;
+   > JSON-LD is still tried first and its behaviour is unchanged, so every other
+   > board and `_verify_listings_alive` see exactly what they saw before. Measured
+   > 8/8 live listings at 890–4,816 chars against their 500-char teasers.
+   >
+   > Three things about the fallback are load-bearing. **It must stay scoped** — the
+   > page continues past the description into "Stats for this job", "Receive similar
+   > jobs by email" and a **"Similar jobs" list of other postings**, which is the
+   > contamination the judge's SCOPE OF EACH POSTING'S TEXT rule exists to prevent; a
+   > whole-page `_visible_text` would blend four listings' requirements, which is
+   > *worse* than the teaser starvation it fixes (a starved judge says it cannot tell,
+   > a contaminated one is confidently wrong). **The closing tag is matched
+   > depth-aware**, because a non-greedy `.*?</section>` truncates at the first nested
+   > close and the result still reads like a description that merely ended. And a
+   > sub-`_ADZUNA_BODY_MIN_CHARS` extraction is treated as **no result**, since
+   > `_enrich_pre_gate`'s beats-the-snippet guard only compares LENGTH and cannot tell
+   > a 600-char fragment from a 600-char description. Note what is genuinely lost:
+   > rendered markup carries no `datePosted`/`validThrough`, so a fallback-sourced
+   > row has no dates and Adzuna again has no `expires_at` source at all.
+   Throttled much harder than the Reed twin — and **harder again since the fix**,
+   because the old setting was itself part of the failure. `ADZUNA_DETAIL_MAX_WORKERS`
+   is now **1** (was 3) with `ADZUNA_DETAIL_DELAY_SECONDS` (2.0) between requests and
+   `ADZUNA_DETAIL_BUDGET_SECONDS` (45) as a wall-clock ceiling, against Reed's 12
+   workers. Three workers is enough to trip the host: 12 urls at `max_workers=3`
+   returned *"0/12 (rate-limited, batch cut short)"* in 4.8s, while the same urls
+   fetched one at a time with a short delay returned 200 on 6 of 6. Past the 429s
+   Adzuna's CloudFront escalates to a blanket **403 for the whole host** — which is
+   why `fetch_adzuna_details` now counts 403 alongside 429 toward giving up, and why
+   spending real latency here is correct: discovery (`fetch_adzuna`) runs against the
+   same host, so being blocked out of it costs far more than the text is worth.
+   Neither status is ever a dead signal. Serial is affordable *at this call site
+   specifically* — the judge-pool pass is bounded by `JUDGE_POOL` and runs after the
+   cards are already on screen. Both enrichers share `engine._enrich_pre_gate`, which owns the
    subtle half: only text that BEATS the snippet is stored, `_has_full_text` must be
    set or the gate cache-key richness marker goes stale, and the DB write is one
    indexed SELECT + commit.
@@ -2036,14 +2164,19 @@ inbox at the time.
 
 **Deliberately NOT built: post-run re-checking.** No endpoint re-verifies a role after its
 run, and a saved role is never re-checked. The guarantee is "live when shown", not "live
-forever". The card therefore badges the **absence** of a check, not its presence
-(`RoleCard.unverifiedChip`): since `_verify_final_picks` verifies every pick
-unconditionally, a positive "Checked live" chip was a constant on every card and carried
-no information, while a row that was never verified at all (provisional/quick-scored, or
-from a run predating the check) is worth saying. It fires on the stable property — no
-`last_verified_at` on the row — never on a clock, because a role verified last week WAS
-verified when it was shown, and ageing the chip into a warning would contradict the
-guarantee above rather than restate it.
+forever".
+
+**None of this is shown on the card any more, and the chip should not come back in either
+polarity.** It ran twice. As "Checked live" it was a constant — `_verify_final_picks`
+verifies every pick unconditionally — so it carried no information. Flipped to badge the
+**absence** instead (`RoleCard.unverifiedChip`, now removed) it was no better: the rows it
+fires on are exactly the provisional and quick-scored ones, plus rows from runs predating
+the check, so it reads as a caveat about a particular listing while really just restating
+which section of the page the card is in. Everything behind it is untouched and still
+load-bearing — `last_verified_at` is still stamped, `UNVERIFIED_RANK_PENALTY` still demotes
+an unverifiable row in `_selection_score` only, and a confirmed-dead listing is still
+dropped before it can be shown. The verification does its work by deciding what reaches the
+page, which is the right place for it; it never needed a badge.
 
 **Check order, and the trap in it.** 404/410 first (the workhorse — every genuine death
 in a 45-row live sample was a hard 404, nothing else contributed one), then a schema.org

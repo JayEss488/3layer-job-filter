@@ -31,6 +31,7 @@ const QUALIFICATION = "§qualification";
  *  under 22 or earlier keep rendering their narrative until re-judged. */
 const AI_REASONING = "§ai-reasoning";
 const APPLY_HIGHLIGHTS = "§apply-highlights";
+const REQUIREMENTS = "§requirements";
 const GHOST = "§ghost";
 const CAUTION = "§caution";
 
@@ -51,6 +52,12 @@ interface Analysis {
    *  sentence — behind "Show more". Rows judged before FINAL_EVAL_PROMPT_VERSION 29
    *  carry the older single "This role likely filters on: …" lead instead. */
   applyHighlights: string[];
+  /** The judge's full requirements checklist as "✓ ..."/"✗ ..." lines, one per ask
+   *  — behind "Show more". Distinct from `applyHighlights`, which is capped at 5 and
+   *  pairs an ask with the candidate's evidence: this is the inventory, so a reader
+   *  can see what was found rather than inferring it from a truncated mapping.
+   *  Absent on rows judged before the marker existed, which simply don't render it. */
+  requirements: string[];
   /** Pre-v23 narrative paragraph — behind "Show more". Replaced by
    *  `applyHighlights`; only ever populated on a not-yet-re-judged row. */
   aiReasoning: string[];
@@ -83,10 +90,10 @@ interface Analysis {
 function parseAnalysis(text: string): Analysis {
   const out: Analysis = {
     headline: null, notes: [], legacy: [], qualificationVerdict: [], qualification: [],
-    applyHighlights: [], aiReasoning: [], ghost: [], caution: [],
+    applyHighlights: [], requirements: [], aiReasoning: [], ghost: [], caution: [],
   };
-  let bucket: "lead" | "qualification" | "applyHighlights" | "aiReasoning" | "ghost"
-    | "caution" = "lead";
+  let bucket: "lead" | "qualification" | "applyHighlights" | "requirements"
+    | "aiReasoning" | "ghost" | "caution" = "lead";
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
@@ -94,6 +101,8 @@ function parseAnalysis(text: string): Analysis {
       bucket = "qualification";
     } else if (line === APPLY_HIGHLIGHTS) {
       bucket = "applyHighlights";
+    } else if (line === REQUIREMENTS) {
+      bucket = "requirements";
     } else if (line === AI_REASONING) {
       bucket = "aiReasoning";
     } else if (line === GHOST) {
@@ -198,26 +207,20 @@ function distanceChip(role: Role): string | null {
   return `${miles} miles away`;
 }
 
-/**
- * The INVERSE of the old "Checked live" chip, and the inversion is the point.
+/*
+ * There is deliberately no "Not checked live" / "Checked live" chip here any more.
  *
- * engine._verify_final_picks verifies every final pick unconditionally before
- * any Role row is written, so a positive badge was on essentially every card
- * the user ever saw — a constant, which carries no information and trains the
- * reader to stop looking at that row of chips. What actually varies is the
- * absence: a provisional/quick-scored row, or a row from a run predating the
- * check, was never verified at all, and THAT is worth saying.
+ * It was the inverse of an earlier positive badge: since engine._verify_final_picks
+ * verifies every final pick unconditionally, "Checked live" was a constant and so
+ * carried no information, and the chip was flipped to mark the absence instead. But
+ * the absence turned out not to be worth a slot either — it is true of every
+ * provisional and quick-scored row by construction, so it reads as a caveat about
+ * THIS role while actually describing which section of the page the card is in.
  *
- * Fires on the stable property (there is no verification timestamp on this row),
- * never on a clock. An age-out would put a warning on every saved role a day
- * later, which is not what it means — the guarantee is "live when shown", and a
- * role verified last week was still verified when it was shown. Provisional
- * cards are excluded: the card already says it is mid-run.
+ * The backend is untouched: last_verified_at is still stamped, UNVERIFIED_RANK_PENALTY
+ * still demotes an unverifiable row in _selection_score, and dead listings are still
+ * dropped before they can be shown. This was display only.
  */
-function unverifiedChip(role: Role): string | null {
-  if (role.provisional) return null;
-  return role.last_verified_at ? null : "Not checked live";
-}
 
 /**
  * Visa sponsorship, which is TWO different questions and used to be shown as
@@ -366,13 +369,11 @@ function factChips(
         : null,
     ),
     chip(ageChip(role)),
-    chip(unverifiedChip(role)),
-    // Next to unverifiedChip on purpose: the two answer adjacent questions —
-    // "does this listing still exist" and "is there a job behind it".
+    // These two are caveats about whether the listing is what it appears to be —
+    // "is there a job behind it" and "is this employer what it says" — so they sit
+    // together rather than scattered among the neutral facts, and both are styled
+    // as warnings.
     chip(ghostChip(role, hasGhostNotes), true),
-    // Beside the ghost chip for the same reason it sits beside unverifiedChip:
-    // all three are caveats about whether the listing is what it appears to be,
-    // and they should read as one group rather than be scattered among the facts.
     chip(cautionChip(hasCautionNotes), true),
     chip(sponsorChip(role, sponsorFilterOn)),
     chip(distanceChip(role)),
@@ -409,6 +410,7 @@ export function RoleCard({
     (a.qualificationVerdict.length > 0 ||
       a.qualification.length > 0 ||
       a.applyHighlights.length > 0 ||
+      a.requirements.length > 0 ||
       a.aiReasoning.length > 0 ||
       a.ghost.length > 0 ||
       a.caution.length > 0);
@@ -417,6 +419,7 @@ export function RoleCard({
     (a.legacy.length > 0 ||
       a.qualification.length > 0 ||
       a.applyHighlights.length > 0 ||
+      a.requirements.length > 0 ||
       a.aiReasoning.length > 0 ||
       a.ghost.length > 0 ||
       a.caution.length > 0);
@@ -538,6 +541,24 @@ export function RoleCard({
                         // "- " convention the qualification block uses, but
                         // .an-map rather than .an-sub — see globals.css.
                         <div key={i} className={l.startsWith("- ") ? "an-map" : undefined}>
+                          {l}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {a.requirements.length > 0 && (
+                    <div className="an-sec">
+                      {/* Deliberately headed "found in the posting", not
+                          "everything the posting asks for". This is the judge's
+                          extraction, and it is not guaranteed complete -- the
+                          heading should not make a claim the list can't keep. */}
+                      <div className="an-h">Requirements found in the posting</div>
+                      {a.requirements.map((l, i) => (
+                        // "✗" lines carry .concern so an unmet ask reads as one at
+                        // a glance; met asks stay neutral. No count or ratio is
+                        // rendered here or in engine._compose_analysis -- see the
+                        // §requirements block there for why.
+                        <div key={i} className={l.startsWith("✗") ? "concern" : undefined}>
                           {l}
                         </div>
                       ))}

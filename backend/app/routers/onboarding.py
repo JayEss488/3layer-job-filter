@@ -17,7 +17,7 @@ from ..schemas import (
     SuggestOut,
 )
 from ..services import formation
-from ..services.families import ensure_families
+from ..services.families import ensure_families, top_up_new_families_bg
 from ..services.harvest import harvest_for_profile
 from ..services.llm import llm_json
 from ..services.parsing import CVParseFailed, extract_text_from_upload
@@ -145,6 +145,10 @@ async def _run_formation(
     # Grow the ATS company set for this profile's sectors, off-request. Skips its
     # own SerpAPI spend when the derived keywords are unchanged (see harvest.py).
     background.add_task(harvest_for_profile, profile.id)
+    # Top up each seeded family's title reserve pool toward
+    # FAMILY_TITLE_RESERVE_TARGET, off-request -- see
+    # families.top_up_new_families_bg for why this must not run inline here.
+    background.add_task(top_up_new_families_bg, profile.id)
     return created
 
 
