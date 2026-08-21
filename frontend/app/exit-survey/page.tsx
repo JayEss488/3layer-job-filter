@@ -32,8 +32,8 @@ import { getUsername, setBetaExpired, setNeedsExitSurvey } from "@/lib/auth";
 const FEATURES: { slug: string; label: string }[] = [
   { slug: "ghost_check", label: "Ghost job checking" },
   { slug: "sponsor_check", label: "Visa sponsor checking" },
-  { slug: "one_line_summary", label: "The one-line role summary" },
-  { slug: "why_qualified", label: "The “why you’re qualified” summary" },
+  { slug: "one_line_summary", label: "The role bullet points" },
+  { slug: "why_qualified", label: "The qualification ticklist" },
   { slug: "none", label: "None of these" },
 ];
 

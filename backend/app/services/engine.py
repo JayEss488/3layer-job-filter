@@ -1899,6 +1899,53 @@ def _keep_richer_copy(kept: list[dict], pos: int, challenger: dict) -> None:
     kept[pos] = merged
 
 
+# ── Trading-name/feed-variant company matching, for the near-text dup check ──
+#
+# _norm_company only strips legal-entity suffixes, so two names that are
+# plainly the same organisation still compare unequal: a recruiter posting
+# through several trading names ("Hays Specialist Recruitment Limited" /
+# "Hays" / "Hays Accounts and Finance"), or one employer whose feed reports it
+# inconsistently ("GlobalData" / "GlobalData UK Ltd" / "GlobalData PLC"). Live
+# case: "Charalle Recruitment Limited" and "Charalle Group" reached the
+# results page as two separate "Marketing Administrator" cards, body text
+# word-for-word identical, because every existing dedup path (_dup_key,
+# _find_soft_duplicate, _same_vacancy's own company gate) requires an EXACT
+# normalized-company match first.
+#
+# _company_first_token gives _suppress_judge_duplicates a second way to group
+# candidates for the near-text check: two DIFFERENT company strings that share
+# a leading, non-generic token. Deliberately narrow -- only the FIRST token,
+# and only when it survives _GENERIC_COMPANY_WORDS, since a bare "Group" /
+# "Recruitment" / "Solutions" / etc. says nothing about identity and would
+# merge unrelated employers that both happen to use one as a suffix. Measured
+# over the live store: of 25,016 same-canonical-title, different-company pairs
+# already at or above _same_vacancy's own 0.65 containment bar, this rule
+# keeps 175 and drops the rest; every one of the 175 hand-scanned is a genuine
+# trading-name or feed-formatting variant of one employer (Hays, Oscar,
+# GlobalData, Capital One, Randstad, Salt, Ocho, Michael Page, Davies Group,
+# Concern Worldwide, Charalle...), while pairs with no safe shared anchor
+# (e.g. "Qodea"/"Beyond") are correctly left unmerged. The risk this accepts
+# is the same one _same_vacancy already accepts for a single company posting
+# several distinct reqs off one boilerplate template -- a false merge here
+# costs one judge slot on a near-identical role and is recoverable, since the
+# dropped copy keeps its cached rank score and is never persisted as rejected.
+_GENERIC_COMPANY_WORDS = {
+    "the", "a", "an", "we", "group", "recruitment", "recruiting", "talent",
+    "solutions", "services", "careers", "consulting", "consultancy",
+    "staffing", "resourcing", "people", "resource", "resources", "partners",
+    "associates", "specialist", "specialists", "agency", "jobs", "uk", "ltd",
+    "limited", "plc", "llp", "holdings", "international", "global", "digital",
+    "professional", "professionals",
+}
+
+
+def _company_first_token(company_norm: str) -> str | None:
+    for tok in re.findall(r"[a-z0-9]+", company_norm):
+        if tok not in _GENERIC_COMPANY_WORDS and len(tok) > 2:
+            return tok
+    return None
+
+
 def _suppress_judge_duplicates(
     rank_by_cluster: dict[int, list[dict]],
     decided_keys: set[tuple[str, str]] | None = None,
@@ -1914,10 +1961,13 @@ def _suppress_judge_duplicates(
 
     Three tests, in cost order: an exact normalized-prefix key (_dup_key, catches
     a recruiter template reposted verbatim), a near-identical-text check within
-    the same company and EQUIVALENT title (_same_vacancy + _canonical_title_key,
-    catching both the same vacancy syndicated to a second board with different
-    chrome and truncation, and one vacancy advertised under several
-    near-synonymous titles), and -- when
+    an EQUIVALENT title (_same_vacancy + _canonical_title_key) whose company
+    either matches exactly or shares a distinctive leading token
+    (_company_first_token -- catches both the same vacancy syndicated to a
+    second board with different chrome/truncation and one vacancy advertised
+    under several near-synonymous titles, now also across a recruiter's
+    several trading names or a feed's inconsistent company formatting), and --
+    when
     `decided_keys` is supplied -- a CROSS-RUN family check against roles the user
     has already saved or applied to (see _decided_role_keys).
 
@@ -1936,7 +1986,7 @@ def _suppress_judge_duplicates(
     # would be interpreted against whichever cluster happened to be in scope and
     # could substitute into an unrelated row, or run off the end.
     seen: dict[tuple, tuple[list, int]] = {}
-    kept_texts: dict[tuple[str, frozenset], list[tuple[frozenset, list, int]]] = defaultdict(list)
+    kept_texts: dict[frozenset, list[tuple[str, str | None, frozenset, list, int]]] = defaultdict(list)
     suppressed = 0
     decided_hits: dict[tuple[str, str], int] = defaultdict(int)
     for idx, jobs in rank_by_cluster.items():
@@ -1963,11 +2013,17 @@ def _suppress_judge_duplicates(
             # no employer to anchor on, two unrelated postings sharing a generic
             # title and boilerplate could merge. _dup_key's own blank-company path
             # (title + location + exact prefix) still covers aggregator reposts.
+            token = _company_first_token(company) if company else None
             shingles = _text_shingles(j) if company and title else frozenset()
-            group = kept_texts[(company, title)] if shingles else None
+            # Grouped by title alone (company is no longer part of the bucket
+            # key) so a trading-name/feed variant of the same employer -- see
+            # _company_first_token above -- lands in the same bucket instead of
+            # a company-keyed one it could never reach.
+            group = kept_texts[title] if shingles else None
             if group is not None:
-                hit = next(((lst, pos) for s, lst, pos in group
-                            if _same_vacancy(shingles, s)), None)
+                hit = next(((lst, pos) for comp, tok, s, lst, pos in group
+                            if (comp == company or (token and tok == token))
+                            and _same_vacancy(shingles, s)), None)
                 if hit is not None:
                     suppressed += 1
                     _keep_richer_copy(*hit, j)
@@ -1976,7 +2032,7 @@ def _suppress_judge_duplicates(
             if key is not None:
                 seen[key] = (kept, pos)
             if group is not None:
-                group.append((shingles, kept, pos))
+                group.append((company, token, shingles, kept, pos))
             kept.append(j)
         rank_by_cluster[idx] = kept
     return suppressed, sum(decided_hits.values()), dict(decided_hits)

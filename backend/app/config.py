@@ -128,9 +128,10 @@ SIGNUP_PRIORITY_CHOICES = [
 #     one specific day, which is the single most likely way to collect nothing.
 #   * BETA_WINDOW_DAYS -- access lapses (a real 403, see require_active_beta).
 #
-# Note what CANNOT enforce this: TOKEN_MAX_AGE_SECONDS above is 30 days, far
-# longer than the window, so token expiry is no help and the check is its own.
-BETA_WINDOW_DAYS = int(os.getenv("BETA_WINDOW_DAYS", "7"))
+# Note what CANNOT enforce this: TOKEN_MAX_AGE_SECONDS above is 30 days, the
+# same length as the window below, so token expiry is not a reliable backstop
+# for it and the check is its own.
+BETA_WINDOW_DAYS = int(os.getenv("BETA_WINDOW_DAYS", "30"))
 EXIT_SURVEY_AFTER_DAYS = int(os.getenv("EXIT_SURVEY_AFTER_DAYS", "4"))
 
 # Q2 of the wrap-up survey: which features materially proved useful (multi
@@ -141,8 +142,10 @@ EXIT_SURVEY_AFTER_DAYS = int(os.getenv("EXIT_SURVEY_AFTER_DAYS", "4"))
 EXIT_SURVEY_FEATURE_CHOICES = [
     "ghost_check",        # ghost job checking
     "sponsor_check",      # visa sponsor checking
-    "one_line_summary",   # the one-line role summary
-    "why_qualified",      # the "why qualified" summary
+    "one_line_summary",   # now the role bullet points (was the one-line summary,
+                           # pre-v23 card format)
+    "why_qualified",      # now the qualification ticklist (was the "why qualified"
+                           # summary, pre-v29 card format)
     "none",               # none of these
 ]
 

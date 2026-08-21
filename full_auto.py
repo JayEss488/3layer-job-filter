@@ -6397,6 +6397,40 @@ async def expand_category_pages(
 # forbade even mentioning it in "concerns", so the judge could neither reject nor flag
 # it. A v20 verdict was reached under a rule that could not fail a remote role.
 #
+# 33 (from 32): EVIDENCE STRENGTH's anecdote-stretching rule now also governs the
+# step-D checklist's own "met" field, not just can_do_fit/filters_on/highlight -- and
+# step D gained two rules of its own that follow from it. Found on a live store:
+# role_id 501 ("New Job" @ Red Sky Personnel, a Health & Safety data-and-reporting
+# role) ticked "Health and Safety data reporting" MET off the candidate's Night
+# Supervisor/Rides Host safety-SUPERVISION responsibilities -- the exact
+# "safety-critical responsibility" anecdote rule 8 already names by example, but rule
+# 8's own sentence only said not to present it in "can_do_fit", "filters_on" or
+# "highlight", never "requirements". Since step D (the checklist) runs before step E
+# (the evidence mapping) in the mandated order of work, the ungoverned field is also
+# the FIRST one written -- the wrong "met": true was already locked in by the time the
+# guarded fields ran, and they just explained it. Rule 8's own text now says so
+# directly, and step D's "met" paragraph carries a forward-pointing sentence with a
+# second, distinct live example (role_id 469, "procurement data across multiple
+# systems" ticked met off an unrelated contact-sourcing pipeline) so the check fires
+# at the point the decision is actually made, not only in the separately-numbered rule
+# a model may read as scoped to later fields.
+# Also measured: the SAME Robert Half "Data & Reporting Analyst" posting
+# (near-identical text, two branches, role_id 464 and role_id 500) scored "Strong
+# hands-on Power BI experience" as unmet in one run and met in the next, off the SAME
+# self-directed Player Analytics evidence both times -- a track-record ask ("Strong
+# hands-on ... experience") graded inconsistently depending on whether the checklist
+# item's own wording happened to retain "experience" that run. Traced to step D's
+# "KEEP THE JD'S OWN SPECIFICITY" rule not naming this compression: "Experience
+# producing reports, dashboards ..." (Opus, role_id 468) was rendered as bare "Produce
+# reports, dashboards ..." -- which reads as a capability ask, not a track-record one,
+# so EVIDENCE STRENGTH's self-directed-is-weaker discipline no longer applies to it
+# once the word is gone. The rule now names this compression explicitly and gives a
+# before/after pair alongside the existing degree/ETL ones.
+# Neither change touches the rubric or any disqualifier -- both are about what counts
+# as evidence for an already-decided checklist item, not about grading -- but a v32
+# checklist may carry "met": true on an item a v33 read of the identical text would
+# mark false, so it is not comparable.
+#
 # 29 (from 28): the OUTPUT-ORDER rework. Three connected changes.
 #   (a) The item shape now emits "requirements" and "filters_on" BEFORE "concerns",
 #       "fit_level" and "can_do_fit". The rubric has said since v16 that the grade is
@@ -6437,7 +6471,21 @@ async def expand_category_pages(
 # tightened step F's "[] when nothing concrete" escape on "role_duties" -- it was
 # being read too liberally, and an empty list costs the card its whole second
 # column, not just a sentence.
-FINAL_EVAL_PROMPT_VERSION = 31
+#
+# 32 (from 31): closed a vacuous-truth hole in the fit_level rubric. "very_strong"/
+# "strong" require every CORE item met and no concern touching one -- but a checklist
+# with zero or one core item satisfies that trivially, because there is almost
+# nothing on it to fail. Live case: "Internal Communications Officer" (Veolia), a
+# three-bullet mission-statement teaser with no named tool, system or experience
+# bar, graded "very_strong" with a single concern reading "Limited posting detail
+# available" -- the model correctly saw the posting was too thin to judge, wrote
+# that down, and the grade ignored it anyway, because the concern named the
+# POSTING's thinness rather than a specific unmet core item, which is the only
+# thing the mechanical test can see. The rubric now caps any <2-core-item checklist
+# at "ok", with an explicit anti-gaming line against padding the checklist with an
+# unfailable item to dodge the cap (the exact failure the SHAPE TEST already exists
+# to prevent).
+FINAL_EVAL_PROMPT_VERSION = 33
 
 _FINAL_EVAL_QUOTE_PROTOCOL = """QUOTE-THEN-CLASSIFY (applies to every disqualifier below before you exclude a role under
 it): quote the exact clause you're relying on, verbatim, max 20 words, then classify it HARD
@@ -6738,8 +6786,12 @@ _FINAL_EVAL_STRONG_RULES = """8. EVIDENCE STRENGTH: The candidate's background p
    soft-skill/reliability anecdote (e.g. safety-critical responsibility, leadership of an unrelated
    activity, an Informal-tagged role, or a Self-directed/Academic/AI-assisted-tagged skill), that is NOT
    evidence the requirement is met unless the connection to the requirement is direct and explicitly
-   stated - do not present it as satisfying the requirement in "can_do_fit", "filters_on" or
-   "highlight". Put
+   stated - THIS GOVERNS THE STEP-D CHECKLIST FIRST, not only the fields that explain it afterwards: do
+   not mark it "met": true in "requirements", and do not present it as satisfying the requirement in
+   "can_do_fit", "filters_on" or "highlight" either. The checklist is written before the evidence mapping
+   (see the ORDER OF WORK) -- a stretched match that slips into "met" there is already decided by the
+   time you write the later fields, so check this rule at the moment you judge "met", not only when you
+   write the prose that explains it. Put
    any such gap in "concerns" instead, naming the specific origin/depth limitation (e.g. "Salesforce
    experience is self-directed/sandbox, not production or paid use").
    Also weigh CUMULATIVE nice-to-have gaps: several compounding smaller gaps (e.g. no fintech background
@@ -6828,7 +6880,12 @@ D. Build a REQUIREMENTS CHECKLIST. This is the field every other field depends o
    degree", "attention to detail", a tool the candidate has genuinely used even informally). Reserve "met":
    false for a requirement with no real evidence at all, OR one that specifically implies professional/
    production-grade competency where only weak/self-directed/AI-assisted evidence exists (see EVIDENCE
-   STRENGTH). Do not let a strict evidence read collapse EVERY requirement to unmet just because the
+   STRENGTH). "Met" ALSO requires the evidence to be FOR THIS SPECIFIC ASK, not merely adjacent to it: a
+   generic or topically-unrelated anecdote is not evidence unless the connection is direct and explicitly
+   stated, however plausible the match feels while you are writing it -- a safety-supervision role does
+   not evidence "health and safety data reporting", and a data-cleaning project in one domain does not
+   evidence a named ask in an unrelated domain. A shared word between the ask and the candidate's
+   background is not a shared skill. Do not let a strict evidence read collapse EVERY requirement to unmet just because the
    candidate is early-career -- an entry-level candidate genuinely satisfying most secondary asks and some
    core ones is the normal, expected outcome, not an exception; a checklist that comes back all-false
    carries no information for the candidate and should prompt you to re-check whether you're over-applying
@@ -6879,6 +6936,13 @@ D. Build a REQUIREMENTS CHECKLIST. This is the field every other field depends o
      the item is that, not "systems experience". If it asks for ETL work, the item is "ETL", not "data
      transformation". Widening the ask until the candidate's profile covers it is the same error as
      marking it met with no evidence, and is harder to spot afterwards.
+     THIS INCLUDES THE WORD "EXPERIENCE" ITSELF. A JD asking for "previous experience in a Data Analyst,
+     Reporting Analyst or similar role" is a TRACK-RECORD ask, not "Data analysis"; one asking for
+     "experience producing reports and dashboards" keeps "experience producing", not just "Produce
+     reports and dashboards". Dropping "experience"/"previous experience in" turns a track-record ask --
+     which EVIDENCE STRENGTH says a self-directed project cannot satisfy on its own -- into a bare
+     capability ask that the same evidence freely meets, silently loosening the bar you then judge "met"
+     against. If the JD phrases it as experience, the checklist item says experience too.
    - THE DOMAIN-DEFINING ASKS ARE ALWAYS "core". Whatever the person actually spends most days doing --
      the named technical domain, the named tooling, the subject matter that makes this job the job it is
      -- is core by definition and cannot be filed as "secondary" because the candidate lacks it. If you
@@ -7145,6 +7209,26 @@ evidence is portfolio-based, not paid" -- IS such a concern, not a footnote):
 - "ok": exactly one core requirement "met": false, OR two or more concerns touching core
   requirements.
 - "stretch": two or more core requirements "met": false.
+A checklist with FEWER THAN TWO core items can never grade "very_strong" or "strong", whatever
+"met" says -- cap it at "ok" or below. Step D's own target is 4-10 core items; landing at zero
+or one is essentially never a genuinely narrow role and is almost always a posting too vague to
+state real requirements from (a mission-statement teaser, a few generic duty bullets with no
+named tool, system, qualification or experience bar). "Every core requirement met and no
+concern touching one" is true of that checklist only because there was barely anything on it to
+fail -- vacuously true, not honestly earned -- which is exactly the "Limited posting detail
+available" case: the model correctly noticed the posting said too little, wrote that as a
+concern, and then graded "very_strong" anyway because the concern named the POSTING's own
+thinness rather than naming (or being able to name) a specific unmet core item, so the rubric's
+mechanical "did a concern touch a core item" test could not see it. Treat a checklist this thin
+as its own concern instead: name the posting's lack of real detail explicitly in "concerns"
+("the posting states almost nothing concrete about this role's day-to-day requirements, so fit
+here is largely unverified") and let this cap -- not the concern-touches-core test -- hold the
+grade down. Do NOT respond to this rule by inventing a second or third core item that fails the
+SHAPE TEST to dodge the cap; a fabricated-to-order item is the exact failure step D's SHAPE TEST
+exists to prevent, and reaching for one here reintroduces it. If the posting genuinely supports
+only one or two core asks because the role really is that narrowly scoped (a single named tool,
+a single stated duty, nothing more to it), say so plainly in "can_do_fit" rather than grading
+around the cap.
 Grade every pick this way whichever list it is in. "ok" and "stretch" are the expected grades
 for a "backup" item, but they are also the correct, honest grades for a "strong"-list role
 that survived the disqualifiers and is worth showing while still leaving the candidate real
