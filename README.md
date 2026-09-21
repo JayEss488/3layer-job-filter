@@ -17,6 +17,9 @@ Self-hosted, bring-your-own-API-key. Modified to no longer need an account.
 
 **You need:** Python 3.11+, Node.js 18+, and an AI API key.
 
+### 0. Clone- no releases currently.
+It will run locally.
+
 ### 1. Add your keys
 
 ```bash
