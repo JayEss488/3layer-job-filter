@@ -1,69 +1,21 @@
 # AI Job Hunter
 
-**Point it at your CV. It reads thousands of job adverts, throws away the 99% that
-don't fit, and writes you a short list with its reasoning attached.**
+Originally made to be commercial- but since I couldn't find many users, I'm making it public.
 
-Self-hosted, bring-your-own-API-key. No account, no server, no data leaving your
-machine except the API calls you pay for.
+**Point it at your CV. It makes a profile from it, reads a ton of job listings, and writes you a short list with its reasoning attached.**
 
-![Ranked results with per-role requirement checklists](multimedia/demo.gif)
+Self-hosted, bring-your-own-API-key. Modified to no longer need an account.
 
-*Each card is a real posting the pipeline read in full: what the employer is
-actually screening on, ticked against your own evidence, with the gaps marked.*
-📹 **[Full 23-second walkthrough](multimedia/full-walkthrough.mp4)** — results,
-profile editing, and the run diagnostics.
+![Ranked results with per-role requirement checklists](multimedia/gif-4000-2.gif)
+
+*Each card is a real posting for my profile.*
+📹 **[Full 23-second walkthrough](multimedia/full-v2.mp4)**
 
 ---
 
-## What it actually does
+## How to use
 
-Job boards match on keywords, so searching "data analyst" returns a thousand
-listings of which maybe four are worth an application. The interesting problem
-isn't finding postings — it's reading them.
-
-This runs a **three-tier funnel** over every listing it can find. Each tier is a
-different model, and they get progressively more expensive and more careful:
-
-1. **Discovery** — pulls listings from every job board you have a key for, plus
-   ~1,800 company ATS boards (Greenhouse, Lever, Ashby, Workable and friends)
-   that need no key at all. A few thousand postings.
-2. **Embedding pre-filter** — free, offline cosine similarity against your target
-   roles. Plus a set of deterministic checks that cost nothing and are wrong to
-   pay a model for: wrong country, plainly-senior titles, placement years,
-   board category pages that aren't jobs at all. Removes ~65%.
-3. **Cheap model screen** — a batched eight-axis check: is this even one job
-   posting, is it the right *function*, the right level, does it clash with your
-   stated non-negotiables. Hundreds of listings, cheapest model, highest volume.
-4. **Mid model scoring** — a 0–100 fit estimate per surviving listing.
-5. **Full-text fetch** — for the best candidates, fetches the actual job page
-   (most board APIs return only a ~500-character teaser, which is the company
-   blurb, never the requirements).
-6. **Expensive judge** — reads the full descriptions and writes what you see:
-   a requirements checklist ticked against your evidence, what the role really
-   filters on, and the honest weakest link. 1–3 calls per run.
-
-Then some things that aren't matching at all but matter more than it does:
-
-- **Liveness verification** — every role shown is re-fetched and confirmed still
-  open before it reaches you. A measured 26% of already-surfaced listings were
-  already dead.
-- **Ghost-listing detection** — flags adverts with no real vacancy behind them
-  (talent pools, months-old reposts, take-down-and-relist patterns) as named
-  reasons, never an unexplained score.
-- **Visa sponsorship** (UK) — checks the employer against the Home Office
-  register of licensed sponsors *and* what the listing itself says, which
-  disagree more often than you'd think.
-- **Commute distance, salary normalisation, listing age** — a bare postcode
-  becomes a real distance; "£200 per day" and "up to 70k" become comparable
-  numbers.
-- **Feedback** — ticking and crossing roles nudges per-attribute weights. There's
-  no retraining; it just changes what floats to the top next time.
-
----
-
-## Quickstart
-
-**You need:** Python 3.11+, Node.js 18+, and one AI API key.
+**You need:** Python 3.11+, Node.js 18+, and an AI API key.
 
 ### 1. Add your keys
 
@@ -71,10 +23,8 @@ Then some things that aren't matching at all but matter more than it does:
 cp .env.example .env
 ```
 
-Open `.env` and fill in what you have. **Only an AI key is required.** Every job
-board is optional and fails soft — a missing key means that source returns
-nothing and the run carries on. The server prints which sources are live at boot,
-so nothing fails silently.
+Open `.env` and fill. **Only an AI key is required.** 
+Adding extra job boards like reed or adzuna improve performance however.
 
 | Key | Get it | Why |
 |---|---|---|
@@ -87,13 +37,11 @@ so nothing fails silently.
 | Careerjet | — | **No key needed**, works out of the box. Register your own affiliate id at [careerjet.com/partners/api](https://www.careerjet.com/partners/api) for anything beyond personal use |
 | `USAJOBS_API_KEY` + `USAJOBS_USER_AGENT` | [developer.usajobs.gov](https://developer.usajobs.gov/APIRequest) | US federal roles only |
 
-If you add **nothing but the AI key**, it still works — the no-key ATS company
-boards run regardless. It's just a much narrower search. For a UK job hunt, Reed
-and Adzuna together take about five minutes to set up and are most of the value.
+If you add **nothing but the AI key**, it still works.
 
 ### 2. Start it
 
-**Windows** — double-click **`start.bat`**
+**Windows** — double-click **`start.bat`** file.
 
 **macOS** — double-click **`start.command`** (or `./start.sh` in a terminal)
 
@@ -109,18 +57,9 @@ it if something goes wrong.
 
 ### 3. Onboarding
 
-1. **Upload or paste your CV.** Three AI calls run in parallel to pull out your
-   past roles, seniority, location and constraints, group your target roles into
-   families, and write the evidence summary the final judge reads. Takes ~15
-   seconds.
-2. **Check the criteria.** Everything it extracted is an editable chip. Set your
-   location and how far you'll travel, salary floor, work style, maximum listing
-   age, and any hard must-haves or avoids. This is the part that most affects
-   what comes back — it's worth two minutes.
+1. **Upload or paste your CV.**
+2. **Check the criteria.**
 3. **Press ▶ Run New Search.**
-
-First cards appear after ~7 seconds (straight off the embedding pre-filter,
-clearly labelled as not yet reviewed). The page fills in as later tiers finish.
 A full run takes **3–5 minutes**.
 
 ---
@@ -130,6 +69,7 @@ A full run takes **3–5 minutes**.
 Which provider runs is inferred from the **model name**, per tier — so you can
 mix vendors. Anything containing `claude` goes to Anthropic; everything else
 goes to OpenAI.
+What I ran with:
 
 ```bash
 ENGINE_CHEAP_MODEL=gpt-5.4-nano-2026-03-17   # screen gate — highest volume by far
@@ -157,16 +97,19 @@ ENGINE_EXP_MODEL=claude-opus-5
 EMBEDDING_PROVIDER=voyage        # Anthropic has no embeddings API
 VOYAGE_API_KEY=...               # ...or keep an OpenAI key just for embeddings
 ```
+Note: needs adapting if you want local embeddings (which is a few hundred megabytes so plausible here).
 
 Any OpenAI-compatible server (OpenRouter, Groq, Together, LM Studio, Ollama)
 works via `OPENAI_BASE_URL`. See `llm_providers.py` — it's one small file, and
 every provider difference that matters is documented in it.
 
+**Feel free to request improvements for usability in issues- if I'm still maintaining the project, I'll make the changes.**
+
 ---
 
 ## Cost
 
-**Roughly 100,000 tokens per search run.** The shape matters more than the total:
+**Roughly 200,000 tokens per search run.** (most used by the cheapest AI- so not mega expensive to run)
 
 | Tier | Share of tokens | Why |
 |---|---|---|
@@ -182,12 +125,58 @@ used throughout (the judge's fixed prefix is cached for 24h), and the Settings �
 Analytics page reports the per-stage cache hit rate so you can see whether it's
 landing.
 
-**A repeat run is much cheaper than the first.** Embeddings, scraped job text and
+**A repeat run is cheaper than the first.** Embeddings, scraped job text and
 judge verdicts are all cached per job and reused until you edit your profile —
 which is what deliberately invalidates them.
 
-`MAX_SEARCHES_PER_DAY` (default 6) is the hard stop between an experiment and a
-surprising bill.
+`MAX_SEARCHES_PER_DAY` (default 6) is the hard stop.
+
+---
+
+
+
+## What it actually does
+
+Job boards match on keywords, so searching "data analyst" returns a thousand
+listings of which maybe four are worth an application.
+
+This runs a **three-tier funnel** over every listing it can find, to give a much higher fraction of good roles.
+
+
+1. **Discovery** — pulls listings from every job board you have a key for, plus
+   ~1,800 company ATS boards (Greenhouse, Lever, Ashby, Workable and friends)
+   that need no key at all. A few thousand postings.
+2. **Embedding pre-filter** — free, offline cosine similarity against your target
+   roles. Plus a set of deterministic checks that cost nothing and are wrong to
+   pay a model for: wrong country, plainly-senior titles, placement years,
+   board category pages that aren't jobs at all. Removes ~65%.
+3. **Cheap model screen** — a batched eight-axis check: is this even one job
+   posting, is it the right *function*, the right level, does it clash with your
+   stated non-negotiables. Hundreds of listings, cheapest model, highest volume.
+4. **Mid model scoring** — a 0–100 fit estimate per surviving listing.
+5. **Full-text fetch** — for the best candidates, fetches the actual job page
+   (most board APIs return only a ~500-character teaser, which is the company
+   blurb, never the requirements).
+6. **Expensive judge** — reads the full descriptions and writes what you see:
+   a requirements checklist ticked against your evidence, what the role really
+   filters on, and the honest weakest link. 1–3 calls per run.
+
+Then some things it also attempts/ does:
+
+- **Liveness verification** — every role shown is re-fetched and confirmed still
+  open before it reaches you. A measured 26% of already-surfaced listings were
+  already dead.
+- **Ghost-listing detection** — flags adverts with no real vacancy behind them
+  (talent pools, months-old reposts, take-down-and-relist patterns) as named
+  reasons, never an unexplained score.
+- **Visa sponsorship** (UK) — checks the employer against the Home Office
+  register of licensed sponsors *and* what the listing itself says, which
+  disagree more often than you'd think.
+- **Commute distance, salary normalisation, listing age** — a bare postcode
+  becomes a real distance; "£200 per day" and "up to 70k" become comparable
+  numbers.
+- **Feedback** — ticking and crossing roles nudges per-attribute weights. There's
+  no retraining; it just changes what floats to the top next time.
 
 ---
 
