@@ -1,5 +1,5 @@
 {
-  "name": "omni-board-frontend",
+  "name": "ai-job-hunter-frontend",
   "version": "1.0.0",
   "private": true,
   "scripts": {
@@ -9,7 +9,6 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@auth0/nextjs-auth0": "^4.26.0",
     "@tanstack/react-query": "^5.62.7",
     "geist": "^1.7.2",
     "next": "^14.2.35",

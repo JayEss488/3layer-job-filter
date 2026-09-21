@@ -40,8 +40,12 @@ _FEEDBACK_EVENT = {"tick": "role_tick", "cross": "role_cross", "ignore": "role_i
 
 
 def _searches_today(db: Session, user_id: int) -> int:
-    """Count of this USER's searches today. The daily cap is now per-user (a beta
-    has ~50 users; a single global cap would let one exhaust everyone's quota)."""
+    """How many searches have been started today.
+
+    This is the app's main cost guard -- a run spends roughly 100k tokens -- so
+    it is counted from the SearchRun table rather than an in-process counter: a
+    run killed mid-flight still counts, because it really did spend the
+    credits."""
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     return (
         db.query(func.count(SearchRun.id))

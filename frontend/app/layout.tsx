@@ -5,27 +5,15 @@ import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 import { Providers } from "./providers";
 
-// The homepage is now public, so these are what a link preview and a search
-// result show. Kept in the product's own register — what it does and how long
-// it takes — rather than the category label ("AI job matching") the previous
-// description used, which described every tool the landing page argues against.
+// This runs on localhost, so these are really just the browser tab title. Kept
+// accurate rather than promotional -- there is no public page to preview.
 export const metadata: Metadata = {
-  title: "Four in a Thousand — job search that finds the few roles that fit",
+  title: "AI Job Hunter",
   description:
-    "An overengineered job search. Each run reads 480 listings through three layers of AI and hands back a dozen worth your time, each with a one-line verdict on what the job really is and whether you meet the bar. Ghost listings flagged, visa sponsors checked.",
-  openGraph: {
-    type: "website",
-    siteName: "Four in a Thousand",
-    title: "Four in a Thousand — job search that finds the few roles that fit",
-    description:
-      "Most job tools help you apply to everything. We read 480 listings a run and hand back a dozen that fit, with the reasoning attached.",
-  },
-  twitter: {
-    card: "summary",
-    title: "Four in a Thousand — job search that finds the few roles that fit",
-    description:
-      "Most job tools help you apply to everything. We read 480 listings a run and hand back a dozen that fit, with the reasoning attached.",
-  },
+    "Reads job listings through three layers of AI and hands back the few worth "
+    + "your time, each with its reasoning attached: what the role really is, what "
+    + "the employer screens on, and whether you meet the bar. Ghost listings "
+    + "flagged, visa sponsors checked, dead listings removed.",
 };
 
 export default function RootLayout({

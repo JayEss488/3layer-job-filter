@@ -11,7 +11,6 @@ from ..deps import current_user_id, get_profile_or_404
 from ..models import EventLog, Profile, Role
 from ..schemas import (
     AttributeOut,
-    CommentIn,
     ProfileCreate,
     ProfileOut,
     ProfileUpdate,
@@ -105,35 +104,6 @@ def interpret_feedback(
     plain field-save above stays fast for its other callers (rename,
     intent_text)."""
     return interpret_search_feedback(db, profile.id)
-
-
-@router.post("/{profile_id}/comment", status_code=201)
-def submit_comment(
-    body: CommentIn,
-    profile: Profile = Depends(get_profile_or_404),
-    db: Session = Depends(get_db),
-):
-    """Beta-tester product feedback (bugs, confusing bits, feature ideas) --
-    about the APP, not the search results (contrast with search_feedback
-    above, which tunes the judge). Written as a plain EventLog row
-    (event_type="beta_comment") rather than through the best-effort
-    log_event() helper: submitting a comment IS the whole action here, so a
-    write failure must surface to the tester as a real error rather than be
-    silently swallowed the way a secondary analytics side-effect is
-    elsewhere. Read back by the owner-only GET /admin/analytics."""
-    text = body.text.strip()
-    if not text:
-        raise HTTPException(status_code=422, detail="Comment can't be empty.")
-    db.add(
-        EventLog(
-            user_id=profile.user_id,
-            profile_id=profile.id,
-            event_type="beta_comment",
-            payload=json.dumps({"text": text}),
-        )
-    )
-    db.commit()
-    return {"status": "ok"}
 
 
 @router.delete("/{profile_id}", status_code=204)

@@ -6,17 +6,14 @@ sqlalchemy==2.0.36
 pydantic==2.13.4
 python-multipart==0.0.20
 python-dotenv==1.2.2
-# Used directly by services/auth.py to verify Google ID tokens against Google's
-# tokeninfo endpoint. It arrives transitively via openai anyway, but the auth
-# path must not depend on another package's dependency tree staying the same.
+# Used directly by llm_providers.py (the Voyage embeddings call) and by several
+# fetchers. It arrives transitively via openai anyway, but depending on another
+# package's dependency tree staying the same is not a dependency declaration.
 httpx==0.28.1
-# Sign in with Apple. Apple publishes no tokeninfo-style endpoint (the way
-# Google does), so an Apple ID token has to be verified LOCALLY against their
-# JWKS -- RS256 signature, issuer, audience and expiry. That is the one part of
-# this app where a subtle mistake is an authentication bypass rather than a bad
-# job match, so it uses a maintained library instead of hand-rolled crypto.
-# The [crypto] extra pulls `cryptography`, which is required for RS256.
-pyjwt[crypto]==2.10.1
 openai==2.44.0
+# OPTIONAL. Only needed if you point a model tier at a Claude model -- see
+# ENGINE_*_MODEL in .env.example. llm_providers.py imports it lazily, so an
+# OpenAI-only install can remove this line and nothing breaks.
+anthropic==1.6.0
 pdfplumber==0.11.10
 python-docx==1.2.0

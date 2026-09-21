@@ -4,10 +4,10 @@ Same posture as scripts/gen_uk_charity_seed.py, scripts/gen_uk_geo.py and
 scripts/gen_countries.py: one dev-time source of truth, one generated plain-data
 module the app imports, zero runtime dependencies and zero per-search API calls.
 
-  source (gitignored):   txt non code/SP_-_Worker_and_Temporary_Worker_Web_Register_-_*.csv
+  source (gitignored):   archive/txt non code/SP_-_Worker_and_Temporary_Worker_Web_Register_-_*.csv
   generated (committed): backend/app/uk_sponsor_gen.py
 
-The source CSV lives under the gitignored /txt non code/, so the generated
+The source CSV lives under the gitignored /archive/txt non code/, so the generated
 module is what ships -- exactly as for the Charity Commission extract.
 
 WHAT THE REGISTER IS
@@ -55,7 +55,7 @@ import sys
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The Home Office puts the publication date in the filename, so glob rather than
 # hardcode it: a refreshed register is a new file, not an edited one.
-SOURCE_GLOB = os.path.join(BASE_DIR, "txt non code",
+SOURCE_GLOB = os.path.join(BASE_DIR, "archive", "txt non code",
                            "SP_-_Worker_and_Temporary_Worker_Web_Register_-_*.csv")
 OUT = os.path.join(BASE_DIR, "backend", "app", "uk_sponsor_gen.py")
 

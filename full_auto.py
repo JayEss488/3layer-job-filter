@@ -27,7 +27,8 @@ from datetime import datetime
 from typing import Optional, List, Dict
 import numpy as np
 import httpx
-from openai import OpenAI
+
+import llm_providers
 from crawl4ai import (
     AsyncWebCrawler,
     BrowserConfig,
@@ -225,16 +226,35 @@ ADZUNA_PAGES_PER_TERM_SPONSOR = int(os.getenv("ADZUNA_PAGES_PER_TERM_SPONSOR", "
 # nothing for the profiles this change is about.
 USAJOBS_PAGES_PER_TERM = int(os.getenv("USAJOBS_PAGES_PER_TERM", "1"))
 
-DEBUG_SAVE_RAW = True
+# Writes the whole raw discovery payload (several MB a run) to
+# data_paths.RAW_API_JOBS_PATH. Default unchanged; set DEBUG_SAVE_RAW=0 to skip it.
+DEBUG_SAVE_RAW = os.getenv("DEBUG_SAVE_RAW", "1").strip().lower() not in {"0", "false", "no"}
 
 # ── Dynamic Path Configuration ──────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH  = os.path.join(BASE_DIR, "boards_cache.db")
 
-# Automatically discover CV file in current directory or fallback gracefully
-CV_PATH = os.path.join(BASE_DIR, "exp.txt")
-if not os.path.exists(CV_PATH):
-    CV_PATH = "/home/jamesstephens/Documents/search_auto/exp.txt"
+# Everything this module WRITES lives under one gitignored directory -- see
+# data_paths.py for why that module exists and how DATA_DIR / the per-file env
+# overrides interact. BASE_DIR stays as it was: it still locates code and
+# committed data next to this file, which is a different question from where
+# generated files go.
+import data_paths as _dp
+
+DB_PATH = str(_dp.BOARDS_CACHE_PATH)
+
+# The scratch file the expensive-AI step reads its CV text from. It is always
+# WRITTEN before it is read -- the backend writes build_snapshot()'s synthesised
+# cv_text here at the top of every run, and the legacy standalone path writes the
+# uploaded CV -- so this must be a path this process can CREATE, never one that
+# merely happens to exist. It used to fall back to a hardcoded absolute path on
+# the original author's machine when BASE_DIR/exp.txt was absent, which is the
+# state of every fresh checkout: the write then failed with FileNotFoundError and
+# killed the whole search run before the pipeline started.
+CV_PATH = str(_dp.CV_PATH)
+
+# Both paths above are written before they are read, so the directory has to
+# exist by now rather than be assumed present.
+_dp.ensure_data_dir()
 
 # ── Global Tuning Hyperparameters ──────────────────────────────────────────────
 # Deliberately kept on the older/cheaper nano tier, not GPT-5.6 Luna -- nano is
@@ -306,7 +326,7 @@ DISCOVERY_MAX_WORKERS = int(os.getenv("DISCOVERY_MAX_WORKERS", "12"))
 DISCOVERY_BUDGET_SECONDS = float(os.getenv("DISCOVERY_BUDGET_SECONDS", "100"))
 RELEVANCE_THRESHOLD = 0.35    # Balanced threshold preventing snippet penalty
 TOP_CANDIDATES      = 25      # Pool size handed to the final evaluator
-FINAL_PICKS         = 12      # Max results returned, quality-gated
+FINAL_PICKS         = int(os.getenv("FINAL_PICKS", "12"))  # Max results returned, quality-gated
 # Cap per single Phase 6 prompt; a larger cluster splits into CONCURRENT batches
 # rather than one call risking the client's 90s read timeout (see client below).
 #
@@ -438,8 +458,10 @@ CATEGORY_EXPAND_BUDGET_SECONDS      = 30.0  # wall-clock budget for the whole st
 # The SDK default (httpx.Timeout(600, connect=5.0), max_retries=2) lets a single
 # stalled call block up to ~30 min before raising anything -- with a search
 # running as a background task with no outer watchdog, that stalls the whole
-# pipeline at status="running" with no way to recover short of a restart.
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=httpx.Timeout(90.0, connect=5.0))
+# pipeline at status="running" with no way to recover short of a restart. The
+# provider layer builds its clients with this timeout; 90s (not llm.py's 45s)
+# because the final judge legitimately generates thousands of output tokens.
+LLM_TIMEOUT_SECONDS = 90.0
 
 
 def run_pipeline(cv_text: str, log_queue: queue.Queue) -> list[dict]:
@@ -1711,7 +1733,7 @@ def fetch_careerjet(query: str, location: str = "United Kingdom",
         # The API requires these (it geolocates the caller); fixed placeholders
         # are fine since `location`/`locale_code` drive the actual scoping.
         "user_ip": "11.22.33.44",
-        "user_agent": "Mozilla/5.0 (compatible; four-in-a-thousand/1.0)",
+        "user_agent": "Mozilla/5.0 (compatible; ai-job-hunter/1.0)",
     }
     # Careerjet rejects the call (403 "Undeclared referrer") without a Referer
     # header, and the shared example affid only accepts certain referers -- see
@@ -3067,7 +3089,7 @@ def gather_jobs(profile: Dict) -> List[Dict]:
         emit(f"   [source] ats:{vendor}: {count} jobs (slowest board {slowest.get(f'ats:{vendor}', 0.0):.1f}s)")
 
     if DEBUG_SAVE_RAW:
-        with open(os.path.join(BASE_DIR, "raw_api_jobs.json"), "w") as f:
+        with open(_dp.RAW_API_JOBS_PATH, "w") as f:
             json.dump(all_jobs, f, indent=2)
 
     return all_jobs
@@ -3144,10 +3166,16 @@ def init_db():
 # still work when run from seed_ats.py without importing the backend package.
 # A non-sqlite DATABASE_URL, e.g. Postgres, isn't supported by this bridge.)
 def _ats_db_path() -> str:
+    # Must resolve to the SAME file backend/app/config.py hands SQLAlchemy, or the
+    # end-of-run ATS harvest writes company_ats rows into a database the app never
+    # reads. Only an explicit DATABASE_URL in the ENVIRONMENT can be seen from
+    # here (config.py computes its default in Python and does not export it), so
+    # the fallback has to be data_paths' shared answer rather than a hardcoded
+    # path -- hardcoding is what made these two diverge when the default moved.
     url = os.getenv("DATABASE_URL", "")
     if url.startswith("sqlite:///"):
         return url[len("sqlite:///"):]
-    return os.path.join(BASE_DIR, "backend", "jobmatch.db")
+    return str(_dp.APP_DB_PATH)
 
 
 def _ats_db() -> sqlite3.Connection:
@@ -3591,33 +3619,29 @@ def llm(prompt: str, system: str = "", model: str = CHEAP_MODEL,
     truncated JSON response would fail to parse and fall through the caller's
     fail-open path, so a rising count there is the difference between "the model
     chose to write less" and "we cut it off" -- two diagnoses needing opposite
-    fixes, and previously indistinguishable."""
-    msgs = []
-    if system:
-        msgs.append({"role": "system", "content": system})
-    msgs.append({"role": "user", "content": prompt})
+    fixes, and previously indistinguishable.
 
-    args = {"model": model, "messages": msgs, "temperature": temperature}
-    if require_json:
-        args["response_format"] = {"type": "json_object"}
-    if cache_key:
-        args["prompt_cache_key"] = cache_key
-    if cache_retention:
-        args["prompt_cache_retention"] = cache_retention
-    if max_output_tokens:
-        args["max_completion_tokens"] = max_output_tokens
-
-    resp = client.chat.completions.create(**args)
-    choice = resp.choices[0]
-    _record_llm_usage(stage, model, getattr(resp, "usage", None),
-                      getattr(choice, "finish_reason", "") or "")
-    return choice.message.content.strip()
+    Which PROVIDER answers is decided by the model name (see llm_providers.py),
+    so pointing a tier at a Claude model is a one-env-var change and needs
+    nothing here."""
+    result = llm_providers.chat(
+        prompt,
+        system=system,
+        model=model,
+        require_json=require_json,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        cache_key=cache_key,
+        cache_retention=cache_retention,
+        timeout=LLM_TIMEOUT_SECONDS,
+    )
+    _record_llm_usage(stage, model, result.usage, result.finish_reason)
+    return result.text
 
 
 def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
     cleaned = [t[:8000] for t in texts]
-    resp = client.embeddings.create(model=EMBED_MODEL, input=cleaned)
-    return [e.embedding for e in resp.data]
+    return llm_providers.embed(cleaned, model=EMBED_MODEL, timeout=LLM_TIMEOUT_SECONDS)
 
 
 # ── Phase 1: Dynamic Profile Extraction ────────────────────────────────────────

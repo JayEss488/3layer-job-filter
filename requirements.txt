@@ -1,3 +1,8 @@
+# Search-engine dependencies (full_auto.py): crawl4ai + playwright for page
+# scraping, numpy for the embedding maths, openai for the model calls.
+# The API's own deps are in backend/requirements.txt -- install both.
+#
+# OPTIONAL: `anthropic` is only needed if a model tier points at a Claude model.
 aiofiles==25.1.0
 aiohappyeyeballs==2.6.2
 aiohttp==3.14.1
@@ -56,6 +61,7 @@ networkx==3.6.1
 nltk==3.9.4
 numpy==2.5.0
 openai==2.44.0
+anthropic==1.6.0
 packaging==26.2
 patchright==1.60.1
 pdfminer.six==20260107

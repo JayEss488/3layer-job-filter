@@ -1,7 +1,13 @@
-"""FastAPI application entrypoint. Closed-beta auth: an HTTP middleware reads the
-Bearer token into a per-request ContextVar (see services/auth.py), the public
-/login router mints tokens, and every data router is guarded by
-require_authenticated. deps.current_user_id() reads that ContextVar."""
+"""FastAPI application entrypoint.
+
+There is no login. This runs as a single local user (see deps.current_user_id),
+which is the right shape for a tool you run on your own machine against your own
+API keys: an account system would add a database of credentials to protect and
+would gate nothing, since anyone who can reach the port can already read the
+SQLite file next to it.
+
+If you expose this beyond localhost, put an authenticating reverse proxy in
+front of it -- the app itself performs no access control."""
 import asyncio
 import sys
 
@@ -13,7 +19,7 @@ import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import FRONTEND_ORIGINS
@@ -21,18 +27,14 @@ from .database import init_db
 from .routers import (
     admin,
     attributes,
-    auth_router,
     families,
-    feedback,
     onboarding,
     profiles,
     search,
     settings,
 )
-from .services.auth import parse_token, require_authenticated, reset_current_user, set_current_user
-from .services.beta import require_active_beta
 
-app = FastAPI(title="Four in a Thousand API", version="1.0.0")
+app = FastAPI(title="AI Job Hunter API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,29 +45,16 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def _auth_context(request: Request, call_next):
-    """Populate the current-user ContextVar from the Bearer token, per request.
-
-    Does NOT reject anything itself -- enforcement is the require_authenticated
-    dependency on the protected routers (and current_user_id() raising). Keeping
-    rejection out of the middleware means every 401 is raised inside the app,
-    where the CORS middleware still wraps it with the right headers. Runs in the
-    request's async context so the value is copied into the threadpool that sync
-    routes/dependencies execute in."""
-    auth = request.headers.get("authorization") or ""
-    token = auth[7:].strip() if auth[:7].lower() == "bearer " else None
-    uid = parse_token(token) if token else None
-    ctx_token = set_current_user(uid)
-    try:
-        return await call_next(request)
-    finally:
-        reset_current_user(ctx_token)
-
-
 @app.on_event("startup")
 def _startup():
     init_db()
+
+    # What this install can actually do, given the keys present. Printed before
+    # anything else because a missing key here fails SILENTLY at search time --
+    # see services/startup_report.py.
+    from .services.startup_report import report
+
+    report()
 
     from .database import SessionLocal
     from .services.engine import reap_stale_search_runs
@@ -153,36 +142,15 @@ def health():
     return {"status": "ok"}
 
 
-# Public, and it MUST stay public: this router carries POST /auth/google, which
-# is how an account comes into existence. Putting it behind require_authenticated
-# would make sign-up require being signed in.
-#
-# The routes inside it that DO need a user (/me, /signup/survey, /exit/survey)
-# self-guard by calling current_user_id(), which raises 401 when the request
-# carried no valid token -- the same pattern /me has always used.
-#
-# It also MUST stay off the beta-window dependency below: /exit/survey has to be
-# reachable by exactly the users whose window has lapsed, or the wrap-up survey
-# becomes unanswerable by the people it exists to ask.
-app.include_router(auth_router.router)
+app.include_router(profiles.router)
+app.include_router(attributes.router)
+app.include_router(families.router)
+app.include_router(onboarding.router)
+app.include_router(search.router)
+app.include_router(settings.router)
 
-# Protected: a valid Bearer token AND an unlapsed beta window are required for
-# every route below. require_active_beta is what makes "access lapses at day 7"
-# real rather than cosmetic -- an expired user cannot start a search, edit a
-# profile or read roles. See services/beta.py for why the wrap-up survey gate is
-# deliberately NOT enforced here too.
-_auth = [Depends(require_authenticated), Depends(require_active_beta)]
-app.include_router(profiles.router, dependencies=_auth)
-app.include_router(attributes.router, dependencies=_auth)
-app.include_router(families.router, dependencies=_auth)
-app.include_router(onboarding.router, dependencies=_auth)
-app.include_router(search.router, dependencies=_auth)
-app.include_router(settings.router, dependencies=_auth)
-
-# Feedback is authed but NOT beta-gated: an answer the user has already typed
-# must never be lost to a window that lapsed between the prompt appearing and
-# the button being pressed.
-app.include_router(feedback.router, dependencies=[Depends(require_authenticated)])
-
-# Owner-only analytics, guarded by the ADMIN_TOKEN header (not user auth).
+# Maintenance endpoints (the direct-employer crawl, the daily observation pass,
+# the liveness re-check). Guarded by the ADMIN_TOKEN header when one is set --
+# see routers/admin.py. They are separated from the routers above because they
+# are operator actions, not part of using the app.
 app.include_router(admin.router)

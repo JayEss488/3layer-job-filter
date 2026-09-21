@@ -1,14 +1,40 @@
+# Secrets. Copy .env.example -> .env and fill in your own keys.
 .env
+frontend/.env.local
+
+# Python
 __pycache__/
 *.pyc
+venv/
+.venv/
+
+# Node
+node_modules/
+frontend/.next/
+frontend/out/
+
+# Everything the app GENERATES: the SQLite store (created on first boot), the
+# engine's gate/rank cache, the CV scratch file and the raw discovery dump. All
+# of it lands in one directory so a clean slate is `rm -rf data/`. Point DATA_DIR
+# somewhere outside the repo to keep a test run's output away entirely; see
+# data_paths.py.
+data/
+
+# Belt-and-braces: installs predating data/, and a DATA_DIR pointed back inside
+# the repo. (Harness output has its own block further down.)
 *.db
 *.db-shm
 *.db-wal
 *.bak
-venv/
 raw_api_jobs.json
-.offline_test/
-.embedding_analysis/
+exp.txt
+
+# Everything not part of the running app: archived prototypes, wireframes,
+# design docs, ad-hoc analysis scripts, raw data samples, private documents.
+# Kept on disk, never published. See archive/README.md.
+archive/
+
+# Diagnostic report output from tests/ and scripts/
 tests/gate_reports/
 tests/tier_reports/
 tests/prompt_pipeline_reports/
@@ -16,34 +42,5 @@ tests/profile_formation_reports/
 tests/medium_vs_strong_reports/
 tests/judge_reports/
 
-# Archived data snapshots (see scripts/reset_user_data.py)
-memory_archive/
-
-# Beta credentials handed out manually -- never commit plaintext
-beta_credentials.txt
-beta_credentials_prod.txt
-
-# Untracked-but-kept-local dev/archive material (removed from the repo for the
-# beta; delete locally if you don't want them)
-/inactive components/
-/legacy/
-/wireframes/
-/Functional wireframe design upgrade/
-/Interface redesign with role cards/
-/claude/
-/txt non code/
-/JobMatch_Roadmap_and_Assessment.docx
-/launch_content_review.docx
-/profile7_raw_sample.xlsx
-/exp.txt
-/results.md
-/how to run webapp.txt
-/analyze_embedding_gate.py
-/analyze_medium_vs_strong.py
-/analyze_rank_gate.py
-/migrate_embedding_format.py
-/test_pipeline_offline.py
-
 # Dev-only crawl cache for scripts/gen_uk_geo.py (the generated module is committed)
 scripts/.uk_geo_crawl_cache.json
-Four_in_a_Thousand_Privacy_Policy.docx

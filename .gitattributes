@@ -1,15 +1,9 @@
-# This machine has core.autocrlf=true, so anything git checks out gets CRLF in
-# the working tree -- and `fly deploy` builds the image from the WORKING TREE,
-# not from a git archive. Files below are read by Linux inside the container,
-# where a trailing \r is not whitespace but part of the token:
-#
-#   * crontab   -- supercronic hands each line to /bin/sh, so a CRLF entry runs
-#                  `python scripts/observe_listings.py\r` and fails with a
-#                  "not found" that names a command you can see is present.
-#                  Silent: supercronic keeps running, the job just never works.
-#   * Dockerfile / *.sh -- same class of failure in RUN/CMD lines.
-#
-# These are currently LF and must stay LF through every clone and checkout.
-crontab   text eol=lf
-Dockerfile text eol=lf
-*.sh      text eol=lf
+# Shell scripts must keep LF endings whatever the checkout platform does.
+# With core.autocrlf=true a CRLF script fails with a "not found" error naming a
+# command that plainly exists -- the hardest kind of breakage to read.
+*.sh text eol=lf
+start.command text eol=lf
+
+# The demo assets are binary; never let them through line-ending conversion.
+*.gif binary
+*.mp4 binary

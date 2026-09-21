@@ -59,6 +59,33 @@ from .sources import (
     save_last_run_counts,
 )
 
+# ── Env-tunable pipeline budgets ─────────────────────────────────────────────
+# The constants below set what a run COSTS and how much it looks at. They have
+# in-code defaults tuned against a live store (each one's own comment records
+# the measurement), and every one of them is overridable from .env so you can
+# trade money for coverage without editing Python. See the README's "Tuning"
+# table for which knob does what.
+def _env_int(name: str, default: int) -> int:
+    """An int from the environment, falling back to the tuned default.
+
+    Silently keeps the default for a malformed value rather than raising: this
+    runs at import time, and a typo in .env should not stop the server booting
+    when there is a perfectly good default sitting right here."""
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        print(f"[config] {name} is not a whole number -- using the default ({default}).")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except ValueError:
+        print(f"[config] {name} is not a number -- using the default ({default}).")
+        return default
+
+
 # ── Adaptive funnel tuning ───────────────────────────────────────────────────
 # Funnel: per cluster, batches of embed-score-ranked candidates are fed through
 # gate+rank (see _gate_rank_refill_cluster) until that cluster's fair share of
@@ -69,7 +96,7 @@ from .sources import (
 # above-RELEVANCE_FLOOR pool instead of leaving hundreds of unexamined,
 # fair-scoring candidates on the table every run. Survivors -> expensive
 # full-text judge -> engine.FINAL_PICKS capped final results.
-TARGET_POOL       = 90     # gate-survivor checkpoint per cluster per refill round
+TARGET_POOL       = _env_int("TARGET_POOL", 90)     # gate-survivor checkpoint per cluster per refill round
 # Examine-round sizing inside _gate_rank_refill_cluster. A round gates then ranks
 # one batch and only THEN reports its judge-eligible snapshot for provisional
 # "Verifying…" cards, so the size of the FIRST round is what gates time-to-first-
@@ -93,7 +120,7 @@ TARGET_POOL       = 90     # gate-survivor checkpoint per cluster per refill rou
 # work. Keeping the slice at 80 keeps that calibration byte-identical to the
 # round-based loop.
 GATE_ROUND_SIZE   = 80     # strictness-calibration slice (was: examine round size)
-MIN_RESULTS       = 3      # below this many strong matches, broaden the threshold
+MIN_RESULTS       = _env_int("MIN_RESULTS", 3)      # below this many strong matches, broaden the threshold
 # Below this many characters, a job's discovery-time snippet is assumed too
 # thin (e.g. a short Google-organic blurb) to judge fit against without
 # reading the real page. ATS-sourced snippets (greenhouse/lever/etc.) already
@@ -123,8 +150,17 @@ SNIPPET_SUFFICIENT_CHARS = 600
 # RELEVANCE_PRIMARY -- `broadened` (>= floor) has to stay a superset of
 # `strong` (>= primary) or the harsh/floor_fallback bookkeeping below stops
 # meaning what its own comments say it means.
-RELEVANCE_PRIMARY = 0.39   # strict strong-fit threshold
-RELEVANCE_FLOOR    = 0.39  # never include anything weaker than this
+RELEVANCE_PRIMARY = _env_float("RELEVANCE_PRIMARY", 0.39)   # strict strong-fit threshold
+RELEVANCE_FLOOR    = _env_float("RELEVANCE_FLOOR", 0.39)  # never include anything weaker than this
+# RELEVANCE_FLOOR is the actual pool-admission gate and RELEVANCE_PRIMARY only
+# flags a cluster as harsh, so a floor set ABOVE the primary threshold is not a
+# stricter search -- it is an inconsistent one. Clamp rather than raise: this is
+# import-time, and silently admitting nothing would be far harder to diagnose.
+if RELEVANCE_FLOOR > RELEVANCE_PRIMARY:
+    print(f"[config] RELEVANCE_FLOOR ({RELEVANCE_FLOOR}) is above RELEVANCE_PRIMARY "
+          f"({RELEVANCE_PRIMARY}); clamping the floor down to match.")
+    RELEVANCE_FLOOR = RELEVANCE_PRIMARY
+
 BACKLOG_TOPUP     = 40     # enriched rows pulled in when fresh discovery is thin
 STORE_SCORE_CAP   = 6000   # max 'new' rows relevance-scored per run (whole store)
 # Fresh-row embedding fetch (_ensure_embeddings): texts are capped at ~2000
@@ -161,7 +197,7 @@ def _embed_chunk_size(n: int) -> int:
 # the expensive full-text judge: an extra cheap-model pass that scores gate
 # survivors 0-100 on fit instead of a boolean pass/fail, so the expensive judge
 # only ever sees a curated top slice instead of every gate survivor.
-JUDGE_POOL = 40               # top-ranked candidates sent on to scrape + judge
+JUDGE_POOL = _env_int("JUDGE_POOL", 40)               # top-ranked candidates sent on to scrape + judge
 # The mid tier is deliberately run WIDER than the judge is: it accumulates up to
 # RANK_TARGET_POOL approvals and the judge then takes the best JUDGE_POOL of them,
 # so the expensive stage chooses from a curated best-of rather than from whatever
@@ -171,7 +207,7 @@ JUDGE_POOL = 40               # top-ranked candidates sent on to scrape + judge
 # least-bad of five. Widening the mid tier is cheap relative to the judge (CHEAP
 # screen + MID rank vs. a STRONG full-text call on a scraped page), which is the
 # whole reason the ratio is worth paying for.
-RANK_TARGET_POOL = 80         # run-wide judge-eligible target for the gate+rank stage
+RANK_TARGET_POOL = _env_int("RANK_TARGET_POOL", 80)         # run-wide judge-eligible target for the gate+rank stage
 # Run-wide ceiling on how many candidates the cheap+mid stages examine, split
 # evenly across active clusters at the call site. Replaces the old per-cluster
 # SINGLE_CLUSTER_EXAMINE_CAP(80)/MULTI_CLUSTER_EXAMINE_CAP(40) pair, whose total
@@ -194,7 +230,7 @@ RANK_TARGET_POOL = 80         # run-wide judge-eligible target for the gate+rank
 # REED_/ADZUNA_ENRICH_PRE_GATE_CAP and *_PAGES_PER_TERM are the knobs to turn,
 # not this one: the gate screens the whole budget in one wave (see
 # GATE_ROUND_SIZE), so a wider budget costs more batches, not more serial waves.
-RANK_EXAMINE_BUDGET = 480
+RANK_EXAMINE_BUDGET = _env_int("RANK_EXAMINE_BUDGET", 480)
 # ...and it is now a CEILING rather than a fixed spend. _adaptive_examine_budget
 # sizes each run from the previous comparable run's selection ratio
 # (judge_eligible_total / rank_scored), on the reasoning that a profile whose gate
@@ -375,7 +411,7 @@ LISTING_REVALIDATE_AFTER_DAYS = 2
 # candidate would actually consider reach the judge -- the whole reason for the
 # change. Selection remains the wide-pool-plus-top-N cut's job, which cannot
 # starve a cluster the way an absolute cutoff can.
-RANK_REJECT_SCORE_FLOOR = 32
+RANK_REJECT_SCORE_FLOOR = _env_int("RANK_REJECT_SCORE_FLOOR", 32)
 # Ordering-only penalty for a candidate rank_gate flagged as violating one of the
 # candidate's SOFT-enforced stated preferences (work arrangement, salary floor --
 # see full_auto._rank_prompt's SOFT-PREFERENCE MISMATCHES section). Applied in

@@ -5,13 +5,65 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## User preferences
 Don't run a full end to end search in testing because it uses real API credits.
 
+> ## ⚠ READ THIS FIRST — what is STALE in this document
+>
+> This file is the engineering record of the app as it was built, and most of it
+> is still accurate and still the best reference for *why* any given constant is
+> the number it is. But the app was renamed and opened up as a public,
+> self-hosted, bring-your-own-key tool, and **several systems described below no
+> longer exist**. Where this document and the code disagree, the code is right.
+>
+> **Deleted entirely.** Do not follow any guidance about them:
+> * **All authentication.** Google / Apple / email+password sign-in, the
+>   `User`, `SignupSurvey` and `FeedbackResponse` tables, `services/auth.py`,
+>   `routers/auth_router.py`, the login/welcome/verify/reset pages, the
+>   `AUTH_SECRET` / `GOOGLE_CLIENT_ID` / `APPLE_CLIENT_ID` config, and the
+>   deployment checklists for all of it. There is no login. `deps.current_user_id()`
+>   returns `config.LOCAL_USER_ID` and remains the single auth seam.
+> * **The 7-day beta window** and both of its gates (`services/beta.py`,
+>   `require_active_beta`, `/exit-survey`, `beta_started_at`).
+> * **Transactional email** (`services/mailer.py`, Resend/Gmail SMTP,
+>   verification and password-reset links).
+> * **The in-product feedback prompts and surveys** — `results_quality`,
+>   `setup_ok`, the wrap-up survey, the team-visible `beta_comment` endpoint, and
+>   `GET /admin/analytics` / `/admin/signups` with them. The `/search` box that
+>   tunes the NEXT run (`profile.search_feedback`) is a real pipeline input and
+>   **is still there**.
+> * **The public landing page.** `/` is now the first-run router that used to
+>   live at `/start`.
+> * **The hosted deployment config** (Fly/Render/Vercel/Docker/supercronic),
+>   moved to `archive/removed-deploy/`. The cron reasoning in the observation
+>   section is still worth reading if you redeploy.
+>
+> **Changed.**
+> * **Model calls are provider-agnostic.** Every chat and embedding call goes
+>   through `llm_providers.py` (repo root), which routes on the MODEL NAME:
+>   anything containing `claude` goes to Anthropic, everything else to OpenAI.
+>   The three tier constants are unchanged in meaning and still env-overridable.
+>   Anything below that assumes the OpenAI SDK directly is out of date; the
+>   prompt-caching notes still hold on both providers.
+> * **The pipeline budgets are env-tunable**: `RANK_EXAMINE_BUDGET`,
+>   `JUDGE_POOL`, `RANK_TARGET_POOL`, `RANK_REJECT_SCORE_FLOOR`, `TARGET_POOL`,
+>   `MIN_RESULTS`, `FINAL_PICKS`, `RELEVANCE_PRIMARY`/`_FLOOR`. The in-code
+>   numbers quoted throughout are now DEFAULTS, and every measurement behind
+>   them still stands.
+> * **`archive/`** holds the prototypes, wireframes, ad-hoc analysis scripts,
+>   private documents and generator source data, all gitignored as one unit.
+>   `scripts/gen_uk_sponsors.py` and `gen_uk_charity_seed.py` read their source
+>   data from `archive/txt non code/` now.
+>
+> Everything else — the pipeline, the prompts and their version history, the
+> ghost rules, liveness, sponsors, geo, salary, the measurements and the traps —
+> is current.
+
 ## What this is
 
-Four in a Thousand: an AI job-matching app that parses a CV into structured "memory" (profile
+AI Job Hunter (formerly "Four in a Thousand"): a self-hosted, bring-your-own-key
+AI job-matching app that parses a CV into structured "memory" (profile
 attributes), runs a multi-stage search/ranking pipeline against several job boards and
 ATS vendors, and learns from tick/cross feedback (no retraining — just weight nudges).
-Single-user prototype (`user_id` hardcoded, but present everywhere so multi-user auth is
-a drop-in later).
+Single-user by design — there is no login, but `user_id` is present on every table so
+multi-user auth remains a drop-in.
 
 Stack: FastAPI + SQLAlchemy (SQLite) backend, Next.js (App Router) + TanStack Query
 frontend, wrapping a pre-existing standalone search engine (`full_auto.py`).

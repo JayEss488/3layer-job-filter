@@ -538,24 +538,3 @@ export interface SearchStart {
 // ── Beta feedback ───────────────────────────────────────────────────────────
 
 /** This user's wrap-up survey answers. `answered` is the whole gate. */
-export interface ExitSurvey {
-  answered: boolean;
-  change: string;
-  useful_features: string[];
-  speed_tradeoff: string;
-  created_at?: string | null;
-}
-
-export interface FeedbackPrompt {
-  due: boolean;
-  /** The run this answer would be about; null for the setup prompt, which fires
-   *  at CV-parse time when no run exists yet. */
-  run_id: number | null;
-}
-
-/** Which in-product prompts to show. Computed server-side — see
- *  backend routers/feedback.py for why the trigger rules don't live in the client. */
-export interface FeedbackDue {
-  results_quality: FeedbackPrompt;
-  setup_ok: FeedbackPrompt;
-}

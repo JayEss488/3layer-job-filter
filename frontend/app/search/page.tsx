@@ -34,16 +34,6 @@ export default function SearchPage() {
   // having to scroll past them.
   const [showGhosts, setShowGhosts] = useState(false);
   const [outcomePromptHidden, setOutcomePromptHidden] = useState(false);
-  // "Are these results what they should be?" — armed by the FIRST cross or
-  // apply on a run, which is the moment the user has actually formed an opinion
-  // about the results rather than just looked at them. Whether it is due at all
-  // is the server's call (GET /feedback/due): it holds the prompt back until the
-  // user's second completed run, so their first search isn't interrupted, and
-  // knows whether they already answered for this run on another device.
-  //
-  // Stays null until that first action, so simply landing on the page never
-  // shows it. Cleared on answer/dismiss, which restores the bug-report box.
-  const [resultsPrompt, setResultsPrompt] = useState<{ runId: number | null } | null>(null);
   // includeProvisional + a poll while running: mid-run "being verified" rows
   // land as soon as the engine's gate+rank phase persists them (~halfway).
   const { data: roles } = useRoles(activeId ?? null, "new,saved,crossed", {
@@ -61,26 +51,8 @@ export default function SearchPage() {
     qc.invalidateQueries({ queryKey: ["roles", activeId] });
     qc.invalidateQueries({ queryKey: ["stats", activeId] });
   };
-  // Ask the server whether the results prompt is due, after the user's first
-  // cross or apply this session. Best-effort and deliberately silent on
-  // failure: a feedback prompt failing to appear must never look like the
-  // cross/apply itself failed.
-  const maybeArmResultsPrompt = () => {
-    if (!activeId || resultsPrompt) return;
-    api
-      .feedbackDue(activeId)
-      .then((due) => {
-        if (due.results_quality.due) {
-          setResultsPrompt({ runId: due.results_quality.run_id });
-        }
-      })
-      .catch(() => {
-        /* non-blocking by design */
-      });
-  };
   const afterJudgement = () => {
     invalidate();
-    maybeArmResultsPrompt();
   };
   const tick = useMutation({ mutationFn: api.tick, onSuccess: invalidate });
   const cross = useMutation({ mutationFn: api.cross, onSuccess: afterJudgement });
@@ -226,8 +198,13 @@ export default function SearchPage() {
               You applied to {awaiting.length} role{awaiting.length === 1 ? "" : "s"} over three
               weeks ago. Did any of them come back to you?
             </span>
+            {/* "Update them", not "Tell us": this records the outcome against
+                your own applications on /my-roles, and it is the only ground
+                truth the ghost-listing rules have to calibrate against. The old
+                wording read as sending feedback to someone, which it never was
+                and certainly isn't now. */}
             <a className="btn btn-secondary sm" href="/my-roles">
-              Tell us
+              Update them
             </a>
             <button
               className="btn btn-ghost sm"
@@ -239,11 +216,7 @@ export default function SearchPage() {
           </div>
         )}
         {!running && (
-          <SearchFeedbackBox
-            profileId={activeId}
-            resultsPrompt={resultsPrompt}
-            onResultsPromptDone={() => setResultsPrompt(null)}
-          />
+          <SearchFeedbackBox profileId={activeId} />
         )}
         <TrainingBanner />
 

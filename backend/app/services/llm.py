@@ -1,16 +1,20 @@
-"""Thin OpenAI wrapper shared by parsing + suggestion services.
+"""Thin LLM wrapper shared by parsing + suggestion services.
 
 Kept independent of the search engine (full_auto.py) so the app's lightweight LLM
-calls don't drag in crawl4ai/playwright at import time."""
+calls don't drag in crawl4ai/playwright at import time.
+
+Provider-agnostic: the actual call goes through llm_providers.py (repo root),
+which routes on the model NAME -- so setting MID_MODEL to a Claude model moves
+CV parsing to Anthropic with no change here. The three tier constants below are
+deliberately SEPARATE from full_auto.py's ENGINE_-prefixed ones so that an A/B
+on the search pipeline doesn't silently retune CV parsing too."""
 import contextvars
 import json
 import os
 import time
 from contextlib import contextmanager
-from functools import lru_cache
 
-import httpx
-from openai import OpenAI
+import llm_providers
 
 # Match the model family the engine uses for cheap calls. Deliberately stays on
 # the older/cheaper nano tier (matches full_auto.py's CHEAP_MODEL) rather than
@@ -78,20 +82,6 @@ _READ_TIMEOUT_SECONDS = 45.0
 _SDK_MAX_RETRIES = 1
 
 
-@lru_cache(maxsize=1)
-def _client() -> OpenAI:
-    # Same fix as full_auto.py's client: an explicit timeout instead of the SDK's
-    # 600s default, so a stalled call fails fast instead of hanging the search
-    # background task. This client's calls run first in a search (region
-    # inference/role clustering, before full_auto is even imported), so a hang
-    # here used to happen before anything else in the pipeline even started.
-    return OpenAI(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        timeout=httpx.Timeout(_READ_TIMEOUT_SECONDS, connect=5.0),
-        max_retries=_SDK_MAX_RETRIES,
-    )
-
-
 def _clean_json(raw: str) -> str:
     return (
         raw.strip()
@@ -102,13 +92,29 @@ def _clean_json(raw: str) -> str:
     )
 
 
-# Some tiers (gpt-5.5, gpt-5.6-terra) reject any non-default temperature outright
-# (400 Unsupported value) -- mirrors full_auto.py's llm()/EXP_MODEL handling, kept
-# duplicated rather than shared since this module deliberately stays independent
-# of full_auto.py (see module docstring). Confirmed via a live 400 that silently
-# emptied every CV parse for months: llm_json swallowed the exception below and
-# returned {}, which looked identical to "the model found nothing on this CV".
-_FIXED_TEMPERATURE_MODELS = ("gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra")
+# Some OpenAI tiers (gpt-5.5, gpt-5.6-*) reject any non-default temperature
+# outright (400 Unsupported value) -- mirrors full_auto.py's llm()/EXP_MODEL
+# handling, kept duplicated rather than shared since this module deliberately
+# stays independent of full_auto.py (see module docstring). Confirmed via a live
+# 400 that silently emptied every CV parse for months: llm_json swallowed the
+# exception below and returned {}, which looked identical to "the model found
+# nothing on this CV".
+#
+# A PREFIX test, not exact membership, for the same reason full_auto.py uses one:
+# the model names are env-overridable, so a perfectly reasonable dated variant
+# ("gpt-5.6-luna-2026-05-01") would miss an exact tuple and get the 400.
+_FIXED_TEMPERATURE_PREFIXES = ("gpt-5.5", "gpt-5.6")
+
+
+def _temperature_for(model: str) -> float:
+    """The temperature to send for `model`.
+
+    Only OpenAI has the fixed-temperature restriction above; Anthropic accepts
+    the full 0..1 range on every model, so the restriction must not be applied
+    to a Claude model that happens to be configured here."""
+    if llm_providers.provider_for(model) != "openai":
+        return 0.2
+    return 1 if any((model or "").startswith(p) for p in _FIXED_TEMPERATURE_PREFIXES) else 0.2
 
 
 def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
@@ -123,11 +129,7 @@ def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
     one-shot and user-facing, so a single transient hiccup shouldn't surface as a
     hard failure. Confirmed live: an identical STRONG_MODEL call 401'd, then
     succeeded seconds later with no code or key change."""
-    msgs = []
-    if system:
-        msgs.append({"role": "system", "content": system})
-    msgs.append({"role": "user", "content": prompt})
-    temperature = 1 if model in _FIXED_TEMPERATURE_MODELS else 0.2
+    temperature = _temperature_for(model)
 
     trace = _llm_trace.get()
     started = time.perf_counter()
@@ -138,14 +140,17 @@ def llm_json(prompt: str, system: str = "", model: str = CHEAP_MODEL) -> dict:
     for attempt in (1, 2):
         attempts_used = attempt
         try:
-            resp = _client().chat.completions.create(
+            resp = llm_providers.chat(
+                prompt,
+                system=system,
                 model=model,
-                messages=msgs,
+                require_json=True,
                 temperature=temperature,
-                response_format={"type": "json_object"},
+                timeout=_READ_TIMEOUT_SECONDS,
+                max_retries=_SDK_MAX_RETRIES,
             )
-            result = json.loads(_clean_json(resp.choices[0].message.content))
-            usage = getattr(resp, "usage", None)
+            result = json.loads(_clean_json(resp.text))
+            usage = resp.usage
             ok = True
             break
         except Exception as e:

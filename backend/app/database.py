@@ -54,14 +54,11 @@ def init_db():
 
     Base.metadata.create_all(bind=engine)
     _migrate_columns()
-    _migrate_signup_indexes()
-    _migrate_auth_provider()
     _migrate_family_tier_vocabulary()
     _migrate_soft_dup_key()
     _migrate_ghost_indexes()
     _migrate_dead_at_backfill()
     _migrate_listing_observations()
-    _migrate_signup_feedback_backfill()
 
 
 def _migrate_columns():
@@ -115,26 +112,6 @@ def _migrate_columns():
         "profile_attributes": [("proficiency", "TEXT"), ("evidence_origin", "TEXT"),
                                 ("family_id", "INTEGER"), ("pinned", "BOOLEAN DEFAULT 0"),
                                 ("enforcement", "TEXT")],
-        # Self-serve sign-up. Note google_sub/email declare index=True + unique on
-        # the model, and ADD COLUMN cannot carry either -- see
-        # _migrate_signup_indexes below, which is the same class of bug the
-        # jobs_seen.repost_key note documents.
-        # Self-serve sign-up + the open-beta window. beta_started_at is
-        # deliberately left NULL by this migration: NULL means "no window", so
-        # every pre-existing account is exempt from expiry and from the wrap-up
-        # survey without any backfill. Do NOT "fix" that by stamping a date here
-        # -- it would start a 7-day clock on the original beta testers.
-        # auth_provider is deliberately left NULL for every pre-existing row:
-        # NULL means "legacy hand-assigned account", which is exactly what those
-        # rows are, and it is what exempts them from the sign-up survey. Google
-        # accounts created before this column existed are backfilled from
-        # google_sub by _migrate_auth_provider, which cannot guess wrong (only
-        # the Google path has ever written that column).
-        "users": [("google_sub", "TEXT"), ("apple_sub", "TEXT"),
-                   ("auth_provider", "TEXT"), ("email", "TEXT"),
-                   ("email_verified", "BOOLEAN"),
-                   ("display_name", "TEXT"), ("last_login_at", "DATETIME"),
-                   ("beta_started_at", "DATETIME")],
     }
     for table, cols in additions.items():
         if not insp.has_table(table):
@@ -146,136 +123,7 @@ def _migrate_columns():
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}"))
 
 
-def _migrate_signup_feedback_backfill():
-    """Mirror already-collected signup_surveys rows into feedback_responses.
 
-    The feedback store is meant to hold all three surfaces so the admin readout
-    is one query; without this, sign-up answers collected BEFORE the store
-    existed would be the one surface missing from it, and the report would
-    silently under-count the earliest (and currently only) respondents.
-
-    signup_surveys remains the source of truth -- it is the survey GATE
-    (auth_router._needs_survey reads it) and GET /admin/signups reads it
-    directly. This is a read-side mirror, nothing depends on it for correctness.
-
-    Idempotent: skips any user who already has a "signup" row, so it is a no-op
-    on every boot after the first."""
-    from sqlalchemy import inspect, text
-
-    insp = inspect(engine)
-    if not insp.has_table("signup_surveys") or not insp.has_table("feedback_responses"):
-        return
-    try:
-        with engine.begin() as conn:
-            done = {
-                r[0] for r in conn.execute(
-                    text("SELECT DISTINCT user_id FROM feedback_responses WHERE surface = 'signup'")
-                )
-            }
-            rows = conn.execute(
-                text("SELECT user_id, priority, used_ai_tool, created_at FROM signup_surveys")
-            ).all()
-            # Count what was actually INSERTED, not a difference between two set
-            # sizes -- those only agree when every already-mirrored user still
-            # has a signup_surveys row, and a log line that reports 0 while
-            # writing rows is how a working migration gets distrusted later.
-            mirrored = 0
-            for user_id, priority, used_ai_tool, created_at in rows:
-                if user_id in done:
-                    continue
-                for question_id, answer in (
-                    ("signup_priority", priority or ""),
-                    ("signup_used_ai_tool", "yes" if used_ai_tool else "no"),
-                ):
-                    conn.execute(
-                        text(
-                            "INSERT INTO feedback_responses "
-                            "(user_id, profile_id, run_id, surface, question_id, answer, created_at) "
-                            "VALUES (:u, NULL, NULL, 'signup', :q, :a, :t)"
-                        ),
-                        {"u": user_id, "q": question_id, "a": answer, "t": created_at},
-                    )
-                mirrored += 1
-            if mirrored:
-                print(f"[migrate] mirrored {mirrored} signup survey answer set(s) into feedback_responses")
-    except Exception as e:  # pragma: no cover - a mirror must never block startup
-        print(f"[migrate] could not backfill signup feedback: {e!r}")
-
-
-def _migrate_signup_indexes():
-    """Create the indexes `users.google_sub` / `users.email` declare on the model.
-
-    Same trap as _migrate_ghost_indexes documents for jobs_seen.repost_key:
-    _migrate_columns only issues ALTER TABLE ADD COLUMN, and create_all never
-    revisits an existing table, so `index=True` / `unique=True` on a column added
-    that way takes effect only on a database built from scratch afterwards.
-
-    The uniqueness of `google_sub` is not a performance detail here -- it is the
-    last line of defence against two rows for the same Google account, which
-    would silently split one person's profiles and search history in two. It is
-    created as a UNIQUE index for that reason; `email` gets a plain one because
-    email is display-only and is genuinely allowed to repeat (a legacy beta
-    account and a Google account can belong to the same person).
-
-    Idempotent via IF NOT EXISTS. The UNIQUE index will legitimately fail on a
-    database that somehow already holds duplicates -- that is reported rather
-    than swallowed, because carrying on would leave the invariant unenforced
-    with nothing anywhere saying so."""
-    from sqlalchemy import inspect, text
-
-    insp = inspect(engine)
-    if not insp.has_table("users"):
-        return
-    cols = {c["name"] for c in insp.get_columns("users")}
-    if "google_sub" not in cols:
-        return
-    # Guarded per column rather than as one list: _migrate_columns runs first so
-    # all four normally exist, but a half-migrated store must not turn a missing
-    # column into a printed error that looks like index corruption.
-    stmts = ["CREATE UNIQUE INDEX IF NOT EXISTS ix_users_google_sub ON users (google_sub)",
-             "CREATE INDEX IF NOT EXISTS ix_users_email ON users (email)"]
-    if "apple_sub" in cols:
-        # Same argument as google_sub, for the same reason: two rows for one
-        # Apple account would split a person's profiles and history in two.
-        stmts.append("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_apple_sub ON users (apple_sub)")
-    if "auth_provider" in cols:
-        stmts.append("CREATE INDEX IF NOT EXISTS ix_users_auth_provider ON users (auth_provider)")
-    with engine.begin() as conn:
-        for s in stmts:
-            try:
-                conn.execute(text(s))
-            except Exception as e:  # pragma: no cover - only on a corrupt store
-                print(f"[migrate] could not create index ({s.split()[-3]}): {e}")
-
-
-def _migrate_auth_provider():
-    """Stamp `google` on accounts that predate the auth_provider column.
-
-    NULL on that column means "legacy hand-assigned account", and that meaning
-    is load-bearing: auth_router._needs_survey never asks a legacy account the
-    sign-up questions, so leaving a Google account NULL would silently exempt
-    every existing self-serve user from a survey they have (in most cases)
-    already answered -- harmless -- while also mislabelling them in
-    GET /admin/signups, which is the only place anyone sees who has arrived.
-
-    Cannot guess wrong: `google_sub` has only ever been written by the Google
-    sign-in path, so a non-null value is proof of provenance. Rows with a NULL
-    google_sub are left NULL, which is exactly right for them. Apple and email
-    accounts always write the column at creation, so they never need this.
-    Idempotent -- the WHERE clause matches nothing on a second run."""
-    from sqlalchemy import inspect, text
-
-    insp = inspect(engine)
-    if not insp.has_table("users"):
-        return
-    cols = {c["name"] for c in insp.get_columns("users")}
-    if not {"auth_provider", "google_sub"} <= cols:
-        return
-    with engine.begin() as conn:
-        conn.execute(text(
-            "UPDATE users SET auth_provider = 'google' "
-            "WHERE auth_provider IS NULL AND google_sub IS NOT NULL AND google_sub != ''"
-        ))
 
 
 def _migrate_soft_dup_key():

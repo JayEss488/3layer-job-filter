@@ -4,7 +4,7 @@ Same posture as scripts/gen_uk_geo.py and scripts/gen_countries.py: one
 dev-time source of truth, one generated plain-data module the app imports, zero
 runtime dependencies and zero per-search API calls.
 
-  source (gitignored, ~507MB):  txt non code/publicextract.charity.json
+  source (gitignored, ~507MB):  archive/txt non code/publicextract.charity.json
   generated (committed):        backend/app/uk_charity_gen.py
 
 WHY THIS EXISTS
@@ -50,7 +50,7 @@ import sys
 from urllib.parse import urlsplit
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCE = os.path.join(BASE_DIR, "txt non code", "publicextract.charity.json")
+SOURCE = os.path.join(BASE_DIR, "archive", "txt non code", "publicextract.charity.json")
 OUT = os.path.join(BASE_DIR, "backend", "app", "uk_charity_gen.py")
 
 # See the module docstring: below this, a charity has no payroll to hire onto.

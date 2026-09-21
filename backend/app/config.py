@@ -20,246 +20,53 @@ if str(ROOT_DIR) not in sys.path:
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(BACKEND_DIR / ".env", override=False)
 
-# Fallback user_id used ONLY as a column default (models.py) and by the
-# throwaway diagnostics probe profile. The real, per-request user now comes from
-# the authenticated login token -- see services/auth.py and deps.current_user_id().
-CURRENT_USER_ID = 1
+# ── The single local user ────────────────────────────────────────────────────
+# There is no login. Every table still carries a `user_id` column and every
+# ownership check still goes through deps.current_user_id(), which returns this
+# constant -- so the multi-user seam is intact if it is ever wanted again, but
+# nothing today asks who you are.
+LOCAL_USER_ID = int(os.getenv("LOCAL_USER_ID", "1"))
 
-# ── Auth (closed beta) ───────────────────────────────────────────────────────
-# AUTH_SECRET signs login tokens. MUST be set to a stable, random value in
-# production: if it's the dev default, tokens are both forgeable and reset on
-# every process restart. Generate one with e.g. `python -c "import secrets;
-# print(secrets.token_urlsafe(48))"` and set it in the host's env.
-AUTH_SECRET = os.getenv("AUTH_SECRET", "dev-insecure-secret-change-me")
-if AUTH_SECRET == "dev-insecure-secret-change-me":
-    print("[config] WARNING: AUTH_SECRET is the insecure dev default -- set it in the environment before any real deployment.")
+# Kept as an alias because `models.py` uses it as a column default and a handful
+# of diagnostics probes reference it by this name.
+CURRENT_USER_ID = LOCAL_USER_ID
 
-# How long a login token stays valid before the user must sign in again.
-TOKEN_MAX_AGE_SECONDS = int(os.getenv("TOKEN_MAX_AGE_SECONDS", str(60 * 60 * 24 * 30)))
-
-# Shared secret guarding the owner-only analytics endpoint (GET /admin/analytics,
-# sent as the `X-Admin-Token` header). Empty string = endpoint disabled/locked.
+# Optional shared secret guarding the maintenance endpoints under /admin (the
+# direct-employer crawl, the daily observation pass, the liveness re-check),
+# sent as the `X-Admin-Token` header. Empty (the default) leaves them open,
+# which is correct for a tool bound to localhost and wrong the moment it is not.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
-# ── Self-serve sign-up (Google) ──────────────────────────────────────────────
-# The OAuth 2.0 *Web application* client id from Google Cloud Console →
-# APIs & Services → Credentials. It is public by design (it ships in the
-# frontend bundle); there is no client SECRET here because Google Identity
-# Services' button hands the browser a signed ID token directly and the backend
-# only ever VERIFIES it -- we never exchange an auth code, so no confidential
-# credential is involved.
-#
-# It is nonetheless load-bearing for security: verification checks the token's
-# `aud` claim equals this exact value. Without that check, an ID token minted by
-# Google for ANY other application would authenticate here. Empty string
-# therefore disables self-serve sign-up entirely (POST /auth/google returns 503)
-# rather than falling back to an unverified path.
-#
-# Add the site's origin to "Authorised JavaScript origins" on that OAuth client,
-# or Google refuses to render the button at all.
-#
-# GOOGLE_OAUTH_CLIENT_ID is accepted as a fallback: a client already existed in
-# the repo-root .env under that name before self-serve sign-up was built, and
-# silently ignoring it would present as "sign-in is unavailable" on a deployment
-# that is, as far as the operator is concerned, already configured.
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "") or os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
-if not GOOGLE_CLIENT_ID:
-    print("[config] NOTE: GOOGLE_CLIENT_ID is unset -- Google sign-in is disabled (POST /auth/google -> 503).")
-
-# ── Sign in with Apple ───────────────────────────────────────────────────────
-# The **Services ID** (e.g. "com.fourinathousand.web"), NOT the App ID: the web
-# flow authenticates against a Services ID and Apple puts it in the token's
-# `aud`. As with Google this is public (it ships in the AppleID.js init call) and
-# is load-bearing for exactly the same reason -- verification compares `aud` to
-# this exact value, and without that comparison an Apple ID token minted for any
-# other application would authenticate here.
-#
-# Unlike Google there is NO client secret and no .p8 key needed, because the
-# browser flow used here (AppleID.auth.signIn with usePopup) hands the page a
-# signed id_token directly and the backend only verifies it. The private key is
-# only required for the server-side authorization-code exchange, which this does
-# not do.
-#
-# Empty disables Apple sign-in entirely (POST /auth/apple -> 503) and the button
-# is not rendered. Setup, all of which is on Apple's side:
-#   1. An Apple Developer Program membership (paid) and an App ID.
-#   2. A Services ID with "Sign in with Apple" enabled, whose value goes here.
-#   3. The site's domain registered on that Services ID, and the return URL
-#      added -- Apple rejects the popup outright if the origin isn't listed.
-APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID", "")
-
-# Email + password sign-up. On by default: its whole purpose is to be the path
-# that needs no third-party account, so requiring an env var to turn it on would
-# leave the default deployment offering exactly the two providers it exists to
-# supplement. Set EMAIL_SIGNUP_ENABLED=0 to hide the form and 503 the endpoints.
-#
-# There IS now a verification email and a password reset, both through Resend --
-# see the mail block further down and services/mailer.py. Before that existed,
-# an email account was a second-class citizen in a way that only showed up at
-# the worst moment: nobody had proved they owned the address, and a forgotten
-# password locked the holder out permanently with no recovery path at all.
-EMAIL_SIGNUP_ENABLED = os.getenv("EMAIL_SIGNUP_ENABLED", "1").lower() not in {"0", "false", "no"}
-# Minimum password length. A length floor is the only password rule imposed:
-# composition rules ("one number, one symbol") measurably push people toward
-# shorter, more guessable passwords, and nothing here is protecting a payment
-# method -- the account holds a CV and a list of job adverts.
-PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
-
-# Q1 of the post-signup survey (single select). Stored on SignupSurvey.priority
-# as the raw slug; the labels live in the frontend so wording can change without
-# a migration. Order is the display order.
-SIGNUP_PRIORITY_CHOICES = [
-    "ghost_roles",       # avoiding jobs that aren't really hiring
-    "visa_sponsors",     # filtering to visa sponsors
-    "faster",            # discovering ok roles faster
-    "hard_to_find_fit",  # it's difficult to find roles that fit
-    "niche",             # finding niche / lower-competition roles
-    "none",              # none of these
-]
-
-# ── Open beta: the fixed test window ─────────────────────────────────────────
-# Two SEPARATE gates off one clock (User.beta_started_at), and they must stay
-# separate -- see services/beta.py:
-#
-#   * EXIT_SURVEY_AFTER_DAYS -- from this day on, the next time the user loads
-#     the app they are held on /exit-survey until they answer. Answering
-#     releases them back into the app for the rest of the window. Deliberately
-#     NOT the last day: triggering on day 7 would require the user to log in on
-#     one specific day, which is the single most likely way to collect nothing.
-#   * BETA_WINDOW_DAYS -- access lapses (a real 403, see require_active_beta).
-#
-# Note what CANNOT enforce this: TOKEN_MAX_AGE_SECONDS above is 30 days, the
-# same length as the window below, so token expiry is not a reliable backstop
-# for it and the check is its own.
-BETA_WINDOW_DAYS = int(os.getenv("BETA_WINDOW_DAYS", "30"))
-EXIT_SURVEY_AFTER_DAYS = int(os.getenv("EXIT_SURVEY_AFTER_DAYS", "4"))
-
-# Q2 of the wrap-up survey: which features materially proved useful (multi
-# select). "none" is NOT padding -- with a plain checkbox group, zero ticks is
-# indistinguishable between "none of these were useful" (a real, valuable
-# answer) and "hasn't answered yet", and the survey gate has to be able to tell
-# when to release the user. Same reasoning as SIGNUP_PRIORITY_CHOICES' "none".
-EXIT_SURVEY_FEATURE_CHOICES = [
-    "ghost_check",        # ghost job checking
-    "sponsor_check",      # visa sponsor checking
-    "one_line_summary",   # now the role bullet points (was the one-line summary,
-                           # pre-v23 card format)
-    "why_qualified",      # now the qualification ticklist (was the "why qualified"
-                           # summary, pre-v29 card format)
-    "none",               # none of these
-]
-
-# Q3 of the wrap-up survey: the speed/quality trade-off, asked assuming the
-# current ~12 roles per run.
-EXIT_SURVEY_SPEED_CHOICES = [
-    "slower_better",  # wait longer for slightly better roles
-    "as_is",          # keep it as-is
-    "faster_worse",   # wait a lot less for slightly worse roles
-]
-
 # SQLite by default; flip DATABASE_URL to a postgres:// URL to migrate later.
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'jobmatch.db'}")
+#
+# The default file now lives under the gitignored data/ directory alongside every
+# other generated file, so wiping local state is one `rm -rf data/` instead of a
+# hunt across backend/, tests/ and the repo root. data_paths is imported (not
+# spelled out here) because full_auto.py needs the same answers and the two must
+# not drift; it is safe to import at this point because ROOT_DIR is already on
+# sys.path above and the module pulls in nothing heavier than pathlib.
+#
+# data_paths.APP_DB_PATH keeps returning the OLD backend/jobmatch.db whenever that
+# file already exists, so an existing install's only copy of its profiles and
+# roles is never silently orphaned by this change -- only fresh installs get data/.
+# It is None when DATABASE_URL is set, in which case the caller's value wins and
+# there is no path to resolve.
+import data_paths as _dp
+
+_dp.ensure_data_dir()
+DATABASE_URL = os.getenv("DATABASE_URL") or f"sqlite:///{_dp.APP_DB_PATH}"
 
 # Frontend origin(s) allowed through CORS.
 FRONTEND_ORIGINS = os.getenv(
     "FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",")
 
-# ── Transactional mail (Resend) ──────────────────────────────────────────────
-# The provider is Resend (https://resend.com). Only two things are ever sent:
-# an address-verification link and a password-reset link. There is no marketing
-# mail, no digest and no list -- every send is the direct result of an action
-# the recipient just took, which is what keeps this out of consent/unsubscribe
-# territory entirely.
+# Cost guard: max live searches per calendar day. This is the main thing
+# standing between an experiment and a surprising API bill -- a run costs
+# roughly 100k tokens (see the README's cost section). Raise it deliberately.
 #
-# An unset RESEND_API_KEY DISABLES sending rather than erroring. That is not
-# laziness: the endpoints that send are also the endpoints that create accounts
-# and accept sign-ins, and the documented product invariant is that nothing in
-# the auth path may block a new user. A dev box with no key gets working
-# sign-up with a link printed to the console (see services/mailer.py).
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-
-# Alternative provider: a Gmail account's own SMTP relay + an App Password,
-# instead of Resend. Exists because Resend's sandbox sender (see EMAIL_FROM
-# below) only delivers to the Resend account owner until a domain is verified
-# -- Gmail SMTP delivers to any recipient immediately, no domain needed, which
-# makes it the faster path for local dev and small-scale testing. See
-# mailer.py for how the two providers are chosen between and Gmail's own
-# limits (roughly 500 messages/day on a consumer account, no bounce feedback).
-# Requires 2-Step Verification on the Gmail account and a generated App
-# Password (myaccount.google.com/apppasswords) -- NOT the account's login
-# password, which SMTP auth will reject.
-GMAIL_SMTP_ADDRESS = os.getenv("GMAIL_SMTP_ADDRESS", "")
-GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "")
-
-# The From address. MUST be on a domain verified in the Resend dashboard, with
-# one exception: `onboarding@resend.dev` is Resend's shared testing sender,
-# which is deliverable ONLY to the email address that owns the Resend account.
-# That is the right default (it works out of the box for the operator's own
-# testing) and the wrong production value (every other recipient is rejected),
-# so it is called out in the deployment checklist rather than silently assumed.
-EMAIL_FROM = os.getenv("EMAIL_FROM", "Four in a Thousand <onboarding@resend.dev>")
-# Where replies go. Optional; when set it is usually a real inbox, since the
-# From above frequently is not.
-EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "")
-
-# Loud on purpose, same reasoning as the AUTH_SECRET warning above: these vars
-# are read once at process start, so editing .env alone (without a process
-# restart -- uvicorn --reload only reacts to .py changes) silently keeps the
-# OLD provider active. A visible startup line is what makes that self-evident
-# instead of a confusing "nothing arrived" a run later.
-if GMAIL_SMTP_ADDRESS and GMAIL_SMTP_APP_PASSWORD:
-    print(f"[config] mail: Gmail SMTP ({GMAIL_SMTP_ADDRESS})")
-elif RESEND_API_KEY:
-    print(f"[config] mail: Resend (from={EMAIL_FROM})")
-else:
-    print("[config] mail: no provider configured -- verification/reset links print to console")
-
-# The public origin the links in those emails point at -- the FRONTEND's origin,
-# not the API's. Defaults to the first CORS origin, which is right in dev and
-# right in production whenever FRONTEND_ORIGINS is set to the real site; set it
-# explicitly when several origins are allowed, because the first one wins and a
-# link to the wrong one is a dead link in someone's inbox.
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/") or FRONTEND_ORIGINS[0].strip().rstrip("/")
-
-# Whether an unverified address BLOCKS sign-in.
-#
-# Default OFF, and the reasoning is the same product invariant as above:
-# "instant access" is what this app promises, and a hard gate here means an
-# undelivered email (a wrong address, a spam folder, a Resend outage, an
-# unverified sending domain) is indistinguishable from a broken account. With
-# it off, an unverified user is signed in and nagged by a banner until they
-# click the link. Flip it to 1 once deliverability has been observed to be
-# reliable and the trade is worth making.
-EMAIL_VERIFICATION_REQUIRED = os.getenv("EMAIL_VERIFICATION_REQUIRED", "0").lower() in {"1", "true", "yes"}
-
-# Link lifetimes. The reset link is deliberately far shorter-lived than the
-# verification link: it is a bearer credential that grants a password change,
-# whereas the verification link only ever asserts "this mailbox exists".
-EMAIL_VERIFY_TOKEN_MAX_AGE_SECONDS = int(os.getenv("EMAIL_VERIFY_TOKEN_MAX_AGE_SECONDS", str(60 * 60 * 24 * 3)))
-PASSWORD_RESET_TOKEN_MAX_AGE_SECONDS = int(os.getenv("PASSWORD_RESET_TOKEN_MAX_AGE_SECONDS", str(60 * 60)))
-
-# Abuse guard on the endpoints that will send mail to an address supplied by an
-# UNAUTHENTICATED caller. Without it, /auth/password/forgot is a free
-# mail-bombing lever pointed at any address someone types, billed to our Resend
-# quota and charged against our sending reputation. In-process (single instance,
-# see MAX_CONCURRENT_SEARCHES).
-#
-# TWO limits, because the two keys guard different attacks and a single number
-# cannot serve both. The ADDRESS limit stops one mailbox being flooded from many
-# clients, and can be tight: nobody legitimately needs six reset links to one
-# address in an hour. The CLIENT limit stops one caller walking a list of
-# addresses, and must be much looser, because an IP is not a person -- a shared
-# office connection or a mobile carrier's CGNAT puts thousands of unrelated
-# users behind one address, and setting this to the per-address number would
-# mean the fifth person on that network to forget their password is refused
-# because of four strangers.
-EMAIL_SEND_MAX_PER_HOUR = int(os.getenv("EMAIL_SEND_MAX_PER_HOUR", "5"))
-EMAIL_SEND_MAX_PER_HOUR_PER_CLIENT = int(os.getenv("EMAIL_SEND_MAX_PER_HOUR_PER_CLIENT", "30"))
-
-# Cost guard: max live searches PER USER, per calendar day (see
-# routers/search.py::_searches_today, which counts a user's own runs only). It
-# is not a global/shared pool -- one beta user cannot exhaust everyone's quota.
+# Note a run killed mid-flight (crash, restart) still counts: the row exists and
+# it really did spend API credits.
 MAX_SEARCHES_PER_DAY = int(os.getenv("MAX_SEARCHES_PER_DAY", "6"))
 
 # Capacity guard, orthogonal to the per-user daily cap above: how many searches
